@@ -15,8 +15,10 @@ cd "$BOT_DIR" || exit 1
 OLD_HASH=$(git rev-parse HEAD 2>/dev/null)
 
 # Pull latest (force-reset to match remote exactly)
-git fetch origin main --quiet 2>/dev/null
-REMOTE_HASH=$(git rev-parse origin/main 2>/dev/null)
+# Detect branch name (master or main)
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "master")
+git fetch origin "$BRANCH" --quiet 2>/dev/null
+REMOTE_HASH=$(git rev-parse origin/"$BRANCH" 2>/dev/null)
 
 # Only update if there's actually a change
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
@@ -27,7 +29,7 @@ fi
 echo "$LOG_PREFIX UPDATE: $OLD_HASH -> $REMOTE_HASH"
 
 # Apply update (preserves .env and logs)
-git reset --hard origin/main --quiet 2>/dev/null
+git reset --hard origin/"$BRANCH" --quiet 2>/dev/null
 
 # Show what changed
 git log --oneline "$OLD_HASH".."$REMOTE_HASH" 2>/dev/null
@@ -62,7 +64,7 @@ import httpx
 token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
 if token and chat_id:
-    changes = '''$(git log --oneline "$OLD_HASH".."$REMOTE_HASH" 2>/dev/null | head -5)'''
+    changes = '''$(git log --oneline ${OLD_HASH}..${REMOTE_HASH} 2>/dev/null | head -5)'''
     msg = f'Bot Updated & Restarted\n\nNew commits:\n{changes}\n\nStatus: $STATUS\nNext cycle starts in ~30s.'
     try:
         httpx.post(f'https://api.telegram.org/bot{token}/sendMessage',
