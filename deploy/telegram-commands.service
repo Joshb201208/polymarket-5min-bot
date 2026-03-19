@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket Bot — Telegram Command Handler
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-bot
+ExecStart=/root/polymarket-bot/venv/bin/python /root/polymarket-bot/telegram_commands.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=append:/root/polymarket-bot/logs/telegram_cmd.log
+StandardError=append:/root/polymarket-bot/logs/telegram_cmd.log
+
+MemoryMax=128M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target

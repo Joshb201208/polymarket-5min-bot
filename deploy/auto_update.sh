@@ -39,9 +39,9 @@ if git diff --name-only "$OLD_HASH" "$REMOTE_HASH" | grep -q "requirements.txt";
     pip install --quiet -r requirements.txt
 fi
 
-# Restart the bot service to pick up new code
-echo "$LOG_PREFIX Restarting bot service..."
-systemctl restart polymarket-bot 2>/dev/null || true
+# Restart both services to pick up new code
+echo "$LOG_PREFIX Restarting services..."
+systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
 sleep 2
 
 if systemctl is-active --quiet polymarket-bot; then

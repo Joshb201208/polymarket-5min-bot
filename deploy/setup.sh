@@ -75,11 +75,15 @@ echo -e "${GREEN}[5/7] Installing systemd service...${NC}"
 sed "s|/root/polymarket-bot|$BOT_DIR|g" "$BOT_DIR/deploy/polymarket-bot.service" > /etc/systemd/system/polymarket-bot.service
 sed -i "s|User=root|User=$(whoami)|g" /etc/systemd/system/polymarket-bot.service
 
-systemctl daemon-reload
-systemctl enable polymarket-bot
-systemctl restart polymarket-bot
+# Telegram command handler service
+sed "s|/root/polymarket-bot|$BOT_DIR|g" "$BOT_DIR/deploy/telegram-commands.service" > /etc/systemd/system/telegram-commands.service
+sed -i "s|User=root|User=$(whoami)|g" /etc/systemd/system/telegram-commands.service
 
-echo "  Systemd service installed and started ✓"
+systemctl daemon-reload
+systemctl enable polymarket-bot telegram-commands
+systemctl restart polymarket-bot telegram-commands
+
+echo "  Systemd services installed and started ✓"
 
 # ── 6. Install cron jobs (auto-update + health check) ──────
 echo -e "${GREEN}[6/7] Installing cron jobs...${NC}"
