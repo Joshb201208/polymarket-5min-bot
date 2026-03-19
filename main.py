@@ -412,10 +412,10 @@ class PolymarketBot:
                     "\U0001f4e5 Redeemed %s %s: %.2f tokens → $%.2f USDC",
                     r.asset, r.outcome, r.tokens_redeemed, r.usdc_received,
                 )
-                if self._telegram_cfg and self._telegram_cfg.is_configured:
+                if self._config.telegram and self._config.telegram.is_configured:
                     send_telegram_message(
-                        self._telegram_cfg.bot_token,
-                        self._telegram_cfg.chat_id,
+                        self._config.telegram.bot_token,
+                        self._config.telegram.chat_id,
                         f"\U0001f4e5 Redeemed {r.asset} {r.outcome}: "
                         f"${r.usdc_received:,.2f} USDC collected",
                     )
@@ -559,6 +559,21 @@ class PolymarketBot:
                 signal.asset, signal.direction, result.filled_price,
                 result.filled_size, result.order_id,
             )
+            # Telegram trade alert
+            if self._config.telegram and self._config.telegram.is_configured:
+                bal = self._paper_trader.get_balance() if self._paper_trader else 0
+                msg = (
+                    f"NEW TRADE\n"
+                    f"Asset: {signal.asset}\n"
+                    f"Direction: {signal.direction}\n"
+                    f"Entry: {result.filled_price:.3f}\n"
+                    f"Size: ${size:.2f}\n"
+                    f"Shares: {result.filled_size:.2f}\n"
+                    f"Edge: {signal.edge:.3f}\n"
+                    f"Strategy: {signal.strategy_name}\n"
+                    f"Balance: ${bal:.2f}"
+                )
+                send_telegram_message(self._config.telegram.bot_token, self._config.telegram.chat_id, msg)
         else:
             logger.info("[PAPER] Order failed: %s", result.error)
 
@@ -593,6 +608,20 @@ class PolymarketBot:
                 signal.asset, signal.direction, result.filled_price,
                 result.order_id,
             )
+            # Telegram trade alert
+            if self._config.telegram and self._config.telegram.is_configured:
+                bal = self._risk_manager.get_balance()
+                msg = (
+                    f"LIVE TRADE\n"
+                    f"Asset: {signal.asset}\n"
+                    f"Direction: {signal.direction}\n"
+                    f"Entry: {result.filled_price:.3f}\n"
+                    f"Size: ${size:.2f}\n"
+                    f"Edge: {signal.edge:.3f}\n"
+                    f"Strategy: {signal.strategy_name}\n"
+                    f"Balance: ${bal:.2f}"
+                )
+                send_telegram_message(self._config.telegram.bot_token, self._config.telegram.chat_id, msg)
         else:
             logger.warning("[LIVE] Order failed: %s", result.error)
 
@@ -655,6 +684,19 @@ class PolymarketBot:
                 won=trade.won,
             )
             self._monitor.log_trade(entry)
+
+            # Telegram resolution alert
+            if self._config.telegram and self._config.telegram.is_configured:
+                result_emoji = "WIN" if trade.won else "LOSS"
+                msg = (
+                    f"TRADE RESOLVED: {result_emoji}\n"
+                    f"Asset: {trade.asset}\n"
+                    f"Direction: {trade.direction}\n"
+                    f"Entry: {trade.entry_price:.3f} -> Exit: {trade.exit_price:.3f}\n"
+                    f"P&L: ${trade.net_pnl:+.2f}\n"
+                    f"Balance: ${trade.balance_after:.2f}"
+                )
+                send_telegram_message(self._config.telegram.bot_token, self._config.telegram.chat_id, msg)
 
     # ------------------------------------------------------------------
     # Midpoint fetching (WebSocket first, then REST fallback)
