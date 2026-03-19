@@ -11,6 +11,7 @@ Strategy:
 Returns structured market dicts with everything the strategy needs.
 """
 
+import json
 import math
 import time
 import logging
@@ -262,7 +263,8 @@ class MarketFinder:
         token_id_yes = ""
         token_id_no = ""
 
-        tokens = data.get("tokens", data.get("clobTokenIds", []))
+        # Parse tokens - try structured tokens array first
+        tokens = data.get("tokens")
         if isinstance(tokens, list):
             for token in tokens:
                 if isinstance(token, dict):
@@ -272,20 +274,19 @@ class MarketFinder:
                         token_id_yes = token_id
                     elif outcome in ("down", "no", "lower"):
                         token_id_no = token_id
-        elif isinstance(tokens, list) and all(isinstance(t, str) for t in tokens):
-            # Sometimes just a list of two IDs; assume [YES, NO] ordering
-            if len(tokens) >= 2:
-                token_id_yes = tokens[0]
-                token_id_no = tokens[1]
 
-        # Some responses embed token IDs directly
+        # Gamma API often returns clobTokenIds as a JSON string, not a list
+        # e.g., '["tokenid1", "tokenid2"]' — parse it
         if not token_id_yes and not token_id_no:
-            outcomes = data.get("outcomes", [])
-            outcome_prices = data.get("outcomePrices", [])
-            clob_ids = data.get("clobTokenIds", [])
-            if isinstance(clob_ids, list) and len(clob_ids) >= 2:
-                token_id_yes = str(clob_ids[0])
-                token_id_no = str(clob_ids[1])
+            clob_ids_raw = data.get("clobTokenIds", [])
+            if isinstance(clob_ids_raw, str):
+                try:
+                    clob_ids_raw = json.loads(clob_ids_raw)
+                except (json.JSONDecodeError, ValueError):
+                    clob_ids_raw = []
+            if isinstance(clob_ids_raw, list) and len(clob_ids_raw) >= 2:
+                token_id_yes = str(clob_ids_raw[0])
+                token_id_no = str(clob_ids_raw[1])
 
         if not condition_id and not token_id_yes:
             logger.debug("MarketFinder: could not parse market data: %s", data)

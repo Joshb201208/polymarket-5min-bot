@@ -391,18 +391,36 @@ class PaperTrader:
             # Gamma stores resolution in different fields depending on version
             resolution = data.get("resolution", "")
             winner = data.get("winner", "")
+
+            # Method 1: Check outcomePrices (often a JSON string)
+            # Format: '["0.0", "1.0"]' where index 0=YES/Up, 1=NO/Down
+            outcome_prices_raw = data.get("outcomePrices", [])
+            if isinstance(outcome_prices_raw, str):
+                try:
+                    import json as _json
+                    outcome_prices_raw = _json.loads(outcome_prices_raw)
+                except (ValueError, TypeError):
+                    outcome_prices_raw = []
+            if isinstance(outcome_prices_raw, list) and len(outcome_prices_raw) >= 2:
+                yes_price = float(outcome_prices_raw[0])
+                no_price = float(outcome_prices_raw[1])
+                if yes_price >= 0.95:
+                    return "up"
+                if no_price >= 0.95:
+                    return "down"
+
+            # Method 2: Check structured tokens array
             tokens = data.get("tokens", [])
+            if isinstance(tokens, list):
+                for token in tokens:
+                    if isinstance(token, dict):
+                        outcome = str(token.get("outcome", "")).lower()
+                        price = float(token.get("price", 0) or 0)
+                        if price >= 0.99:
+                            return outcome
 
-            # Check resolved prices: winning token = 1.0
-            for token in tokens:
-                if isinstance(token, dict):
-                    outcome = str(token.get("outcome", "")).lower()
-                    price = float(token.get("price", 0) or 0)
-                    if price >= 0.99:  # resolved as winner
-                        return outcome
-
-            # Fall back to resolution string
-            combined = (resolution + winner).lower()
+            # Method 3: Fall back to resolution string
+            combined = (str(resolution) + str(winner)).lower()
             if "up" in combined or "higher" in combined or "yes" in combined:
                 return "up"
             if "down" in combined or "lower" in combined or "no" in combined:
@@ -421,37 +439,44 @@ class PaperTrader:
     def _get_fill_price(self, token_id: str, desired_price: float) -> Optional[float]:
         """
         Get the current best ask price from the CLOB orderbook.
+        Falls back to CLOB midpoint, then returns None (caller uses desired_price).
 
         Returns:
             Best ask price, or None on error.
         """
+        # Try CLOB orderbook first
         try:
             with httpx.Client(timeout=6) as client:
                 resp = client.get(
                     f"{self.CLOB_BASE}/book",
                     params={"token_id": token_id},
                 )
-                resp.raise_for_status()
-                book = resp.json()
-
-            asks = book.get("asks", [])
-            if asks:
-                best_ask = min(float(a.get("price", 1.0)) for a in asks)
-                return round_to_tick(best_ask)
-
-            # Fallback: use midpoint
-            resp2 = httpx.get(
-                f"{self.CLOB_BASE}/midpoint",
-                params={"token_id": token_id},
-                timeout=6,
-            )
-            resp2.raise_for_status()
-            mid = float(resp2.json().get("mid", 0.5))
-            return round_to_tick(mid + 0.01)  # add 1 tick for buy slippage
-
+                if resp.status_code == 200:
+                    book = resp.json()
+                    asks = book.get("asks", [])
+                    if asks:
+                        best_ask = min(float(a.get("price", 1.0)) for a in asks)
+                        return round_to_tick(best_ask)
         except Exception as exc:
-            logger.debug("PaperTrader: fill price error for %s: %s", token_id[:16], exc)
-            return None
+            logger.debug("PaperTrader: CLOB book error for %s: %s", token_id[:16], exc)
+
+        # Try CLOB midpoint
+        try:
+            with httpx.Client(timeout=6) as client:
+                resp = client.get(
+                    f"{self.CLOB_BASE}/midpoint",
+                    params={"token_id": token_id},
+                )
+                if resp.status_code == 200:
+                    mid = float(resp.json().get("mid", 0) or 0)
+                    if mid > 0:
+                        return round_to_tick(mid + 0.01)
+        except Exception as exc:
+            logger.debug("PaperTrader: CLOB midpoint error for %s: %s", token_id[:16], exc)
+
+        # All CLOB methods failed — return None (caller uses desired_price as fallback)
+        logger.debug("PaperTrader: all CLOB methods failed for %s, using fallback", token_id[:16])
+        return None
 
     # ------------------------------------------------------------------
     # State Persistence
