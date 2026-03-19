@@ -196,6 +196,11 @@ class StrategyEngine:
         if not signal.is_valid and self._scfg.primary_strategy == "latency_arb":
             signal = self._signal_based_signal(asset, polymarket_mid_yes, secs_remaining)
 
+        # If both latency_arb and signal_based found nothing,
+        # try macro momentum (24h exchange change vs Polymarket mid)
+        if not signal.is_valid:
+            signal = self._macro_momentum_signal(asset, polymarket_mid_yes, secs_remaining)
+
         # In the 30–60 second zone, also try the late-window strategy
         # as a supplementary check (it may find a cleaner entry)
         if not signal.is_valid and secs_remaining < 60:
@@ -226,10 +231,11 @@ class StrategyEngine:
             )
             return False
 
-        # Late-window maker strategy uses a lower confidence threshold
-        # (it's a high-conviction, short-duration trade)
+        # Late-window maker and macro momentum strategies use lower confidence thresholds
         if signal.strategy_name == "late_window_maker":
             min_conf = max(0.50, self._scfg.signal_confidence_threshold - 0.10)
+        elif signal.strategy_name == "macro_momentum":
+            min_conf = max(0.40, self._scfg.signal_confidence_threshold - 0.20)
         else:
             min_conf = self._scfg.signal_confidence_threshold
 
@@ -639,6 +645,138 @@ class StrategyEngine:
             + 0.20 * edge_factor
         )
         return clamp(confidence, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Strategy 4: Macro Momentum (24h exchange change vs Polymarket mid)
+    # ------------------------------------------------------------------
+
+    def _macro_momentum_signal(
+        self,
+        asset: str,
+        polymarket_mid_yes: float,
+        secs_remaining: float,
+    ) -> TradingSignal:
+        """
+        Macro momentum strategy: use the 24-hour price change from the
+        exchange as a directional signal.
+
+        Logic:
+          - If the exchange shows a strong 24h move (e.g., BTC down -4%),
+            the 5-min market should reflect that directional bias.
+          - If Polymarket is still at 0.50 (fair coin), there is clear edge.
+          - Scale confidence with the magnitude of the 24h move.
+          - Use a lower threshold than latency_arb since 24h change is
+            a stronger and more persistent signal.
+
+        Thresholds:
+          - |24h change| >= 1.0% → consider a trade
+          - |24h change| >= 2.0% → moderate confidence
+          - |24h change| >= 3.0% → high confidence
+
+        Also incorporates short-term momentum (if available) as confirmation.
+        """
+        change_24h = self._feed.get_24h_change(asset)
+
+        if abs(change_24h) < 0.01:  # less than 1% — not enough signal
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Macro momentum: {asset} 24h change {change_24h*100:+.2f}% "
+                    f"below 1% threshold"
+                ),
+                asset=asset,
+                strategy_name="macro_momentum",
+                seconds_remaining=secs_remaining,
+            )
+
+        # Determine direction from 24h change
+        if change_24h < 0:
+            # Exchange is bearish → expect DOWN in 5-min window
+            direction = "NO"          # Buy the Down token
+            poly_prob = 1.0 - polymarket_mid_yes  # Current DOWN price
+        else:
+            # Exchange is bullish → expect UP in 5-min window
+            direction = "YES"         # Buy the Up token
+            poly_prob = polymarket_mid_yes        # Current UP price
+
+        # Estimate our probability based on 24h change magnitude
+        # Larger 24h move → stronger directional bias for the 5-min window
+        abs_change = abs(change_24h)
+        if abs_change >= 0.05:      # 5%+ move
+            our_prob = 0.62
+        elif abs_change >= 0.03:    # 3-5% move
+            our_prob = 0.58
+        elif abs_change >= 0.02:    # 2-3% move
+            our_prob = 0.55
+        else:                       # 1-2% move
+            our_prob = 0.53
+
+        # Short-term momentum confirmation (if available)
+        momentum_30s = self._feed.get_momentum(asset, window=30)
+        momentum_confirms = (
+            (change_24h < 0 and momentum_30s <= 0) or
+            (change_24h > 0 and momentum_30s >= 0)
+        )
+        if momentum_confirms:
+            our_prob += 0.02  # boost if short-term agrees with 24h trend
+
+        # Edge = our estimated probability - market price - fees
+        edge_raw = our_prob - poly_prob
+        fee = polymarket_fee(shares=1.0, price=poly_prob)
+        edge = edge_raw - fee
+
+        if edge <= 0:
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Macro momentum: {asset} 24h={change_24h*100:+.2f}% "
+                    f"our_prob={our_prob:.2f} poly={poly_prob:.2f} "
+                    f"edge={edge:.4f} after fee — not enough"
+                ),
+                asset=asset,
+                strategy_name="macro_momentum",
+                edge=edge,
+                exchange_prob=our_prob,
+                polymarket_mid=polymarket_mid_yes,
+                seconds_remaining=secs_remaining,
+            )
+
+        # Confidence scales with: magnitude of 24h change, edge, momentum confirmation
+        change_factor = clamp(abs_change / 0.05, 0.3, 1.0)  # caps at 5%
+        edge_factor = clamp(edge / 0.08, 0.1, 1.0)          # caps at 8 cents edge
+        confirm_factor = 0.8 if momentum_confirms else 0.5
+        # Time factor: prefer trading earlier in window (more time for our thesis)
+        time_factor = clamp(secs_remaining / 240, 0.4, 1.0)
+
+        confidence = (
+            0.35 * change_factor
+            + 0.25 * edge_factor
+            + 0.20 * confirm_factor
+            + 0.20 * time_factor
+        )
+        confidence = clamp(confidence, 0.0, 1.0)
+
+        reasoning = (
+            f"Macro momentum: {asset} 24h={change_24h*100:+.2f}% → dir={direction} "
+            f"our_prob={our_prob:.2f} poly={poly_prob:.2f} edge={edge:.4f} "
+            f"conf={confidence:.2f} confirm={'yes' if momentum_confirms else 'no'} "
+            f"{secs_remaining:.0f}s remaining"
+        )
+
+        logger.info(reasoning)
+
+        return TradingSignal(
+            direction=direction,
+            confidence=confidence,
+            edge=edge,
+            strategy_name="macro_momentum",
+            reasoning=reasoning,
+            suggested_price=poly_prob,
+            exchange_prob=our_prob,
+            polymarket_mid=polymarket_mid_yes,
+            seconds_remaining=secs_remaining,
+            asset=asset,
+        )
 
     # ------------------------------------------------------------------
     # Strategy 2: Signal-Based

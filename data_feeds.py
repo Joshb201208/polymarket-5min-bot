@@ -151,6 +151,8 @@ class PriceFeed:
         # Latest price per asset
         self._latest: Dict[str, float] = {a: 0.0 for a in self._assets}
         self._latest_ts: Dict[str, float] = {a: 0.0 for a in self._assets}
+        # 24h change from exchange (decimal, e.g. -0.04 = -4%)
+        self._change_24h: Dict[str, float] = {a: 0.0 for a in self._assets}
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -225,10 +227,18 @@ class PriceFeed:
             price = float(price_str)
             ts = time.time()
 
+            # 24h change: Crypto.com field 'c' is 24h price change as decimal
+            change_24h_str = data.get("c") or data.get("change") or "0"
+            try:
+                change_24h = float(change_24h_str)
+            except (ValueError, TypeError):
+                change_24h = 0.0
+
             with self._lock:
                 self._prices[asset].append(PricePoint(ts, price))
                 self._latest[asset] = price
                 self._latest_ts[asset] = ts
+                self._change_24h[asset] = change_24h
 
             if not self._ready.is_set():
                 self._ready.set()
@@ -298,6 +308,12 @@ class PriceFeed:
         cutoff = time.time() - minutes * 60
         with self._lock:
             return [(p.timestamp, p.price) for p in self._prices.get(asset, []) if p.timestamp >= cutoff]
+
+    def get_24h_change(self, asset: str) -> float:
+        """Return the 24h price change as a decimal (e.g., -0.04 = -4%)."""
+        asset = asset.upper()
+        with self._lock:
+            return self._change_24h.get(asset, 0.0)
 
     def get_momentum(self, asset: str, window: int = 30) -> float:
         """Price change % over the last `window` seconds."""

@@ -14,11 +14,32 @@ cd "$BOT_DIR" || exit 1
 # Store current commit hash
 OLD_HASH=$(git rev-parse HEAD 2>/dev/null)
 
-# Pull latest (force-reset to match remote exactly)
-# Detect branch name (master or main)
-BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "master")
-git fetch origin "$BRANCH" --quiet 2>/dev/null
-REMOTE_HASH=$(git rev-parse origin/"$BRANCH" 2>/dev/null)
+# Detect which branch exists on the remote (master or main)
+# Try the local branch first, then fall back
+LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+git fetch origin --quiet 2>/dev/null
+
+# Figure out which remote branch to track
+BRANCH=""
+for try_branch in "$LOCAL_BRANCH" "master" "main"; do
+    if git rev-parse --verify "origin/$try_branch" >/dev/null 2>&1; then
+        BRANCH="$try_branch"
+        break
+    fi
+done
+
+if [ -z "$BRANCH" ]; then
+    echo "$LOG_PREFIX ERROR: Could not find remote branch (tried: $LOCAL_BRANCH, master, main)"
+    exit 1
+fi
+
+REMOTE_HASH=$(git rev-parse "origin/$BRANCH" 2>/dev/null)
+
+# Safety: if we couldn't get either hash, bail out
+if [ -z "$OLD_HASH" ] || [ -z "$REMOTE_HASH" ]; then
+    echo "$LOG_PREFIX ERROR: Could not determine hashes (old=$OLD_HASH remote=$REMOTE_HASH)"
+    exit 1
+fi
 
 # Only update if there's actually a change
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
@@ -28,8 +49,14 @@ fi
 
 echo "$LOG_PREFIX UPDATE: $OLD_HASH -> $REMOTE_HASH"
 
+# Make sure local branch matches remote branch name
+if [ "$LOCAL_BRANCH" != "$BRANCH" ]; then
+    echo "$LOG_PREFIX Switching from $LOCAL_BRANCH to $BRANCH"
+    git checkout "$BRANCH" --quiet 2>/dev/null
+fi
+
 # Apply update (preserves .env and logs)
-git reset --hard origin/"$BRANCH" --quiet 2>/dev/null
+git reset --hard "origin/$BRANCH" --quiet 2>/dev/null
 
 # Show what changed
 git log --oneline "$OLD_HASH".."$REMOTE_HASH" 2>/dev/null

@@ -483,7 +483,7 @@ class PolymarketBot:
         signal: TradingSignal = self._strategy.evaluate(market, polymarket_mid)
 
         if not signal.is_valid:
-            logger.debug("[%s] No signal: %s", asset, signal.reasoning)
+            logger.info("[%s] No signal: %s", asset, signal.reasoning)
             return
 
         logger.info("[%s] Signal: %s", asset, signal)
