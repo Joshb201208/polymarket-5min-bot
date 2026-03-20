@@ -1,40 +1,26 @@
 """
 strategy.py - Trading strategy engine for Polymarket 5-minute crypto markets.
 
-Three strategies are implemented:
+UPGRADE v3 — March 20, 2026
+  - NEW: Oracle Latency Arb (primary) — compares Binance price vs Price-to-Beat
+    to detect when oracle lag creates exploitable mispricing.
+  - NEW: Regime Filter — ADX + Bollinger Band width + volatility checks.
+    Blocks ALL strategies from trading in choppy / low-vol conditions.
+  - KEPT: Late-Window Maker, Latency Arb (legacy), Signal-Based, Macro Momentum
 
-1. Latency Arbitrage (primary / recommended)
-   ─────────────────────────────────────────
-   Exploit the lag between Binance price movement and Polymarket's re-pricing.
-   - If Binance just moved UP ≥ threshold in last 30s, but Polymarket "Up"
-     token is still ≤ 0.50, buy YES (Up) — the market hasn't repriced yet.
-   - If Binance just moved DOWN ≥ threshold in last 30s, but Polymarket "Down"
-     token is still ≤ 0.50, buy YES (Down).
-   - Edge = |exchange_implied_prob - polymarket_mid| − fees
-
-2. Signal-Based (secondary / conservative)
-   ────────────────────────────────────────
-   Use technical indicators to build directional confidence:
-   - RSI + momentum: oversold + positive flip → bullish
-   - MACD crossover + Bollinger Band bounce
-   - Combined confidence must exceed MIN_CONFIDENCE threshold (default 0.60)
-
-3. Late-Window Maker (high-alpha, zero-fee)
-   ──────────────────────────────────────────
-   Activates only in the final 15 seconds of a 5-minute window.
-   Key insight: 85% of BTC's direction is determined T-10s before window end,
-   but Polymarket odds haven't fully reflected this information yet.
-   - Place MAKER orders at 0.90-0.95 on the winning side
-   - Edge = 1.00 - entry_price (winner pays $1.00 at settlement)
-   - Zero fees + maker rebate
-   - Higher confidence with larger price move and less time remaining
+Strategies (priority order during evaluation):
+  1. oracle_arb        — Oracle latency arb using Price-to-Beat spread (NEW)
+  2. late_window_maker — Final-seconds maker orders
+  3. latency_arb       — Legacy momentum-based latency arb
+  4. signal_based      — RSI / MACD / BB technical signals
+  5. macro_momentum    — 24h trend following
 """
 
 import time
 import math
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from config import StrategyConfig, RiskConfig
 from data_feeds import PriceFeed
@@ -50,6 +36,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 300  # 5 minutes
+
 
 # ---------------------------------------------------------------------------
 # TradingSignal — the output of strategy evaluation
@@ -105,6 +92,108 @@ NO_SIGNAL = TradingSignal(direction=None, reasoning="No opportunity found")
 
 
 # ---------------------------------------------------------------------------
+# Regime Filter — blocks trading in choppy / low-vol conditions
+# ---------------------------------------------------------------------------
+
+class RegimeFilter:
+    """
+    Determines whether the current market regime is suitable for trading.
+
+    Checks:
+      1. ADX proxy > threshold (trending market)
+      2. Bollinger Band width > threshold (enough volatility to profit)
+      3. Recent candle body size (not just wicks / noise)
+
+    If the regime is unfavorable, ALL strategies are blocked.
+    """
+
+    # ADX-equivalent thresholds (using momentum-based proxy)
+    ADX_THRESHOLD = 15.0          # Minimum ADX-proxy for a "trending" market
+    BB_WIDTH_THRESHOLD = 0.0015   # Minimum BB width as fraction of mid price
+    MIN_CANDLE_BODY_PCT = 0.0005  # Minimum recent candle body (0.05%)
+
+    def __init__(self, price_feed: PriceFeed):
+        self._feed = price_feed
+
+    def is_favorable(self, asset: str) -> Tuple[bool, str]:
+        """
+        Returns (True, reason) if trading conditions are favorable,
+        or (False, reason) if the regime filter blocks trading.
+        """
+        asset = asset.upper()
+
+        # --- Check 1: ADX proxy (directional strength) ---
+        # True ADX requires DM+/DM- calculations over many candles.
+        # We approximate using the ratio of directional movement to total
+        # movement over the last 5 minutes.
+        adx_proxy = self._calculate_adx_proxy(asset)
+        if adx_proxy < self.ADX_THRESHOLD:
+            return False, (
+                f"Regime filter: ADX proxy {adx_proxy:.1f} < {self.ADX_THRESHOLD} "
+                f"— market is choppy, skipping"
+            )
+
+        # --- Check 2: Bollinger Band width ---
+        bb_upper, bb_mid, bb_lower = self._feed.get_bollinger_bands(
+            asset, period=20, std=2.0, minutes=15
+        )
+        if bb_mid > 0 and bb_upper > bb_lower:
+            bb_width = (bb_upper - bb_lower) / bb_mid
+            if bb_width < self.BB_WIDTH_THRESHOLD:
+                return False, (
+                    f"Regime filter: BB width {bb_width:.5f} < {self.BB_WIDTH_THRESHOLD} "
+                    f"— volatility too low, skipping"
+                )
+
+        # --- Check 3: Recent candle body size ---
+        momentum_60s = abs(self._feed.get_momentum(asset, window=60))
+        if momentum_60s < self.MIN_CANDLE_BODY_PCT:
+            # Additional check: is 30s momentum also flat?
+            momentum_30s = abs(self._feed.get_momentum(asset, window=30))
+            if momentum_30s < self.MIN_CANDLE_BODY_PCT:
+                return False, (
+                    f"Regime filter: 60s momentum {momentum_60s*100:.4f}% and "
+                    f"30s momentum {momentum_30s*100:.4f}% both below "
+                    f"{self.MIN_CANDLE_BODY_PCT*100:.3f}% — flat market, skipping"
+                )
+
+        return True, f"Regime favorable: ADX={adx_proxy:.1f}, 60s_mom={momentum_60s*100:.3f}%"
+
+    def _calculate_adx_proxy(self, asset: str) -> float:
+        """
+        Approximate ADX using directional movement ratio.
+
+        Logic:
+          - Get price history for last 5 minutes
+          - Calculate net directional movement vs total absolute movement
+          - Scale to 0-100 range (like ADX)
+
+        A high ratio means the price moved consistently in one direction
+        (trending). A low ratio means it oscillated (choppy).
+        """
+        history = self._feed.get_price_history(asset, minutes=5)
+        if len(history) < 10:
+            return 50.0  # Neutral — don't block if insufficient data
+
+        prices = [p for _, p in history]
+
+        # Net movement (directional)
+        net_move = abs(prices[-1] - prices[0])
+
+        # Total absolute movement (sum of all candle-to-candle changes)
+        total_move = sum(abs(prices[i] - prices[i-1]) for i in range(1, len(prices)))
+
+        if total_move == 0:
+            return 0.0
+
+        # Directional ratio [0, 1] → scale to [0, 100]
+        ratio = net_move / total_move
+        adx_proxy = ratio * 100.0
+
+        return adx_proxy
+
+
+# ---------------------------------------------------------------------------
 # StrategyEngine
 # ---------------------------------------------------------------------------
 
@@ -130,6 +219,11 @@ class StrategyEngine:
         self._scfg = strategy_config
         self._rcfg = risk_config
         self._fee_manager = fee_manager  # Optional FeeManager for maker rebate estimates
+        self._regime_filter = RegimeFilter(price_feed)
+
+        # Oracle arb state: track when Binance has been consistently above/below
+        # the Price-to-Beat for signal persistence check
+        self._oracle_signal_state = {}  # asset -> {direction, start_time, spread}
 
     # ------------------------------------------------------------------
     # Main evaluation entry point
@@ -151,7 +245,23 @@ class StrategyEngine:
         window_end = market.get("window_end", 0)
         secs_remaining = max(0.0, window_end - time.time())
 
-        # In the final 15 seconds, try the late-window maker strategy instead of blocking
+        # ================================================================
+        # REGIME FILTER — blocks all strategies in choppy conditions
+        # Exception: oracle_arb in last 60s (the oracle lag is structural,
+        # not dependent on "trendiness")
+        # ================================================================
+        regime_ok, regime_reason = self._regime_filter.is_favorable(asset)
+        if not regime_ok and secs_remaining > 60:
+            logger.info("[%s] %s", asset, regime_reason)
+            return TradingSignal(
+                direction=None,
+                reasoning=regime_reason,
+                seconds_remaining=secs_remaining,
+                asset=asset,
+                strategy_name="regime_filter",
+            )
+
+        # In the final 15 seconds, try the late-window maker strategy
         if secs_remaining < 15:
             late_signal = self.evaluate_late_window(market, polymarket_mid_yes)
             if late_signal.is_valid:
@@ -184,7 +294,18 @@ class StrategyEngine:
                 asset=asset,
             )
 
-        # Run primary strategy first
+        # ================================================================
+        # STRATEGY 1: Oracle Latency Arb (NEW — highest priority)
+        # ================================================================
+        oracle_signal = self._oracle_arb_signal(
+            asset, current_price, polymarket_mid_yes, window_start, secs_remaining
+        )
+        if oracle_signal.is_valid:
+            return oracle_signal
+
+        # ================================================================
+        # STRATEGY 2: Legacy Latency Arb (momentum-based)
+        # ================================================================
         if self._scfg.primary_strategy == "latency_arb":
             signal = self._latency_arb_signal(
                 asset, polymarket_mid_yes, window_start, secs_remaining
@@ -202,7 +323,6 @@ class StrategyEngine:
             signal = self._macro_momentum_signal(asset, polymarket_mid_yes, secs_remaining)
 
         # In the 30–60 second zone, also try the late-window strategy
-        # as a supplementary check (it may find a cleaner entry)
         if not signal.is_valid and secs_remaining < 60:
             late_signal = self.evaluate_late_window(market, polymarket_mid_yes)
             if late_signal.is_valid:
@@ -219,7 +339,7 @@ class StrategyEngine:
           - Edge exceeds MIN_EDGE_THRESHOLD
           - Confidence exceeds strategy threshold
           - At least 60 seconds remain in the window
-            (exception: late_window_maker strategy may have <60s)
+            (exception: late_window_maker and oracle_arb may have <60s)
         """
         if not signal.is_valid:
             return False
@@ -231,11 +351,13 @@ class StrategyEngine:
             )
             return False
 
-        # Late-window maker and macro momentum strategies use lower confidence thresholds
+        # Confidence thresholds vary by strategy
         if signal.strategy_name == "late_window_maker":
             min_conf = max(0.50, self._scfg.signal_confidence_threshold - 0.10)
         elif signal.strategy_name == "macro_momentum":
             min_conf = max(0.40, self._scfg.signal_confidence_threshold - 0.20)
+        elif signal.strategy_name == "oracle_arb":
+            min_conf = 0.55  # Oracle arb has structural edge — lower bar
         else:
             min_conf = self._scfg.signal_confidence_threshold
 
@@ -246,13 +368,259 @@ class StrategyEngine:
             )
             return False
 
-        # Late-window maker can trade with < 60s remaining — that's the point
-        if signal.strategy_name != "late_window_maker" and signal.seconds_remaining < 60:
+        # Late-window maker and oracle_arb can trade with < 60s remaining
+        if signal.strategy_name not in ("late_window_maker", "oracle_arb") and signal.seconds_remaining < 60:
             logger.debug("should_trade: SKIP — only %.0fs remaining", signal.seconds_remaining)
             return False
 
         logger.info("should_trade: TRADE — %s", signal)
         return True
+
+    # ------------------------------------------------------------------
+    # NEW STRATEGY: Oracle Latency Arbitrage
+    # ------------------------------------------------------------------
+
+    def _oracle_arb_signal(
+        self,
+        asset: str,
+        current_price: float,
+        polymarket_mid_yes: float,
+        window_start: int,
+        secs_remaining: float,
+    ) -> TradingSignal:
+        """
+        Oracle latency arbitrage: exploit the 3-10 second lag between
+        Binance/exchange price and Chainlink Data Streams oracle.
+
+        Core insight: Polymarket settlement uses Chainlink oracle snapshots
+        at window open and close. The oracle lags Binance by several seconds.
+        If Binance has moved firmly in one direction, the oracle will follow.
+
+        Logic:
+          1. Estimate the "Price to Beat" (oracle opening price) from
+             the exchange price near window start
+          2. Compare current Binance price vs Price to Beat
+          3. If spread > threshold AND persists for 5+ seconds, signal
+          4. Higher confidence with: larger spread, less time remaining,
+             confirmed across multiple timeframes
+        """
+        # --- Estimate Price to Beat ---
+        # The true Price to Beat is the Chainlink oracle snapshot at window open.
+        # We approximate it using the exchange price at window start.
+        price_to_beat = self._estimate_price_to_beat(asset, window_start)
+        if price_to_beat <= 0:
+            return TradingSignal(
+                direction=None,
+                reasoning=f"Oracle arb: cannot estimate Price-to-Beat for {asset}",
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+
+        # --- Calculate spread ---
+        spread = current_price - price_to_beat
+        abs_spread = abs(spread)
+
+        # Dynamic threshold based on asset price level
+        # BTC ~$70K → $50 threshold; ETH ~$2K → $2 threshold; SOL ~$90 → $0.10
+        if current_price > 10000:      # BTC
+            min_spread = 40.0
+        elif current_price > 500:       # ETH
+            min_spread = 1.50
+        else:                           # SOL
+            min_spread = 0.08
+
+        # Spread as percentage of price
+        spread_pct = abs_spread / price_to_beat if price_to_beat > 0 else 0
+
+        if abs_spread < min_spread:
+            # Reset signal state if spread collapsed
+            if asset in self._oracle_signal_state:
+                del self._oracle_signal_state[asset]
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} spread ${spread:+,.2f} "
+                    f"({spread_pct*100:.3f}%) below threshold ${min_spread:.2f}"
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+
+        # --- Determine direction ---
+        direction = "YES" if spread > 0 else "NO"  # YES=Up, NO=Down
+
+        # --- Signal persistence check ---
+        # The spread must persist in the same direction for at least 5 seconds
+        # to confirm it's a real move, not a spike that will revert.
+        state = self._oracle_signal_state.get(asset)
+        now = time.time()
+
+        if state is None or state["direction"] != direction:
+            # New signal or direction changed — start tracking
+            self._oracle_signal_state[asset] = {
+                "direction": direction,
+                "start_time": now,
+                "spread": spread,
+                "peak_spread": abs_spread,
+            }
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} new signal {direction} spread=${spread:+,.2f} "
+                    f"— waiting for 5s confirmation"
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+
+        signal_age = now - state["start_time"]
+        state["peak_spread"] = max(state["peak_spread"], abs_spread)
+
+        CONFIRMATION_SECONDS = 5.0
+        if signal_age < CONFIRMATION_SECONDS:
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} {direction} confirmed {signal_age:.1f}s "
+                    f"/ {CONFIRMATION_SECONDS}s — waiting"
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+
+        # ================================================================
+        # SIGNAL CONFIRMED — calculate edge and confidence
+        # ================================================================
+
+        # Polymarket probability for the winning side
+        if direction == "YES":
+            poly_prob = polymarket_mid_yes
+        else:
+            poly_prob = 1.0 - polymarket_mid_yes
+
+        # Our estimated true probability based on the spread
+        # Larger spread = higher true probability of the outcome
+        # Base: 70% at threshold, scaling up to 95% at 4x threshold
+        spread_multiple = abs_spread / min_spread  # 1.0 at threshold, grows with spread
+        true_prob = clamp(0.70 + (spread_multiple - 1.0) * 0.08, 0.70, 0.95)
+
+        # Time boost: closer to window end = more certainty (less time to reverse)
+        if secs_remaining < 60:
+            true_prob = clamp(true_prob + 0.05, 0.70, 0.97)
+        if secs_remaining < 30:
+            true_prob = clamp(true_prob + 0.05, 0.70, 0.98)
+
+        # Edge = true_prob - entry_cost (poly prob + fees)
+        entry_price = poly_prob
+        fee = polymarket_fee(shares=1.0, price=entry_price)
+        edge = true_prob - entry_price - fee
+
+        if edge <= 0:
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} {direction} spread=${spread:+,.2f} "
+                    f"true_prob={true_prob:.2f} poly={poly_prob:.2f} fee={fee:.4f} "
+                    f"edge={edge:.4f} — not profitable"
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                edge=edge,
+                seconds_remaining=secs_remaining,
+            )
+
+        # Confidence factors
+        # 1. Spread magnitude (larger = more confident)
+        spread_factor = clamp(spread_multiple / 3.0, 0.3, 1.0)
+        # 2. Signal persistence (longer confirmed = more confident)
+        persistence_factor = clamp(signal_age / 15.0, 0.3, 1.0)
+        # 3. Time factor (less time remaining = more certain about direction)
+        time_factor = clamp(1.0 - secs_remaining / 300.0, 0.2, 1.0)
+        # 4. Cross-timeframe confirmation: 30s and 60s momentum agree?
+        momentum_30s = self._feed.get_momentum(asset, window=30)
+        momentum_60s = self._feed.get_momentum(asset, window=60)
+        momentum_agrees = (
+            (direction == "YES" and momentum_30s > 0 and momentum_60s > 0) or
+            (direction == "NO" and momentum_30s < 0 and momentum_60s < 0)
+        )
+        confirm_factor = 1.0 if momentum_agrees else 0.6
+
+        confidence = (
+            0.30 * spread_factor
+            + 0.20 * persistence_factor
+            + 0.25 * time_factor
+            + 0.25 * confirm_factor
+        )
+        confidence = clamp(confidence, 0.0, 1.0)
+
+        reasoning = (
+            f"ORACLE ARB: {asset} {direction} | "
+            f"Binance=${current_price:,.2f} vs PtB=${price_to_beat:,.2f} | "
+            f"spread=${spread:+,.2f} ({spread_pct*100:.3f}%) | "
+            f"true_prob={true_prob:.2f} poly={poly_prob:.2f} | "
+            f"edge={edge:.4f} conf={confidence:.2f} | "
+            f"confirmed={signal_age:.0f}s | {secs_remaining:.0f}s remaining"
+        )
+
+        logger.info(reasoning)
+
+        # Clear state after emitting signal (don't re-signal same move)
+        del self._oracle_signal_state[asset]
+
+        return TradingSignal(
+            direction=direction,
+            confidence=confidence,
+            edge=edge,
+            strategy_name="oracle_arb",
+            reasoning=reasoning,
+            suggested_price=entry_price,
+            exchange_prob=true_prob,
+            polymarket_mid=polymarket_mid_yes,
+            seconds_remaining=secs_remaining,
+            asset=asset,
+        )
+
+    def _estimate_price_to_beat(self, asset: str, window_start: int) -> float:
+        """
+        Estimate the oracle's "Price to Beat" (opening price) for this window.
+
+        The true PtB is the Chainlink Data Stream snapshot at window_start.
+        We approximate it using the exchange price closest to window_start
+        from our price history.
+
+        If we don't have data from window start, fall back to the earliest
+        price in the current window.
+        """
+        history = self._feed.get_price_history(asset, minutes=6)
+        if not history:
+            return 0.0
+
+        # Find the price closest to window_start
+        target_ts = float(window_start)
+        best_price = 0.0
+        best_diff = float("inf")
+
+        for ts, price in history:
+            diff = abs(ts - target_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_price = price
+
+        # If our best match is more than 60s from window start, it's unreliable
+        if best_diff > 60:
+            # Fall back to earliest price in the window
+            window_prices = [(ts, p) for ts, p in history if ts >= target_ts]
+            if window_prices:
+                _, best_price = min(window_prices, key=lambda x: x[0])
+            else:
+                # Last resort: use current price (worst case)
+                best_price = self._feed.get_current_price(asset)
+
+        return best_price
 
     # ------------------------------------------------------------------
     # Strategy 3: Late-Window Maker
@@ -296,7 +664,6 @@ class StrategyEngine:
         secs_remaining = max(0.0, window_end - time.time())
 
         # Strategy only fires in the final 60 seconds
-        # (with progressively higher confidence closer to the end)
         if secs_remaining > 60:
             return TradingSignal(
                 direction=None,
@@ -324,14 +691,11 @@ class StrategyEngine:
         window_start_records = [(ts, p) for ts, p in history if ts <= cutoff]
 
         if not window_start_records:
-            # Fall back to 30-second momentum if we don't have full window history
             window_open_price = None
         else:
-            # Use oldest available record near window start
             _, window_open_price = min(window_start_records, key=lambda x: abs(x[0] - cutoff))
 
         if window_open_price is None or window_open_price <= 0:
-            # Fall back to 30-second momentum
             momentum_30s = self._feed.get_momentum(asset, window=30)
             window_momentum = momentum_30s
         else:
@@ -353,35 +717,28 @@ class StrategyEngine:
 
         # Determine winning side
         if window_momentum > 0:
-            direction = "YES"  # Price went up → YES (Up) token wins
+            direction = "YES"
             poly_prob = polymarket_mid_yes
         else:
-            direction = "NO"   # Price went down → NO (Down) token wins
+            direction = "NO"
             poly_prob = 1.0 - polymarket_mid_yes
 
         # Determine entry price based on time remaining
-        # With more time → more uncertainty → enter at 0.90
-        # Very close to end → higher certainty → can enter at 0.95
-        # Scale between 0.90 and 0.95 based on time remaining
         if secs_remaining <= 5:
             entry_price = 0.95
         elif secs_remaining <= 15:
-            entry_price = 0.90 + (15 - secs_remaining) / 15 * 0.05  # 0.90 → 0.95
+            entry_price = 0.90 + (15 - secs_remaining) / 15 * 0.05
         else:
-            # 15–60 seconds: use 0.90 as base, adjust upward with momentum
             momentum_bonus = clamp(abs(window_momentum) * 20, 0.0, 0.05)
             entry_price = 0.90 + momentum_bonus
 
         entry_price = clamp(round(entry_price, 2), 0.85, 0.97)
 
         # Edge: at settlement, winner pays $1.00; we enter at entry_price
-        # So edge = 1.00 - entry_price (for a MAKER order, no fee deducted)
         edge = 1.0 - entry_price
 
         # Reduce edge if Polymarket already priced near our entry
-        # (less "mispricing" to capture)
         if poly_prob >= entry_price:
-            # Market is already at or above our target price — edge may be negative
             edge -= (poly_prob - entry_price)
 
         if edge <= 0:
@@ -398,11 +755,7 @@ class StrategyEngine:
             )
 
         # Compute confidence
-        # Factors:
-        #   1. Time factor: higher confidence closer to window end
-        #   2. Momentum factor: larger move = more decisive direction
-        #   3. Mispricing factor: bigger gap between poly and target = more alpha
-        time_factor = clamp(1.0 - secs_remaining / 60.0, 0.1, 1.0)  # 0.1 at 60s, 1.0 at 0s
+        time_factor = clamp(1.0 - secs_remaining / 60.0, 0.1, 1.0)
         momentum_factor = clamp(abs(window_momentum) / DIRECTION_THRESHOLD, 1.0, 5.0) / 5.0
         mispricing = clamp(entry_price - poly_prob, 0.0, 0.20) / 0.20
         mispricing_factor = clamp(mispricing, 0.0, 1.0)
@@ -418,7 +771,7 @@ class StrategyEngine:
         rebate = 0.0
         if self._fee_manager is not None:
             rebate = self._fee_manager.estimate_maker_rebate(entry_price)
-            edge += rebate  # rebate improves net edge
+            edge += rebate
 
         reasoning = (
             f"Late-window maker: {asset} moved {window_momentum*100:+.3f}% in window. "
@@ -436,14 +789,14 @@ class StrategyEngine:
             strategy_name="late_window_maker",
             reasoning=reasoning,
             suggested_price=entry_price,
-            exchange_prob=0.5 + (window_momentum * 5),  # rough directional estimate
+            exchange_prob=0.5 + (window_momentum * 5),
             polymarket_mid=polymarket_mid_yes,
             seconds_remaining=secs_remaining,
             asset=asset,
         )
 
     # ------------------------------------------------------------------
-    # Strategy 1: Latency Arbitrage
+    # Strategy 1: Latency Arbitrage (legacy)
     # ------------------------------------------------------------------
 
     def _latency_arb_signal(
@@ -456,21 +809,14 @@ class StrategyEngine:
         """
         Latency arbitrage: exploit the delay between exchange price movement
         and Polymarket's orderbook repricing.
-
-        Logic:
-          - Measure price momentum over the last LATENCY_ARB_LOOKBACK_SECONDS.
-          - Compute exchange-implied probability based on that momentum.
-          - If Polymarket hasn't repriced yet, compute edge and emit a signal.
         """
         lookback = self._scfg.latency_arb_lookback_seconds
         threshold = self._scfg.latency_arb_threshold
 
-        # Current exchange price
         current_price = self._feed.get_current_price(asset)
         if current_price <= 0:
             return NO_SIGNAL
 
-        # Price `lookback` seconds ago
         history = self._feed.get_price_history(asset, minutes=1)
         cutoff = time.time() - lookback
 
@@ -483,34 +829,26 @@ class StrategyEngine:
                 strategy_name="latency_arb",
             )
 
-        # Use the most recent record before the cutoff
         _, old_price = max(old_records, key=lambda x: x[0])
         if old_price <= 0:
             return NO_SIGNAL
 
-        momentum = (current_price - old_price) / old_price  # signed fraction
+        momentum = (current_price - old_price) / old_price
 
-        # Compute exchange-implied probability of finishing UP
-        # We use a simplified model: larger momentum → higher prob of finishing up.
         volatility = self._feed.get_volatility(asset, window=300)
         exchange_prob = self._momentum_to_probability(momentum, volatility, secs_remaining)
 
-        # Polymarket implied probability for DOWN outcome
         polymarket_mid_no = 1.0 - polymarket_mid_yes
 
-        # Determine direction of the edge
         if momentum >= threshold:
-            # Exchange says UP is likely; check if Polymarket agrees
-            direction = "YES"        # YES = Up token
+            direction = "YES"
             poly_prob = polymarket_mid_yes
             edge_raw = exchange_prob - poly_prob
         elif momentum <= -threshold:
-            # Exchange says DOWN is likely
-            direction = "NO"         # NO = Down token (we still buy YES for Down)
+            direction = "NO"
             poly_prob = polymarket_mid_no
             edge_raw = (1.0 - exchange_prob) - poly_prob
         else:
-            # Momentum is too small to be confident
             return TradingSignal(
                 direction=None,
                 reasoning=(
@@ -524,7 +862,6 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Subtract fee cost from edge
         entry_price = poly_prob
         fee = polymarket_fee(shares=1.0, price=entry_price)
         edge = edge_raw - fee
@@ -543,7 +880,6 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Confidence scales with momentum magnitude and remaining time
         confidence = self._latency_arb_confidence(
             abs(momentum), threshold, secs_remaining, edge
         )
@@ -573,9 +909,6 @@ class StrategyEngine:
         """
         Convert a price momentum fraction to a probability of finishing UP
         using a simplified log-normal model.
-
-        For very small secs_remaining or zero volatility, we rely more on
-        the sign of momentum.
         """
         if secs_remaining <= 0:
             return 0.5 + clamp(momentum * 5, -0.49, 0.49)
@@ -583,25 +916,19 @@ class StrategyEngine:
         sigma = volatility * math.sqrt(secs_remaining) if volatility > 0 else 0.0
 
         if sigma == 0:
-            # No volatility estimate — use sign of momentum
             if momentum > 0:
                 return clamp(0.5 + abs(momentum) * 10, 0.5, 0.95)
             elif momentum < 0:
                 return clamp(0.5 - abs(momentum) * 10, 0.05, 0.5)
             return 0.5
 
-        # Normal CDF approximation: prob = Φ(momentum / sigma)
-        # Using Abramowitz & Stegun rational approximation
         z = momentum / sigma
         prob = self._normal_cdf(z)
         return clamp(prob, 0.01, 0.99)
 
     @staticmethod
     def _normal_cdf(z: float) -> float:
-        """
-        Rational approximation of Φ(z) (normal CDF).
-        Max error < 1.5e-7 (Abramowitz & Stegun 26.2.17).
-        """
+        """Rational approximation of Φ(z) (normal CDF)."""
         sign = 1.0 if z >= 0 else -1.0
         z = abs(z)
         t = 1.0 / (1.0 + 0.2316419 * z)
@@ -619,24 +946,10 @@ class StrategyEngine:
         secs_remaining: float,
         edge: float,
     ) -> float:
-        """
-        Estimate confidence in the latency-arb signal.
-
-        Factors:
-          - How much larger is momentum vs the threshold?
-          - More time remaining → more uncertainty about final direction → lower conf
-          - Larger edge → higher confidence
-        """
-        # Momentum factor: 1.0 when momentum == threshold, grows with excess
+        """Estimate confidence in the latency-arb signal."""
         momentum_factor = clamp(abs_momentum / threshold, 1.0, 3.0) / 3.0
-
-        # Time factor: high confidence early in window (price will continue),
-        #              but lower confidence if too early (can reverse)
-        # Sweet spot: 120–240 seconds remaining
         time_factor = 1.0 - abs(secs_remaining - 180) / 180
         time_factor = clamp(time_factor, 0.3, 1.0)
-
-        # Edge factor: scale edge into [0, 1] range
         edge_factor = clamp(edge / 0.10, 0.0, 1.0)
 
         confidence = (
@@ -659,25 +972,10 @@ class StrategyEngine:
         """
         Macro momentum strategy: use the 24-hour price change from the
         exchange as a directional signal.
-
-        Logic:
-          - If the exchange shows a strong 24h move (e.g., BTC down -4%),
-            the 5-min market should reflect that directional bias.
-          - If Polymarket is still at 0.50 (fair coin), there is clear edge.
-          - Scale confidence with the magnitude of the 24h move.
-          - Use a lower threshold than latency_arb since 24h change is
-            a stronger and more persistent signal.
-
-        Thresholds:
-          - |24h change| >= 1.0% → consider a trade
-          - |24h change| >= 2.0% → moderate confidence
-          - |24h change| >= 3.0% → high confidence
-
-        Also incorporates short-term momentum (if available) as confirmation.
         """
         change_24h = self._feed.get_24h_change(asset)
 
-        if abs(change_24h) < 0.005:  # less than 0.5% — not enough signal
+        if abs(change_24h) < 0.005:
             return TradingSignal(
                 direction=None,
                 reasoning=(
@@ -689,18 +987,13 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Determine direction from 24h change
         if change_24h < 0:
-            # Exchange is bearish → expect DOWN in 5-min window
-            direction = "NO"          # Buy the Down token
-            poly_prob = 1.0 - polymarket_mid_yes  # Current DOWN price
+            direction = "NO"
+            poly_prob = 1.0 - polymarket_mid_yes
         else:
-            # Exchange is bullish → expect UP in 5-min window
-            direction = "YES"         # Buy the Up token
-            poly_prob = polymarket_mid_yes        # Current UP price
+            direction = "YES"
+            poly_prob = polymarket_mid_yes
 
-        # Skip if market has already priced in the move heavily
-        # (poly_prob > 0.70 means market is already 70%+ confident)
         if poly_prob > 0.70:
             return TradingSignal(
                 direction=None,
@@ -713,30 +1006,26 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Estimate our probability based on 24h change magnitude
-        # Larger 24h move → stronger directional bias for the 5-min window
         abs_change = abs(change_24h)
-        if abs_change >= 0.05:      # 5%+ move
+        if abs_change >= 0.05:
             our_prob = 0.62
-        elif abs_change >= 0.03:    # 3-5% move
+        elif abs_change >= 0.03:
             our_prob = 0.58
-        elif abs_change >= 0.02:    # 2-3% move
+        elif abs_change >= 0.02:
             our_prob = 0.56
-        elif abs_change >= 0.01:    # 1-2% move
+        elif abs_change >= 0.01:
             our_prob = 0.54
-        else:                       # 0.5-1% move
+        else:
             our_prob = 0.52
 
-        # Short-term momentum confirmation (if available)
         momentum_30s = self._feed.get_momentum(asset, window=30)
         momentum_confirms = (
             (change_24h < 0 and momentum_30s <= 0) or
             (change_24h > 0 and momentum_30s >= 0)
         )
         if momentum_confirms:
-            our_prob += 0.02  # boost if short-term agrees with 24h trend
+            our_prob += 0.02
 
-        # Edge = our estimated probability - market price - fees
         edge_raw = our_prob - poly_prob
         fee = polymarket_fee(shares=1.0, price=poly_prob)
         edge = edge_raw - fee
@@ -757,11 +1046,9 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Confidence scales with: magnitude of 24h change, edge, momentum confirmation
-        change_factor = clamp(abs_change / 0.03, 0.3, 1.0)  # caps at 3%
-        edge_factor = clamp(edge / 0.05, 0.1, 1.0)          # caps at 5 cents edge
+        change_factor = clamp(abs_change / 0.03, 0.3, 1.0)
+        edge_factor = clamp(edge / 0.05, 0.1, 1.0)
         confirm_factor = 0.8 if momentum_confirms else 0.5
-        # Time factor: prefer trading earlier in window (more time for our thesis)
         time_factor = clamp(secs_remaining / 240, 0.4, 1.0)
 
         confidence = (
@@ -806,20 +1093,9 @@ class StrategyEngine:
     ) -> TradingSignal:
         """
         Signal-based strategy using RSI, MACD, and Bollinger Bands.
-
-        Bullish signals (BUY YES = Up):
-          - RSI < 30 (oversold) AND positive recent momentum
-          - MACD histogram just turned positive (crossover)
-          - Price bounced off lower Bollinger Band
-
-        Bearish signals (BUY YES = Down):
-          - RSI > 70 (overbought) AND negative recent momentum
-          - MACD histogram just turned negative
-          - Price rejected at upper Bollinger Band
         """
         lookback = self._scfg.signal_lookback_minutes
 
-        # Get indicators
         rsi = self._feed.get_rsi(asset, period=self._scfg.rsi_period, minutes=lookback)
         macd_line, macd_signal, macd_hist = self._feed.get_macd(
             asset,
@@ -839,12 +1115,10 @@ class StrategyEngine:
         momentum_30s = self._feed.get_momentum(asset, window=30)
         momentum_60s = self._feed.get_momentum(asset, window=60)
 
-        # --- Bullish scoring ---
         bullish_score = 0.0
         bearish_score = 0.0
         reasons = []
 
-        # RSI signal
         if rsi < self._scfg.rsi_oversold:
             rsi_bull = (self._scfg.rsi_oversold - rsi) / self._scfg.rsi_oversold
             bullish_score += 0.35 * rsi_bull
@@ -854,7 +1128,6 @@ class StrategyEngine:
             bearish_score += 0.35 * rsi_bear
             reasons.append(f"RSI={rsi:.1f} overbought")
 
-        # Momentum confirmation
         if momentum_30s > 0 and bullish_score > 0:
             bullish_score += 0.15
             reasons.append(f"Momentum +{momentum_30s*100:.3f}%")
@@ -862,7 +1135,6 @@ class StrategyEngine:
             bearish_score += 0.15
             reasons.append(f"Momentum {momentum_30s*100:.3f}%")
 
-        # MACD crossover signal
         if macd_hist > 0 and macd_line > macd_signal:
             bullish_score += 0.25
             reasons.append(f"MACD bull crossover hist={macd_hist:.5f}")
@@ -870,20 +1142,18 @@ class StrategyEngine:
             bearish_score += 0.25
             reasons.append(f"MACD bear crossover hist={macd_hist:.5f}")
 
-        # Bollinger Band bounce
         if bb_lower > 0 and current_price > 0:
             bb_range = bb_upper - bb_lower
             if bb_range > 0:
-                position = (current_price - bb_lower) / bb_range  # 0 = at lower, 1 = at upper
+                position = (current_price - bb_lower) / bb_range
 
-                if position < 0.15:  # Near lower band — potential bounce up
+                if position < 0.15:
                     bullish_score += 0.25
                     reasons.append(f"BB lower band bounce pos={position:.2f}")
-                elif position > 0.85:  # Near upper band — potential reversal down
+                elif position > 0.85:
                     bearish_score += 0.25
                     reasons.append(f"BB upper band rejection pos={position:.2f}")
 
-        # Pick the dominant direction
         if bullish_score >= bearish_score and bullish_score > 0:
             direction = "YES"
             confidence = bullish_score
@@ -903,7 +1173,6 @@ class StrategyEngine:
                 seconds_remaining=secs_remaining,
             )
 
-        # Calculate edge
         edge_raw = implied_prob - poly_prob
         fee = polymarket_fee(shares=1.0, price=poly_prob)
         edge = edge_raw - fee
