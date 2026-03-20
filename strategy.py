@@ -677,12 +677,12 @@ class StrategyEngine:
         """
         change_24h = self._feed.get_24h_change(asset)
 
-        if abs(change_24h) < 0.01:  # less than 1% — not enough signal
+        if abs(change_24h) < 0.005:  # less than 0.5% — not enough signal
             return TradingSignal(
                 direction=None,
                 reasoning=(
                     f"Macro momentum: {asset} 24h change {change_24h*100:+.2f}% "
-                    f"below 1% threshold"
+                    f"below 0.5% threshold"
                 ),
                 asset=asset,
                 strategy_name="macro_momentum",
@@ -699,6 +699,20 @@ class StrategyEngine:
             direction = "YES"         # Buy the Up token
             poly_prob = polymarket_mid_yes        # Current UP price
 
+        # Skip if market has already priced in the move heavily
+        # (poly_prob > 0.70 means market is already 70%+ confident)
+        if poly_prob > 0.70:
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Macro momentum: {asset} market already priced in "
+                    f"(poly={poly_prob:.2f} for {direction}) — no edge left"
+                ),
+                asset=asset,
+                strategy_name="macro_momentum",
+                seconds_remaining=secs_remaining,
+            )
+
         # Estimate our probability based on 24h change magnitude
         # Larger 24h move → stronger directional bias for the 5-min window
         abs_change = abs(change_24h)
@@ -707,9 +721,11 @@ class StrategyEngine:
         elif abs_change >= 0.03:    # 3-5% move
             our_prob = 0.58
         elif abs_change >= 0.02:    # 2-3% move
-            our_prob = 0.55
-        else:                       # 1-2% move
-            our_prob = 0.53
+            our_prob = 0.56
+        elif abs_change >= 0.01:    # 1-2% move
+            our_prob = 0.54
+        else:                       # 0.5-1% move
+            our_prob = 0.52
 
         # Short-term momentum confirmation (if available)
         momentum_30s = self._feed.get_momentum(asset, window=30)
@@ -742,8 +758,8 @@ class StrategyEngine:
             )
 
         # Confidence scales with: magnitude of 24h change, edge, momentum confirmation
-        change_factor = clamp(abs_change / 0.05, 0.3, 1.0)  # caps at 5%
-        edge_factor = clamp(edge / 0.08, 0.1, 1.0)          # caps at 8 cents edge
+        change_factor = clamp(abs_change / 0.03, 0.3, 1.0)  # caps at 3%
+        edge_factor = clamp(edge / 0.05, 0.1, 1.0)          # caps at 5 cents edge
         confirm_factor = 0.8 if momentum_confirms else 0.5
         # Time factor: prefer trading earlier in window (more time for our thesis)
         time_factor = clamp(secs_remaining / 240, 0.4, 1.0)
