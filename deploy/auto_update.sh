@@ -41,9 +41,24 @@ if [ -z "$OLD_HASH" ] || [ -z "$REMOTE_HASH" ]; then
     exit 1
 fi
 
-# Only update if there's actually a change
+# Even if no code changes, check if bot service is alive
+# If bot is dead, restart it immediately
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
-    echo "$LOG_PREFIX No updates"
+    if ! systemctl is-active --quiet polymarket-bot; then
+        echo "$LOG_PREFIX No code updates BUT bot is NOT running — restarting..."
+        systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
+        sleep 3
+        if systemctl is-active --quiet polymarket-bot; then
+            echo "$LOG_PREFIX Bot restarted successfully (was dead)"
+            # Run health check
+            bash "$BOT_DIR/deploy/health_check.sh" 2>/dev/null &
+        else
+            echo "$LOG_PREFIX WARNING: Bot FAILED to restart!"
+            bash "$BOT_DIR/deploy/health_check.sh" 2>/dev/null &
+        fi
+    else
+        echo "$LOG_PREFIX No updates, bot is running"
+    fi
     exit 0
 fi
 
@@ -99,5 +114,8 @@ if token and chat_id:
     except:
         pass
 " 2>/dev/null
+
+# Run health check to report status
+bash "$BOT_DIR/deploy/health_check.sh" 2>/dev/null &
 
 echo "$LOG_PREFIX Update complete"
