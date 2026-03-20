@@ -311,6 +311,57 @@ def cmd_health() -> str:
     )
 
 
+def cmd_reset() -> str:
+    """Reset paper trading state to fresh $500 balance."""
+    import subprocess
+    try:
+        # Stop the bot first so it doesn't overwrite our reset
+        subprocess.run(["systemctl", "stop", "polymarket-bot"], timeout=10)
+        time.sleep(2)
+
+        # Write fresh paper state
+        fresh_state = {
+            "balance": 500.0,
+            "order_counter": 0,
+            "open_orders": {},
+            "resolved_count": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "updated": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        state_path = Path("/root/polymarket-bot/paper_state.json")
+        with open(state_path, "w") as f:
+            json.dump(fresh_state, f, indent=2)
+
+        # Clear trades.csv (keep header if it exists)
+        trades_path = Path("/root/polymarket-bot/trades.csv")
+        if trades_path.exists():
+            with open(trades_path, "r") as f:
+                header = f.readline()
+            with open(trades_path, "w") as f:
+                if header.strip():
+                    f.write(header)
+
+        # Restart the bot
+        subprocess.run(["systemctl", "start", "polymarket-bot"], timeout=10)
+
+        return (
+            "PAPER TRADING RESET\n\n"
+            "Balance: $500.00\n"
+            "Trades: cleared\n"
+            "Open positions: cleared\n\n"
+            "Bot restarted with fresh state."
+        )
+    except Exception as e:
+        # Try to restart bot even if something failed
+        try:
+            subprocess.run(["systemctl", "start", "polymarket-bot"], timeout=10)
+        except Exception:
+            pass
+        return f"Reset error: {e}"
+
+
 def cmd_help() -> str:
     """Return list of available commands."""
     return (
@@ -323,6 +374,7 @@ def cmd_help() -> str:
         "/logs     - Last 30 lines of bot log\n"
         "/health   - Quick health diagnostic\n"
         "/restart  - Restart bot service\n"
+        "/reset    - Reset paper balance to $500\n"
         "/help     - This message"
     )
 
@@ -402,6 +454,7 @@ COMMANDS = {
     "/logs": cmd_logs,
     "/restart": cmd_restart,
     "/health": cmd_health,
+    "/reset": cmd_reset,
     "/help": cmd_help,
     "/start": cmd_help,  # default Telegram /start command
 }
