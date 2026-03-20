@@ -451,6 +451,41 @@ class StrategyEngine:
         # --- Determine direction ---
         direction = "YES" if spread > 0 else "NO"  # YES=Up, NO=Down
 
+        # --- FIX: Skip if market already reflects the direction ---
+        # If Polymarket mid for our side is below 0.35, the market is heavily
+        # pricing the OTHER direction. That means the move is already priced
+        # in — there's no oracle "lag" to exploit, just a contrarian bet.
+        # Similarly, if our side is above 0.65, the arb opportunity is gone
+        # because the market already agrees with us (no mispricing left).
+        our_poly_prob = polymarket_mid_yes if direction == "YES" else (1.0 - polymarket_mid_yes)
+        if our_poly_prob < 0.35:
+            if asset in self._oracle_signal_state:
+                del self._oracle_signal_state[asset]
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} {direction} SKIPPED — market already heavily "
+                    f"against us (poly={our_poly_prob:.2f}). No latency edge when market "
+                    f"has priced in the move."
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+        if our_poly_prob > 0.65:
+            if asset in self._oracle_signal_state:
+                del self._oracle_signal_state[asset]
+            return TradingSignal(
+                direction=None,
+                reasoning=(
+                    f"Oracle arb: {asset} {direction} SKIPPED — market already agrees "
+                    f"(poly={our_poly_prob:.2f}). Entry too expensive, no edge left."
+                ),
+                asset=asset,
+                strategy_name="oracle_arb",
+                seconds_remaining=secs_remaining,
+            )
+
         # --- Signal persistence check ---
         # The spread must persist in the same direction for at least 5 seconds
         # to confirm it's a real move, not a spike that will revert.
@@ -504,15 +539,24 @@ class StrategyEngine:
 
         # Our estimated true probability based on the spread
         # Larger spread = higher true probability of the outcome
-        # Base: 70% at threshold, scaling up to 95% at 4x threshold
+        # Base: 55% at threshold, scaling up to 75% at 4x threshold
+        # FIX: Previous values (0.70-0.95) were unrealistically high and
+        # created phantom edge. Oracle lag gives us a modest informational
+        # advantage, not a crystal ball. Realistic range: 55-75%.
         spread_multiple = abs_spread / min_spread  # 1.0 at threshold, grows with spread
-        true_prob = clamp(0.70 + (spread_multiple - 1.0) * 0.08, 0.70, 0.95)
+        true_prob = clamp(0.55 + (spread_multiple - 1.0) * 0.06, 0.55, 0.75)
 
         # Time boost: closer to window end = more certainty (less time to reverse)
         if secs_remaining < 60:
-            true_prob = clamp(true_prob + 0.05, 0.70, 0.97)
+            true_prob = clamp(true_prob + 0.03, 0.55, 0.78)
         if secs_remaining < 30:
-            true_prob = clamp(true_prob + 0.05, 0.70, 0.98)
+            true_prob = clamp(true_prob + 0.03, 0.55, 0.80)
+
+        # FIX: Cap true_prob so it can never exceed poly_prob by more than 0.15.
+        # If the market prices our side at 0.50, we can claim at most 0.65.
+        # This prevents absurd edge calculations like 0.70 - 0.19 = 0.51.
+        max_true_prob = poly_prob + 0.15
+        true_prob = min(true_prob, max_true_prob)
 
         # Edge = true_prob - entry_cost (poly prob + fees)
         entry_price = poly_prob
