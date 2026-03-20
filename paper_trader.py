@@ -486,13 +486,19 @@ class PaperTrader:
         """Save paper trading state to JSON file."""
         try:
             with self._lock:
+                resolved = list(self._resolved)
+                wins = sum(1 for t in resolved if t.won)
+                total_pnl = sum(t.net_pnl for t in resolved)
                 state = {
                     "balance": self._balance,
                     "order_counter": self._order_counter,
                     "open_orders": {
                         k: asdict(v) for k, v in self._open_orders.items()
                     },
-                    "resolved_count": len(self._resolved),
+                    "resolved_count": len(resolved),
+                    "wins": wins,
+                    "losses": len(resolved) - wins,
+                    "total_pnl": total_pnl,
                     "updated": datetime.now(tz=timezone.utc).isoformat(),
                 }
             with open(self._state_file, "w") as f:

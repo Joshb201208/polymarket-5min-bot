@@ -46,6 +46,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL = 2  # seconds between checking for new messages
 STATS_FILE = Path("stats.json")
+PAPER_STATE_FILE = Path("paper_state.json")
 TRADES_FILE = Path("trades.csv")
 BOT_LOG = Path("logs/bot.log")
 
@@ -113,10 +114,14 @@ def cmd_status() -> str:
             bot_status = "POSSIBLY DOWN"
         last_activity = f"{age_min:.0f}m ago"
     
-    balance = stats.get("paper_balance", stats.get("balance", 500))
+    # Paper balance from paper_state.json (most accurate source)
+    balance = stats.get("paper_balance", stats.get("last_balance", stats.get("balance", 500)))
     total_trades = stats.get("total_trades", 0)
     wins = stats.get("wins", 0)
     losses = stats.get("losses", 0)
+    open_orders = stats.get("open_orders", 0)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    pnl = balance - 500.0
     
     return (
         f"BOT STATUS\n"
@@ -124,9 +129,10 @@ def cmd_status() -> str:
         f"Status: {bot_status}\n"
         f"Last Activity: {last_activity}\n"
         f"Mode: Paper Trading\n"
-        f"Balance: ${balance:.2f}\n"
-        f"Total Trades: {total_trades}\n"
-        f"Record: {wins}W / {losses}L\n"
+        f"Balance: ${balance:.2f} (P&L: ${pnl:+.2f})\n"
+        f"Open Positions: {open_orders}\n"
+        f"Resolved Trades: {total_trades}\n"
+        f"Record: {wins}W / {losses}L ({win_rate:.0f}%)\n"
         f"\n"
         f"Time: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
@@ -136,7 +142,7 @@ def cmd_pnl() -> str:
     """Return P&L summary."""
     stats = _load_stats()
     
-    balance = stats.get("paper_balance", stats.get("balance", 500))
+    balance = stats.get("paper_balance", stats.get("last_balance", stats.get("balance", 500)))
     starting = 500.0  # initial paper balance
     pnl = balance - starting
     pnl_pct = (pnl / starting) * 100
@@ -145,20 +151,27 @@ def cmd_pnl() -> str:
     wins = stats.get("wins", 0)
     losses = stats.get("losses", 0)
     win_rate = (wins / total * 100) if total > 0 else 0
+    open_orders = stats.get("open_orders", 0)
     
     # Calculate average win/loss from trades
     avg_win, avg_loss = _calc_avg_win_loss()
+    
+    # Profit factor
+    profit_factor = stats.get("profit_factor", 0)
+    pf_str = f"{profit_factor:.2f}" if profit_factor else "N/A"
     
     return (
         f"P&L REPORT\n"
         f"\n"
         f"Balance: ${balance:.2f}\n"
         f"P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+        f"Open Positions: {open_orders}\n"
         f"\n"
         f"Total Trades: {total}\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}\n"
         f"Win Rate: {win_rate:.1f}%\n"
+        f"Profit Factor: {pf_str}\n"
         f"\n"
         f"Avg Win: ${avg_win:+.2f}\n"
         f"Avg Loss: ${avg_loss:+.2f}"
@@ -210,9 +223,10 @@ def cmd_trades() -> str:
 def cmd_balance() -> str:
     """Return current balance."""
     stats = _load_stats()
-    balance = stats.get("paper_balance", stats.get("balance", 500))
+    balance = stats.get("paper_balance", stats.get("last_balance", stats.get("balance", 500)))
     pnl = balance - 500.0
-    return f"Balance: ${balance:.2f} (P&L: ${pnl:+.2f})"
+    open_orders = stats.get("open_orders", 0)
+    return f"Balance: ${balance:.2f} (P&L: ${pnl:+.2f})\nOpen Positions: {open_orders}"
 
 
 def cmd_help() -> str:
@@ -233,14 +247,32 @@ def cmd_help() -> str:
 # ---------------------------------------------------------------------------
 
 def _load_stats() -> dict:
-    """Load stats.json."""
+    """Load stats from stats.json and paper_state.json, merging them."""
+    result = {}
+
+    # Load monitor stats (nested under "stats" key)
     if STATS_FILE.exists():
         try:
             with open(STATS_FILE) as f:
-                return json.load(f)
+                raw = json.load(f)
+            # Stats are nested: {"updated": ..., "stats": {"total_trades": ...}}
+            inner = raw.get("stats", raw)
+            result.update(inner)
         except Exception:
             pass
-    return {}
+
+    # Load paper trader state for live balance + open orders
+    if PAPER_STATE_FILE.exists():
+        try:
+            with open(PAPER_STATE_FILE) as f:
+                paper = json.load(f)
+            result["paper_balance"] = float(paper.get("balance", 500))
+            result["open_orders"] = len(paper.get("open_orders", {}))
+            result["resolved_count"] = int(paper.get("resolved_count", 0))
+        except Exception:
+            pass
+
+    return result
 
 
 def _calc_avg_win_loss() -> tuple:

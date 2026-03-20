@@ -457,6 +457,14 @@ class PolymarketBot:
         asset = market.get("asset", "")
         slug = market.get("slug", "")
 
+        # ── Duplicate-trade guard ─────────────────────────────────────────
+        # Skip if we already have an open paper position for this exact slug
+        if self._paper_trader:
+            for order in self._paper_trader.get_open_orders():
+                if order.market_slug == slug:
+                    logger.debug("[%s] Already have open position for %s — skipping", asset, slug)
+                    return
+
         # Get Polymarket midpoint for YES (Up) token
         token_id_yes = market.get("token_id_yes", "")
         if not token_id_yes:
