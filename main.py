@@ -599,6 +599,52 @@ class PolymarketBot:
             logger.debug("[%s] Signal below threshold", asset)
             return
 
+        # ── PRE-EXECUTION RECHECK ─────────────────────────────────────────
+        # Re-fetch the Polymarket mid right before execution.
+        # The book can move between strategy evaluation and now (especially
+        # in fast 5-min markets). If the poly_prob filter would now reject
+        # the trade, abort. This prevents stale-price entries like buying
+        # NO at 0.78 when the market has already moved against us.
+        fresh_mid = self._get_polymarket_mid(token_id_yes)
+        if fresh_mid > 0:
+            if signal.direction == "YES":
+                fresh_our_prob = fresh_mid
+            else:
+                fresh_our_prob = 1.0 - fresh_mid
+
+            # Apply the same poly_prob filter as strategy.py (0.35–0.65)
+            if fresh_our_prob < 0.35 or fresh_our_prob > 0.65:
+                logger.info(
+                    "[%s] PRE-EXEC RECHECK BLOCKED: %s poly_prob=%.3f "
+                    "(was %.3f at eval) — outside 0.35-0.65 filter",
+                    asset, signal.direction, fresh_our_prob,
+                    signal.polymarket_mid if signal.direction == "YES"
+                    else (1.0 - signal.polymarket_mid),
+                )
+                return
+
+            # Also recheck: would the edge still be positive?
+            fresh_entry = fresh_our_prob
+            from utils import polymarket_fee
+            fresh_fee = polymarket_fee(shares=1.0, price=fresh_entry)
+            fresh_edge = signal.exchange_prob - fresh_entry - fresh_fee
+            if fresh_edge < self._config.risk.min_edge_threshold:
+                logger.info(
+                    "[%s] PRE-EXEC RECHECK BLOCKED: %s fresh_edge=%.4f < min %.4f "
+                    "(book moved against us)",
+                    asset, signal.direction, fresh_edge,
+                    self._config.risk.min_edge_threshold,
+                )
+                return
+
+            # Use the fresh price for execution (more accurate fill)
+            polymarket_mid = fresh_mid
+            logger.debug(
+                "[%s] Pre-exec recheck OK: %s fresh_poly=%.3f fresh_edge=%.4f",
+                asset, signal.direction, fresh_our_prob, fresh_edge,
+            )
+        # ── END PRE-EXECUTION RECHECK ─────────────────────────────────────
+
         # Calculate position size
         balance = (
             self._paper_trader.get_balance()
