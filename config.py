@@ -418,5 +418,18 @@ def load_config() -> Config:
     return config
 
 
-# Singleton — modules can `from config import CONFIG`
-CONFIG = load_config()
+# FIX #5: The CONFIG singleton previously ran unconditionally at import time.
+# If .env is missing or corrupted this would crash the entire process before
+# main() was ever called.  The singleton is now wrapped in a try/except so
+# that an import-time failure is non-fatal: it logs a warning and sets CONFIG
+# to None.  Any module that needs the config should call load_config() directly
+# rather than relying on this singleton.
+try:
+    CONFIG = load_config()
+except Exception as _config_exc:
+    logger.warning(
+        "CONFIG singleton failed to load at import time: %s — "
+        "call load_config() explicitly in your entry point.",
+        _config_exc,
+    )
+    CONFIG = None

@@ -15,6 +15,7 @@ Provides:
 """
 
 import json
+import os
 import time
 import logging
 import threading
@@ -34,9 +35,39 @@ INSTRUMENT_MAP = {
     "SOL": "SOL_USDT",
 }
 
+# FIX #6: Check at module load time whether the external-tool binary is
+# available on this host.  On the VPS it is NOT present, so every call to
+# _call_crypto_com() previously took the full 15s subprocess timeout before
+# falling through to HTTP.  By checking once at startup we skip the CLI path
+# entirely when the binary doesn't exist, making every ticker poll instant.
+_EXTERNAL_TOOL_PATH = "external-tool"
+_EXTERNAL_TOOL_AVAILABLE: bool = False
+
+try:
+    _probe = subprocess.run(
+        ["which", _EXTERNAL_TOOL_PATH],
+        capture_output=True, text=True, timeout=2,
+    )
+    _EXTERNAL_TOOL_AVAILABLE = _probe.returncode == 0
+except Exception:
+    _EXTERNAL_TOOL_AVAILABLE = False
+
+if _EXTERNAL_TOOL_AVAILABLE:
+    logger.info("data_feeds: external-tool binary found — CLI path enabled")
+else:
+    logger.info("data_feeds: external-tool binary NOT found — skipping CLI path, using HTTP directly")
+
 
 def _call_crypto_com(tool_name: str, arguments: dict) -> Optional[dict]:
-    """Call Crypto.com via the external-tool CLI."""
+    """Call Crypto.com via the external-tool CLI.
+
+    FIX #6: Skip entirely if external-tool is not installed (e.g. on VPS).
+    This avoids the 15s subprocess timeout on every poll cycle.
+    """
+    # FIX #6: Fast-path exit when the binary is absent
+    if not _EXTERNAL_TOOL_AVAILABLE:
+        return None
+
     try:
         payload = json.dumps({
             "source_id": "crypto_com",
@@ -44,8 +75,11 @@ def _call_crypto_com(tool_name: str, arguments: dict) -> Optional[dict]:
             "arguments": arguments,
         })
         result = subprocess.run(
-            ["external-tool", "call", payload],
-            capture_output=True, text=True, timeout=15,
+            [_EXTERNAL_TOOL_PATH, "call", payload],
+            capture_output=True, text=True,
+            # FIX #6: Reduced timeout from 15s → 2s even if binary exists,
+            # so a stalled CLI call never blocks the main poll cycle for long.
+            timeout=2,
         )
         if result.returncode != 0:
             logger.debug("external-tool error: %s", result.stderr[:200])
@@ -111,7 +145,7 @@ def _call_crypto_com_http(tool_name: str, arguments: dict) -> Optional[dict]:
 
 
 def call_crypto_com(tool_name: str, arguments: dict) -> Optional[dict]:
-    """Try external-tool CLI first, fall back to direct HTTP."""
+    """Try external-tool CLI first (if available), fall back to direct HTTP."""
     result = _call_crypto_com(tool_name, arguments)
     if result:
         return result
@@ -134,6 +168,9 @@ class PriceFeed:
     CANDLE_INTERVAL = 60.0       # seconds between candle fetches
     MAX_HISTORY_POINTS = 1800    # max price points to keep (~30 min at 1/s)
     MAX_CANDLES = 120            # max 1-min candles to keep (2 hours)
+
+    # FIX #7: Number of consecutive feed failures before sending Telegram alert
+    FEED_FAILURE_ALERT_THRESHOLD = 10
 
     def __init__(self, assets: List[str] = None, history_minutes: int = 30):
         self._assets = [a.upper() for a in (assets or ["BTC", "ETH", "SOL"])]
@@ -159,6 +196,21 @@ class PriceFeed:
         self._candle_thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._use_cli = True  # Try CLI first, may fall back
+
+        # FIX #7: Track consecutive poll failures for alerting
+        self._consecutive_failures: int = 0
+        self._last_failure_alert_ts: float = 0.0
+        # Telegram config injected externally after init (set by main.py)
+        self._telegram_bot_token: str = ""
+        self._telegram_chat_id: str = ""
+
+    def configure_alerts(self, bot_token: str, chat_id: str) -> None:
+        """
+        FIX #7: Inject Telegram credentials so the feed can send failure alerts.
+        Called by the bot after initialisation.
+        """
+        self._telegram_bot_token = bot_token
+        self._telegram_chat_id = chat_id
 
     def start(self) -> None:
         """Start polling threads."""
@@ -193,8 +245,29 @@ class PriceFeed:
     def _poll_loop(self) -> None:
         """Fetch ticker data every POLL_INTERVAL seconds."""
         while self._running:
+            poll_success = False
             for asset in self._assets:
-                self._fetch_ticker(asset)
+                if self._fetch_ticker(asset):
+                    poll_success = True
+
+            # FIX #7: Track consecutive failures across all assets in a cycle.
+            # If every asset in this cycle failed, increment the counter.
+            if not poll_success:
+                self._consecutive_failures += 1
+                logger.warning(
+                    "PriceFeed: poll cycle failed for all assets (consecutive=%d)",
+                    self._consecutive_failures,
+                )
+                self._maybe_send_failure_alert()
+            else:
+                # Any success resets the failure counter
+                if self._consecutive_failures > 0:
+                    logger.info(
+                        "PriceFeed: feed recovered after %d consecutive failures",
+                        self._consecutive_failures,
+                    )
+                self._consecutive_failures = 0
+
             time.sleep(self.POLL_INTERVAL)
 
     def _candle_loop(self) -> None:
@@ -208,21 +281,26 @@ class PriceFeed:
             for asset in self._assets:
                 self._fetch_candles(asset)
 
-    def _fetch_ticker(self, asset: str) -> None:
-        """Fetch current ticker for an asset."""
+    def _fetch_ticker(self, asset: str) -> bool:
+        """
+        Fetch current ticker for an asset.
+
+        FIX #7: Returns True on success, False on failure so _poll_loop
+        can track consecutive failures accurately.
+        """
         instrument = INSTRUMENT_MAP.get(asset)
         if not instrument:
-            return
+            return False
 
         try:
             data = call_crypto_com("get_ticker", {"instrument_name": instrument})
             if not data:
-                return
+                return False
 
             # Crypto.com uses 'a' for last price, 'b' for bid, 'k' for ask
             price_str = data.get("a") or data.get("last")
             if not price_str:
-                return
+                return False
 
             price = float(price_str)
             ts = time.time()
@@ -244,8 +322,11 @@ class PriceFeed:
                 self._ready.set()
                 logger.info("PriceFeed: first price received for %s: $%.2f", asset, price)
 
+            return True
+
         except Exception as e:
             logger.debug("PriceFeed: ticker fetch failed for %s: %s", asset, e)
+            return False
 
     def _fetch_candles(self, asset: str) -> None:
         """Fetch recent 1-min candles for indicator calculation."""
@@ -281,6 +362,43 @@ class PriceFeed:
 
         except Exception as e:
             logger.debug("PriceFeed: candle fetch failed for %s: %s", asset, e)
+
+    # ------------------------------------------------------------------
+    # FIX #7: Failure alerting
+    # ------------------------------------------------------------------
+
+    def _maybe_send_failure_alert(self) -> None:
+        """
+        FIX #7: Send a Telegram alert if consecutive poll failures have
+        exceeded FEED_FAILURE_ALERT_THRESHOLD.  Rate-limits to one alert
+        per 5 minutes so we don't spam during extended outages.
+        """
+        if self._consecutive_failures < self.FEED_FAILURE_ALERT_THRESHOLD:
+            return
+
+        # Rate-limit: only alert once every 5 minutes
+        now = time.time()
+        if now - self._last_failure_alert_ts < 300:
+            return
+
+        self._last_failure_alert_ts = now
+        msg = (
+            f"PRICE FEED ALERT: Crypto.com ticker has failed "
+            f"{self._consecutive_failures} consecutive polls. "
+            f"Bot is running blind — check connectivity."
+        )
+        logger.error(msg)
+
+        if self._telegram_bot_token and self._telegram_chat_id:
+            try:
+                from utils import send_telegram_message
+                send_telegram_message(
+                    self._telegram_bot_token,
+                    self._telegram_chat_id,
+                    msg,
+                )
+            except Exception as exc:
+                logger.error("PriceFeed: failed to send Telegram failure alert: %s", exc)
 
     # ------------------------------------------------------------------
     # Public query methods

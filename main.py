@@ -1,7 +1,7 @@
 """
 main.py - Main orchestrator for the Polymarket 5-minute crypto trading bot.
 
-Execution loop (runs every ~30 seconds):
+Execution loop (runs every ~10 seconds):
   1. Find active 5-minute markets for BTC, ETH, SOL
   2. For each market:
      a. Fetch real-time price from Binance WebSocket
@@ -92,50 +92,83 @@ class PolymarketBot:
     Orchestrates all modules into a running trading bot.
     """
 
-    LOOP_INTERVAL = 30       # seconds between full evaluation cycles
+    # FIX #1: Loop interval reduced from 30s to 10s for more evaluation cycles
+    # With 5-min windows, 10s gives ~30 evaluations vs ~10 at 30s.
+    # Oracle arb needs 5s persistence confirmation; late-window fires in last 60s.
+    LOOP_INTERVAL = 10       # seconds between full evaluation cycles (was 30)
     STARTUP_WAIT = 20        # seconds to wait for price feed to warm up
+
+    # FIX #3: Watchdog — alert if main loop hasn't run in this many seconds
+    WATCHDOG_TIMEOUT = 120   # 2 minutes
 
     def __init__(self, config: Config):
         self._config = config
         self._running = False
         self._shutdown_event = threading.Event()
 
+        # FIX #3: Watchdog heartbeat timestamp (updated each loop iteration)
+        self._last_loop_ts: float = time.time()
+        self._watchdog_thread: Optional[threading.Thread] = None
+
         logger.info("=" * 60)
         logger.info("Polymarket 5-Min Crypto Bot v2 — %s mode", config.trading_mode.upper())
         logger.info("=" * 60)
 
+        # FIX #4: Wrap each non-critical upgrade module init in try/except so
+        # that a broken module doesn't abort the entire bot startup.
+
         # ── Upgrade 1: FeeManager ─────────────────────────────────────────
         if _FEE_MANAGER_OK and config.fee.dynamic_fee_enabled:
-            self._fee_manager = FeeManager()
-            logger.info("FeeManager: enabled (dynamic feeRateBps querying active)")
+            try:
+                self._fee_manager = FeeManager()
+                logger.info("FeeManager: enabled (dynamic feeRateBps querying active)")
+            except Exception as exc:
+                # FIX #4: Initialization failure is non-fatal
+                self._fee_manager = None
+                logger.warning("FeeManager: init failed (%s) — feeRateBps will default to 0", exc)
         else:
             self._fee_manager = None
             logger.info("FeeManager: disabled (feeRateBps will default to 0)")
 
         # ── Upgrade 2: WebSocket Orderbook Feed ───────────────────────────
         if _WS_FEED_OK and config.polymarket_ws.enabled:
-            self._ws_feed = WebSocketFeed()
-            logger.info("WebSocketFeed: enabled (real-time CLOB orderbook)")
+            try:
+                self._ws_feed = WebSocketFeed()
+                logger.info("WebSocketFeed: enabled (real-time CLOB orderbook)")
+            except Exception as exc:
+                # FIX #4: Initialization failure is non-fatal
+                self._ws_feed = None
+                logger.warning("WebSocketFeed: init failed (%s) — using REST polling", exc)
         else:
             self._ws_feed = None
             logger.info("WebSocketFeed: disabled (using REST polling)")
 
         # ── Upgrade 3: PositionMerger ─────────────────────────────────────
         if _POSITION_MERGER_OK and config.merger.enabled:
-            self._position_merger = PositionMerger(
-                paper_mode=config.is_paper_mode,
-            )
-            logger.info("PositionMerger: enabled")
+            try:
+                self._position_merger = PositionMerger(
+                    paper_mode=config.is_paper_mode,
+                )
+                logger.info("PositionMerger: enabled")
+            except Exception as exc:
+                # FIX #4: Initialization failure is non-fatal
+                self._position_merger = None
+                logger.warning("PositionMerger: init failed (%s) — disabled", exc)
         else:
             self._position_merger = None
             logger.info("PositionMerger: disabled")
 
         # ── Upgrade 4: AutoRedeemer ───────────────────────────────────────
         if _REDEEMER_OK:
-            self._redeemer = AutoRedeemer(
-                paper_mode=config.is_paper_mode,
-            )
-            logger.info("AutoRedeemer: enabled — winnings will be collected automatically")
+            try:
+                self._redeemer = AutoRedeemer(
+                    paper_mode=config.is_paper_mode,
+                )
+                logger.info("AutoRedeemer: enabled — winnings will be collected automatically")
+            except Exception as exc:
+                # FIX #4: Initialization failure is non-fatal
+                self._redeemer = None
+                logger.warning("AutoRedeemer: init failed (%s) — disabled", exc)
         else:
             self._redeemer = None
             logger.info("AutoRedeemer: disabled")
@@ -145,6 +178,12 @@ class PolymarketBot:
             assets=config.strategy.assets,
             history_minutes=config.exchange.price_history_minutes,
         )
+        # FIX #7: Wire Telegram credentials into PriceFeed for failure alerts
+        if config.telegram and config.telegram.is_configured:
+            self._price_feed.configure_alerts(
+                bot_token=config.telegram.bot_token,
+                chat_id=config.telegram.chat_id,
+            )
 
         self._market_finder = MarketFinder(
             assets=config.strategy.assets,
@@ -242,6 +281,15 @@ class PolymarketBot:
             # Additional subscriptions happen in _evaluate_cycle as markets are discovered
             logger.info("WebSocketFeed started — will subscribe to market tokens on first cycle")
 
+        # FIX #3: Start the watchdog thread
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name="watchdog",
+        )
+        self._watchdog_thread.start()
+        logger.info("Watchdog started (timeout=%ds)", self.WATCHDOG_TIMEOUT)
+
         # Wait for price data
         logger.info("Waiting up to %ds for Binance price feed…", self.STARTUP_WAIT)
         if not self._price_feed.wait_for_data(timeout=self.STARTUP_WAIT):
@@ -296,6 +344,41 @@ class PolymarketBot:
         self.shutdown(f"Signal {signum}")
 
     # ------------------------------------------------------------------
+    # Watchdog (FIX #3)
+    # ------------------------------------------------------------------
+
+    def _watchdog_loop(self) -> None:
+        """
+        FIX #3: Watchdog heartbeat monitor.
+        Runs in a background thread. If the main loop hasn't updated
+        _last_loop_ts in WATCHDOG_TIMEOUT seconds, send a Telegram alert.
+        """
+        # Wait a full cycle before first check so startup doesn't false-alarm
+        self._shutdown_event.wait(timeout=self.WATCHDOG_TIMEOUT)
+
+        while self._running:
+            age = time.time() - self._last_loop_ts
+            if age > self.WATCHDOG_TIMEOUT:
+                msg = (
+                    f"WATCHDOG ALERT: Main loop has not run in {age:.0f}s "
+                    f"(threshold={self.WATCHDOG_TIMEOUT}s). Bot may be frozen."
+                )
+                logger.error(msg)
+                try:
+                    cfg = self._config
+                    if cfg.telegram and cfg.telegram.is_configured:
+                        send_telegram_message(
+                            cfg.telegram.bot_token,
+                            cfg.telegram.chat_id,
+                            msg,
+                        )
+                except Exception as exc:
+                    logger.error("Watchdog: failed to send Telegram alert: %s", exc)
+
+            # Check every half the timeout window to avoid multiple rapid alerts
+            self._shutdown_event.wait(timeout=self.WATCHDOG_TIMEOUT / 2)
+
+    # ------------------------------------------------------------------
     # Main Loop
     # ------------------------------------------------------------------
 
@@ -307,19 +390,29 @@ class PolymarketBot:
             loop_start = time.time()
             self._cycle_count += 1
 
+            # FIX #2: Wrap the ENTIRE loop body (not just _evaluate_cycle) so
+            # that failures in report methods don't crash the loop.
             try:
                 self._evaluate_cycle()
             except Exception as exc:
                 logger.error("Unhandled exception in main loop: %s", exc, exc_info=True)
 
-            # Print periodic reports
-            if self._monitor.should_print_hourly_report():
-                report = self._monitor.get_hourly_report()
-                logger.info("\n%s", report)
+            # FIX #2: Periodic reports are now inside the outer try/except so
+            # any failure here is caught and logged rather than crashing the loop.
+            try:
+                # Print periodic reports
+                if self._monitor.should_print_hourly_report():
+                    report = self._monitor.get_hourly_report()
+                    logger.info("\n%s", report)
 
-            if self._monitor.should_print_daily_report():
-                report = self._monitor.get_daily_report()
-                logger.info("\n%s", report)
+                if self._monitor.should_print_daily_report():
+                    report = self._monitor.get_daily_report()
+                    logger.info("\n%s", report)
+            except Exception as exc:
+                logger.error("Error in periodic report: %s", exc, exc_info=True)
+
+            # FIX #3: Update watchdog heartbeat after each successful loop iteration
+            self._last_loop_ts = time.time()
 
             # Wait for next cycle (precise timing)
             elapsed = time.time() - loop_start
@@ -771,6 +864,7 @@ class PolymarketBot:
             f"Assets: {', '.join(cfg.strategy.assets)}\n"
             f"Strategy: {cfg.strategy.primary_strategy}\n"
             f"Upgrades: {upgrades_str}\n"
+            f"Loop interval: {self.LOOP_INTERVAL}s\n"
             f"Balance: {format_usd(self._risk_manager.get_balance())}"
         )
         if cfg.telegram.is_configured:

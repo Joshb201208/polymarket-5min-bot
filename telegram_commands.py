@@ -229,16 +229,101 @@ def cmd_balance() -> str:
     return f"Balance: ${balance:.2f} (P&L: ${pnl:+.2f})\nOpen Positions: {open_orders}"
 
 
+def cmd_logs() -> str:
+    """Return last 30 lines of bot log."""
+    if not BOT_LOG.exists():
+        return "No bot log found."
+    try:
+        with open(BOT_LOG, "r") as f:
+            lines = f.readlines()
+        recent = lines[-30:] if len(lines) > 30 else lines
+        text = "RECENT BOT LOGS (last 30 lines)\n\n"
+        for line in recent:
+            text += line.rstrip()[:120] + "\n"  # truncate long lines
+        # Telegram has a 4096 char limit
+        if len(text) > 4000:
+            text = text[:3990] + "\n...(truncated)"
+        return text
+    except Exception as e:
+        return f"Error reading logs: {e}"
+
+
+def cmd_restart() -> str:
+    """Restart the bot service via systemctl."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", "polymarket-bot"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            return "Bot service restarted successfully. It should be back online in ~20s."
+        else:
+            return f"Restart failed (exit code {result.returncode}):\n{result.stderr[:500]}"
+    except Exception as e:
+        return f"Restart error: {e}"
+
+
+def cmd_health() -> str:
+    """Quick health check — is the bot actually running and trading?"""
+    import subprocess
+    
+    # Check systemd status
+    try:
+        svc = subprocess.run(
+            ["systemctl", "is-active", "polymarket-bot"],
+            capture_output=True, text=True, timeout=5,
+        )
+        bot_svc = svc.stdout.strip()
+    except Exception:
+        bot_svc = "unknown"
+    
+    # Check git commit
+    try:
+        git = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd="/root/polymarket-bot",
+        )
+        git_hash = git.stdout.strip() if git.returncode == 0 else "unknown"
+    except Exception:
+        git_hash = "unknown"
+    
+    # Paper state
+    stats = _load_stats()
+    balance = stats.get("paper_balance", stats.get("balance", 500))
+    open_orders = stats.get("open_orders", 0)
+    
+    # Log freshness
+    log_age = "unknown"
+    if BOT_LOG.exists():
+        age_s = (datetime.now(timezone.utc) - datetime.fromtimestamp(BOT_LOG.stat().st_mtime, tz=timezone.utc)).total_seconds()
+        log_age = f"{age_s:.0f}s ago"
+    
+    return (
+        f"HEALTH CHECK\n\n"
+        f"Bot Service: {bot_svc}\n"
+        f"Git Commit: {git_hash}\n"
+        f"Last Log Write: {log_age}\n"
+        f"Balance: ${balance:.2f}\n"
+        f"Open Positions: {open_orders}\n"
+        f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+    )
+
+
 def cmd_help() -> str:
     """Return list of available commands."""
     return (
         "AVAILABLE COMMANDS\n"
         "\n"
-        "/status  - Bot status and uptime\n"
-        "/pnl     - Profit & loss summary\n"
-        "/trades  - Recent trade history\n"
-        "/balance - Current balance\n"
-        "/help    - This message"
+        "/status   - Bot status and uptime\n"
+        "/pnl      - Profit & loss summary\n"
+        "/trades   - Recent trade history\n"
+        "/balance  - Current balance\n"
+        "/logs     - Last 30 lines of bot log\n"
+        "/health   - Quick health diagnostic\n"
+        "/restart  - Restart bot service\n"
+        "/help     - This message"
     )
 
 
@@ -314,6 +399,9 @@ COMMANDS = {
     "/pnl": cmd_pnl,
     "/trades": cmd_trades,
     "/balance": cmd_balance,
+    "/logs": cmd_logs,
+    "/restart": cmd_restart,
+    "/health": cmd_health,
     "/help": cmd_help,
     "/start": cmd_help,  # default Telegram /start command
 }
