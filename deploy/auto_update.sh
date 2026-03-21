@@ -44,6 +44,20 @@ fi
 # Even if no code changes, check if bot service is alive
 # If bot is dead, restart it immediately
 
+# Always ensure service files are in sync (fixes switchover to scalp_main.py)
+# Compare what systemd has vs what's in the repo
+REPO_SERVICE="$BOT_DIR/deploy/polymarket-bot.service"
+SYSTEM_SERVICE="/etc/systemd/system/polymarket-bot.service"
+if [ -f "$REPO_SERVICE" ] && ! diff -q "$REPO_SERVICE" "$SYSTEM_SERVICE" >/dev/null 2>&1; then
+    echo "$LOG_PREFIX Service file out of sync — updating and reloading..."
+    cp "$REPO_SERVICE" "$SYSTEM_SERVICE" 2>/dev/null || true
+    cp "$BOT_DIR/deploy/telegram-commands.service" /etc/systemd/system/ 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
+    sleep 3
+    echo "$LOG_PREFIX Service file synced and restarted"
+fi
+
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
     if ! systemctl is-active --quiet polymarket-bot; then
         echo "$LOG_PREFIX No code updates BUT bot is NOT running — restarting..."
