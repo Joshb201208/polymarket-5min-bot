@@ -308,9 +308,17 @@ class ScalpBot:
                     market.get("slug", "?"), exc, exc_info=True,
                 )
 
+    # BTC-only: highest liquidity, biggest dollar moves, proven edge
+    SCALP_ASSETS = {"BTC"}
+
     def _evaluate_market(self, market: dict, secs_remaining: float) -> None:
         """Evaluate a single market: exits first, then entries."""
         asset = market.get("asset", "")
+
+        # Only scalp assets with sufficient liquidity
+        if asset not in self.SCALP_ASSETS:
+            return
+
         token_id_yes = market.get("token_id_yes", "")
 
         if not token_id_yes:
