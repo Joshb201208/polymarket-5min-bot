@@ -43,6 +43,7 @@ fi
 
 # Even if no code changes, check if bot service is alive
 # If bot is dead, restart it immediately
+
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
     if ! systemctl is-active --quiet polymarket-bot; then
         echo "$LOG_PREFIX No code updates BUT bot is NOT running — restarting..."
@@ -50,7 +51,6 @@ if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
         sleep 3
         if systemctl is-active --quiet polymarket-bot; then
             echo "$LOG_PREFIX Bot restarted successfully (was dead)"
-            # Run health check
             bash "$BOT_DIR/deploy/health_check.sh" 2>/dev/null &
         else
             echo "$LOG_PREFIX WARNING: Bot FAILED to restart!"

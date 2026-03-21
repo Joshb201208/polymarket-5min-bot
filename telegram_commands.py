@@ -362,6 +362,90 @@ def cmd_reset() -> str:
         return f"Reset error: {e}"
 
 
+def cmd_export() -> str:
+    """Export full paper state + all trades for analysis."""
+    msg_parts = []
+
+    # --- Paper state ---
+    if PAPER_STATE_FILE.exists():
+        try:
+            with open(PAPER_STATE_FILE) as f:
+                paper = json.load(f)
+            balance = float(paper.get("balance", 500))
+            open_count = len(paper.get("open_orders", {}))
+            resolved = int(paper.get("resolved_count", 0))
+            wins = int(paper.get("wins", 0))
+            losses = int(paper.get("losses", 0))
+            total = wins + losses
+            pnl = balance - 500.0
+            wr = (wins / total * 100) if total > 0 else 0
+            msg_parts.append(
+                f"PAPER STATE\n"
+                f"Balance: ${balance:.2f} (PnL: ${pnl:+.2f})\n"
+                f"Resolved: {total} ({wins}W/{losses}L, {wr:.0f}%)\n"
+                f"Open: {open_count}\n"
+                f"Updated: {paper.get('updated', '?')}"
+            )
+        except Exception as e:
+            msg_parts.append(f"Paper state error: {e}")
+    else:
+        msg_parts.append("No paper_state.json found")
+
+    # --- All trades ---
+    if TRADES_FILE.exists():
+        try:
+            with open(TRADES_FILE) as f:
+                lines = f.readlines()
+            if len(lines) > 1:
+                msg_parts.append(f"\nALL TRADES ({len(lines)-1} total)\n")
+                # Send header + all trade lines
+                # Format: timestamp, slug, asset, direction, size, entry, exit, pnl, won
+                header = lines[0].strip()
+                msg_parts.append(header[:120])
+                for line in lines[1:]:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 14:
+                        try:
+                            ts = parts[0][:16]
+                            asset = parts[3]
+                            direction = parts[5]
+                            size = parts[6]
+                            entry = parts[7]
+                            exit_p = parts[8]
+                            gross_pnl = parts[9]
+                            net_pnl = parts[10]
+                            bal = parts[11]
+                            edge = parts[12]
+                            won = parts[-1].strip()
+                            result = "W" if won == "True" else "L"
+                            msg_parts.append(
+                                f"{ts}|{asset}|{direction}|${size}|E:{entry}|X:{exit_p}|PnL:${net_pnl}|Bal:${bal}|{result}"
+                            )
+                        except (IndexError, ValueError):
+                            msg_parts.append(line.strip()[:120])
+                    else:
+                        msg_parts.append(line.strip()[:120])
+            else:
+                msg_parts.append("No trades yet")
+        except Exception as e:
+            msg_parts.append(f"Trades file error: {e}")
+    else:
+        msg_parts.append("No trades.csv found")
+
+    full_msg = "\n".join(msg_parts)
+    # Telegram 4096 char limit — split if needed
+    if len(full_msg) > 4000:
+        # Send first chunk
+        send_message(full_msg[:4000] + "\n...(cont)")
+        remaining = full_msg[4000:]
+        while remaining:
+            chunk = remaining[:4000]
+            remaining = remaining[4000:]
+            send_message(chunk if not remaining else chunk + "\n...(cont)")
+        return ""  # already sent
+    return full_msg
+
+
 def cmd_help() -> str:
     """Return list of available commands."""
     return (
@@ -375,6 +459,7 @@ def cmd_help() -> str:
         "/health   - Quick health diagnostic\n"
         "/restart  - Restart bot service\n"
         "/reset    - Reset paper balance to $500\n"
+        "/export   - Export all data for analysis\n"
         "/help     - This message"
     )
 
@@ -455,6 +540,7 @@ COMMANDS = {
     "/restart": cmd_restart,
     "/health": cmd_health,
     "/reset": cmd_reset,
+    "/export": cmd_export,
     "/help": cmd_help,
     "/start": cmd_help,  # default Telegram /start command
 }
