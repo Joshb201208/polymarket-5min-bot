@@ -83,13 +83,12 @@ if git diff --name-only "$OLD_HASH" "$REMOTE_HASH" | grep -q "requirements.txt";
     pip install --quiet -r requirements.txt
 fi
 
-# Copy service files and reload systemd if they changed
-if git diff --name-only "$OLD_HASH" "$REMOTE_HASH" | grep -q "service"; then
-    echo "$LOG_PREFIX Service files changed, reloading systemd..."
-    cp "$BOT_DIR/deploy/polymarket-bot.service" /etc/systemd/system/ 2>/dev/null || true
-    cp "$BOT_DIR/deploy/telegram-commands.service" /etc/systemd/system/ 2>/dev/null || true
-    systemctl daemon-reload
-fi
+# Always sync service files and reload systemd
+# This ensures the service file in /etc/systemd/system/ matches the repo
+echo "$LOG_PREFIX Syncing service files..."
+cp "$BOT_DIR/deploy/polymarket-bot.service" /etc/systemd/system/ 2>/dev/null || true
+cp "$BOT_DIR/deploy/telegram-commands.service" /etc/systemd/system/ 2>/dev/null || true
+systemctl daemon-reload
 
 # Restart both services to pick up new code
 echo "$LOG_PREFIX Restarting services..."
