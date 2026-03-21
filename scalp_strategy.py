@@ -352,7 +352,7 @@ class ScalpStrategy:
     # ------------------------------------------------------------------
     LATE_WINDOW_SECS = 150.0        # Enter in last 2.5 minutes
     LATE_MIN_CONFIRMATION = 0.80    # Token must be 0.80+ (strong direction)
-    LATE_MAX_ENTRY = 0.92           # Don't buy above 0.92 (need room for profit)
+    LATE_MAX_ENTRY = 0.88           # Was 0.92 — at 0.92 the +12% target exceeds $1
     LATE_TAKE_PROFIT = 0.12         # +12% target (e.g. 0.85 -> 0.95)
     LATE_STOP_LOSS = 0.08           # -8% stop (tight, direction is confirmed)
     LATE_MAX_HOLD = 120.0           # 2 min max hold (window is ending)
@@ -545,13 +545,21 @@ class ScalpStrategy:
             )
             return None
 
-        # Verify exchange price agrees with direction
+        # Verify exchange price STRONGLY agrees with direction
+        # Require at least half the normal spread threshold for confirmation
         spread = exchange_price - price_to_beat
-        if direction == "YES" and spread < 0:
-            logger.debug("[%s] Late scalp: YES but exchange is below PtB — skip", asset)
+        min_confirm = self._spread_thresholds.get(asset, 18.0) * 0.5  # half of normal threshold
+        if direction == "YES" and spread < min_confirm:
+            logger.debug(
+                "[%s] Late scalp: YES but spread %.2f < confirm %.2f — skip",
+                asset, spread, min_confirm,
+            )
             return None
-        if direction == "NO" and spread > 0:
-            logger.debug("[%s] Late scalp: NO but exchange is above PtB — skip", asset)
+        if direction == "NO" and spread > -min_confirm:
+            logger.debug(
+                "[%s] Late scalp: NO but spread %.2f > -%.2f — skip",
+                asset, spread, min_confirm,
+            )
             return None
 
         # Confidence: based on how strong the confirmation is + time pressure
