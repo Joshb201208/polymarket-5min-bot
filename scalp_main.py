@@ -11,6 +11,8 @@ service file or run directly:
 
     python scalp_main.py
     TRADING_MODE=paper python scalp_main.py
+
+v1.0 — Initial scalp bot release
 """
 
 import os
