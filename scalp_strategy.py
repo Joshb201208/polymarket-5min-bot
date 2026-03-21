@@ -353,9 +353,9 @@ class ScalpStrategy:
     LATE_WINDOW_SECS = 150.0        # Enter in last 2.5 minutes
     LATE_MIN_CONFIRMATION = 0.80    # Token must be 0.80+ (strong direction)
     LATE_MAX_ENTRY = 0.88           # Was 0.92 — at 0.92 the +12% target exceeds $1
-    LATE_TAKE_PROFIT = 0.12         # +12% target (e.g. 0.85 -> 0.95)
-    LATE_STOP_LOSS = 0.08           # -8% stop (tight, direction is confirmed)
-    LATE_MAX_HOLD = 120.0           # 2 min max hold (window is ending)
+    LATE_TAKE_PROFIT = 99.0         # Effectively disabled — hold to expiry for max payout
+    LATE_STOP_LOSS = 0.10           # -10% stop (protection against rare flips)
+    LATE_MAX_HOLD = 9999.0          # Disabled — let window expiry handle exit
 
     # ------------------------------------------------------------------
     # Entry signal
@@ -641,7 +641,9 @@ class ScalpStrategy:
             max_hold = self._max_hold_seconds
 
         # 1. Emergency exit: window ending
-        if secs_remaining < self._emergency_exit_secs:
+        # Late mode: hold to expiry (don't sell early — collect full $1 payout)
+        # Only emergency exit early-mode positions
+        if secs_remaining < self._emergency_exit_secs and position.mode != "late":
             logger.info(
                 "[%s] EMERGENCY EXIT [%s]: window ending in %.0fs, pnl=%.1f%%",
                 position.asset, position.mode, secs_remaining, pnl_pct * 100,
