@@ -458,62 +458,51 @@ class StrategyEngine:
         # --- Determine direction ---
         direction = "YES" if spread > 0 else "NO"  # YES=Up, NO=Down
 
-        # --- FIX: Skip if market already reflects the direction ---
-        # If Polymarket mid for our side is below 0.35, the market is heavily
-        # pricing the OTHER direction. That means the move is already priced
-        # in — there's no oracle "lag" to exploit, just a contrarian bet.
-        # Similarly, if our side is above 0.65, the arb opportunity is gone
-        # because the market already agrees with us (no mispricing left).
+        # --- Poly prob filter: skip if market already priced in ---
         our_poly_prob = polymarket_mid_yes if direction == "YES" else (1.0 - polymarket_mid_yes)
         if our_poly_prob < 0.35:
             if asset in self._oracle_signal_state:
                 del self._oracle_signal_state[asset]
+            reason = (
+                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} < 0.35 "
+                f"(market heavily against us)"
+            )
+            logger.info(reason)
             return TradingSignal(
-                direction=None,
-                reasoning=(
-                    f"Oracle arb: {asset} {direction} SKIPPED — market already heavily "
-                    f"against us (poly={our_poly_prob:.2f}). No latency edge when market "
-                    f"has priced in the move."
-                ),
-                asset=asset,
-                strategy_name="oracle_arb",
-                seconds_remaining=secs_remaining,
+                direction=None, reasoning=reason, asset=asset,
+                strategy_name="oracle_arb", seconds_remaining=secs_remaining,
             )
         if our_poly_prob > 0.65:
             if asset in self._oracle_signal_state:
                 del self._oracle_signal_state[asset]
+            reason = (
+                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} > 0.65 "
+                f"(market already agrees, no edge)"
+            )
+            logger.info(reason)
             return TradingSignal(
-                direction=None,
-                reasoning=(
-                    f"Oracle arb: {asset} {direction} SKIPPED — market already agrees "
-                    f"(poly={our_poly_prob:.2f}). Entry too expensive, no edge left."
-                ),
-                asset=asset,
-                strategy_name="oracle_arb",
-                seconds_remaining=secs_remaining,
+                direction=None, reasoning=reason, asset=asset,
+                strategy_name="oracle_arb", seconds_remaining=secs_remaining,
             )
 
-        # --- Signal persistence check ---
-        # The spread must persist in the same direction for at least 5 seconds
-        # to confirm it's a real move, not a spike that will revert.
+        # --- Signal persistence check (5s confirmation) ---
         state = self._oracle_signal_state.get(asset)
         now = time.time()
 
         if state is None or state["direction"] != direction:
-            # New signal or direction changed — start tracking
             self._oracle_signal_state[asset] = {
                 "direction": direction,
                 "start_time": now,
                 "spread": spread,
                 "peak_spread": abs_spread,
             }
+            reason = (
+                f"Oracle arb: {asset} {direction} spread=${spread:+,.2f} "
+                f"poly={our_poly_prob:.2f} — waiting 5s confirm"
+            )
+            logger.info(reason)
             return TradingSignal(
-                direction=None,
-                reasoning=(
-                    f"Oracle arb: {asset} new signal {direction} spread=${spread:+,.2f} "
-                    f"— waiting for 5s confirmation"
-                ),
-                asset=asset,
+                direction=None, reasoning=reason, asset=asset,
                 strategy_name="oracle_arb",
                 seconds_remaining=secs_remaining,
             )
@@ -523,6 +512,10 @@ class StrategyEngine:
 
         CONFIRMATION_SECONDS = 5.0
         if signal_age < CONFIRMATION_SECONDS:
+            logger.info(
+                "Oracle arb: %s %s confirming %.1f/%.0fs spread=$%+.2f poly=%.2f",
+                asset, direction, signal_age, CONFIRMATION_SECONDS, spread, our_poly_prob,
+            )
             return TradingSignal(
                 direction=None,
                 reasoning=(
@@ -569,6 +562,13 @@ class StrategyEngine:
         entry_price = poly_prob
         fee = polymarket_fee(shares=1.0, price=entry_price)
         edge = true_prob - entry_price - fee
+
+        logger.info(
+            "Oracle arb: %s %s CONFIRMED spread=$%+.2f true=%.2f poly=%.2f "
+            "fee=%.4f edge=%.4f %ds left",
+            asset, direction, spread, true_prob, poly_prob, fee, edge,
+            int(secs_remaining),
+        )
 
         if edge <= 0:
             return TradingSignal(
