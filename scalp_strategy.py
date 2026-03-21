@@ -32,6 +32,7 @@ class ScalpSignal:
     velocity: float          # price change % over lookback window
     confidence: float        # 0-1 signal strength
     reasoning: str           # human-readable explanation
+    mode: str = "early"      # "early" or "late" — determines exit params
 
 
 @dataclass
@@ -54,6 +55,7 @@ class ScalpPosition:
     size_usd: float
     entry_time: float        # Unix timestamp
     entry_fee: float
+    mode: str = "early"      # "early" or "late"
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +348,16 @@ class ScalpStrategy:
         return best
 
     # ------------------------------------------------------------------
+    # Late-window scalp config
+    # ------------------------------------------------------------------
+    LATE_WINDOW_SECS = 150.0        # Enter in last 2.5 minutes
+    LATE_MIN_CONFIRMATION = 0.80    # Token must be 0.80+ (strong direction)
+    LATE_MAX_ENTRY = 0.92           # Don't buy above 0.92 (need room for profit)
+    LATE_TAKE_PROFIT = 0.12         # +12% target (e.g. 0.85 -> 0.95)
+    LATE_STOP_LOSS = 0.08           # -8% stop (tight, direction is confirmed)
+    LATE_MAX_HOLD = 120.0           # 2 min max hold (window is ending)
+
+    # ------------------------------------------------------------------
     # Entry signal
     # ------------------------------------------------------------------
 
@@ -466,6 +478,113 @@ class ScalpStrategy:
         )
 
     # ------------------------------------------------------------------
+    # Late-window entry signal
+    # ------------------------------------------------------------------
+
+    def check_late_entry(
+        self,
+        asset: str,
+        exchange_price: float,
+        price_to_beat: float,
+        poly_mid_yes: float,
+        secs_remaining: float,
+        market: dict,
+    ) -> Optional[ScalpSignal]:
+        """
+        Late-window scalp: enter when direction is already confirmed
+        (one side trading at 0.80+) with 2-3 minutes left.
+
+        Lower risk, lower reward (10-15% target) but higher win rate
+        because direction is already established.
+        """
+        asset = asset.upper()
+
+        # Only in the late window
+        if secs_remaining > self.LATE_WINDOW_SECS:
+            return None
+
+        # Need at least 30s to execute (entry + exit)
+        if secs_remaining < 30:
+            return None
+
+        # Risk check
+        can_trade, reason = self.risk_manager.can_trade(asset)
+        if not can_trade:
+            return None
+
+        # Determine which side is confirmed
+        # YES side strong = poly_mid_yes >= 0.80
+        # NO side strong = (1 - poly_mid_yes) >= 0.80, i.e. poly_mid_yes <= 0.20
+        yes_strong = poly_mid_yes >= self.LATE_MIN_CONFIRMATION
+        no_strong = (1.0 - poly_mid_yes) >= self.LATE_MIN_CONFIRMATION
+
+        if not yes_strong and not no_strong:
+            logger.debug(
+                "[%s] Late scalp: no confirmed side (YES=%.2f, NO=%.2f)",
+                asset, poly_mid_yes, 1.0 - poly_mid_yes,
+            )
+            return None
+
+        if yes_strong:
+            direction = "YES"
+            our_token_price = poly_mid_yes
+            token_id = market.get("token_id_yes", "")
+        else:
+            direction = "NO"
+            our_token_price = 1.0 - poly_mid_yes
+            token_id = market.get("token_id_no", "")
+
+        if not token_id:
+            return None
+
+        # Don't buy too expensive — need room for profit
+        if our_token_price > self.LATE_MAX_ENTRY:
+            logger.debug(
+                "[%s] Late scalp: token %.3f > max entry %.2f — too expensive",
+                asset, our_token_price, self.LATE_MAX_ENTRY,
+            )
+            return None
+
+        # Verify exchange price agrees with direction
+        spread = exchange_price - price_to_beat
+        if direction == "YES" and spread < 0:
+            logger.debug("[%s] Late scalp: YES but exchange is below PtB — skip", asset)
+            return None
+        if direction == "NO" and spread > 0:
+            logger.debug("[%s] Late scalp: NO but exchange is above PtB — skip", asset)
+            return None
+
+        # Confidence: based on how strong the confirmation is + time pressure
+        strength = (our_token_price - self.LATE_MIN_CONFIRMATION) / (1.0 - self.LATE_MIN_CONFIRMATION)
+        time_pressure = max(0, min(1, (self.LATE_WINDOW_SECS - secs_remaining) / self.LATE_WINDOW_SECS))
+        confidence = 0.5 * min(strength, 1.0) + 0.3 * time_pressure + 0.2
+
+        signed_velocity = self._get_velocity(asset, 10.0)
+
+        reasoning = (
+            f"LATE SCALP: {direction} confirmed at {our_token_price:.2f}, "
+            f"spread {spread:+.2f}, {secs_remaining:.0f}s left, "
+            f"target +{self.LATE_TAKE_PROFIT*100:.0f}%"
+        )
+
+        logger.info(
+            "[%s] LATE SCALP ENTRY: %s token=%.3f spread=%+.2f %.0fs left conf=%.2f",
+            asset, direction, our_token_price, spread, secs_remaining, confidence,
+        )
+
+        return ScalpSignal(
+            direction=direction,
+            asset=asset,
+            entry_price=our_token_price,
+            token_id_to_buy=token_id,
+            spread=spread,
+            velocity=signed_velocity,
+            confidence=confidence,
+            reasoning=reasoning,
+            mode="late",
+        )
+
+    # ------------------------------------------------------------------
     # Exit signal
     # ------------------------------------------------------------------
 
@@ -503,11 +622,21 @@ class ScalpStrategy:
         pnl_pct = (current_price - position.entry_price) / position.entry_price
         hold_time = time.time() - position.entry_time
 
+        # Select exit params based on mode
+        if position.mode == "late":
+            tp_pct = self.LATE_TAKE_PROFIT
+            sl_pct = self.LATE_STOP_LOSS
+            max_hold = self.LATE_MAX_HOLD
+        else:
+            tp_pct = self._take_profit_pct
+            sl_pct = self._stop_loss_pct
+            max_hold = self._max_hold_seconds
+
         # 1. Emergency exit: window ending
         if secs_remaining < self._emergency_exit_secs:
             logger.info(
-                "[%s] EMERGENCY EXIT: window ending in %.0fs, pnl_pct=%.1f%%",
-                position.asset, secs_remaining, pnl_pct * 100,
+                "[%s] EMERGENCY EXIT [%s]: window ending in %.0fs, pnl=%.1f%%",
+                position.asset, position.mode, secs_remaining, pnl_pct * 100,
             )
             return ExitSignal(
                 reason="window_ending",
@@ -516,10 +645,10 @@ class ScalpStrategy:
             )
 
         # 2. Take profit
-        if pnl_pct >= self._take_profit_pct:
+        if pnl_pct >= tp_pct:
             logger.info(
-                "[%s] TAKE PROFIT: pnl_pct=%.1f%% >= %.1f%%",
-                position.asset, pnl_pct * 100, self._take_profit_pct * 100,
+                "[%s] TAKE PROFIT [%s]: pnl=%.1f%% >= %.1f%%",
+                position.asset, position.mode, pnl_pct * 100, tp_pct * 100,
             )
             return ExitSignal(
                 reason="take_profit",
@@ -528,10 +657,10 @@ class ScalpStrategy:
             )
 
         # 3. Stop loss
-        if pnl_pct <= -self._stop_loss_pct:
+        if pnl_pct <= -sl_pct:
             logger.info(
-                "[%s] STOP LOSS: pnl_pct=%.1f%% <= -%.1f%%",
-                position.asset, pnl_pct * 100, self._stop_loss_pct * 100,
+                "[%s] STOP LOSS [%s]: pnl=%.1f%% <= -%.1f%%",
+                position.asset, position.mode, pnl_pct * 100, sl_pct * 100,
             )
             return ExitSignal(
                 reason="stop_loss",
@@ -540,7 +669,7 @@ class ScalpStrategy:
             )
 
         # 4. Max hold time
-        if hold_time >= self._max_hold_seconds:
+        if hold_time >= max_hold:
             logger.info(
                 "[%s] MAX HOLD: held %.0fs >= %.0fs, pnl_pct=%.1f%%",
                 position.asset, hold_time, self._max_hold_seconds, pnl_pct * 100,

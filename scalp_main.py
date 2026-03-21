@@ -363,6 +363,20 @@ class ScalpBot:
 
         if entry_signal:
             self._execute_entry(market, entry_signal)
+            return  # don't also check late entry
+
+        # --- STEP 3: Check late-window entry (confirmed direction, 10-15% target) ---
+        late_signal = self._strategy.check_late_entry(
+            asset=asset,
+            exchange_price=exchange_price,
+            price_to_beat=ptb,
+            poly_mid_yes=poly_mid_yes,
+            secs_remaining=secs_remaining,
+            market=market,
+        )
+
+        if late_signal:
+            self._execute_entry(market, late_signal)
 
     # ------------------------------------------------------------------
     # Entry execution
@@ -383,6 +397,7 @@ class ScalpBot:
                 side=signal.direction,
                 size_usd=size,
                 price=signal.entry_price,
+                mode=signal.mode,
             )
 
             if result.success:
@@ -592,21 +607,29 @@ class ScalpBot:
         direction_label = "Up" if signal.direction == "YES" else "Down"
         balance = self._get_balance()
 
-        # Calculate targets
-        target_price = round_to_tick(signal.entry_price * (1 + self._strategy._take_profit_pct))
-        stop_price = round_to_tick(signal.entry_price * (1 - self._strategy._stop_loss_pct))
+        # Use mode-specific exit params for target/stop display
+        if signal.mode == "late":
+            tp = self._strategy.LATE_TAKE_PROFIT
+            sl = self._strategy.LATE_STOP_LOSS
+            mode_label = "LATE"
+        else:
+            tp = self._strategy._take_profit_pct
+            sl = self._strategy._stop_loss_pct
+            mode_label = "EARLY"
+
+        target_price = round_to_tick(signal.entry_price * (1 + tp))
+        stop_price = round_to_tick(signal.entry_price * (1 - sl))
 
         msg = (
-            f"SCALP ENTRY\n"
+            f"SCALP ENTRY [{mode_label}]\n"
             f"Asset: {signal.asset}\n"
             f"Direction: {signal.direction} ({direction_label})\n"
             f"Entry: {signal.entry_price:.2f}\n"
             f"Size: ${size_usd:.2f}\n"
             f"Shares: {shares:.2f}\n"
             f"Spread: {signal.spread:+.2f}\n"
-            f"Velocity: {signal.velocity*100:+.4f}%/10s\n"
-            f"Target: {target_price:.2f} (+{self._strategy._take_profit_pct*100:.0f}%)\n"
-            f"Stop: {stop_price:.2f} (-{self._strategy._stop_loss_pct*100:.0f}%)\n"
+            f"Target: {target_price:.2f} (+{tp*100:.0f}%)\n"
+            f"Stop: {stop_price:.2f} (-{sl*100:.0f}%)\n"
             f"Balance: ${balance:.2f}"
         )
         logger.info(msg.replace("\n", " | "))

@@ -136,6 +136,7 @@ class ScalpPaperTrader:
         side: str,
         size_usd: float,
         price: float,
+        mode: str = "early",
     ) -> BuyResult:
         """
         Simulate buying tokens on Polymarket.
@@ -203,6 +204,7 @@ class ScalpPaperTrader:
                 size_usd=size_usd,
                 entry_time=time.time(),
                 entry_fee=fee,
+                mode=mode,
             )
             self._positions[position_id] = position
 
