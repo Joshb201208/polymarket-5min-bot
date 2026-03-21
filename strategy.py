@@ -418,13 +418,16 @@ class StrategyEngine:
         abs_spread = abs(spread)
 
         # Dynamic threshold based on asset price level
-        # BTC ~$70K → $50 threshold; ETH ~$2K → $2 threshold; SOL ~$90 → $0.10
+        # TUNED: Previous values ($40/$1.50/$0.08) were too high — real
+        # BTC spreads sit around $10-20 in normal conditions, meaning
+        # the bot never traded oracle_arb. Halved to get actual trades
+        # while still requiring meaningful price divergence.
         if current_price > 10000:      # BTC
-            min_spread = 40.0
+            min_spread = 18.0          # Was $40 — real spreads ~$10-20
         elif current_price > 500:       # ETH
-            min_spread = 1.50
+            min_spread = 0.60          # Was $1.50 — real spreads ~$0.2-0.5
         else:                           # SOL
-            min_spread = 0.08
+            min_spread = 0.04          # Was $0.08 — real spreads ~$0.03-0.06
 
         # Spread as percentage of price
         spread_pct = abs_spread / price_to_beat if price_to_beat > 0 else 0
