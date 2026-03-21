@@ -358,20 +358,11 @@ class ScalpBot:
         if ptb is None or ptb <= 0:
             return
 
-        entry_signal = self._strategy.check_entry(
-            asset=asset,
-            exchange_price=exchange_price,
-            price_to_beat=ptb,
-            poly_mid_yes=poly_mid_yes,
-            secs_remaining=secs_remaining,
-            market=market,
-        )
+        # EARLY MODE DISABLED — backtest showed 39% WR, -$668 P&L
+        # Only late mode is profitable (51% WR, +$183 in backtest)
+        # entry_signal = self._strategy.check_entry(...)
 
-        if entry_signal:
-            self._execute_entry(market, entry_signal)
-            return  # don't also check late entry
-
-        # --- STEP 3: Check late-window entry (confirmed direction, 10-15% target) ---
+        # --- STEP 2b: Check late-window entry (confirmed direction, hold to expiry) ---
         late_signal = self._strategy.check_late_entry(
             asset=asset,
             exchange_price=exchange_price,
