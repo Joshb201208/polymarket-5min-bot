@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
-ExecStart=/root/polymarket-bot/venv/bin/python /root/polymarket-bot/main.py
+ExecStart=/root/polymarket-bot/venv/bin/python /root/polymarket-bot/scalp_main.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1

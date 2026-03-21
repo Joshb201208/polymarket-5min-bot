@@ -47,6 +47,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL = 2  # seconds between checking for new messages
 STATS_FILE = Path("stats.json")
 PAPER_STATE_FILE = Path("paper_state.json")
+SCALP_STATE_FILE = Path("scalp_paper_state.json")
 TRADES_FILE = Path("trades.csv")
 BOT_LOG = Path("logs/bot.log")
 
@@ -123,6 +124,23 @@ def cmd_status() -> str:
     win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
     pnl = balance - 500.0
     
+    # Scalp bot info
+    scalp = _load_scalp_state()
+    scalp_section = ""
+    if scalp:
+        scalp_balance = float(scalp.get("balance", 0))
+        scalp_positions = len(scalp.get("positions", {}))
+        scalp_stats = scalp.get("stats", {})
+        scalp_trades = scalp_stats.get("total_trades", 0)
+        scalp_wins = scalp_stats.get("wins", 0)
+        scalp_pnl = scalp_stats.get("total_pnl", 0)
+        scalp_section = (
+            f"\n--- SCALP BOT ---\n"
+            f"Balance: ${scalp_balance:.2f} (P&L: ${scalp_pnl:+.2f})\n"
+            f"Open Positions: {scalp_positions}\n"
+            f"Scalp Trades: {scalp_trades} ({scalp_wins}W)\n"
+        )
+
     return (
         f"BOT STATUS\n"
         f"\n"
@@ -133,6 +151,7 @@ def cmd_status() -> str:
         f"Open Positions: {open_orders}\n"
         f"Resolved Trades: {total_trades}\n"
         f"Record: {wins}W / {losses}L ({win_rate:.0f}%)\n"
+        f"{scalp_section}"
         f"\n"
         f"Time: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
@@ -160,6 +179,24 @@ def cmd_pnl() -> str:
     profit_factor = stats.get("profit_factor", 0)
     pf_str = f"{profit_factor:.2f}" if profit_factor else "N/A"
     
+    # Scalp P&L
+    scalp = _load_scalp_state()
+    scalp_section = ""
+    if scalp:
+        scalp_stats = scalp.get("stats", {})
+        scalp_pnl = scalp_stats.get("total_pnl", 0)
+        scalp_total = scalp_stats.get("total_trades", 0)
+        scalp_wins = scalp_stats.get("wins", 0)
+        scalp_losses = scalp_stats.get("losses", 0)
+        scalp_wr = (scalp_wins / scalp_total * 100) if scalp_total > 0 else 0
+        scalp_bal = float(scalp.get("balance", 0))
+        scalp_section = (
+            f"\n--- SCALP P&L ---\n"
+            f"Balance: ${scalp_bal:.2f}\n"
+            f"P&L: ${scalp_pnl:+.2f}\n"
+            f"Trades: {scalp_total} ({scalp_wins}W/{scalp_losses}L, {scalp_wr:.0f}%)\n"
+        )
+
     return (
         f"P&L REPORT\n"
         f"\n"
@@ -175,6 +212,7 @@ def cmd_pnl() -> str:
         f"\n"
         f"Avg Win: ${avg_win:+.2f}\n"
         f"Avg Loss: ${avg_loss:+.2f}"
+        f"{scalp_section}"
     )
 
 
@@ -432,6 +470,42 @@ def cmd_export() -> str:
     else:
         msg_parts.append("No trades.csv found")
 
+    # --- Scalp state ---
+    scalp = _load_scalp_state()
+    if scalp:
+        scalp_bal = float(scalp.get("balance", 0))
+        scalp_stats = scalp.get("stats", {})
+        scalp_positions = len(scalp.get("positions", {}))
+        scalp_trades = scalp_stats.get("total_trades", 0)
+        scalp_pnl = scalp_stats.get("total_pnl", 0)
+        scalp_wins = scalp_stats.get("wins", 0)
+        scalp_losses = scalp_stats.get("losses", 0)
+        msg_parts.append(
+            f"\nSCALP STATE\n"
+            f"Balance: ${scalp_bal:.2f} (PnL: ${scalp_pnl:+.2f})\n"
+            f"Open: {scalp_positions}\n"
+            f"Trades: {scalp_trades} ({scalp_wins}W/{scalp_losses}L)\n"
+            f"Updated: {scalp.get('updated', '?')}"
+        )
+
+        # Recent scalp trades
+        closed = scalp.get("closed_trades", [])
+        if closed:
+            recent = closed[-10:]
+            msg_parts.append(f"\nRECENT SCALP TRADES (last {len(recent)})")
+            for t in recent:
+                asset = t.get("asset", "?")
+                direction = t.get("direction", "?")
+                entry = float(t.get("entry_price", 0))
+                exit_p = float(t.get("exit_price", 0))
+                net = float(t.get("net_pnl", 0))
+                hold = float(t.get("hold_time_secs", 0))
+                reason = t.get("exit_reason", "?")
+                result = "W" if net > 0 else "L"
+                msg_parts.append(
+                    f"{asset}|{direction}|E:{entry:.2f}|X:{exit_p:.2f}|PnL:${net:+.2f}|{hold:.0f}s|{reason}|{result}"
+                )
+
     full_msg = "\n".join(msg_parts)
     # Telegram 4096 char limit — split if needed
     if len(full_msg) > 4000:
@@ -446,21 +520,56 @@ def cmd_export() -> str:
     return full_msg
 
 
+def cmd_positions() -> str:
+    """Show open scalp positions."""
+    scalp = _load_scalp_state()
+    if not scalp:
+        return "No scalp state found. Scalp bot may not be running."
+
+    positions = scalp.get("positions", {})
+    if not positions:
+        return "SCALP POSITIONS\n\nNo open positions."
+
+    now = time.time()
+    msg = f"SCALP POSITIONS ({len(positions)} open)\n\n"
+
+    for pid, p in positions.items():
+        entry_price = float(p.get("entry_price", 0))
+        size_usd = float(p.get("size_usd", 0))
+        entry_time = float(p.get("entry_time", 0))
+        hold_secs = now - entry_time if entry_time > 0 else 0
+        asset = p.get("asset", "?")
+        direction = p.get("direction", "?")
+        shares = float(p.get("shares", 0))
+
+        msg += (
+            f"{asset} {direction}\n"
+            f"  Entry: {entry_price:.3f} | Size: ${size_usd:.2f}\n"
+            f"  Shares: {shares:.2f} | Hold: {hold_secs:.0f}s\n"
+            f"  ID: {pid[:20]}\n\n"
+        )
+
+    balance = float(scalp.get("balance", 0))
+    msg += f"Balance: ${balance:.2f}"
+    return msg
+
+
 def cmd_help() -> str:
     """Return list of available commands."""
     return (
         "AVAILABLE COMMANDS\n"
         "\n"
-        "/status   - Bot status and uptime\n"
-        "/pnl      - Profit & loss summary\n"
-        "/trades   - Recent trade history\n"
-        "/balance  - Current balance\n"
-        "/logs     - Last 30 lines of bot log\n"
-        "/health   - Quick health diagnostic\n"
-        "/restart  - Restart bot service\n"
-        "/reset    - Reset paper balance to $500\n"
-        "/export   - Export all data for analysis\n"
-        "/help     - This message"
+        "/status    - Bot status and uptime\n"
+        "/pnl       - Profit & loss summary\n"
+        "/trades    - Recent trade history\n"
+        "/positions - Open scalp positions\n"
+        "/balance   - Current balance\n"
+        "/logs      - Last 30 lines of bot log\n"
+        "/health    - Quick health diagnostic\n"
+        "/restart   - Restart bot service\n"
+        "/reset     - Reset paper balance to $500\n"
+        "/export    - Export all data for analysis\n"
+        "/help      - This message"
     )
 
 
@@ -495,6 +604,17 @@ def _load_stats() -> dict:
             pass
 
     return result
+
+
+def _load_scalp_state() -> dict:
+    """Load scalp paper trader state."""
+    if not SCALP_STATE_FILE.exists():
+        return {}
+    try:
+        with open(SCALP_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def _calc_avg_win_loss() -> tuple:
@@ -535,6 +655,7 @@ COMMANDS = {
     "/status": cmd_status,
     "/pnl": cmd_pnl,
     "/trades": cmd_trades,
+    "/positions": cmd_positions,
     "/balance": cmd_balance,
     "/logs": cmd_logs,
     "/restart": cmd_restart,

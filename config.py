@@ -224,6 +224,36 @@ class LateWindowConfig:
 
 
 # ---------------------------------------------------------------------------
+# Scalp Strategy Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScalpConfig:
+    enabled: bool = True
+    loop_interval: float = 2.0
+    state_file: str = "scalp_paper_state.json"
+    # Entry thresholds
+    btc_min_spread: float = 18.0
+    eth_min_spread: float = 0.60
+    sol_min_spread: float = 0.04
+    min_velocity_pct: float = 0.0003  # 0.03% stored as fraction
+    min_secs_remaining: float = 60.0
+    poly_prob_low: float = 0.25
+    poly_prob_high: float = 0.70
+    # Exit thresholds
+    take_profit_pct: float = 0.30    # +30%
+    stop_loss_pct: float = 0.20      # -20%
+    max_hold_seconds: float = 90.0
+    emergency_exit_secs: float = 15.0  # exit if window ends in <15s
+    # Risk
+    max_positions_per_asset: int = 1
+    max_total_positions: int = 3
+    max_daily_loss: float = 50.0
+    loss_cooldown_secs: float = 60.0
+    position_size_pct: float = 0.03  # 3% of balance
+
+
+# ---------------------------------------------------------------------------
 # Exchange / WebSocket Config
 # ---------------------------------------------------------------------------
 
@@ -293,6 +323,7 @@ class Config:
     polymarket_ws: PolymarketWSConfig = field(default_factory=PolymarketWSConfig)
     merger: MergerConfig = field(default_factory=MergerConfig)
     late_window: LateWindowConfig = field(default_factory=LateWindowConfig)
+    scalp: ScalpConfig = field(default_factory=ScalpConfig)
     # "paper" or "live"
     trading_mode: str = "paper"
 
@@ -392,6 +423,28 @@ def load_config() -> Config:
         entry_price_max=_env_float("LATE_WINDOW_ENTRY_MAX", 0.95),
     )
 
+    scalp_cfg = ScalpConfig(
+        enabled=_env_bool("SCALP_ENABLED", True),
+        loop_interval=_env_float("SCALP_LOOP_INTERVAL", 2.0),
+        state_file=os.environ.get("SCALP_STATE_FILE", "scalp_paper_state.json"),
+        btc_min_spread=_env_float("SCALP_BTC_MIN_SPREAD", 18.0),
+        eth_min_spread=_env_float("SCALP_ETH_MIN_SPREAD", 0.60),
+        sol_min_spread=_env_float("SCALP_SOL_MIN_SPREAD", 0.04),
+        min_velocity_pct=_env_float("SCALP_MIN_VELOCITY_PCT", 0.0003),
+        min_secs_remaining=_env_float("SCALP_MIN_SECS_REMAINING", 60.0),
+        poly_prob_low=_env_float("SCALP_POLY_PROB_LOW", 0.25),
+        poly_prob_high=_env_float("SCALP_POLY_PROB_HIGH", 0.70),
+        take_profit_pct=_env_float("SCALP_TAKE_PROFIT_PCT", 0.30),
+        stop_loss_pct=_env_float("SCALP_STOP_LOSS_PCT", 0.20),
+        max_hold_seconds=_env_float("SCALP_MAX_HOLD_SECONDS", 90.0),
+        emergency_exit_secs=_env_float("SCALP_EMERGENCY_EXIT_SECS", 15.0),
+        max_positions_per_asset=_env_int("SCALP_MAX_POS_PER_ASSET", 1),
+        max_total_positions=_env_int("SCALP_MAX_TOTAL_POSITIONS", 3),
+        max_daily_loss=_env_float("SCALP_MAX_DAILY_LOSS", 50.0),
+        loss_cooldown_secs=_env_float("SCALP_LOSS_COOLDOWN_SECS", 60.0),
+        position_size_pct=_env_float("SCALP_POSITION_SIZE_PCT", 0.03),
+    )
+
     config = Config(
         credentials=credentials,
         risk=risk,
@@ -405,6 +458,7 @@ def load_config() -> Config:
         polymarket_ws=polymarket_ws_cfg,
         merger=merger_cfg,
         late_window=late_window_cfg,
+        scalp=scalp_cfg,
         trading_mode=trading_mode,
     )
 
