@@ -108,9 +108,13 @@ class RegimeFilter:
     """
 
     # ADX-equivalent thresholds (using momentum-based proxy)
-    ADX_THRESHOLD = 15.0          # Minimum ADX-proxy for a "trending" market
-    BB_WIDTH_THRESHOLD = 0.0015   # Minimum BB width as fraction of mid price
-    MIN_CANDLE_BODY_PCT = 0.0005  # Minimum recent candle body (0.05%)
+    # TUNED: Previous values (ADX 15, BB 0.0015, candle 0.0005) were too
+    # aggressive — they blocked 95%+ of windows and prevented oracle_arb
+    # from EVER firing. Real BTC ADX proxy sits around 7-12 in normal
+    # conditions. Lowered to allow trading in moderately trending markets.
+    ADX_THRESHOLD = 8.0           # Was 15.0 — normal crypto ADX is 7-12
+    BB_WIDTH_THRESHOLD = 0.0008   # Was 0.0015 — allow moderate volatility
+    MIN_CANDLE_BODY_PCT = 0.0002  # Was 0.0005 — allow smaller moves (0.02%)
 
     def __init__(self, price_feed: PriceFeed):
         self._feed = price_feed
