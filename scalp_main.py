@@ -671,15 +671,15 @@ class ScalpBot:
 
         # Use mode-specific exit params for target/stop display
         if signal.mode == "late":
-            tp = self._strategy.LATE_TAKE_PROFIT
             sl = self._strategy.LATE_STOP_LOSS
             mode_label = "LATE"
+            target_str = "$1.00 (hold to expiry)"
         else:
             tp = self._strategy._take_profit_pct
             sl = self._strategy._stop_loss_pct
             mode_label = "EARLY"
+            target_str = f"{round_to_tick(signal.entry_price * (1 + tp)):.2f} (+{tp*100:.0f}%)"
 
-        target_price = round_to_tick(signal.entry_price * (1 + tp))
         stop_price = round_to_tick(signal.entry_price * (1 - sl))
 
         msg = (
@@ -690,7 +690,7 @@ class ScalpBot:
             f"Size: ${size_usd:.2f}\n"
             f"Shares: {shares:.2f}\n"
             f"Spread: {signal.spread:+.2f}\n"
-            f"Target: {target_price:.2f} (+{tp*100:.0f}%)\n"
+            f"Target: {target_str}\n"
             f"Stop: {stop_price:.2f} (-{sl*100:.0f}%)\n"
             f"Balance: ${balance:.2f}"
         )
