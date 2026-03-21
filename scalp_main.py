@@ -61,7 +61,7 @@ class ScalpBot:
 
     STARTUP_WAIT = 20       # seconds to wait for price feed
     WATCHDOG_TIMEOUT = 120  # seconds before watchdog alerts
-    HEALTH_REPORT_INTERVAL = 600  # seconds between health reports (10 min)
+    HEALTH_REPORT_INTERVAL = 3600  # seconds between health reports (1 hour)
 
     def __init__(self, config: Config):
         self._config = config
