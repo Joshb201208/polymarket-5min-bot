@@ -249,46 +249,6 @@ class StrategyEngine:
         window_end = market.get("window_end", 0)
         secs_remaining = max(0.0, window_end - time.time())
 
-        # ================================================================
-        # REGIME FILTER — blocks all strategies in choppy conditions
-        # Exception: oracle_arb in last 60s (the oracle lag is structural,
-        # not dependent on "trendiness")
-        # ================================================================
-        regime_ok, regime_reason = self._regime_filter.is_favorable(asset)
-        if not regime_ok and secs_remaining > 60:
-            logger.info("[%s] %s", asset, regime_reason)
-            return TradingSignal(
-                direction=None,
-                reasoning=regime_reason,
-                seconds_remaining=secs_remaining,
-                asset=asset,
-                strategy_name="regime_filter",
-            )
-
-        # In the final 15 seconds, try the late-window maker strategy
-        if secs_remaining < 15:
-            late_signal = self.evaluate_late_window(market, polymarket_mid_yes)
-            if late_signal.is_valid:
-                return late_signal
-            return TradingSignal(
-                direction=None,
-                reasoning=f"Only {secs_remaining:.0f}s remaining — too late to trade",
-                seconds_remaining=secs_remaining,
-                asset=asset,
-            )
-
-        # In the 15–30 second zone, try late-window strategy first
-        if secs_remaining < 30:
-            late_signal = self.evaluate_late_window(market, polymarket_mid_yes)
-            if late_signal.is_valid:
-                return late_signal
-            return TradingSignal(
-                direction=None,
-                reasoning=f"Only {secs_remaining:.0f}s remaining — too late to trade",
-                seconds_remaining=secs_remaining,
-                asset=asset,
-            )
-
         # Don't trade if we have no price data
         current_price = self._feed.get_current_price(asset)
         if current_price <= 0:
@@ -299,16 +259,44 @@ class StrategyEngine:
             )
 
         # ================================================================
-        # STRATEGY 1: Oracle Latency Arb (highest priority)
+        # STRATEGY 1: Oracle Latency Arb (ALWAYS evaluated first)
+        # Oracle arb does NOT need a trending market — it exploits the lag
+        # between exchange price and Polymarket book. A flat market can
+        # still have oracle lag. The spread check inside oracle_arb is
+        # the only filter it needs.
         # ================================================================
         oracle_signal = self._oracle_arb_signal(
             asset, current_price, polymarket_mid_yes, window_start, secs_remaining
         )
         if oracle_signal.is_valid:
             return oracle_signal
-        # Log oracle arb rejection reason (helps diagnose why it never fires)
-        if oracle_signal.reasoning and "threshold" not in oracle_signal.reasoning:
-            logger.debug("[%s] Oracle arb skip: %s", asset, oracle_signal.reasoning[:150])
+
+        # ================================================================
+        # REGIME FILTER — only gates lower-priority strategies
+        # Oracle arb above is exempt (structural edge, not trend-dependent)
+        # ================================================================
+        regime_ok, regime_reason = self._regime_filter.is_favorable(asset)
+        if not regime_ok:
+            logger.debug("[%s] %s", asset, regime_reason)
+            return TradingSignal(
+                direction=None,
+                reasoning=regime_reason,
+                seconds_remaining=secs_remaining,
+                asset=asset,
+                strategy_name="regime_filter",
+            )
+
+        # In the final 30 seconds, try the late-window maker strategy
+        if secs_remaining < 30:
+            late_signal = self.evaluate_late_window(market, polymarket_mid_yes)
+            if late_signal.is_valid:
+                return late_signal
+            return TradingSignal(
+                direction=None,
+                reasoning=f"Only {secs_remaining:.0f}s remaining — too late to trade",
+                seconds_remaining=secs_remaining,
+                asset=asset,
+            )
 
         # ================================================================
         # STRATEGY 2: Legacy Latency Arb (momentum-based)
