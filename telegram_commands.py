@@ -287,15 +287,27 @@ def cmd_logs() -> str:
 
 
 def cmd_restart() -> str:
-    """Restart the bot service via systemctl."""
+    """Restart the bot service via systemctl, syncing service files first."""
     import subprocess
     try:
+        bot_dir = "/root/polymarket-bot"
+        # Always sync service files before restart
+        subprocess.run(
+            ["cp", f"{bot_dir}/deploy/polymarket-bot.service", "/etc/systemd/system/"],
+            capture_output=True, timeout=5,
+        )
+        subprocess.run(
+            ["cp", f"{bot_dir}/deploy/telegram-commands.service", "/etc/systemd/system/"],
+            capture_output=True, timeout=5,
+        )
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
+
         result = subprocess.run(
             ["systemctl", "restart", "polymarket-bot"],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0:
-            return "Bot service restarted successfully. It should be back online in ~20s."
+            return "Service files synced + daemon-reload + restart done. Bot should be online in ~20s."
         else:
             return f"Restart failed (exit code {result.returncode}):\n{result.stderr[:500]}"
     except Exception as e:
