@@ -295,13 +295,16 @@ class StrategyEngine:
             )
 
         # ================================================================
-        # STRATEGY 1: Oracle Latency Arb (NEW — highest priority)
+        # STRATEGY 1: Oracle Latency Arb (highest priority)
         # ================================================================
         oracle_signal = self._oracle_arb_signal(
             asset, current_price, polymarket_mid_yes, window_start, secs_remaining
         )
         if oracle_signal.is_valid:
             return oracle_signal
+        # Log oracle arb rejection reason (helps diagnose why it never fires)
+        if oracle_signal.reasoning and "threshold" not in oracle_signal.reasoning:
+            logger.debug("[%s] Oracle arb skip: %s", asset, oracle_signal.reasoning[:150])
 
         # ================================================================
         # STRATEGY 2: Legacy Latency Arb (momentum-based)
@@ -317,10 +320,11 @@ class StrategyEngine:
         if not signal.is_valid and self._scfg.primary_strategy == "latency_arb":
             signal = self._signal_based_signal(asset, polymarket_mid_yes, secs_remaining)
 
-        # If both latency_arb and signal_based found nothing,
-        # try macro momentum (24h exchange change vs Polymarket mid)
-        if not signal.is_valid:
-            signal = self._macro_momentum_signal(asset, polymarket_mid_yes, secs_remaining)
+        # DISABLED: macro_momentum was the only strategy firing overnight,
+        # and it lost money (38% win rate, -$35 P&L). It applies 24h trends
+        # to 5-min markets — a fundamentally flawed approach.
+        # if not signal.is_valid:
+        #     signal = self._macro_momentum_signal(asset, polymarket_mid_yes, secs_remaining)
 
         # In the 30–60 second zone, also try the late-window strategy
         if not signal.is_valid and secs_remaining < 60:
@@ -432,6 +436,14 @@ class StrategyEngine:
 
         # Spread as percentage of price
         spread_pct = abs_spread / price_to_beat if price_to_beat > 0 else 0
+
+        # DIAGNOSTIC: Log spread values to understand why oracle_arb rarely fires
+        logger.info(
+            "[%s] Oracle spread: $%+.2f (%.3f%%) vs threshold $%.2f | "
+            "price=%.2f ptb=%.2f | poly_mid=%.3f | %ds left",
+            asset, spread, spread_pct * 100, min_spread,
+            current_price, price_to_beat, polymarket_mid_yes, int(secs_remaining),
+        )
 
         if abs_spread < min_spread:
             # Reset signal state if spread collapsed
