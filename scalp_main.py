@@ -339,9 +339,16 @@ class ScalpBot:
         # --- STEP 1: Check exits ---
         open_positions = self._get_open_positions_for_asset(asset)
         for position in open_positions:
+            # CRITICAL: fetch midpoint using the POSITION's token, not the
+            # current market's token. When windows change, the market's
+            # token_id_yes points to the NEW window, but the position
+            # holds tokens from the OLD window.
+            pos_mid = self._get_position_mid(position)
+            if pos_mid is None:
+                continue
             exit_signal = self._strategy.check_exit(
                 position=position,
-                current_poly_mid_yes=poly_mid_yes,
+                current_poly_mid_yes=pos_mid,
                 secs_remaining=secs_remaining,
             )
             if exit_signal:
@@ -501,6 +508,45 @@ class ScalpBot:
     # ------------------------------------------------------------------
     # Price helpers
     # ------------------------------------------------------------------
+
+    def _get_position_mid(self, position) -> Optional[float]:
+        """
+        Get the YES-equivalent midpoint for a position's token.
+        
+        For YES positions: returns the token's mid directly.
+        For NO positions: fetches the NO token mid and returns (1 - NO_mid)
+        so that check_exit can use its standard YES-perspective math.
+        
+        Actually simpler: we always need the YES mid of the SAME market.
+        The position stores the token_id of the side it bought.
+        For YES: that IS the YES token, fetch its mid.
+        For NO: we need the YES mid of the same market. But we don't
+        store the YES token_id on NO positions.
+        
+        Simplest correct approach: fetch the position's token mid directly
+        and pass it as-is. Then in check_exit, treat it as our-side price.
+        """
+        token_id = position.token_id
+        if not token_id:
+            return None
+        
+        try:
+            mid = self._get_polymarket_mid(token_id)
+            if mid <= 0:
+                return None
+            
+            # mid is the price of the token we hold.
+            # check_exit expects YES mid and converts internally.
+            # If we hold YES, mid IS the YES mid -> pass as-is.
+            # If we hold NO, mid is the NO token price.
+            #   check_exit does: current_price = 1.0 - yes_mid
+            #   So we need to pass yes_mid = 1.0 - no_mid
+            if position.direction == "NO":
+                return 1.0 - mid  # convert NO mid to YES-equivalent
+            return mid
+        except Exception as exc:
+            logger.debug("Could not get position mid for %s: %s", token_id[:16], exc)
+            return None
 
     def _get_polymarket_mid(self, token_id: str) -> float:
         """Fetch YES token midpoint from CLOB."""
