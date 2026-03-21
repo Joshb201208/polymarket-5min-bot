@@ -612,11 +612,11 @@ class PolymarketBot:
             else:
                 fresh_our_prob = 1.0 - fresh_mid
 
-            # Apply the same poly_prob filter as strategy.py (0.35–0.65)
-            if fresh_our_prob < 0.35 or fresh_our_prob > 0.65:
+            # Apply the same poly_prob filter as strategy.py (0.30–0.72)
+            if fresh_our_prob < 0.30 or fresh_our_prob > 0.72:
                 logger.info(
                     "[%s] PRE-EXEC RECHECK BLOCKED: %s poly_prob=%.3f "
-                    "(was %.3f at eval) — outside 0.35-0.65 filter",
+                    "(was %.3f at eval) — outside 0.30-0.72 filter",
                     asset, signal.direction, fresh_our_prob,
                     signal.polymarket_mid if signal.direction == "YES"
                     else (1.0 - signal.polymarket_mid),

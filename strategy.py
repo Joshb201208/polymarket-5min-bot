@@ -459,12 +459,18 @@ class StrategyEngine:
         direction = "YES" if spread > 0 else "NO"  # YES=Up, NO=Down
 
         # --- Poly prob filter: skip if market already priced in ---
+        # TUNED: Widened from 0.35-0.65 to 0.30-0.72.
+        # At 0.65, BTC was being blocked with poly=0.68 even though the
+        # exchange spread was $30+. The market is efficient but not perfect;
+        # there can still be edge at 0.68-0.72 if our true_prob is higher.
+        # Below 0.30: market is heavily against us, no point.
+        # Above 0.72: entry too expensive, risk/reward breaks down.
         our_poly_prob = polymarket_mid_yes if direction == "YES" else (1.0 - polymarket_mid_yes)
-        if our_poly_prob < 0.35:
+        if our_poly_prob < 0.30:
             if asset in self._oracle_signal_state:
                 del self._oracle_signal_state[asset]
             reason = (
-                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} < 0.35 "
+                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} < 0.30 "
                 f"(market heavily against us)"
             )
             logger.info(reason)
@@ -472,12 +478,12 @@ class StrategyEngine:
                 direction=None, reasoning=reason, asset=asset,
                 strategy_name="oracle_arb", seconds_remaining=secs_remaining,
             )
-        if our_poly_prob > 0.65:
+        if our_poly_prob > 0.72:
             if asset in self._oracle_signal_state:
                 del self._oracle_signal_state[asset]
             reason = (
-                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} > 0.65 "
-                f"(market already agrees, no edge)"
+                f"Oracle arb: {asset} {direction} SKIP poly_prob={our_poly_prob:.2f} > 0.72 "
+                f"(entry too expensive)"
             )
             logger.info(reason)
             return TradingSignal(
