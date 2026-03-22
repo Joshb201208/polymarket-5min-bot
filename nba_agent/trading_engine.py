@@ -30,6 +30,8 @@ class TradingEngine:
 
         try:
             from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
             client = ClobClient(
                 self.config.CLOB_API_BASE,
                 key=self.config.PRIVATE_KEY,
@@ -37,9 +39,25 @@ class TradingEngine:
                 signature_type=0,
                 funder=self.config.FUNDER_ADDRESS,
             )
-            client.set_api_creds(client.create_or_derive_api_creds())
+
+            # If API creds are provided in .env, use them
+            if (self.config.POLYMARKET_API_KEY
+                    and self.config.POLYMARKET_API_SECRET
+                    and self.config.POLYMARKET_API_PASSPHRASE):
+                client.set_api_creds(ApiCreds(
+                    api_key=self.config.POLYMARKET_API_KEY,
+                    api_secret=self.config.POLYMARKET_API_SECRET,
+                    api_passphrase=self.config.POLYMARKET_API_PASSPHRASE,
+                ))
+                logger.info("Using pre-set API credentials from .env")
+            else:
+                # Derive fresh credentials from private key
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+                logger.info("Derived fresh API credentials from private key")
+
             self._live_client = client
-            logger.info("Initialized live CLOB client")
+            logger.info("Initialized live CLOB client (funder=%s)", self.config.FUNDER_ADDRESS[:10])
             return self._live_client
         except Exception as e:
             logger.error("Failed to initialize live CLOB client: %s", e)
