@@ -353,9 +353,9 @@ class ScalpStrategy:
     LATE_WINDOW_SECS = 150.0        # Enter in last 2.5 minutes
     LATE_MIN_CONFIRMATION = 0.80    # Token must be 0.80+ (strong direction)
     LATE_MAX_ENTRY = 0.88           # Was 0.92 — at 0.92 the +12% target exceeds $1
-    LATE_TAKE_PROFIT = 99.0         # Disabled — hold to expiry for max payout
-    LATE_STOP_LOSS = 99.0           # Disabled — stop loss was chopping winners (37% WR with it)
-    LATE_MAX_HOLD = 9999.0          # Disabled — let window expiry handle exit
+    LATE_TAKE_PROFIT = 0.12         # +12% — sell into strength, don't hold for binary risk
+    LATE_STOP_LOSS = 99.0           # Disabled — no stop loss (was chopping winners at 37% WR)
+    LATE_MAX_HOLD = 9999.0          # Disabled — if TP not hit, hold to expiry as fallback
 
     # ------------------------------------------------------------------
     # Entry signal
