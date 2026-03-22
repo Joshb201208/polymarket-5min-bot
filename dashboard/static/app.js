@@ -6,9 +6,8 @@
 // ---------------------------------------------------------------------------
 // API Base URL
 // ---------------------------------------------------------------------------
-const API = "__PORT_8080__".startsWith("__")
-    ? "http://localhost:8080"
-    : "__PORT_8080__";
+// Use relative URLs — nginx proxies /api/ to the backend on port 8080
+const API = "";
 
 const REFRESH_INTERVAL = 30_000; // 30 seconds
 
