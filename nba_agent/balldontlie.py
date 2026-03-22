@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.balldontlie.io"
 
 
+# BDL team ID -> abbreviation mapping (IDs 1-30 are current NBA teams)
+_BDL_TEAM_ABBR: dict[int, str] = {
+    1: "ATL", 2: "BOS", 3: "BKN", 4: "CHA", 5: "CHI",
+    6: "CLE", 7: "DAL", 8: "DEN", 9: "DET", 10: "GSW",
+    11: "HOU", 12: "IND", 13: "LAC", 14: "LAL", 15: "MEM",
+    16: "MIA", 17: "MIL", 18: "MIN", 19: "NOP", 20: "NYK",
+    21: "OKC", 22: "ORL", 23: "PHI", 24: "PHX", 25: "POR",
+    26: "SAC", 27: "SAS", 28: "TOR", 29: "UTA", 30: "WAS",
+}
+
+
 class BDLClient:
     """BallDontLie API client with caching."""
 
@@ -77,12 +88,17 @@ class BDLClient:
         return injuries
 
     def get_team_injuries(self, team_abbr: str) -> list[dict]:
-        """Get injuries for a specific team."""
+        """Get injuries for a specific team by abbreviation."""
         all_injuries = self.get_injuries()
-        return [
-            inj for inj in all_injuries
-            if inj.get("team", {}).get("abbreviation", "").upper() == team_abbr.upper()
-        ]
+        target = team_abbr.upper()
+        result = []
+        for inj in all_injuries:
+            player = inj.get("player", {})
+            bdl_team_id = player.get("team_id")
+            inj_abbr = _BDL_TEAM_ABBR.get(bdl_team_id, "").upper()
+            if inj_abbr == target:
+                result.append(inj)
+        return result
 
     def count_team_out(self, team_abbr: str) -> tuple[int, list[str]]:
         """Count players OUT for a team. Returns (count, [player names])."""
@@ -90,7 +106,7 @@ class BDLClient:
         out_players = []
         for inj in injuries:
             status = inj.get("status", "").lower()
-            if status in ("out", "doubtful"):
+            if any(kw in status for kw in ("out", "doubtful")):
                 player = inj.get("player", {})
                 name = f"{player.get('first_name', '')} {player.get('last_name', '')}".strip()
                 if name:
@@ -109,10 +125,10 @@ class BDLClient:
         data = self._get(
             "/nba/v1/team_season_averages/general",
             params={
-                "season": 2025,  # BDL uses start year of season
+                "season": 2025,  # BDL uses start year of season (2025 = 2025-26)
                 "season_type": "regular",
                 "type": "advanced",
-                "per_page": 30,
+                "per_page": 100,  # Get all 30 teams in one call
             },
         )
         if not data:
@@ -122,19 +138,22 @@ class BDLClient:
         for entry in data.get("data", []):
             team = entry.get("team", {})
             tid = team.get("id")
-            if tid:
+            stats = entry.get("stats", {})  # BDL nests stats under "stats" key
+            if tid and stats:
                 result[tid] = {
                     "team_name": f"{team.get('city', '')} {team.get('name', '')}".strip(),
                     "team_abbr": team.get("abbreviation", ""),
-                    "off_rating": entry.get("off_rating", 0.0),
-                    "def_rating": entry.get("def_rating", 0.0),
-                    "net_rating": entry.get("net_rating", 0.0),
-                    "pace": entry.get("pace", 0.0),
-                    "ts_pct": entry.get("ts_pct", 0.0),     # True shooting %
-                    "efg_pct": entry.get("efg_pct", 0.0),   # Effective FG%
-                    "ast_pct": entry.get("ast_pct", 0.0),
-                    "reb_pct": entry.get("reb_pct", 0.0),
-                    "pie": entry.get("pie", 0.0),            # Player Impact Estimate
+                    "off_rating": stats.get("off_rating", 0.0),
+                    "def_rating": stats.get("def_rating", 0.0),
+                    "net_rating": stats.get("net_rating", 0.0),
+                    "pace": stats.get("pace", 0.0),
+                    "ts_pct": stats.get("ts_pct", 0.0),     # True shooting %
+                    "efg_pct": stats.get("efg_pct", 0.0),   # Effective FG%
+                    "ast_pct": stats.get("ast_pct", 0.0),
+                    "reb_pct": stats.get("reb_pct", 0.0),
+                    "pie": stats.get("pie", 0.0),            # Player Impact Estimate
+                    "wins": stats.get("w", 0),
+                    "losses": stats.get("l", 0),
                 }
 
         self._team_averages_cache = result

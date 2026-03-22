@@ -188,6 +188,16 @@ class NBAResearch:
         self.season = self.config.NBA_SEASON
         self._data_source: str = "none"
 
+        # Build proxy URL if configured
+        self._proxy_url: str | None = None
+        if self.config.PROXY_HOST and self.config.PROXY_USER:
+            self._proxy_url = (
+                f"http://{self.config.PROXY_USER}:{self.config.PROXY_PASS}"
+                f"@{self.config.PROXY_HOST}:{self.config.PROXY_PORT}"
+            )
+            logger.info("Residential proxy configured: %s:%s",
+                        self.config.PROXY_HOST, self.config.PROXY_PORT)
+
         # NBA CDN caches
         self._schedule_raw: dict | None = None
         self._schedule_ts: datetime | None = None
@@ -216,7 +226,10 @@ class NBAResearch:
 
         for attempt in range(2):
             try:
-                resp = httpx.get(_SCHEDULE_URL, headers=_HTTP_HEADERS, timeout=30.0)
+                client_kwargs = {"headers": _HTTP_HEADERS, "timeout": 30.0}
+                if self._proxy_url:
+                    client_kwargs["proxy"] = self._proxy_url
+                resp = httpx.get(_SCHEDULE_URL, **client_kwargs)
                 resp.raise_for_status()
                 data = resp.json()
                 self._schedule_raw = data

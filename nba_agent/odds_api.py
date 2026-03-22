@@ -243,20 +243,20 @@ class OddsAPI:
         if h2h_away:
             game.away_ml = self._build_line(away, h2h_away)
         if spread_home:
-            avg_point = sum(p for _, p, _ in spread_home) / len(spread_home)
-            game.home_spread = self._build_line(home, [(p, s, sp) for p, _, sp in spread_home],
+            avg_point = sum(pt for _, pt, _ in spread_home) / len(spread_home)
+            game.home_spread = self._build_line(home, [(prob, is_s) for prob, _, is_s in spread_home],
                                                 spread=avg_point)
         if spread_away:
-            avg_point = sum(p for _, p, _ in spread_away) / len(spread_away)
-            game.away_spread = self._build_line(away, [(p, s, sp) for p, _, sp in spread_away],
+            avg_point = sum(pt for _, pt, _ in spread_away) / len(spread_away)
+            game.away_spread = self._build_line(away, [(prob, is_s) for prob, _, is_s in spread_away],
                                                 spread=avg_point)
         if total_over:
-            avg_line = sum(p for _, p, _ in total_over) / len(total_over)
-            game.over = self._build_line("Over", [(p, l, sp) for p, _, sp in total_over],
+            avg_line = sum(pt for _, pt, _ in total_over) / len(total_over)
+            game.over = self._build_line("Over", [(prob, is_s) for prob, _, is_s in total_over],
                                          total=avg_line)
         if total_under:
-            avg_line = sum(p for _, p, _ in total_under) / len(total_under)
-            game.under = self._build_line("Under", [(p, l, sp) for p, _, sp in total_under],
+            avg_line = sum(pt for _, pt, _ in total_under) / len(total_under)
+            game.under = self._build_line("Under", [(prob, is_s) for prob, _, is_s in total_under],
                                           total=avg_line)
 
         return game
