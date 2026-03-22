@@ -1,92 +1,87 @@
 """
-Agent 1 — Entry point for Event/News markets scanner.
-
-Runs a single scan cycle: scan -> analyze -> alert -> paper-track.
-Called on schedule by the orchestrator.
+Agent 1 Main — Events agent entry point.
+Scans for short-term event markets and researches them for edge.
 """
 
 import logging
-import traceback
+import time
+from datetime import datetime, timezone, timedelta
 
-from agents.agent1_events.scanner import scan_event_markets, get_scan_count
-from agents.agent1_events.analyzer import analyze_market
+from agents.common import config
+from agents.common import telegram
+from agents.common.bankroll import BankrollManager
 from agents.common.paper_tracker import PaperTracker
-from agents.common.telegram_alerts import send_edge_alert, send_error_alert
+from .scanner import scan_event_markets, scan_volume_surges
+from .researcher import research_market
 
 logger = logging.getLogger(__name__)
 
-# Module-level counters for daily summary
-_alerts_sent = 0
-_markets_scanned = 0
+# Track recently analyzed markets to avoid re-analysis
+_analyzed_cache: dict[str, datetime] = {}
 
 
-def run_agent1(paper_tracker: PaperTracker) -> None:
-    """Execute one full scan cycle for Agent 1."""
-    global _alerts_sent, _markets_scanned
+def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
+    """Run one analysis cycle for event markets."""
+    logger.info("=== Agent 1 (Events): Starting scan ===")
 
-    logger.info("=" * 50)
-    logger.info("Agent 1 (Events) — starting scan cycle")
-    logger.info("=" * 50)
+    # Scan for qualifying markets
+    markets = scan_event_markets()
+    time.sleep(1)
 
-    try:
-        candidates = scan_event_markets()
-        _markets_scanned = get_scan_count()
+    # Also check volume surges
+    surges = scan_volume_surges()
+    surge_ids = {m["id"] for m in surges}
 
-        if not candidates:
-            logger.info("No qualifying event markets found this cycle")
-            return
+    # Merge, prioritizing surges
+    all_markets = surges + [m for m in markets if m["id"] not in surge_ids]
 
-        logger.info("Analyzing %d candidate markets...", len(candidates))
+    analyzed = 0
+    opportunities = 0
 
-        for market, event in candidates:
-            try:
-                alert = analyze_market(market, event)
-                if alert is None:
-                    continue
+    for market in all_markets:
+        market_id = market.get("id", "")
 
-                # Send Telegram alert
-                sent = send_edge_alert(**alert)
-                if sent:
-                    _alerts_sent += 1
-                    logger.info("Alert sent for: %s", alert["market_title"][:50])
-
-                # Paper-track the recommendation
-                paper_tracker.record_trade(
-                    market_slug=alert["market_slug"],
-                    market_question=alert["market_title"],
-                    direction=alert["direction"],
-                    entry_price=alert["market_price"],
-                    recommended_size=alert["suggested_size"],
-                    fair_prob=alert["fair_value"],
-                    market_prob=alert["market_price"],
-                    edge=alert["edge"],
-                    confidence=alert["confidence"],
-                    agent_name="Agent 1 (Events)",
-                    reasoning="; ".join(alert["reasoning"][:3]),
-                )
-
-            except Exception as exc:
-                logger.error("Error analyzing market: %s", exc)
+        # Cooldown check
+        if market_id in _analyzed_cache:
+            last_analyzed = _analyzed_cache[market_id]
+            if datetime.now(timezone.utc) - last_analyzed < timedelta(hours=config.COOLDOWN_HOURS):
                 continue
 
-        logger.info("Agent 1 cycle complete — %d alerts sent", _alerts_sent)
+        # Research
+        try:
+            analysis = research_market(market)
+            _analyzed_cache[market_id] = datetime.now(timezone.utc)
+            analyzed += 1
 
-    except Exception as exc:
-        logger.error("Agent 1 scan cycle failed: %s\n%s", exc, traceback.format_exc())
-        send_error_alert("Agent 1 (Events)", str(exc))
+            if analysis:
+                opportunities += 1
+                edge = analysis["edge"]
+
+                # Alert on any edge > MIN_EDGE (5%)
+                if edge >= config.MIN_EDGE:
+                    telegram.alert_opportunity("Events", market, analysis)
+
+                # Paper trade on edge > MIN_EDGE_BET (7%)
+                if edge >= config.MIN_EDGE_BET:
+                    paper_tracker.place_trade(market, analysis)
+
+            time.sleep(0.5)  # Rate limit between markets
+        except Exception as e:
+            logger.error(f"Error researching market {market_id}: {e}")
+
+        # Limit per cycle to avoid long runs
+        if analyzed >= 15:
+            break
+
+    logger.info(f"Agent 1 done: {analyzed} analyzed, {opportunities} opportunities")
+
+    # Clean old cache entries
+    _clean_cache()
 
 
-def get_daily_stats() -> dict:
-    """Return stats for the daily summary."""
-    return {
-        "name": "Agent 1 (Events)",
-        "alerts": _alerts_sent,
-        "scanned": _markets_scanned,
-    }
-
-
-def reset_daily_stats() -> None:
-    """Reset counters for a new day."""
-    global _alerts_sent, _markets_scanned
-    _alerts_sent = 0
-    _markets_scanned = 0
+def _clean_cache():
+    """Remove cache entries older than 24h."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    expired = [k for k, v in _analyzed_cache.items() if v < cutoff]
+    for k in expired:
+        del _analyzed_cache[k]

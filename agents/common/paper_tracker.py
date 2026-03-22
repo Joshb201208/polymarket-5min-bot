@@ -1,205 +1,170 @@
 """
-Paper trading tracker with JSON persistence.
-
-Tracks all recommended bets, checks resolutions, and computes performance stats.
+Paper trade tracking with early exit monitoring.
+Tracks all paper trades, monitors for exit conditions, and logs daily P&L.
 """
 
 import json
 import logging
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from agents.common.config import PAPER_TRADES_FILE
-from agents.common.polymarket_client import fetch_markets
+from . import config
+from . import polymarket_api as pm
+from . import telegram
+from .bankroll import BankrollManager
 
 logger = logging.getLogger(__name__)
 
+TRADES_FILE = config.DATA_DIR / "paper_trades.json"
+
 
 class PaperTracker:
-    """Thread-safe paper trading tracker backed by a JSON file."""
+    """Track paper trades and monitor for early exits."""
 
-    def __init__(self, filepath: str | None = None):
-        self.filepath = filepath or PAPER_TRADES_FILE
-        self._trades: list[dict[str, Any]] = []
-        self._load()
+    def __init__(self, bankroll: BankrollManager):
+        self.bankroll = bankroll
 
-    # ── Persistence ───────────────────────────────────────────
+    def place_trade(self, market: dict, analysis: dict) -> dict | None:
+        """Place a paper trade based on analysis results."""
+        edge = analysis.get("edge", 0)
+        if edge < config.MIN_EDGE_BET:
+            logger.info(f"Edge {edge:.1%} below minimum {config.MIN_EDGE_BET:.1%}, skipping trade")
+            return None
 
-    def _load(self) -> None:
-        """Load trades from disk."""
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    self._trades = json.load(f)
-                logger.info("Loaded %d paper trades from %s", len(self._trades), self.filepath)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.error("Failed to load paper trades: %s", exc)
-                self._trades = []
-        else:
-            self._trades = []
+        side = analysis.get("side", "YES")
+        price = analysis.get("price", 0)
+        if not price or price <= 0:
+            return None
 
-    def _save(self) -> None:
-        """Persist trades to disk."""
-        try:
-            Path(self.filepath).parent.mkdir(parents=True, exist_ok=True)
-            with open(self.filepath, "w") as f:
-                json.dump(self._trades, f, indent=2, default=str)
-        except OSError as exc:
-            logger.error("Failed to save paper trades: %s", exc)
+        odds = 1 / price if price > 0 else 1
+        confidence = analysis.get("confidence", "medium")
+        bet_size = self.bankroll.kelly_size(edge, odds, confidence)
 
-    # ── Recording ─────────────────────────────────────────────
+        if bet_size <= 0:
+            logger.info("Kelly sizing returned 0, skipping trade")
+            return None
 
-    def record_trade(
-        self,
-        market_slug: str,
-        market_question: str,
-        direction: str,
-        entry_price: float,
-        recommended_size: float,
-        fair_prob: float,
-        market_prob: float,
-        edge: float,
-        confidence: str,
-        agent_name: str,
-        reasoning: str,
-    ) -> dict:
-        """Record a new paper trade recommendation."""
-        trade = {
-            "id": f"{agent_name}_{int(time.time())}_{market_slug[:30]}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "market_slug": market_slug,
-            "market_question": market_question,
-            "direction": direction,
-            "entry_price": entry_price,
-            "recommended_size": recommended_size,
-            "fair_prob": fair_prob,
-            "market_prob": market_prob,
+        token_id = ""
+        token_ids = market.get("token_ids", [])
+        if token_ids:
+            token_id = token_ids[0] if side == "YES" else (token_ids[1] if len(token_ids) > 1 else token_ids[0])
+
+        position = self.bankroll.open_position(
+            market_id=market.get("id", ""),
+            question=market.get("question", ""),
+            side=side,
+            entry_price=price,
+            size=bet_size,
+            edge=edge,
+            token_id=token_id,
+            reasoning=analysis.get("reasoning", ""),
+        )
+
+        # Send Telegram alert
+        trade_info = {
+            "side": side,
+            "price": price,
+            "size": bet_size,
             "edge": edge,
-            "confidence": confidence,
-            "agent_name": agent_name,
-            "reasoning": reasoning,
-            "resolved": False,
-            "outcome": None,
-            "pnl": 0.0,
         }
-        self._trades.append(trade)
-        self._save()
-        logger.info("Recorded paper trade: %s %s on %s", direction, entry_price, market_slug)
-        return trade
+        telegram.alert_paper_trade("BUY", market, trade_info)
 
-    # ── Resolution checking ───────────────────────────────────
+        self._save_trade_log(position, "OPEN")
+        return position
 
-    def check_resolutions(self) -> list[dict]:
-        """Check unresolved trades against Gamma API. Returns newly resolved."""
-        newly_resolved = []
-        unresolved = [t for t in self._trades if not t["resolved"]]
-        if not unresolved:
-            return []
-
-        # Group by slug to avoid duplicate API calls
-        slugs_checked: dict[str, dict | None] = {}
-        for trade in unresolved:
-            slug = trade["market_slug"]
-            if slug not in slugs_checked:
-                markets = fetch_markets(slug=slug, closed="true")
-                slugs_checked[slug] = markets[0] if markets else None
-
-            market = slugs_checked[slug]
-            if not market:
+    def check_early_exits(self) -> list[dict]:
+        """Check all open positions for early exit conditions."""
+        exits = []
+        for position in list(self.bankroll.positions):
+            if position["status"] != "OPEN":
                 continue
 
-            # Check if market is closed/resolved
-            is_closed = (
-                str(market.get("closed", "")).lower() == "true"
-                or market.get("closed") is True
-            )
-            if not is_closed:
+            token_id = position.get("token_id", "")
+            if not token_id:
                 continue
 
-            # Determine outcome
-            outcome_prices_raw = market.get("outcomePrices")
-            if not outcome_prices_raw:
-                continue
-            try:
-                prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
-                yes_price = float(prices[0])
-            except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+            current_price = pm.get_market_price(token_id)
+            if current_price is None:
                 continue
 
-            # Resolved: YES wins if price ~1.0, NO wins if price ~0.0
-            if yes_price > 0.9:
-                winner = "YES"
-            elif yes_price < 0.1:
-                winner = "NO"
-            else:
-                continue  # Not fully resolved yet
+            position["current_price"] = current_price
+            should_exit, reason = self.bankroll.should_early_exit(position, current_price)
 
-            trade["resolved"] = True
-            trade["outcome"] = winner
+            if should_exit:
+                entry = position["entry_price"]
+                side = position["side"]
+                if side == "YES":
+                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                else:
+                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
 
-            # Calculate P&L
-            if trade["direction"].upper() == winner:
-                # Won: payout is (1 - entry_price) * size
-                trade["pnl"] = round(
-                    (1.0 - trade["entry_price"]) * trade["recommended_size"], 2
-                )
-            else:
-                # Lost: lose entry_price * size
-                trade["pnl"] = round(
-                    -trade["entry_price"] * trade["recommended_size"], 2
-                )
+                close_reason = "early_exit_profit" if pnl_pct > 0 else "stop_loss"
+                closed = self.bankroll.close_position(position["id"], current_price, close_reason)
 
-            newly_resolved.append(trade)
+                if closed:
+                    closed["current_price"] = current_price
+                    pnl_dollars = closed.get("pnl_dollars", 0)
+                    closed["pnl_dollars"] = pnl_dollars
 
-        if newly_resolved:
-            self._save()
-            logger.info("Resolved %d paper trades", len(newly_resolved))
+                    if pnl_pct > 0:
+                        telegram.alert_early_exit(closed, reason, pnl_pct)
+                    else:
+                        telegram.alert_stop_loss(closed, pnl_pct)
 
-        return newly_resolved
+                    exits.append(closed)
+                    self._save_trade_log(closed, "CLOSED")
+                    logger.info(f"Early exit: {reason} | P&L: ${pnl_dollars:+.2f}")
 
-    # ── Stats ─────────────────────────────────────────────────
+        return exits
 
-    def get_stats(self) -> dict[str, Any]:
-        """Compute aggregate performance stats."""
-        resolved = [t for t in self._trades if t["resolved"]]
-        wins = [t for t in resolved if t["pnl"] > 0]
-        total_pnl = sum(t["pnl"] for t in resolved)
-        edges = [abs(t["edge"]) for t in self._trades if t.get("edge")]
+    def update_position_prices(self) -> list[dict]:
+        """Update all position prices and alert on significant moves."""
+        updates = []
+        for position in self.bankroll.positions:
+            if position["status"] != "OPEN":
+                continue
 
-        best_trade = max(resolved, key=lambda t: t["pnl"], default=None)
-        worst_trade = min(resolved, key=lambda t: t["pnl"], default=None)
+            token_id = position.get("token_id", "")
+            if not token_id:
+                continue
 
-        return {
-            "total": len(self._trades),
-            "resolved": len(resolved),
-            "wins": len(wins),
-            "win_rate": (len(wins) / len(resolved) * 100) if resolved else 0.0,
-            "pnl": round(total_pnl, 2),
-            "avg_edge": (sum(edges) / len(edges) * 100) if edges else 0.0,
-            "best_bet": (
-                f"+${best_trade['pnl']:.0f} ({best_trade['market_question'][:40]})"
-                if best_trade and best_trade["pnl"] > 0 else None
-            ),
-            "worst_bet": (
-                f"-${abs(worst_trade['pnl']):.0f} ({worst_trade['market_question'][:40]})"
-                if worst_trade and worst_trade["pnl"] < 0 else None
-            ),
-        }
+            current_price = pm.get_market_price(token_id)
+            if current_price is None:
+                continue
 
-    def get_active_count(self) -> int:
-        """Number of unresolved positions."""
-        return sum(1 for t in self._trades if not t["resolved"])
+            old_price = position.get("current_price", position["entry_price"])
+            position["current_price"] = current_price
 
-    def get_agent_stats(self, agent_name: str) -> dict[str, int]:
-        """Per-agent alert/scan counts for daily summary."""
-        agent_trades = [t for t in self._trades if t["agent_name"] == agent_name]
-        return {
-            "alerts": len(agent_trades),
-            "today_alerts": sum(
-                1 for t in agent_trades
-                if t.get("timestamp", "")[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            ),
-        }
+            if old_price > 0:
+                change_pct = (current_price - old_price) / old_price
+                if abs(change_pct) >= 0.10:  # 10%+ move
+                    telegram.alert_position_update(position, change_pct)
+                    updates.append(position)
+
+        self.bankroll.save_state()
+        return updates
+
+    def get_open_positions(self) -> list[dict]:
+        """Get all open positions."""
+        return [p for p in self.bankroll.positions if p["status"] == "OPEN"]
+
+    def get_daily_pnl(self) -> float:
+        """Get today's P&L."""
+        self.bankroll._reset_day_pnl_if_needed()
+        return self.bankroll.day_pnl
+
+    def _save_trade_log(self, trade: dict, action: str):
+        """Append trade to log file."""
+        try:
+            trades = []
+            if TRADES_FILE.exists():
+                trades = json.loads(TRADES_FILE.read_text())
+            trades.append({
+                "action": action,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                **{k: v for k, v in trade.items() if k != "reasoning"},
+            })
+            # Keep last 500 entries
+            TRADES_FILE.write_text(json.dumps(trades[-500:], indent=2, default=str))
+        except Exception as e:
+            logger.error(f"Error saving trade log: {e}")

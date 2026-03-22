@@ -1,139 +1,125 @@
 """
-Agent 1 — Event/News markets scanner.
-
-Scans Polymarket for general event markets (politics, crypto, culture, etc.)
-excluding sports (handled by Agents 2 & 3) and 5-min crypto (existing bot).
+Agent 1 Scanner — Find short-term event markets on Polymarket.
+Targets markets resolving in 1-14 days with sufficient liquidity.
 """
 
 import logging
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from agents.common.config import (
-    MARKET_COOLDOWN_HOURS,
-    MIN_EDGE_THRESHOLD,
-    MIN_LIQUIDITY,
-    MIN_VOLUME_24H,
-)
-from agents.common.polymarket_client import (
-    fetch_active_events,
-    get_event_markets,
-    get_market_price,
-    passes_filters,
-    is_market_tradeable,
-)
+from agents.common import config
+from agents.common import polymarket_api as pm
 
 logger = logging.getLogger(__name__)
 
-# Track already-analyzed markets to avoid spam (slug -> timestamp)
-_analyzed_cache: dict[str, float] = {}
-
-# Tags/categories to exclude (handled by other agents or existing bot)
-EXCLUDED_TAGS = {"soccer", "football", "nba", "basketball"}
-EXCLUDED_TITLE_KEYWORDS = [
-    "5-minute", "5 minute", "1-minute", "1 minute",
-    "next 5", "next 1",
+# Tags to search for short-term event markets
+EVENT_TAGS = [
+    "politics", "crypto", "science", "sports",
+    "pop-culture", "business", "world",
 ]
 
 
-def scan_event_markets() -> list[tuple[dict, dict]]:
-    """Scan for qualifying event markets.
+def scan_event_markets() -> list[dict]:
+    """Scan Polymarket for short-term event markets that meet our criteria.
 
-    Returns list of (market, event) tuples that pass all filters.
+    Filters:
+    - Resolves within MAX_RESOLUTION_DAYS (14 days)
+    - Not resolving in less than MIN_RESOLUTION_HOURS (2 hours)
+    - Minimum liquidity ($5k)
+    - Price between 10c-90c (not near-certain)
     """
-    candidates = []
-    now = time.time()
+    all_markets = []
+    now = datetime.now(timezone.utc)
 
-    # Clean up expired cooldowns
-    expired = [
-        slug for slug, ts in _analyzed_cache.items()
-        if now - ts > MARKET_COOLDOWN_HOURS * 3600
-    ]
-    for slug in expired:
-        del _analyzed_cache[slug]
+    for tag in EVENT_TAGS:
+        try:
+            events = pm.search_events(tag=tag, limit=30)
+            for event in events:
+                markets = event.get("markets", [])
+                if not markets:
+                    continue
 
-    logger.info("Scanning Polymarket for event markets...")
+                for market_data in markets:
+                    market = pm.parse_market_data(market_data)
+                    if _passes_filters(market, now):
+                        market["url"] = pm.get_market_url(market_data)
+                        market["source_tag"] = tag
+                        all_markets.append(market)
+        except Exception as e:
+            logger.error(f"Error scanning tag {tag}: {e}")
 
-    # Fetch top events by 24h volume
-    events = fetch_active_events(
-        limit=100,
-        order="volume24hr",
-        ascending=False,
-    )
+    # Deduplicate by market ID
+    seen = set()
+    unique = []
+    for m in all_markets:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            unique.append(m)
 
-    if not events:
-        logger.warning("No events returned from Gamma API")
-        return []
-
-    logger.info("Fetched %d active events", len(events))
-    scanned = 0
-
-    for event in events:
-        # Skip sports events (handled by Agent 2 & 3)
-        tags = event.get("tags", []) or []
-        tag_slugs = set()
-        if isinstance(tags, list):
-            for tag in tags:
-                if isinstance(tag, dict):
-                    tag_slugs.add(tag.get("slug", "").lower())
-                elif isinstance(tag, str):
-                    tag_slugs.add(tag.lower())
-
-        if tag_slugs & EXCLUDED_TAGS:
-            continue
-
-        # Skip 5-min crypto markets (handled by existing bot)
-        event_title = (event.get("title") or "").lower()
-        if any(kw in event_title for kw in EXCLUDED_TITLE_KEYWORDS):
-            continue
-
-        markets = get_event_markets(event)
-        for market in markets:
-            scanned += 1
-            slug = market.get("slug") or market.get("conditionId", "")
-
-            # Skip if recently analyzed
-            if slug in _analyzed_cache:
-                continue
-
-            # Must be tradeable
-            if not is_market_tradeable(market):
-                continue
-
-            # Must meet volume/liquidity thresholds
-            if not passes_filters(market):
-                continue
-
-            # Skip markets resolving within 1 hour
-            end_date_str = market.get("endDate") or market.get("end_date_iso")
-            if end_date_str:
-                try:
-                    end_date = datetime.fromisoformat(
-                        end_date_str.replace("Z", "+00:00")
-                    )
-                    hours_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
-                    if hours_left < 1:
-                        continue
-                except (ValueError, AttributeError):
-                    pass
-
-            # Get current price
-            price = get_market_price(market)
-            if price is None:
-                continue
-
-            # Skip extreme prices (almost certain or impossible)
-            if price < 0.03 or price > 0.97:
-                continue
-
-            # Mark as analyzed
-            _analyzed_cache[slug] = now
-            candidates.append((market, event))
-
-    logger.info("Scanned %d markets, found %d candidates", scanned, len(candidates))
-    return candidates
+    logger.info(f"Found {len(unique)} event markets passing filters")
+    return unique
 
 
-def get_scan_count() -> int:
-    """Return total markets scanned (for daily summary)."""
-    return len(_analyzed_cache)
+def _passes_filters(market: dict, now: datetime) -> bool:
+    """Check if a market passes all filters."""
+    # Must be active
+    if not market.get("active") or market.get("closed"):
+        return False
+
+    # Price range check
+    price = market.get("yes_price")
+    if price is None:
+        return False
+    if not (config.PRICE_RANGE[0] <= price <= config.PRICE_RANGE[1]):
+        return False
+
+    # Liquidity check
+    if market.get("liquidity", 0) < config.MIN_LIQUIDITY:
+        return False
+
+    # Volume check
+    if market.get("volume_24h", 0) < config.MIN_VOLUME_24H:
+        return False
+
+    # Resolution time check
+    end_date_str = market.get("end_date", "")
+    if end_date_str:
+        try:
+            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            hours_until = (end_date - now).total_seconds() / 3600
+            days_until = hours_until / 24
+
+            if days_until > config.MAX_RESOLUTION_DAYS:
+                return False
+            if hours_until < config.MIN_RESOLUTION_HOURS:
+                return False
+        except Exception:
+            return False  # Can't parse date = skip
+    else:
+        return False  # No end date = skip
+
+    return True
+
+
+def scan_volume_surges() -> list[dict]:
+    """Find markets with unusual volume activity (potential news catalyst)."""
+    markets = []
+    try:
+        events = pm.search_events(limit=50)
+        for event in events:
+            for market_data in event.get("markets", []):
+                market = pm.parse_market_data(market_data)
+
+                volume_24h = market.get("volume_24h", 0)
+                total_volume = market.get("volume", 0)
+
+                # Volume surge: 24h volume is >20% of all-time volume
+                if total_volume > 0 and volume_24h > 0:
+                    volume_ratio = volume_24h / total_volume
+                    if volume_ratio > 0.20 and volume_24h > config.MIN_VOLUME_24H:
+                        market["volume_surge_ratio"] = volume_ratio
+                        market["url"] = pm.get_market_url(market_data)
+                        markets.append(market)
+    except Exception as e:
+        logger.error(f"Error scanning volume surges: {e}")
+
+    return sorted(markets, key=lambda x: x.get("volume_surge_ratio", 0), reverse=True)[:10]

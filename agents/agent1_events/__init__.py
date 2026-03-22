@@ -1,1 +1,1 @@
-"""Agent 1 — Event/News markets scanner."""
+"""Agent 1: Short-term event market scanner and researcher."""

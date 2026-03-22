@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket AI Betting Agents
+Description=Polymarket AI Betting Agents v2
 After=network.target
 
 [Service]
@@ -14,8 +14,8 @@ Environment=PYTHONUNBUFFERED=1
 StandardOutput=append:/root/polymarket-bot/logs/agents.log
 StandardError=append:/root/polymarket-bot/logs/agents.log
 
-MemoryMax=256M
-CPUQuota=30%
+MemoryMax=512M
+CPUQuota=50%
 
 [Install]
 WantedBy=multi-user.target

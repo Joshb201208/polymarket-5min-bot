@@ -1,10 +1,10 @@
 """
-health_check.py — Reports bot health to Telegram every 6 hours.
+health_check.py — Reports agent health to Telegram every 6 hours.
 
 Checks:
-  - Bot process running (last cron execution)
-  - Current balance and P&L
-  - Recent trade count and win rate
+  - Agent process running
+  - Current bankroll and P&L
+  - Open positions
   - Disk space and memory
   - Last update timestamp
 """
@@ -54,73 +54,47 @@ def get_system_stats():
     }
 
 
-def get_trading_stats():
-    """Read stats from stats.json and trades.csv."""
+def get_bankroll_stats():
+    """Read bankroll state from data/bankroll_state.json."""
     bot_dir = Path(__file__).parent.parent
+    state_file = bot_dir / "data" / "bankroll_state.json"
     stats = {}
 
-    # Read stats.json
-    stats_file = bot_dir / "stats.json"
-    if stats_file.exists():
+    if state_file.exists():
         try:
-            with open(stats_file) as f:
+            with open(state_file) as f:
                 stats = json.load(f)
         except Exception:
             pass
 
-    # Count recent trades from trades.csv
-    trades_file = bot_dir / "trades.csv"
-    recent_trades = 0
-    if trades_file.exists():
-        try:
-            with open(trades_file) as f:
-                lines = f.readlines()[1:]  # skip header
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-                for line in lines:
-                    # Try to parse timestamp from first column
-                    try:
-                        ts = datetime.fromisoformat(line.split(",")[0].strip())
-                        if ts > cutoff:
-                            recent_trades += 1
-                    except Exception:
-                        recent_trades += 1  # count if can't parse
-        except Exception:
-            pass
-
     return {
-        "balance": stats.get("paper_balance", stats.get("balance", "?")),
-        "pnl": stats.get("running_pnl", stats.get("pnl", "?")),
-        "total_trades": stats.get("total_trades", "?"),
-        "wins": stats.get("wins", "?"),
-        "losses": stats.get("losses", "?"),
-        "recent_trades_24h": recent_trades,
+        "capital": stats.get("capital", "?"),
+        "total_pnl": stats.get("total_pnl", 0),
+        "day_pnl": stats.get("day_pnl", 0),
+        "open_positions": len(stats.get("positions", [])),
+        "total_trades": len(stats.get("history", [])),
+        "updated_at": stats.get("updated_at", "unknown"),
     }
 
 
-def get_last_run():
-    """Check when bot last ran from cron log."""
-    log_file = Path(__file__).parent.parent / "logs" / "cron.log"
-    if log_file.exists():
-        try:
-            # Get last modification time
-            mtime = datetime.fromtimestamp(
-                log_file.stat().st_mtime, tz=timezone.utc
-            )
-            age = datetime.now(timezone.utc) - mtime
-            return {
-                "last_run": mtime.strftime("%Y-%m-%d %H:%M UTC"),
-                "minutes_ago": int(age.total_seconds() / 60),
-            }
-        except Exception:
-            pass
-    return {"last_run": "unknown", "minutes_ago": -1}
+def get_service_status():
+    """Check if agents service is running."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "polymarket-agents"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
 
 
 def get_git_info():
     """Get current git commit and last update."""
     try:
         commit = subprocess.check_output(
-            ["git", "log", "--oneline", "-1"], text=True, cwd=str(Path(__file__).parent.parent)
+            ["git", "log", "--oneline", "-1"], text=True,
+            cwd=str(Path(__file__).parent.parent)
         ).strip()
         return commit
     except Exception:
@@ -137,45 +111,36 @@ def send_health_report():
         return
 
     sys_stats = get_system_stats()
-    trade_stats = get_trading_stats()
-    last_run = get_last_run()
+    bankroll = get_bankroll_stats()
+    service_status = get_service_status()
     git_info = get_git_info()
 
     # Determine health status
-    status = "OK"
-    if last_run["minutes_ago"] > 15:
-        status = "WARNING - Bot may be stuck"
-    if last_run["minutes_ago"] > 60:
-        status = "CRITICAL - Bot not running"
-    if last_run["minutes_ago"] < 0:
-        status = "UNKNOWN - No log file"
+    status = "OK" if service_status == "active" else f"WARNING - {service_status}"
 
-    # Calculate win rate
-    wins = trade_stats.get("wins", 0)
-    total = trade_stats.get("total_trades", 0)
-    if isinstance(wins, int) and isinstance(total, int) and total > 0:
-        win_rate = f"{(wins / total) * 100:.1f}%"
-    else:
-        win_rate = "N/A"
+    # Win rate
+    total = bankroll.get("total_trades", 0)
+    capital = bankroll.get("capital", "?")
+    total_pnl = bankroll.get("total_pnl", 0)
 
-    msg = f"""📊 BOT HEALTH REPORT
+    msg = f"""AGENT HEALTH REPORT
 
 Status: {status}
-Last Run: {last_run['last_run']} ({last_run['minutes_ago']}m ago)
-Code Version: {git_info}
+Service: polymarket-agents ({service_status})
+Code: {git_info}
 
-💰 TRADING
-Balance: ${trade_stats['balance']}
-P&L: ${trade_stats['pnl']}
-Total Trades: {trade_stats['total_trades']}
-Win Rate: {win_rate} ({wins}W / {trade_stats.get('losses', '?')}L)
-Trades (24h): {trade_stats['recent_trades_24h']}
+BANKROLL
+Capital: ${capital}
+Total P&L: ${total_pnl:+.2f}
+Day P&L: ${bankroll.get('day_pnl', 0):+.2f}
+Open Positions: {bankroll.get('open_positions', 0)}
+Total Trades: {total}
 
-🖥️ SYSTEM
+SYSTEM
 Disk: {sys_stats['disk_used']} used / {sys_stats['disk_avail']} free ({sys_stats['disk_pct']})
 RAM: {sys_stats['mem_used_mb']}MB / {sys_stats['mem_total_mb']}MB
 
-⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"""
+{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"""
 
     try:
         resp = httpx.post(

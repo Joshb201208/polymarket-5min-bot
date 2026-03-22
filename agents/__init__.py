@@ -1,1 +1,1 @@
-"""Polymarket AI Betting Agents — advisory-only market scanners with Telegram alerts."""
+"""Polymarket AI Betting Agents v2 — profit-focused with real stats, backtesting, Kelly sizing."""

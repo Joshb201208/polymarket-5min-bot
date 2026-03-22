@@ -1,84 +1,70 @@
 """
-Agent 2 — Entry point for Soccer markets scanner.
+Agent 2 Main — Soccer agent entry point.
+Scans for soccer match markets and researches them for statistical edge.
 """
 
 import logging
-import traceback
+import time
+from datetime import datetime, timezone, timedelta
 
-from agents.agent2_soccer.scanner import scan_soccer_markets, get_scan_count
-from agents.agent2_soccer.analyzer import analyze_market
+from agents.common import config
+from agents.common import telegram
+from agents.common.bankroll import BankrollManager
 from agents.common.paper_tracker import PaperTracker
-from agents.common.telegram_alerts import send_edge_alert, send_error_alert
+from .scanner import scan_soccer_markets
+from .researcher import research_market
 
 logger = logging.getLogger(__name__)
 
-_alerts_sent = 0
-_markets_scanned = 0
+_analyzed_cache: dict[str, datetime] = {}
 
 
-def run_agent2(paper_tracker: PaperTracker) -> None:
-    """Execute one full scan cycle for Agent 2 (Soccer)."""
-    global _alerts_sent, _markets_scanned
+def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
+    """Run one analysis cycle for soccer markets."""
+    logger.info("=== Agent 2 (Soccer): Starting scan ===")
 
-    logger.info("=" * 50)
-    logger.info("Agent 2 (Soccer) — starting scan cycle")
-    logger.info("=" * 50)
+    markets = scan_soccer_markets()
 
-    try:
-        candidates = scan_soccer_markets()
-        _markets_scanned = get_scan_count()
+    analyzed = 0
+    opportunities = 0
 
-        if not candidates:
-            logger.info("No qualifying soccer markets found this cycle")
-            return
+    for market in markets:
+        market_id = market.get("id", "")
 
-        logger.info("Analyzing %d soccer candidates...", len(candidates))
-
-        for market, event in candidates:
-            try:
-                alert = analyze_market(market, event)
-                if alert is None:
-                    continue
-
-                sent = send_edge_alert(**alert)
-                if sent:
-                    _alerts_sent += 1
-                    logger.info("Soccer alert sent: %s", alert["market_title"][:50])
-
-                paper_tracker.record_trade(
-                    market_slug=alert["market_slug"],
-                    market_question=alert["market_title"],
-                    direction=alert["direction"],
-                    entry_price=alert["market_price"],
-                    recommended_size=alert["suggested_size"],
-                    fair_prob=alert["fair_value"],
-                    market_prob=alert["market_price"],
-                    edge=alert["edge"],
-                    confidence=alert["confidence"],
-                    agent_name="Agent 2 (Soccer)",
-                    reasoning="; ".join(alert["reasoning"][:3]),
-                )
-
-            except Exception as exc:
-                logger.error("Error analyzing soccer market: %s", exc)
+        # Cooldown check
+        if market_id in _analyzed_cache:
+            last = _analyzed_cache[market_id]
+            if datetime.now(timezone.utc) - last < timedelta(hours=config.COOLDOWN_HOURS):
                 continue
 
-        logger.info("Agent 2 cycle complete — %d alerts sent", _alerts_sent)
+        try:
+            analysis = research_market(market)
+            _analyzed_cache[market_id] = datetime.now(timezone.utc)
+            analyzed += 1
 
-    except Exception as exc:
-        logger.error("Agent 2 scan cycle failed: %s\n%s", exc, traceback.format_exc())
-        send_error_alert("Agent 2 (Soccer)", str(exc))
+            if analysis:
+                opportunities += 1
+                edge = analysis["edge"]
+
+                if edge >= config.MIN_EDGE:
+                    telegram.alert_opportunity("Soccer", market, analysis)
+
+                if edge >= config.MIN_EDGE_BET:
+                    paper_tracker.place_trade(market, analysis)
+
+            time.sleep(1)  # Rate limit
+        except Exception as e:
+            logger.error(f"Error researching soccer market {market_id}: {e}")
+
+        if analyzed >= 10:
+            break
+
+    logger.info(f"Agent 2 done: {analyzed} analyzed, {opportunities} opportunities")
+    _clean_cache()
 
 
-def get_daily_stats() -> dict:
-    return {
-        "name": "Agent 2 (Soccer)",
-        "alerts": _alerts_sent,
-        "scanned": _markets_scanned,
-    }
-
-
-def reset_daily_stats() -> None:
-    global _alerts_sent, _markets_scanned
-    _alerts_sent = 0
-    _markets_scanned = 0
+def _clean_cache():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    expired = [k for k, v in _analyzed_cache.items() if v < cutoff]
+    for k in expired:
+        del _analyzed_cache[k]

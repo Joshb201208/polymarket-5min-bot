@@ -1,1 +1,1 @@
-"""Agent 2 — Soccer/Football markets scanner."""
+"""Agent 2: Soccer market scanner and researcher."""

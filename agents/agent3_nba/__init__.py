@@ -1,1 +1,1 @@
-"""Agent 3 — NBA basketball markets scanner."""
+"""Agent 3: NBA market scanner and researcher."""

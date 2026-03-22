@@ -1,187 +1,176 @@
 """
-Orchestrator — runs all 3 Polymarket AI agents on independent schedules.
+Orchestrator — Runs all agents on schedule.
 
-Uses threading with staggered start times to avoid API rate limits.
-Each agent runs in its own thread on its own interval:
-  - Agent 1 (Events):  every 2 hours
-  - Agent 2 (Soccer):  every 1 hour
-  - Agent 3 (NBA):     every 1 hour
-
-Daily summary sent at 16:00 UTC (midnight SGT).
+Threads:
+1. Agent 1 (Events): every 1 hour
+2. Agent 2 (Soccer): every 30 minutes
+3. Agent 3 (NBA): every 30 minutes
+4. Early Exit Monitor: every 30 minutes
+5. Daily Summary: at 16:00 UTC (midnight SGT)
+6. Backtest Runner: once per day at 08:00 UTC (4pm SGT)
 """
 
 import logging
-import os
 import sys
-import threading
 import time
-import traceback
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure the project root is on sys.path so `agents.*` imports work
-# when invoked as `python -m agents.run_all` from the repo root.
-PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from agents.agent1_events.main import run_agent1, get_daily_stats as stats1, reset_daily_stats as reset1
-from agents.agent2_soccer.main import run_agent2, get_daily_stats as stats2, reset_daily_stats as reset2
-from agents.agent3_nba.main import run_agent3, get_daily_stats as stats3, reset_daily_stats as reset3
-from agents.common.config import (
-    LOG_LEVEL,
-    SCAN_INTERVAL_EVENTS,
-    SCAN_INTERVAL_NBA,
-    SCAN_INTERVAL_SOCCER,
-)
-from agents.common.paper_tracker import PaperTracker
-from agents.common.telegram_alerts import send_daily_summary, send_startup_alert
-
-# ── Logging setup ─────────────────────────────────────────────
+# Setup logging before imports
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            Path(__file__).parent.parent / "logs" / "agents.log",
+            mode="a",
+        ) if (Path(__file__).parent.parent / "logs").exists() else logging.StreamHandler(),
+    ],
 )
-logger = logging.getLogger("agents.orchestrator")
+logger = logging.getLogger("orchestrator")
 
-# Shared paper tracker (thread-safe via GIL for dict/list ops)
-paper_tracker = PaperTracker()
+from agents.common import config
+from agents.common import telegram
+from agents.common.bankroll import BankrollManager
+from agents.common.paper_tracker import PaperTracker
+from agents.common.backtester import Backtester
+from agents.agent1_events import main as agent1
+from agents.agent2_soccer import main as agent2
+from agents.agent3_nba import main as agent3
 
-# Shutdown event
-_shutdown = threading.Event()
+# Shared state
+bankroll = BankrollManager()
+paper_tracker = PaperTracker(bankroll)
+backtester = Backtester()
 
 
-def _agent_loop(name: str, run_fn, interval: int, stagger: int) -> None:
-    """Run an agent function in a loop with the given interval."""
-    # Stagger start to avoid simultaneous API calls
-    logger.info("%s: starting in %ds (stagger)", name, stagger)
-    if _shutdown.wait(timeout=stagger):
-        return
-
-    while not _shutdown.is_set():
+def run_agent_loop(name: str, run_fn, interval: int):
+    """Run an agent on a fixed interval."""
+    while True:
         try:
-            run_fn(paper_tracker)
-        except Exception as exc:
-            logger.error("%s crashed: %s\n%s", name, exc, traceback.format_exc())
+            logger.info(f"--- {name} cycle starting ---")
+            run_fn(bankroll, paper_tracker)
+            logger.info(f"--- {name} cycle complete, sleeping {interval}s ---")
+        except Exception as e:
+            logger.error(f"{name} error: {e}", exc_info=True)
+        time.sleep(interval)
 
-        # Check for resolved paper trades after each cycle
+
+def run_early_exit_monitor():
+    """Monitor open positions for early exit conditions."""
+    while True:
         try:
-            resolved = paper_tracker.check_resolutions()
-            if resolved:
-                from agents.common.telegram_alerts import send_market_resolved
-                for trade in resolved:
-                    send_market_resolved(
-                        agent_name=trade["agent_name"],
-                        market_title=trade["market_question"],
-                        direction=trade["direction"],
-                        entry_price=trade["entry_price"],
-                        outcome=trade["outcome"],
-                        pnl=trade["pnl"],
-                    )
-        except Exception as exc:
-            logger.error("Resolution check failed: %s", exc)
-
-        logger.info("%s: sleeping %ds until next cycle", name, interval)
-        if _shutdown.wait(timeout=interval):
-            break
+            exits = paper_tracker.check_early_exits()
+            if exits:
+                logger.info(f"Early exit monitor: {len(exits)} positions closed")
+            paper_tracker.update_position_prices()
+        except Exception as e:
+            logger.error(f"Early exit monitor error: {e}", exc_info=True)
+        time.sleep(config.EARLY_EXIT_CHECK_INTERVAL)
 
 
-def _daily_summary_loop() -> None:
-    """Send a daily performance summary at 16:00 UTC (midnight SGT)."""
-    while not _shutdown.is_set():
+def run_daily_summary():
+    """Send daily summary at 16:00 UTC (midnight SGT)."""
+    while True:
         now = datetime.now(timezone.utc)
-        # Calculate seconds until next 16:00 UTC
-        target_hour = 16
-        if now.hour < target_hour:
-            next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+        # Target: 16:00 UTC
+        if now.hour == 16 and now.minute < 5:
+            try:
+                status = bankroll.get_status()
+                positions = bankroll.positions
+                day_pnl = paper_tracker.get_daily_pnl()
+                telegram.send_daily_summary(status, positions, day_pnl)
+                logger.info("Daily summary sent")
+            except Exception as e:
+                logger.error(f"Daily summary error: {e}", exc_info=True)
+            time.sleep(3600)  # Sleep 1h to avoid double-sending
         else:
-            # Tomorrow — use timedelta to handle month/year rollovers safely
-            from datetime import timedelta
-            tomorrow = now + timedelta(days=1)
-            next_run = tomorrow.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-
-        wait_seconds = (next_run - now).total_seconds()
-        if wait_seconds < 0:
-            wait_seconds = 3600  # fallback: 1 hour
-        wait_seconds = min(wait_seconds, 86400)  # cap at 24h
-
-        logger.info("Daily summary scheduled in %.0f seconds", wait_seconds)
-        if _shutdown.wait(timeout=wait_seconds):
-            break
-
-        try:
-            agent_stats = [stats1(), stats2(), stats3()]
-            paper_stats = paper_tracker.get_stats()
-            active = paper_tracker.get_active_count()
-            send_daily_summary(agent_stats, paper_stats, active)
-            logger.info("Daily summary sent")
-
-            # Reset daily counters
-            reset1()
-            reset2()
-            reset3()
-        except Exception as exc:
-            logger.error("Daily summary failed: %s", exc)
+            time.sleep(60)  # Check every minute
 
 
-def main() -> None:
-    """Start all agent threads and the daily summary scheduler."""
+def run_daily_backtest():
+    """Run backtests at 08:00 UTC (4pm SGT)."""
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.hour == 8 and now.minute < 5:
+            try:
+                logger.info("Starting daily backtest...")
+                report = backtester.run_full_backtest()
+                logger.info(f"Backtest complete: {report.get('win_rate', 0):.1%} win rate")
+            except Exception as e:
+                logger.error(f"Backtest error: {e}", exc_info=True)
+            time.sleep(3600)
+        else:
+            time.sleep(60)
+
+
+def main():
+    """Start all agent threads."""
+    # Ensure data and logs directories exist
+    (Path(__file__).parent.parent / "data").mkdir(exist_ok=True)
+    (Path(__file__).parent.parent / "logs").mkdir(exist_ok=True)
+
     logger.info("=" * 60)
-    logger.info("Polymarket AI Betting Agents — Starting")
+    logger.info("Polymarket AI Betting Agents v2 — Starting")
+    logger.info(f"Bankroll: ${config.STARTING_BANKROLL:.2f}")
+    logger.info(f"Mode: {config.TRADING_MODE}")
+    logger.info(f"Scan intervals: Events={config.SCAN_EVENTS}s, Soccer={config.SCAN_SOCCER}s, NBA={config.SCAN_NBA}s")
     logger.info("=" * 60)
 
-    # Ensure data directory exists
-    Path("data").mkdir(exist_ok=True)
+    telegram.send_startup_message("All Agents v2")
 
-    # Send startup notification
-    send_startup_alert()
-
-    # Launch agent threads with staggered starts
     threads = [
         threading.Thread(
-            target=_agent_loop,
-            args=("Agent 1 (Events)", run_agent1, SCAN_INTERVAL_EVENTS, 0),
+            target=run_agent_loop,
+            args=("Agent 1 (Events)", agent1.run_cycle, config.SCAN_EVENTS),
             daemon=True,
             name="agent1-events",
         ),
         threading.Thread(
-            target=_agent_loop,
-            args=("Agent 2 (Soccer)", run_agent2, SCAN_INTERVAL_SOCCER, 30),
+            target=run_agent_loop,
+            args=("Agent 2 (Soccer)", agent2.run_cycle, config.SCAN_SOCCER),
             daemon=True,
             name="agent2-soccer",
         ),
         threading.Thread(
-            target=_agent_loop,
-            args=("Agent 3 (NBA)", run_agent3, SCAN_INTERVAL_NBA, 60),
+            target=run_agent_loop,
+            args=("Agent 3 (NBA)", agent3.run_cycle, config.SCAN_NBA),
             daemon=True,
             name="agent3-nba",
         ),
         threading.Thread(
-            target=_daily_summary_loop,
+            target=run_early_exit_monitor,
+            daemon=True,
+            name="early-exit-monitor",
+        ),
+        threading.Thread(
+            target=run_daily_summary,
             daemon=True,
             name="daily-summary",
+        ),
+        threading.Thread(
+            target=run_daily_backtest,
+            daemon=True,
+            name="daily-backtest",
         ),
     ]
 
     for t in threads:
         t.start()
-        logger.info("Started thread: %s", t.name)
+        logger.info(f"Started thread: {t.name}")
+        time.sleep(5)  # Stagger starts to avoid API burst
 
-    # Keep main thread alive, respond to keyboard interrupt
-    try:
-        while True:
-            time.sleep(60)
-            # Log heartbeat
-            alive = [t.name for t in threads if t.is_alive()]
-            logger.debug("Heartbeat — alive threads: %s", alive)
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested")
-        _shutdown.set()
-        # Give threads time to finish current cycle
-        for t in threads:
-            t.join(timeout=10)
-        logger.info("All agents stopped. Goodbye.")
+    logger.info("All agent threads running. Main thread monitoring...")
+
+    # Keep main thread alive and monitor
+    while True:
+        alive = [t for t in threads if t.is_alive()]
+        dead = [t for t in threads if not t.is_alive()]
+        if dead:
+            logger.warning(f"Dead threads: {[t.name for t in dead]}")
+        time.sleep(300)  # Check every 5 min
 
 
 if __name__ == "__main__":

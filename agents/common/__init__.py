@@ -1,1 +1,1 @@
-"""Shared utilities for all Polymarket agents."""
+"""Common modules shared across all agents."""
