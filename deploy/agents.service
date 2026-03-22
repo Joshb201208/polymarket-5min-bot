@@ -1,21 +1,15 @@
 [Unit]
-Description=Polymarket AI Betting Agents v2
+Description=NBA Polymarket Betting Agent
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
-ExecStart=/root/polymarket-bot/venv/bin/python -m agents.run_all
+ExecStart=/usr/bin/python3 -m nba_agent.main
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1
-
-StandardOutput=append:/root/polymarket-bot/logs/agents.log
-StandardError=append:/root/polymarket-bot/logs/agents.log
-
-MemoryMax=512M
-CPUQuota=50%
 
 [Install]
 WantedBy=multi-user.target

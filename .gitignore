@@ -1,25 +1,8 @@
-# Environment and secrets
 .env
-venv/
-
-# Python
+data/
 __pycache__/
 *.pyc
 *.pyo
-
-# Logs
+.venv/
+venv/
 *.log
-logs/
-
-# Runtime data (generated on VPS)
-backtest_*.json
-stats.json
-trades.csv
-
-# SSH keys (never commit)
-deploy/vps_key
-deploy/vps_key.pub
-
-# OS
-.DS_Store
-Thumbs.db

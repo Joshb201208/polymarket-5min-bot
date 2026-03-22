@@ -1,0 +1,175 @@
+"""Kelly criterion, position sizing, exposure limits."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from nba_agent.config import Config
+from nba_agent.models import Confidence, EdgeResult, Position
+from nba_agent.utils import load_json, atomic_json_write
+
+logger = logging.getLogger(__name__)
+
+
+class BankrollManager:
+    """Manages bankroll, position sizing, and exposure limits."""
+
+    def __init__(self, config: Config | None = None) -> None:
+        self.config = config or Config()
+        self._state_path = self.config.DATA_DIR / "bankroll.json"
+        self._load_state()
+
+    def _load_state(self) -> None:
+        state = load_json(self._state_path, {})
+        self.starting_bankroll = float(state.get("starting_bankroll", self.config.STARTING_BANKROLL))
+        self.current_bankroll = float(state.get("current_bankroll", self.starting_bankroll))
+        self.peak_bankroll = float(state.get("peak_bankroll", self.starting_bankroll))
+        self.is_paused = bool(state.get("is_paused", False))
+        self.is_reduced = bool(state.get("is_reduced", False))
+
+    def save_state(self) -> None:
+        self.config.ensure_data_dir()
+        atomic_json_write(self._state_path, {
+            "starting_bankroll": self.starting_bankroll,
+            "current_bankroll": self.current_bankroll,
+            "peak_bankroll": self.peak_bankroll,
+            "is_paused": self.is_paused,
+            "is_reduced": self.is_reduced,
+        })
+
+    def calculate_bet_size(self, edge_result: EdgeResult) -> float:
+        """Calculate optimal bet size using Quarter-Kelly criterion."""
+        if self.is_paused:
+            logger.warning("Bankroll manager is paused — no bets allowed")
+            return 0.0
+
+        edge = edge_result.edge
+        market_price = edge_result.market_price
+
+        # Kelly fraction: edge / odds_against
+        # odds_against = (1 - prob) / prob, but we use simplified Kelly
+        if market_price <= 0 or market_price >= 1:
+            return 0.0
+
+        odds_against = (1.0 - market_price) / market_price
+        if odds_against <= 0:
+            return 0.0
+
+        kelly_fraction = (edge / odds_against) * 0.25  # Quarter Kelly
+        bet_size = self.current_bankroll * kelly_fraction
+
+        # Apply maximum per-bet limit
+        max_bet = self.current_bankroll * self.config.MAX_BET_PCT
+        bet_size = min(bet_size, max_bet)
+
+        # If in reduced mode, halve bet sizes
+        if self.is_reduced:
+            bet_size *= 0.5
+
+        # Floor at $1
+        if bet_size < 1.0:
+            return 0.0
+
+        # Round to 2 decimal places
+        return round(bet_size, 2)
+
+    def check_game_exposure(
+        self,
+        game_slug: str,
+        open_positions: list[Position],
+        proposed_bet: float,
+    ) -> bool:
+        """Check if adding this bet would exceed per-game exposure limit."""
+        current_exposure = sum(
+            p.cost for p in open_positions
+            if p.status == "open" and game_slug in p.market_slug
+        )
+        max_game_exposure = self.current_bankroll * self.config.MAX_GAME_EXPOSURE_PCT
+        return (current_exposure + proposed_bet) <= max_game_exposure
+
+    def check_total_exposure(
+        self,
+        open_positions: list[Position],
+        proposed_bet: float,
+    ) -> bool:
+        """Check if adding this bet would exceed total exposure limit."""
+        total_open = sum(p.cost for p in open_positions if p.status == "open")
+        max_total = self.current_bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT
+        return (total_open + proposed_bet) <= max_total
+
+    def update_bankroll(self, pnl: float) -> None:
+        """Update bankroll after a trade settles."""
+        self.current_bankroll += pnl
+        if self.current_bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.current_bankroll
+
+        self._check_stop_loss()
+        self.save_state()
+
+    def _check_stop_loss(self) -> None:
+        """Check stop-loss conditions."""
+        # If below 60% of peak — pause trading
+        if self.current_bankroll < self.peak_bankroll * 0.60:
+            if not self.is_paused:
+                logger.critical(
+                    "STOP LOSS: Bankroll $%.2f is below 60%% of peak $%.2f — PAUSING",
+                    self.current_bankroll,
+                    self.peak_bankroll,
+                )
+                self.is_paused = True
+                self.is_reduced = False
+            return
+
+        # If below 75-80% of starting — reduce bet sizes
+        if self.current_bankroll < self.starting_bankroll * 0.80:
+            if not self.is_reduced:
+                logger.warning(
+                    "Bankroll $%.2f is below 80%% of starting $%.2f — reducing bet sizes by 50%%",
+                    self.current_bankroll,
+                    self.starting_bankroll,
+                )
+                self.is_reduced = True
+        else:
+            self.is_reduced = False
+
+        # Reset pause if bankroll recovers above 60% of peak
+        if self.is_paused and self.current_bankroll >= self.peak_bankroll * 0.60:
+            logger.info("Bankroll recovered above 60%% of peak — resuming trading")
+            self.is_paused = False
+
+    def should_exit_early(
+        self,
+        position: Position,
+        current_price: float,
+    ) -> tuple[bool, str]:
+        """Check if a position should be exited early based on confidence tiers."""
+        entry = position.entry_price
+        if entry <= 0:
+            return False, ""
+
+        pnl_pct = (current_price - entry) / entry
+
+        conf = position.confidence.upper()
+
+        if conf == Confidence.HIGH.value:
+            if pnl_pct >= 0.40:
+                return True, "Price target reached (HIGH confidence, +40% threshold)"
+            if pnl_pct <= -0.20:
+                return True, "Stop loss hit (HIGH confidence, -20% threshold)"
+        elif conf == Confidence.MEDIUM.value:
+            if pnl_pct >= 0.25:
+                return True, "Price target reached (MEDIUM confidence, +25% threshold)"
+            if pnl_pct <= -0.15:
+                return True, "Stop loss hit (MEDIUM confidence, -15% threshold)"
+        else:  # LOW
+            if pnl_pct >= 0.15:
+                return True, "Price target reached (LOW confidence, +15% threshold)"
+            if pnl_pct <= -0.10:
+                return True, "Stop loss hit (LOW confidence, -10% threshold)"
+
+        # Line movement check: 10%+ against our position
+        if pnl_pct <= -0.10:
+            return True, "Line moved 10%+ against position"
+
+        return False, ""

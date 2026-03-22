@@ -1,0 +1,71 @@
+"""Configuration — loads .env and exposes all constants."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
+
+
+class Config:
+    """Central configuration loaded from environment variables."""
+
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # Trading mode
+    TRADING_MODE: str = os.getenv("TRADING_MODE", "paper")
+
+    # Polymarket credentials (live mode only)
+    POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
+    POLYMARKET_API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")
+    POLYMARKET_API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+    PRIVATE_KEY: str = os.getenv("PRIVATE_KEY", "")
+    FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
+
+    # Bankroll
+    STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "500"))
+    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.05"))
+    MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.08"))
+    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.40"))
+
+    # Scan intervals (minutes)
+    SCAN_INTERVAL: int = int(os.getenv("SCAN_INTERVAL", "15"))
+    EXIT_CHECK_INTERVAL: int = int(os.getenv("EXIT_CHECK_INTERVAL", "30"))
+    PRE_TIPOFF_MINUTES: int = int(os.getenv("PRE_TIPOFF_MINUTES", "30"))
+
+    # Edge thresholds
+    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.07"))
+    MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.10"))
+
+    # NBA
+    NBA_SEASON: str = os.getenv("NBA_SEASON", "2025-26")
+
+    # Logging
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # Paths
+    PROJECT_ROOT: Path = _PROJECT_ROOT
+    DATA_DIR: Path = _PROJECT_ROOT / "data"
+
+    # API URLs
+    GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
+    CLOB_API_BASE: str = "https://clob.polymarket.com"
+    TELEGRAM_API_BASE: str = "https://api.telegram.org"
+
+    @property
+    def is_live(self) -> bool:
+        return self.TRADING_MODE.lower() == "live"
+
+    @property
+    def is_paper(self) -> bool:
+        return not self.is_live
+
+    def ensure_data_dir(self) -> None:
+        self.DATA_DIR.mkdir(parents=True, exist_ok=True)
