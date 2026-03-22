@@ -1,8 +1,10 @@
 """NBA stats engine — standings, game logs, H2H, team stats.
 
-Uses the NBA CDN schedule endpoint (cdn.nba.com) which is publicly
-accessible from any IP including cloud/VPS servers, unlike stats.nba.com
-which blocks cloud provider IP ranges.
+Data sources (tried in order):
+1. NBA CDN schedule (cdn.nba.com) — full season game-by-game data
+2. ESPN API (site.api.espn.com) — standings + team stats fallback
+
+Both are public APIs accessible from any IP including cloud/VPS servers.
 """
 
 from __future__ import annotations
@@ -21,10 +23,25 @@ from nba_agent.models import TeamStats, H2HRecord
 
 logger = logging.getLogger(__name__)
 
-# NBA CDN schedule endpoint — publicly accessible, no auth, no IP blocking
+# ── Data source URLs ───────────────────────────────────────────────
 _SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json"
+_ESPN_STANDINGS_URL = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
 
-# Build team lookup tables from nba_api static data (no HTTP request needed)
+# Browser headers — NBA CDN needs these to avoid 403 on cloud IPs
+_HTTP_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+}
+
+# ── Static team data (no HTTP, bundled in nba_api package) ─────────
 _ALL_TEAMS = nba_teams_static.get_teams()
 _TEAM_BY_ABBR: dict[str, dict] = {t["abbreviation"].upper(): t for t in _ALL_TEAMS}
 _TEAM_BY_NAME: dict[str, dict] = {}
@@ -33,7 +50,10 @@ for _t in _ALL_TEAMS:
     _TEAM_BY_NAME[_t["nickname"].lower()] = _t
     _TEAM_BY_NAME[_t["city"].lower() + " " + _t["nickname"].lower()] = _t
 
-# Common Polymarket abbreviations to nba_api abbreviations
+# ESPN team ID → nba_api team ID mapping
+_ESPN_ABBR_TO_NBA_ID: dict[str, int] = {t["abbreviation"]: t["id"] for t in _ALL_TEAMS}
+
+# Polymarket abbreviation normalization
 _ABBR_MAP: dict[str, str] = {
     "BKN": "BKN", "BRK": "BKN",
     "CHA": "CHA", "CHO": "CHA",
@@ -44,26 +64,16 @@ _ABBR_MAP: dict[str, str] = {
     "PHX": "PHX", "PHO": "PHX",
     "WSH": "WAS", "WAS": "WAS",
     "UTA": "UTA", "UTAH": "UTA",
-    "OKC": "OKC",
-    "POR": "POR",
-    "LAL": "LAL",
-    "LAC": "LAC",
-    "MEM": "MEM",
-    "DEN": "DEN",
-    "MIL": "MIL",
-    "IND": "IND",
-    "ATL": "ATL",
-    "BOS": "BOS",
-    "CHI": "CHI",
-    "CLE": "CLE",
-    "DAL": "DAL",
-    "DET": "DET",
-    "HOU": "HOU",
-    "MIA": "MIA",
-    "MIN": "MIN",
-    "ORL": "ORL",
-    "PHI": "PHI",
-    "SAC": "SAC",
+    "OKC": "OKC", "POR": "POR",
+    "LAL": "LAL", "LAC": "LAC",
+    "MEM": "MEM", "DEN": "DEN",
+    "MIL": "MIL", "IND": "IND",
+    "ATL": "ATL", "BOS": "BOS",
+    "CHI": "CHI", "CLE": "CLE",
+    "DAL": "DAL", "DET": "DET",
+    "HOU": "HOU", "MIA": "MIA",
+    "MIN": "MIN", "ORL": "ORL",
+    "PHI": "PHI", "SAC": "SAC",
     "TOR": "TOR",
 }
 
@@ -90,19 +100,107 @@ def find_team_by_name(name: str) -> dict | None:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ESPN standings fetcher (fallback — always works from cloud IPs)
+# ═══════════════════════════════════════════════════════════════════
+
+def _parse_espn_record(val: str) -> tuple[int, int]:
+    """Parse '26-8' into (26, 8)."""
+    try:
+        parts = val.split("-")
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+def _fetch_espn_standings() -> dict[int, dict]:
+    """Fetch standings from ESPN API — returns {nba_team_id: stats_dict}."""
+    try:
+        resp = httpx.get(_ESPN_STANDINGS_URL, params={"season": "2026"}, timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("ESPN standings fetch failed: %s", e)
+        return {}
+
+    result: dict[int, dict] = {}
+    for conference in data.get("children", []):
+        for entry in conference.get("standings", {}).get("entries", []):
+            team_info = entry.get("team", {})
+            espn_abbr = team_info.get("abbreviation", "")
+            team_name = team_info.get("displayName", "")
+
+            # Map ESPN abbreviation to nba_api team ID
+            nba_team = find_team_by_name(team_name) or find_team_by_abbr(espn_abbr)
+            if not nba_team:
+                logger.debug("Could not map ESPN team %s (%s)", team_name, espn_abbr)
+                continue
+
+            tid = nba_team["id"]
+            stats_raw = {s["name"]: s for s in entry.get("stats", [])}
+
+            wins = int(stats_raw.get("wins", {}).get("value", 0))
+            losses = int(stats_raw.get("losses", {}).get("value", 0))
+            ppg = float(stats_raw.get("avgPointsFor", {}).get("value", 0))
+            opp_ppg = float(stats_raw.get("avgPointsAgainst", {}).get("value", 0))
+            diff = float(stats_raw.get("differential", {}).get("value", 0))
+            streak_val = int(stats_raw.get("streak", {}).get("value", 0))
+            win_pct = float(stats_raw.get("winPercent", {}).get("value", 0))
+
+            home_str = stats_raw.get("Home", {}).get("displayValue", "0-0")
+            road_str = stats_raw.get("Road", {}).get("displayValue", "0-0")
+            l10_str = stats_raw.get("Last Ten Games", {}).get("displayValue", "0-0")
+            home_w, home_l = _parse_espn_record(home_str)
+            road_w, road_l = _parse_espn_record(road_str)
+            l10_w, l10_l = _parse_espn_record(l10_str)
+
+            result[tid] = {
+                "team_name": team_name,
+                "team_abbr": nba_team["abbreviation"],
+                "wins": wins,
+                "losses": losses,
+                "win_pct": win_pct,
+                "ppg": ppg,
+                "opp_ppg": opp_ppg,
+                "diff": diff,
+                "streak": streak_val,
+                "home_record": home_str,
+                "road_record": road_str,
+                "last_10": l10_str,
+                "home_wins": home_w, "home_losses": home_l,
+                "road_wins": road_w, "road_losses": road_l,
+                "l10_wins": l10_w, "l10_losses": l10_l,
+            }
+
+    logger.info("ESPN standings: loaded %d teams", len(result))
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Main research class
+# ═══════════════════════════════════════════════════════════════════
+
 class NBAResearch:
-    """Fetches and caches NBA statistics from the CDN schedule endpoint."""
+    """Fetches and caches NBA statistics. Tries NBA CDN first, ESPN fallback."""
 
     def __init__(self, config: Config | None = None) -> None:
         self.config = config or Config()
         self.season = self.config.NBA_SEASON
+        self._data_source: str = "none"
 
-        # Caches
+        # NBA CDN caches
         self._schedule_raw: dict | None = None
         self._schedule_ts: datetime | None = None
         self._team_games: dict[int, list[dict]] | None = None
         self._team_records: dict[int, dict] | None = None
+
+        # ESPN caches
+        self._espn_standings: dict[int, dict] | None = None
+        self._espn_ts: datetime | None = None
+
         self._cache_ttl = timedelta(hours=2)
+
+    # ── NBA CDN data fetching ──────────────────────────────────────
 
     def _fetch_schedule(self) -> dict | None:
         """Download the full season schedule from NBA CDN, cached for 2 hours."""
@@ -110,28 +208,28 @@ class NBAResearch:
         if self._schedule_raw and self._schedule_ts and (now - self._schedule_ts) < self._cache_ttl:
             return self._schedule_raw
 
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                resp = httpx.get(_SCHEDULE_URL, timeout=30.0)
+                resp = httpx.get(_SCHEDULE_URL, headers=_HTTP_HEADERS, timeout=30.0)
                 resp.raise_for_status()
                 data = resp.json()
                 self._schedule_raw = data
                 self._schedule_ts = now
-                self._team_games = None  # Invalidate derived caches
+                self._team_games = None
                 self._team_records = None
+                self._data_source = "nba_cdn"
                 logger.info("Fetched NBA schedule from CDN (%d game dates)",
                             len(data.get("leagueSchedule", {}).get("gameDates", [])))
                 return data
             except Exception as e:
-                wait = (attempt + 1) * 2
-                logger.warning("Schedule fetch attempt %d/3 failed: %s — retrying in %ds", attempt + 1, e, wait)
-                time.sleep(wait)
+                logger.warning("CDN schedule attempt %d/2 failed: %s", attempt + 1, e)
+                time.sleep(2)
 
-        logger.error("All 3 schedule fetch attempts failed. NBA CDN may be down.")
-        return self._schedule_raw  # Return stale cache if available
+        logger.warning("NBA CDN unavailable — falling back to ESPN")
+        return None
 
     def _build_team_games(self) -> dict[int, list[dict]]:
-        """Parse the schedule into per-team game logs."""
+        """Parse the CDN schedule into per-team game logs."""
         if self._team_games is not None:
             return self._team_games
 
@@ -144,14 +242,13 @@ class NBAResearch:
 
         for dt in dates:
             for g in dt.get("games", []):
-                if g.get("gameStatus") != 3:  # Only completed games
+                if g.get("gameStatus") != 3:
                     continue
 
                 ht = g["homeTeam"]
                 at = g["awayTeam"]
                 game_date = g.get("gameDateEst", g.get("gameDateUTC", ""))[:10]
 
-                # Home team entry
                 team_games[ht["teamId"]].append({
                     "date": game_date,
                     "is_home": True,
@@ -161,8 +258,6 @@ class NBAResearch:
                     "opp_tricode": at.get("teamTricode", ""),
                     "won": int(ht.get("score", 0)) > int(at.get("score", 0)),
                 })
-
-                # Away team entry
                 team_games[at["teamId"]].append({
                     "date": game_date,
                     "is_home": False,
@@ -173,16 +268,15 @@ class NBAResearch:
                     "won": int(at.get("score", 0)) > int(ht.get("score", 0)),
                 })
 
-        # Sort by date
         for tid in team_games:
             team_games[tid].sort(key=lambda x: x["date"])
 
         self._team_games = dict(team_games)
-        logger.info("Built game logs for %d teams", len(self._team_games))
+        logger.info("Built game logs for %d teams from CDN", len(self._team_games))
         return self._team_games
 
     def _build_team_records(self) -> dict[int, dict]:
-        """Build latest W-L records from the schedule."""
+        """Build latest W-L records from the CDN schedule."""
         if self._team_records is not None:
             return self._team_records
 
@@ -193,7 +287,6 @@ class NBAResearch:
         records: dict[int, dict] = {}
         dates = schedule.get("leagueSchedule", {}).get("gameDates", [])
 
-        # Walk backwards to find most recent record for each team
         for dt in reversed(dates):
             for g in dt.get("games", []):
                 if g.get("gameStatus") != 3:
@@ -216,19 +309,54 @@ class NBAResearch:
         self._team_records = records
         return records
 
+    # ── ESPN fallback ──────────────────────────────────────────────
+
+    def _get_espn_standings(self) -> dict[int, dict]:
+        """Get ESPN standings (cached for 2 hours)."""
+        now = datetime.now(timezone.utc)
+        if self._espn_standings and self._espn_ts and (now - self._espn_ts) < self._cache_ttl:
+            return self._espn_standings
+
+        standings = _fetch_espn_standings()
+        if standings:
+            self._espn_standings = standings
+            self._espn_ts = now
+            self._data_source = "espn"
+        return self._espn_standings or {}
+
+    # ── Public API ─────────────────────────────────────────────────
+
     def get_standings(self) -> list[dict]:
-        """Return standings as a list of dicts (one per team)."""
+        """Return standings as a list of dicts."""
         records = self._build_team_records()
-        return list(records.values())
+        if records:
+            return list(records.values())
+
+        # Fallback to ESPN
+        espn = self._get_espn_standings()
+        return [
+            {"TeamID": tid, "TeamName": s["team_name"], "TeamSlug": s["team_abbr"],
+             "WINS": s["wins"], "LOSSES": s["losses"]}
+            for tid, s in espn.items()
+        ]
 
     def get_team_stats(self, team_id: int) -> TeamStats | None:
-        """Build TeamStats from CDN schedule data."""
+        """Build TeamStats — uses CDN game data if available, ESPN fallback."""
+        # Try CDN-based detailed stats first
         team_games = self._build_team_games()
-        games = team_games.get(team_id, [])
-        if not games:
-            logger.warning("Team ID %d has no games in schedule", team_id)
-            return None
+        if team_games and team_id in team_games:
+            return self._build_stats_from_cdn(team_id, team_games[team_id])
 
+        # Fallback to ESPN standings
+        espn = self._get_espn_standings()
+        if team_id in espn:
+            return self._build_stats_from_espn(team_id, espn[team_id])
+
+        logger.warning("Team ID %d not found in any data source", team_id)
+        return None
+
+    def _build_stats_from_cdn(self, team_id: int, games: list[dict]) -> TeamStats:
+        """Build TeamStats from CDN schedule game data."""
         records = self._build_team_records()
         record = records.get(team_id, {})
 
@@ -247,7 +375,7 @@ class NBAResearch:
         l10_w = sum(1 for g in last_10 if g["won"])
         l10_l = len(last_10) - l10_w
 
-        # Current streak
+        # Streak
         streak_count = 0
         streak_type = "W" if games[-1]["won"] else "L"
         for g in reversed(games):
@@ -261,21 +389,14 @@ class NBAResearch:
         total = wins + losses
         win_pct = wins / total if total > 0 else 0.0
 
-        # Look up full team name from static data
-        team_info = None
-        for t in _ALL_TEAMS:
-            if t["id"] == team_id:
-                team_info = t
-                break
-
+        team_info = next((t for t in _ALL_TEAMS if t["id"] == team_id), None)
         team_name = (
             f"{record.get('TeamCity', '')} {record.get('TeamName', '')}".strip()
             if record
             else (team_info["full_name"] if team_info else f"Team {team_id}")
         )
-        team_abbr = (
-            record.get("TeamSlug", "").upper()
-            or (team_info["abbreviation"] if team_info else "")
+        team_abbr = record.get("TeamSlug", "").upper() or (
+            team_info["abbreviation"] if team_info else ""
         )
 
         ppg = total_pts / n if n > 0 else 0.0
@@ -285,9 +406,7 @@ class NBAResearch:
             team_id=team_id,
             team_name=team_name,
             team_abbr=team_abbr,
-            wins=wins,
-            losses=losses,
-            win_pct=win_pct,
+            wins=wins, losses=losses, win_pct=win_pct,
             home_record=f"{home_w}-{home_l}",
             road_record=f"{road_w}-{road_l}",
             last_10=f"{l10_w}-{l10_l}",
@@ -295,26 +414,56 @@ class NBAResearch:
             opp_points_pg=round(opp_ppg, 1),
             diff_points_pg=round(ppg - opp_ppg, 1),
             current_streak=f"{streak_type}{streak_count}",
-            last_10_wins=l10_w,
-            last_10_losses=l10_l,
-            home_wins=home_w,
-            home_losses=home_l,
-            road_wins=road_w,
-            road_losses=road_l,
+            last_10_wins=l10_w, last_10_losses=l10_l,
+            home_wins=home_w, home_losses=home_l,
+            road_wins=road_w, road_losses=road_l,
         )
 
-        # Estimate offensive/defensive ratings from points data
-        # These are rough approximations — true ratings need possession data
-        # We use points per game as proxy (avg NBA pace ~100 possessions)
-        ts.off_rating = round(ppg * (100 / 98), 1)  # ~adjust for pace
+        ts.off_rating = round(ppg * (100 / 98), 1)
         ts.def_rating = round(opp_ppg * (100 / 98), 1)
         ts.net_rating = round(ts.off_rating - ts.def_rating, 1)
-        ts.pace = 98.0  # Default estimate
+        ts.pace = 98.0
+        return ts
 
+    def _build_stats_from_espn(self, team_id: int, espn: dict) -> TeamStats:
+        """Build TeamStats from ESPN standings data."""
+        streak_val = espn.get("streak", 0)
+        # ESPN streak is positive for wins, negative for losses
+        streak_str = f"W{abs(streak_val)}" if streak_val >= 0 else f"L{abs(streak_val)}"
+
+        ppg = espn.get("ppg", 0.0)
+        opp_ppg = espn.get("opp_ppg", 0.0)
+
+        ts = TeamStats(
+            team_id=team_id,
+            team_name=espn.get("team_name", ""),
+            team_abbr=espn.get("team_abbr", ""),
+            wins=espn.get("wins", 0),
+            losses=espn.get("losses", 0),
+            win_pct=espn.get("win_pct", 0.0),
+            home_record=espn.get("home_record", "0-0"),
+            road_record=espn.get("road_record", "0-0"),
+            last_10=espn.get("last_10", "0-0"),
+            points_pg=round(ppg, 1),
+            opp_points_pg=round(opp_ppg, 1),
+            diff_points_pg=round(espn.get("diff", 0.0), 1),
+            current_streak=streak_str,
+            last_10_wins=espn.get("l10_wins", 0),
+            last_10_losses=espn.get("l10_losses", 0),
+            home_wins=espn.get("home_wins", 0),
+            home_losses=espn.get("home_losses", 0),
+            road_wins=espn.get("road_wins", 0),
+            road_losses=espn.get("road_losses", 0),
+        )
+
+        ts.off_rating = round(ppg * (100 / 98), 1) if ppg else 0.0
+        ts.def_rating = round(opp_ppg * (100 / 98), 1) if opp_ppg else 0.0
+        ts.net_rating = round(ts.off_rating - ts.def_rating, 1)
+        ts.pace = 98.0
         return ts
 
     def get_team_game_log(self, team_id: int, last_n: int = 10) -> list[dict]:
-        """Get recent game log for a team."""
+        """Get recent game log for a team (CDN only)."""
         team_games = self._build_team_games()
         games = team_games.get(team_id, [])
         return games[-last_n:] if games else []
