@@ -9,11 +9,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from nba_agent.config import Config
+from nba_agent.balldontlie import BDLClient
 from nba_agent.bankroll_manager import BankrollManager
 from nba_agent.edge_calculator import EdgeCalculator
 from nba_agent.injury_scanner import InjuryScanner
 from nba_agent.models import MarketType
 from nba_agent.nba_research import NBAResearch
+from nba_agent.odds_api import OddsAPI
 from nba_agent.performance_tracker import PerformanceTracker
 from nba_agent.polymarket_scanner import PolymarketScanner
 from nba_agent.telegram_alerts import TelegramBot
@@ -33,11 +35,24 @@ class NBAAgent:
         self.scanner = PolymarketScanner(self.config)
         self.research = NBAResearch(self.config)
         self.injury_scanner = InjuryScanner()
-        self.edge_calc = EdgeCalculator(self.config, self.research, self.injury_scanner)
+        self.odds_api = OddsAPI(self.config)
+        self.bdl = BDLClient(self.config)
+        self.edge_calc = EdgeCalculator(
+            self.config, self.research, self.injury_scanner,
+            self.odds_api, self.bdl,
+        )
         self.bankroll = BankrollManager(self.config)
         self.engine = TradingEngine(self.config)
         self.tracker = PerformanceTracker(self.config)
         self.telegram = TelegramBot(self.config)
+
+        # Log data sources on startup
+        sources = ["ESPN (always)"]
+        if self.odds_api.is_configured:
+            sources.append("The Odds API (Vegas lines)")
+        if self.bdl.is_configured:
+            sources.append("BallDontLie (advanced stats + injuries)")
+        logger.info("Data sources: %s", ", ".join(sources))
 
         self._shutdown = False
         self._last_daily: datetime | None = None

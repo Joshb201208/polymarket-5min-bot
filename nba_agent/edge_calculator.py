@@ -18,12 +18,18 @@ from nba_agent.models import (
 )
 from nba_agent.nba_research import NBAResearch, find_team_by_abbr, find_team_by_name
 from nba_agent.injury_scanner import InjuryScanner
+from nba_agent.odds_api import OddsAPI
+from nba_agent.balldontlie import BDLClient
 from nba_agent.utils import slugify_game
 
 logger = logging.getLogger(__name__)
 
 # Home court advantage in NBA: ~3-4 points, roughly 60% win rate at home
 _HOME_ADVANTAGE = 0.035  # 3.5% boost to home team
+
+# How much to weight Vegas vs our model when both are available
+_VEGAS_WEIGHT = 0.65  # Vegas lines are sharper than our model
+_MODEL_WEIGHT = 0.35
 
 
 def _normal_cdf(x: float) -> float:
@@ -39,10 +45,14 @@ class EdgeCalculator:
         config: Config | None = None,
         research: NBAResearch | None = None,
         injury_scanner: InjuryScanner | None = None,
+        odds_api: OddsAPI | None = None,
+        bdl: BDLClient | None = None,
     ) -> None:
         self.config = config or Config()
         self.research = research or NBAResearch(self.config)
         self.injury_scanner = injury_scanner or InjuryScanner()
+        self.odds_api = odds_api or OddsAPI(self.config)
+        self.bdl = bdl or BDLClient(self.config)
 
     async def evaluate(self, market: Market) -> EdgeResult | None:
         """Evaluate a market and return edge result if edge found."""
@@ -88,26 +98,42 @@ class EdgeCalculator:
         if not home_stats or not away_stats:
             return None
 
-        # Fetch injury info
-        home_injuries = await self.injury_scanner.get_injury_summary(home_stats.team_name)
-        away_injuries = await self.injury_scanner.get_injury_summary(away_stats.team_name)
+        # Fetch injury info — prefer BDL official data, fall back to Google News RSS
+        home_injuries: list[str] = []
+        away_injuries: list[str] = []
+        if self.bdl.is_configured:
+            h_out, h_names = self.bdl.count_team_out(home_stats.team_abbr)
+            a_out, a_names = self.bdl.count_team_out(away_stats.team_abbr)
+            home_injuries = [f"{n} (OUT)" for n in h_names]
+            away_injuries = [f"{n} (OUT)" for n in a_names]
+        else:
+            home_injuries = await self.injury_scanner.get_injury_summary(home_stats.team_name)
+            away_injuries = await self.injury_scanner.get_injury_summary(away_stats.team_name)
+
+        # Enhance stats with BDL advanced data if available
+        if self.bdl.is_configured:
+            for stats_obj in (home_stats, away_stats):
+                adv = self.bdl.find_team_advanced_stats(stats_obj.team_abbr)
+                if adv:
+                    stats_obj.off_rating = adv.get("off_rating", stats_obj.off_rating) or stats_obj.off_rating
+                    stats_obj.def_rating = adv.get("def_rating", stats_obj.def_rating) or stats_obj.def_rating
+                    stats_obj.net_rating = adv.get("net_rating", stats_obj.net_rating) or stats_obj.net_rating
+                    stats_obj.pace = adv.get("pace", stats_obj.pace) or stats_obj.pace
 
         research_data = ResearchData(
             home_team=home_stats,
             away_team=away_stats,
             h2h=h2h,
-            home_injuries=home_injuries[:3],
-            away_injuries=away_injuries[:3],
+            home_injuries=home_injuries[:5],
+            away_injuries=away_injuries[:5],
         )
 
-        # Compute power ratings
+        # ── Compute fair price from our statistical model ──────────
         home_power = self._compute_power_rating(home_stats, is_home=True)
         away_power = self._compute_power_rating(away_stats, is_home=False)
 
         # H2H adjustment
         if h2h and (h2h.team_a_wins + h2h.team_b_wins) > 0:
-            # h2h is from home team's perspective (team_a = home in our build_research call)
-            # Actually h2h.team_a_id = home_id (first arg to build_research)
             total_h2h = h2h.team_a_wins + h2h.team_b_wins
             if h2h.team_a_id == home_id:
                 h2h_factor = (h2h.team_a_wins / total_h2h - 0.5) * 0.10
@@ -126,15 +152,37 @@ class EdgeCalculator:
         elif rest_diff <= -2:
             away_power += 0.015
 
-        # Injury impact (rough: if team has "out" injuries, slight penalty)
-        home_out = sum(1 for inj in home_injuries if "out" in inj.lower())
-        away_out = sum(1 for inj in away_injuries if "out" in inj.lower())
-        home_power -= home_out * 0.01
-        away_power -= away_out * 0.01
+        # Injury impact — BDL gives exact count, RSS gives rough estimate
+        if self.bdl.is_configured:
+            h_out, _ = self.bdl.count_team_out(home_stats.team_abbr)
+            a_out, _ = self.bdl.count_team_out(away_stats.team_abbr)
+        else:
+            h_out = sum(1 for inj in home_injuries if "out" in inj.lower())
+            a_out = sum(1 for inj in away_injuries if "out" in inj.lower())
+        home_power -= h_out * 0.015
+        away_power -= a_out * 0.015
 
-        # Fair probability for home team (outcome index 1 for home in most Polymarket slugs)
-        # Polymarket convention: outcome[0] = team in first slug position (away), outcome[1] = second (home)
-        fair_home = home_power / (home_power + away_power) if (home_power + away_power) > 0 else 0.5
+        model_fair_home = home_power / (home_power + away_power) if (home_power + away_power) > 0 else 0.5
+
+        # ── Get Vegas line if available ────────────────────────────
+        vegas_fair_home: float | None = None
+        vegas_game = self.odds_api.find_game_odds(home_stats.team_name, away_stats.team_name)
+        if vegas_game and vegas_game.home_ml and vegas_game.away_ml:
+            # Devig: normalize so home + away = 1.0
+            raw_h = vegas_game.home_ml.sharp_prob or vegas_game.home_ml.consensus_prob
+            raw_a = vegas_game.away_ml.sharp_prob or vegas_game.away_ml.consensus_prob
+            total_vig = raw_h + raw_a
+            if total_vig > 0:
+                vegas_fair_home = raw_h / total_vig
+                logger.info("Vegas line for %s: home=%.1f%% (model=%.1f%%) books=%d",
+                            home_stats.team_name, vegas_fair_home * 100,
+                            model_fair_home * 100, vegas_game.home_ml.num_books)
+
+        # ── Blend Vegas + model for final fair price ───────────────
+        if vegas_fair_home is not None:
+            fair_home = _VEGAS_WEIGHT * vegas_fair_home + _MODEL_WEIGHT * model_fair_home
+        else:
+            fair_home = model_fair_home
         fair_away = 1.0 - fair_home
 
         # Determine which side has more edge
