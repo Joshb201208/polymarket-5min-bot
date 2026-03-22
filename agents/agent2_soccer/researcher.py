@@ -96,11 +96,11 @@ def research_market(market: dict) -> dict | None:
 
     confidence = prediction.get("confidence", "medium")
 
-    reasoning = (
-        f"{prediction.get('reasoning', '')} "
-        f"Injuries: {len(home_injuries)} home, {len(away_injuries)} away articles. "
-        f"Fair prob: {fair_prob:.0%} vs market {yes_price:.0%}."
-    )
+    reasoning = [
+        prediction.get('reasoning', ''),
+        f"Injuries: {len(home_injuries)} home, {len(away_injuries)} away articles",
+        f"Fair prob: {fair_prob:.0%} vs market {yes_price:.0%}",
+    ]
 
     return {
         "side": side,
@@ -214,5 +214,5 @@ def _news_based_analysis(market: dict) -> dict | None:
         "fair_probability": fair_prob,
         "edge": edge,
         "confidence": "low",
-        "reasoning": f"News-based: {news_data['sentiment_label']} sentiment from {news_data['total_articles']} articles",
+        "reasoning": [f"News-based: {news_data['sentiment_label']} sentiment from {news_data['total_articles']} articles"],
     }

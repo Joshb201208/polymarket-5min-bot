@@ -28,18 +28,21 @@ def _get(url: str, params: dict = None) -> dict | list | None:
 # ── Gamma API (events, markets, search) ───────────────────────
 
 def search_events(query: str = "", tag: str = "", limit: int = 50,
-                  active: bool = True, closed: bool = False) -> list[dict]:
+                  active: bool = True, closed: bool = False,
+                  order: str = "volume24hr",
+                  ascending: bool = False) -> list[dict]:
     """Search events from Gamma API."""
-    params = {"limit": limit}
+    params = {"limit": limit, "order": order, "ascending": str(ascending).lower()}
     if query:
         params["title"] = query
     if tag:
         params["tag_slug"] = tag
-    if active:
-        params["active"] = "true"
     if closed:
         params["closed"] = "true"
         params.pop("active", None)
+    else:
+        params["active"] = "true"
+        params["closed"] = "false"
     data = _get(f"{config.GAMMA_API}/events", params)
     return data if isinstance(data, list) else []
 

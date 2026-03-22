@@ -162,7 +162,7 @@ def research_market(market: dict) -> dict | None:
         "fair_probability": fair_prob,
         "edge": edge,
         "confidence": confidence,
-        "reasoning": ". ".join(reasoning_parts),
+        "reasoning": reasoning_parts,
     }
 
 
@@ -330,5 +330,5 @@ def _news_based_analysis(market: dict) -> dict | None:
         "fair_probability": fair_prob,
         "edge": edge,
         "confidence": "low",
-        "reasoning": f"News-based: {news_data['sentiment_label']} ({news_data['total_articles']} articles)",
+        "reasoning": [f"News-based: {news_data['sentiment_label']} ({news_data['total_articles']} articles)"],
     }

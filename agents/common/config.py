@@ -26,7 +26,7 @@ MIN_BET = 5.0              # Minimum $5 bet
 MAX_BET = 75.0             # Hard cap
 
 # ── Market Filters ────────────────────────────────────────────
-MAX_RESOLUTION_DAYS = 14   # Only markets resolving within 2 weeks
+MAX_RESOLUTION_DAYS = 120  # 4 months max — we can sell early for profit
 MIN_RESOLUTION_HOURS = 2   # Don't bet on markets closing in <2 hours
 MIN_LIQUIDITY = 5000       # $5k minimum liquidity
 MIN_VOLUME_24H = 1000      # $1k minimum 24h volume
