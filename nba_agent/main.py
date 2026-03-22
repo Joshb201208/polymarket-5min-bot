@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from nba_agent.config import Config
 from nba_agent.balldontlie import BDLClient
 from nba_agent.bankroll_manager import BankrollManager
+from nba_agent.calibrator import Calibrator
 from nba_agent.edge_calculator import EdgeCalculator
 from nba_agent.injury_scanner import InjuryScanner
 from nba_agent.models import MarketType
@@ -41,6 +42,7 @@ class NBAAgent:
             self.config, self.research, self.injury_scanner,
             self.odds_api, self.bdl,
         )
+        self.calibrator = Calibrator(self.config)
         self.bankroll = BankrollManager(self.config)
         self.engine = TradingEngine(self.config)
         self.tracker = PerformanceTracker(self.config)
@@ -53,6 +55,15 @@ class NBAAgent:
         if self.bdl.is_configured:
             sources.append("BallDontLie (advanced stats + injuries)")
         logger.info("Data sources: %s", ", ".join(sources))
+
+        # Log calibrator status
+        cal = self.calibrator
+        if cal.is_active:
+            logger.info("Calibrator ACTIVE: %d bets resolved, adjustments applied", cal.total_resolved)
+        else:
+            remaining = max(0, 200 - cal.total_resolved)
+            logger.info("Calibrator observing: %d/%d bets resolved (%d until active)",
+                        cal.total_resolved, 200, remaining)
 
         self._shutdown = False
         self._last_daily: datetime | None = None
@@ -116,8 +127,8 @@ class NBAAgent:
 
         for market in markets:
             try:
-                # Skip if we already have a position in this market
-                if self.tracker.has_existing_position(market.id):
+                # Skip if we already have a position in this market or game
+                if self.tracker.has_existing_position(market.id, market.slug):
                     continue
 
                 # Evaluate edge
@@ -248,6 +259,19 @@ class NBAAgent:
 
                 logger.info("RESOLVED: %s | %s | P&L=$%.2f | Bankroll=$%.2f",
                             pos.market_question, result, pnl, self.bankroll.current_bankroll)
+
+                # Record in calibrator for self-learning
+                try:
+                    self.calibrator.record_result(
+                        won=(result == "WIN"),
+                        edge=pos.edge_at_entry or 0.05,
+                        confidence=pos.confidence or "LOW",
+                        market_type=pos.market_slug.split("-")[0] if pos.market_slug else "unknown",
+                        side="home" if "home" in (pos.side or "").lower() else "away",
+                        pnl=pnl,
+                    )
+                except Exception as cal_err:
+                    logger.warning("Calibrator record failed: %s", cal_err)
 
             except Exception as e:
                 logger.error("Error resolving position %s: %s", pos.id, e)

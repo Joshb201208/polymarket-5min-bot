@@ -305,6 +305,29 @@ def get_research() -> dict:
 # Health check
 # ---------------------------------------------------------------------------
 
+@app.get("/api/calibration")
+def get_calibration() -> dict:
+    """Return self-learning calibration data."""
+    cal_data = _read_json("calibration.json")
+    if not cal_data:
+        return {
+            "total_resolved": 0, "active": False, "bets_until_active": 200,
+            "edge_buckets": {}, "bet_types": {}, "confidence_tiers": {},
+            "adjustments": {},
+        }
+    return {
+        "total_resolved": cal_data.get("total_resolved", 0),
+        "active": cal_data.get("active", False),
+        "bets_until_active": max(0, 200 - cal_data.get("total_resolved", 0)),
+        "edge_buckets": cal_data.get("edge_buckets", {}),
+        "bet_types": cal_data.get("bet_types", {}),
+        "confidence_tiers": cal_data.get("confidence_tiers", {}),
+        "home_away": cal_data.get("home_away", {}),
+        "vegas_accuracy": cal_data.get("vegas_accuracy", {}),
+        "adjustments": cal_data.get("adjustments", {}),
+    }
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "data_dir": str(DATA_DIR), "exists": DATA_DIR.exists()}

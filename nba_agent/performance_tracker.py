@@ -230,7 +230,18 @@ class PerformanceTracker:
 
         return resolved
 
-    def has_existing_position(self, market_id: str) -> bool:
-        """Check if we already have an open position in this market."""
+    def has_existing_position(self, market_id: str, market_slug: str = "") -> bool:
+        """Check if we already have an open position in this market or game."""
         positions = self.get_open_positions()
-        return any(p.market_id == market_id for p in positions)
+        for p in positions:
+            if p.market_id == market_id:
+                return True
+            # Also check by game slug prefix to prevent duplicate bets on same game
+            # e.g., both "nba-por-den-2026-03-22" positions should be caught
+            if market_slug and p.market_slug:
+                # Extract game identifier (first 3 parts of slug: nba-team-team-date)
+                slug_parts = market_slug.split("-")[:5]  # nba-away-home-YYYY-MM-DD
+                pos_parts = p.market_slug.split("-")[:5]
+                if slug_parts == pos_parts and len(slug_parts) >= 4:
+                    return True
+        return False
