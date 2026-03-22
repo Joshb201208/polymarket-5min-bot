@@ -115,8 +115,8 @@ class Market:
     @property
     def min_edge(self) -> float:
         if self.is_futures_market:
-            return 0.10
-        return 0.07
+            return 0.07  # 7% for futures
+        return 0.04  # 4% for game markets — bet often, learn fast
 
 
 @dataclass

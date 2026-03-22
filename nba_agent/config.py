@@ -31,18 +31,26 @@ class Config:
 
     # Bankroll
     STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "500"))
-    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.05"))
-    MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.08"))
-    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.40"))
+    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.08"))
+    MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.12"))
+    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 
     # Scan intervals (minutes)
-    SCAN_INTERVAL: int = int(os.getenv("SCAN_INTERVAL", "15"))
-    EXIT_CHECK_INTERVAL: int = int(os.getenv("EXIT_CHECK_INTERVAL", "30"))
+    SCAN_INTERVAL: int = int(os.getenv("SCAN_INTERVAL", "10"))
+    EXIT_CHECK_INTERVAL: int = int(os.getenv("EXIT_CHECK_INTERVAL", "20"))
     PRE_TIPOFF_MINUTES: int = int(os.getenv("PRE_TIPOFF_MINUTES", "30"))
 
     # Edge thresholds
-    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.07"))
-    MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.10"))
+    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.04"))
+    MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.07"))
+
+    # External data APIs
+    ODDS_API_KEY: str = os.getenv("ODDS_API_KEY", "")
+    BALLDONTLIE_API_KEY: str = os.getenv("BALLDONTLIE_API_KEY", "")
+    PROXY_HOST: str = os.getenv("PROXY_HOST", "")
+    PROXY_PORT: str = os.getenv("PROXY_PORT", "")
+    PROXY_USER: str = os.getenv("PROXY_USER", "")
+    PROXY_PASS: str = os.getenv("PROXY_PASS", "")
 
     # NBA
     NBA_SEASON: str = os.getenv("NBA_SEASON", "2025-26")

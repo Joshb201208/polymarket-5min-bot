@@ -191,6 +191,7 @@ class NBAResearch:
         # NBA CDN caches
         self._schedule_raw: dict | None = None
         self._schedule_ts: datetime | None = None
+        self._cdn_failed_ts: datetime | None = None  # Track CDN failures
         self._team_games: dict[int, list[dict]] | None = None
         self._team_records: dict[int, dict] | None = None
 
@@ -199,6 +200,7 @@ class NBAResearch:
         self._espn_ts: datetime | None = None
 
         self._cache_ttl = timedelta(hours=2)
+        self._cdn_fail_cooldown = timedelta(minutes=30)  # Don't retry CDN for 30 min after failure
 
     # ── NBA CDN data fetching ──────────────────────────────────────
 
@@ -208,6 +210,10 @@ class NBAResearch:
         if self._schedule_raw and self._schedule_ts and (now - self._schedule_ts) < self._cache_ttl:
             return self._schedule_raw
 
+        # Don't keep retrying CDN if it recently failed
+        if self._cdn_failed_ts and (now - self._cdn_failed_ts) < self._cdn_fail_cooldown:
+            return self._schedule_raw  # None on first failure, stale data otherwise
+
         for attempt in range(2):
             try:
                 resp = httpx.get(_SCHEDULE_URL, headers=_HTTP_HEADERS, timeout=30.0)
@@ -215,6 +221,7 @@ class NBAResearch:
                 data = resp.json()
                 self._schedule_raw = data
                 self._schedule_ts = now
+                self._cdn_failed_ts = None  # Clear failure flag on success
                 self._team_games = None
                 self._team_records = None
                 self._data_source = "nba_cdn"
@@ -225,7 +232,8 @@ class NBAResearch:
                 logger.warning("CDN schedule attempt %d/2 failed: %s", attempt + 1, e)
                 time.sleep(2)
 
-        logger.warning("NBA CDN unavailable — falling back to ESPN")
+        self._cdn_failed_ts = now
+        logger.warning("NBA CDN unavailable — using ESPN only (will retry CDN in 30 min)")
         return None
 
     def _build_team_games(self) -> dict[int, list[dict]]:
@@ -463,8 +471,10 @@ class NBAResearch:
         return ts
 
     def get_team_game_log(self, team_id: int, last_n: int = 10) -> list[dict]:
-        """Get recent game log for a team (CDN only)."""
+        """Get recent game log for a team (CDN only — empty if ESPN-only mode)."""
         team_games = self._build_team_games()
+        if not team_games:
+            return []  # ESPN mode — no game-level data
         games = team_games.get(team_id, [])
         return games[-last_n:] if games else []
 
@@ -473,8 +483,10 @@ class NBAResearch:
         h2h = H2HRecord(team_a_id=team_a_id, team_b_id=team_b_id)
 
         team_games = self._build_team_games()
-        games_a = team_games.get(team_a_id, [])
+        if not team_games:
+            return h2h  # ESPN mode — no H2H data available
 
+        games_a = team_games.get(team_a_id, [])
         matchups = [g for g in games_a if g["opp_id"] == team_b_id]
         for g in matchups:
             if g["won"]:
@@ -492,6 +504,8 @@ class NBAResearch:
     def get_rest_days(self, team_id: int, game_date: str | None = None) -> int:
         """Calculate rest days for a team before a given date."""
         team_games = self._build_team_games()
+        if not team_games:
+            return 1  # ESPN mode — assume 1 day rest
         games = team_games.get(team_id, [])
         if not games:
             return 1

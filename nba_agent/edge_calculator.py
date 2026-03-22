@@ -560,9 +560,9 @@ class EdgeCalculator:
             if research.home_team.rest_days >= 0:
                 data_sources += 1
 
-        if edge > 0.15 and data_sources >= 3:
+        if edge > 0.10 and data_sources >= 3:
             return Confidence.HIGH
-        elif edge > 0.10 and data_sources >= 2:
+        elif edge > 0.06 and data_sources >= 2:
             return Confidence.MEDIUM
         else:
             return Confidence.LOW

@@ -56,7 +56,7 @@ class BankrollManager:
         if odds_against <= 0:
             return 0.0
 
-        kelly_fraction = (edge / odds_against) * 0.25  # Quarter Kelly
+        kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly — aggressive growth for small bankroll
         bet_size = self.current_bankroll * kelly_fraction
 
         # Apply maximum per-bet limit
