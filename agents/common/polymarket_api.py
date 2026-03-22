@@ -173,10 +173,21 @@ def parse_market_data(market: dict) -> dict:
     except (ValueError, IndexError, TypeError):
         yes_price = no_price = None
 
-    # Reject effectively resolved markets (price at 0/1 with closed/not accepting)
+    # If market is closed, mark prices as None (untradeable)
+    if market.get("closed") == True or market.get("closed") == "true":
+        yes_price = None
+        no_price = None
+
+    # If market is explicitly NOT accepting orders, mark as None
+    accepting = market.get("acceptingOrders")
+    if accepting is False or accepting == "false" or accepting == "False":
+        yes_price = None
+        no_price = None
+
+    # Reject effectively resolved markets (price at 0/1)
     if yes_price is not None and (yes_price <= 0.02 or yes_price >= 0.98):
-        if market.get("closed") or not market.get("acceptingOrders", True):
-            yes_price = None  # Mark as untradeable
+        yes_price = None  # Mark as untradeable
+        no_price = None
 
     tokens = market.get("clobTokenIds", "[]")
     if isinstance(tokens, str):

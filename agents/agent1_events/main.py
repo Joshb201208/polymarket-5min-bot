@@ -73,8 +73,8 @@ def run_cycle(bankroll: BankrollManager, executor: Executor):
 
                 # EXECUTE trade on edge > MIN_EDGE_BET (5%)
                 if edge >= config.MIN_EDGE_BET:
-                    # Skip zero/one prices
-                    if price <= 0 or price >= 1:
+                    # HARD REJECT — skip 0c prices and near-resolved
+                    if price is None or price <= 0.03 or price >= 0.97:
                         continue
 
                     # Kelly size the bet using price -> decimal odds

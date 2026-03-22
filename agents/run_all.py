@@ -12,6 +12,7 @@ Threads:
 """
 
 import logging
+import os
 import sys
 import time
 import threading
@@ -137,11 +138,39 @@ def run_daily_backtest():
             time.sleep(60)
 
 
+def _maybe_reset_bankroll():
+    """Reset bankroll once for v3 migration. Uses a flag file to avoid repeated resets."""
+    data_dir = Path(__file__).parent.parent / "data"
+    flag_file = data_dir / ".v3_reset_done"
+    state_file = data_dir / "bankroll_state.json"
+
+    if not flag_file.exists():
+        # Delete existing state to force fresh start
+        if state_file.exists():
+            os.remove(str(state_file))
+            logger.info("Bankroll state reset — starting fresh at $500")
+
+        # Reload bankroll from scratch (will use STARTING_BANKROLL default)
+        bankroll.capital = config.STARTING_BANKROLL
+        bankroll.positions = []
+        bankroll.history = []
+        bankroll.total_pnl = 0.0
+        bankroll.day_pnl = 0.0
+        bankroll.save_state()
+
+        # Create the flag so we don't reset again
+        flag_file.touch()
+        logger.info("v3 reset complete — flag file created")
+
+
 def main():
     """Start all agent threads."""
     # Ensure data and logs directories exist
     (Path(__file__).parent.parent / "data").mkdir(exist_ok=True)
     (Path(__file__).parent.parent / "logs").mkdir(exist_ok=True)
+
+    # One-time bankroll reset for v3
+    _maybe_reset_bankroll()
 
     logger.info("=" * 60)
     logger.info("Polymarket AI Betting Agents v3 — Starting")
@@ -157,7 +186,14 @@ def main():
             bankroll.sync_from_chain(balance)
             logger.info(f"Bankroll synced from chain: ${balance:.2f}")
 
-    telegram.send_startup_message("All Agents v3", executor.mode)
+    # Custom startup message
+    telegram.send_message(
+        "<b>Polymarket AI Agents v3 — Online</b>\n"
+        f"Bankroll: ${bankroll.capital:.2f}\n"
+        f"Mode: <b>{executor.mode.upper()}</b>\n"
+        "Agents: Events, Soccer, NBA\n"
+        "Scanning every 20-45 min."
+    )
 
     threads = [
         threading.Thread(

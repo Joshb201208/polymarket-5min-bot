@@ -124,11 +124,9 @@ def _passes_filters(market: dict, now: datetime) -> bool:
         if excluded in question_lower:
             return False
 
+    # HARD REJECT — price at 0c or near-resolved
     price = market.get("yes_price")
-    if price is None:
-        return False
-    # Explicit zero/one check
-    if price <= 0.02 or price >= 0.98:
+    if price is None or price <= 0.03 or price >= 0.97:
         return False
     if not (config.PRICE_RANGE[0] <= price <= config.PRICE_RANGE[1]):
         return False
@@ -136,10 +134,16 @@ def _passes_filters(market: dict, now: datetime) -> bool:
     if market.get("liquidity", 0) < config.MIN_LIQUIDITY:
         return False
 
+    # Check if market has already ended
     end_date_str = market.get("end_date", "")
     if end_date_str:
         try:
             end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+
+            # REJECT if market already ended
+            if end_date < now:
+                return False
+
             hours_until = (end_date - now).total_seconds() / 3600
             days_until = hours_until / 24
             if days_until > config.MAX_RESOLUTION_DAYS:

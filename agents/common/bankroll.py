@@ -302,6 +302,16 @@ class BankrollManager:
             "win_rate": self._win_rate(),
         }
 
+    def reset(self):
+        """Reset bankroll to starting capital, clear all positions."""
+        self.capital = config.STARTING_BANKROLL
+        self.positions = []
+        self.history = []
+        self.total_pnl = 0.0
+        self.day_pnl = 0.0
+        self.save_state()
+        logger.info(f"Bankroll RESET to ${self.capital:.2f}")
+
     def _win_rate(self) -> float:
         """Calculate win rate from history."""
         if not self.history:
