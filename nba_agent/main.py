@@ -62,10 +62,9 @@ class NBAAgent:
         """Main loop — schedule all recurring tasks."""
         logger.info("NBA Agent starting — mode=%s bankroll=$%.2f", self.config.TRADING_MODE, self.bankroll.current_bankroll)
 
-        await self.telegram.send_startup_message(
-            self.config.TRADING_MODE,
-            self.bankroll.current_bankroll,
-        )
+        # Startup message logged only, not sent to Telegram
+        logger.info("Agent ready — mode=%s bankroll=$%.2f sources=%d markets",
+                    self.config.TRADING_MODE, self.bankroll.current_bankroll, 0)
 
         # Run the main loop
         while not self._shutdown:
@@ -87,8 +86,8 @@ class NBAAgent:
         # 1. Check for early exits on existing positions
         await self._check_exits()
 
-        # 2. Check for resolved positions
-        self._check_resolutions()
+        # 2. Check for resolved positions (auto-collects winnings)
+        await self._check_resolutions()
 
         # 3. Scan for new opportunities
         await self._scan_and_trade()
@@ -160,10 +159,11 @@ class NBAAgent:
                     self.bankroll.current_bankroll -= bet_size
                     self.bankroll.save_state()
 
-                    # Send alert
-                    await self.telegram.send_trade_alert(
-                        position, edge_result, self.bankroll.current_bankroll
-                    )
+                    # Trade alert logged only (daily report handles Telegram)
+                    logger.info("BET PLACED: %s | $%.2f @ %.2f¢ | edge=%.1f%% | conf=%s",
+                                position.market_question, bet_size,
+                                position.entry_price * 100, edge_result.edge * 100,
+                                edge_result.confidence.value)
 
                     # Refresh open positions
                     open_positions = self.tracker.get_open_positions()
@@ -200,28 +200,57 @@ class NBAAgent:
                     pnl = position.pnl or 0
                     self.bankroll.update_bankroll(position.cost + pnl)
 
-                    # Send alert
-                    await self.telegram.send_exit_alert(
-                        position, trade, self.bankroll.current_bankroll
-                    )
-
-                    # Send stop-loss alert if triggered
-                    if self.bankroll.is_paused:
-                        await self.telegram.send_stop_loss_alert(
-                            self.bankroll.current_bankroll,
-                            self.bankroll.peak_bankroll,
-                        )
+                    # Exit alert logged only
+                    logger.info("EXIT: %s | P&L=$%.2f | reason=%s",
+                                position.market_question, position.pnl or 0, reason)
 
             except Exception as e:
                 logger.error("Error checking exit for %s: %s", position.id, e)
 
-    def _check_resolutions(self) -> None:
-        """Check for markets that have ended and resolve positions."""
+    async def _check_resolutions(self) -> None:
+        """Check for markets that have ended and auto-resolve positions."""
         resolved = self.tracker.check_resolved_positions()
         for pos in resolved:
-            # In paper mode, we just log it — we can't easily determine the outcome without
-            # re-querying the market. For now, log that it needs manual review.
-            logger.info("Position %s market has ended — needs resolution: %s", pos.id, pos.market_question)
+            try:
+                # Fetch current price to determine outcome
+                current_price = await self.scanner.get_market_price(pos.token_id)
+                if current_price is None:
+                    # If we can't get price, try to infer from end date passing
+                    # Default: assume loss (conservative) — will be corrected on next check
+                    logger.info("Cannot get price for resolved position %s — will retry", pos.id)
+                    continue
+
+                # Determine win/loss: price near 1.0 = win, near 0.0 = loss
+                if current_price >= 0.90:
+                    # WIN — our side won
+                    payout = pos.shares * 1.0  # Each share pays $1
+                    pnl = payout - pos.cost
+                    result = "WIN"
+                elif current_price <= 0.10:
+                    # LOSS — our side lost
+                    payout = 0.0
+                    pnl = -pos.cost
+                    result = "LOSS"
+                else:
+                    # Still uncertain — skip for now
+                    continue
+
+                # Close the position
+                pos.status = "closed"
+                pos.exit_price = current_price
+                pos.exit_time = utcnow().isoformat()
+                pos.pnl = round(pnl, 2)
+                pos.exit_reason = f"Market resolved: {result}"
+                self.tracker.save_position(pos)
+
+                # Update bankroll — add back cost + P&L
+                self.bankroll.update_bankroll(pos.cost + pnl)
+
+                logger.info("RESOLVED: %s | %s | P&L=$%.2f | Bankroll=$%.2f",
+                            pos.market_question, result, pnl, self.bankroll.current_bankroll)
+
+            except Exception as e:
+                logger.error("Error resolving position %s: %s", pos.id, e)
 
     async def _send_daily_summary(self) -> None:
         """Generate and send daily P&L summary."""
