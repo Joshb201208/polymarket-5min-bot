@@ -36,7 +36,7 @@ class TradingEngine:
                 self.config.CLOB_API_BASE,
                 key=self.config.PRIVATE_KEY,
                 chain_id=137,
-                signature_type=0,
+                signature_type=1,  # POLY_PROXY — Polymarket email/Google login via Magic Link
                 funder=self.config.FUNDER_ADDRESS,
             )
 
