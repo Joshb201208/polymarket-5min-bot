@@ -50,6 +50,10 @@ systemctl enable nba-agent
 systemctl restart nba-agent
 
 # Set up dashboard (nginx + FastAPI)
+# Fix permissions so nginx (www-data) can serve static files from /root/
+chmod 755 /root
+chmod -R 755 /root/polymarket-bot/dashboard/static
+
 cp dashboard/nginx.conf /etc/nginx/sites-available/dashboard
 ln -sf /etc/nginx/sites-available/dashboard /etc/nginx/sites-enabled/dashboard
 rm -f /etc/nginx/sites-enabled/default
