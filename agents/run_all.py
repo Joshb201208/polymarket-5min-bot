@@ -96,9 +96,10 @@ def _daily_summary_loop() -> None:
         if now.hour < target_hour:
             next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
         else:
-            # Tomorrow
-            next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-            next_run = next_run.replace(day=now.day + 1)
+            # Tomorrow — use timedelta to handle month/year rollovers safely
+            from datetime import timedelta
+            tomorrow = now + timedelta(days=1)
+            next_run = tomorrow.replace(hour=target_hour, minute=0, second=0, microsecond=0)
 
         wait_seconds = (next_run - now).total_seconds()
         if wait_seconds < 0:
