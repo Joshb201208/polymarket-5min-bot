@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket AI Betting Agents
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-bot
+ExecStart=/root/polymarket-bot/venv/bin/python -m agents.run_all
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=append:/root/polymarket-bot/logs/agents.log
+StandardError=append:/root/polymarket-bot/logs/agents.log
+
+MemoryMax=256M
+CPUQuota=30%
+
+[Install]
+WantedBy=multi-user.target

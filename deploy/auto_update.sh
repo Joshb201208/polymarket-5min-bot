@@ -52,8 +52,9 @@ if [ -f "$REPO_SERVICE" ] && ! diff -q "$REPO_SERVICE" "$SYSTEM_SERVICE" >/dev/n
     echo "$LOG_PREFIX Service file out of sync — updating and reloading..."
     cp "$REPO_SERVICE" "$SYSTEM_SERVICE" 2>/dev/null || true
     cp "$BOT_DIR/deploy/telegram-commands.service" /etc/systemd/system/ 2>/dev/null || true
+    cp "$BOT_DIR/deploy/agents.service" /etc/systemd/system/polymarket-agents.service 2>/dev/null || true
     systemctl daemon-reload
-    systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
+    systemctl restart polymarket-bot telegram-commands polymarket-agents 2>/dev/null || true
     sleep 3
     echo "$LOG_PREFIX Service file synced and restarted"
 fi
@@ -61,7 +62,7 @@ fi
 if [ "$OLD_HASH" = "$REMOTE_HASH" ]; then
     if ! systemctl is-active --quiet polymarket-bot; then
         echo "$LOG_PREFIX No code updates BUT bot is NOT running — restarting..."
-        systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
+        systemctl restart polymarket-bot telegram-commands polymarket-agents 2>/dev/null || true
         sleep 3
         if systemctl is-active --quiet polymarket-bot; then
             echo "$LOG_PREFIX Bot restarted successfully (was dead)"
@@ -102,11 +103,12 @@ fi
 echo "$LOG_PREFIX Syncing service files..."
 cp "$BOT_DIR/deploy/polymarket-bot.service" /etc/systemd/system/ 2>/dev/null || true
 cp "$BOT_DIR/deploy/telegram-commands.service" /etc/systemd/system/ 2>/dev/null || true
+cp "$BOT_DIR/deploy/agents.service" /etc/systemd/system/polymarket-agents.service 2>/dev/null || true
 systemctl daemon-reload
 
-# Restart both services to pick up new code
+# Restart all services to pick up new code
 echo "$LOG_PREFIX Restarting services..."
-systemctl restart polymarket-bot telegram-commands 2>/dev/null || true
+systemctl restart polymarket-bot telegram-commands polymarket-agents 2>/dev/null || true
 sleep 2
 
 if systemctl is-active --quiet polymarket-bot; then

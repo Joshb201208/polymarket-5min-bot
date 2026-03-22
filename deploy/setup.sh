@@ -79,9 +79,13 @@ sed -i "s|User=root|User=$(whoami)|g" /etc/systemd/system/polymarket-bot.service
 sed "s|/root/polymarket-bot|$BOT_DIR|g" "$BOT_DIR/deploy/telegram-commands.service" > /etc/systemd/system/telegram-commands.service
 sed -i "s|User=root|User=$(whoami)|g" /etc/systemd/system/telegram-commands.service
 
+# AI Betting Agents service
+sed "s|/root/polymarket-bot|$BOT_DIR|g" "$BOT_DIR/deploy/agents.service" > /etc/systemd/system/polymarket-agents.service
+sed -i "s|User=root|User=$(whoami)|g" /etc/systemd/system/polymarket-agents.service
+
 systemctl daemon-reload
-systemctl enable polymarket-bot telegram-commands
-systemctl restart polymarket-bot telegram-commands
+systemctl enable polymarket-bot telegram-commands polymarket-agents
+systemctl restart polymarket-bot telegram-commands polymarket-agents
 
 echo "  Systemd services installed and started ✓"
 
