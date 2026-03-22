@@ -22,7 +22,21 @@ from nba_agent.utils import parse_record
 logger = logging.getLogger(__name__)
 
 # Rate limit delay between nba_api calls
-_API_DELAY = 0.6
+_API_DELAY = 1.0
+
+# Custom headers required by stats.nba.com — without these, cloud/VPS IPs get empty responses
+_NBA_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Host": "stats.nba.com",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
 
 
 def _sleep() -> None:
@@ -105,31 +119,51 @@ class NBAResearch:
         self.season = self.config.NBA_SEASON
         self._standings_cache: list[dict] | None = None
         self._standings_ts: datetime | None = None
+        self._standings_fail_ts: datetime | None = None  # Prevent rapid retries after failure
         self._advanced_cache: dict[int, dict] | None = None
         self._advanced_ts: datetime | None = None
         self._cache_ttl = timedelta(hours=2)
+        self._fail_cooldown = timedelta(minutes=10)  # Wait 10 min before retrying after failure
 
     def get_standings(self) -> list[dict]:
-        """Fetch league standings, cached for 2 hours."""
+        """Fetch league standings, cached for 2 hours. Retries up to 3 times."""
         now = datetime.now(timezone.utc)
         if self._standings_cache and self._standings_ts and (now - self._standings_ts) < self._cache_ttl:
             return self._standings_cache
 
-        try:
-            standings = leaguestandings.LeagueStandings(
-                season=self.season,
-                season_type="Regular Season",
-            )
-            _sleep()
-            df = standings.get_data_frames()[0]
-            records = df.to_dict("records")
-            self._standings_cache = records
-            self._standings_ts = now
-            logger.info("Fetched standings: %d teams", len(records))
-            return records
-        except Exception as e:
-            logger.error("Failed to fetch standings: %s", e)
+        # Don't hammer NBA.com if we just failed — wait 10 min
+        if self._standings_fail_ts and (now - self._standings_fail_ts) < self._fail_cooldown:
             return self._standings_cache or []
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                standings = leaguestandings.LeagueStandings(
+                    season=self.season,
+                    season_type="Regular Season",
+                    headers=_NBA_HEADERS,
+                    timeout=60,
+                )
+                _sleep()
+                df = standings.get_data_frames()[0]
+                records = df.to_dict("records")
+                self._standings_cache = records
+                self._standings_ts = now
+                logger.info("Fetched standings: %d teams", len(records))
+                return records
+            except Exception as e:
+                last_error = e
+                wait = (attempt + 1) * 2
+                logger.warning("Standings fetch attempt %d/3 failed: %s — retrying in %ds", attempt + 1, e, wait)
+                time.sleep(wait)
+
+        self._standings_fail_ts = now
+        logger.error("All 3 standings fetch attempts failed. Last error: %s", last_error)
+        if not self._standings_cache:
+            logger.error("No cached standings available — NBA stats may be blocking this IP. "
+                         "The bot will continue scanning markets but cannot calculate edges. "
+                         "Will retry in 10 minutes.")
+        return self._standings_cache or []
 
     def get_team_stats(self, team_id: int) -> TeamStats | None:
         """Build TeamStats from standings + advanced data."""
@@ -191,6 +225,8 @@ class NBAResearch:
                 season=self.season,
                 measure_type_detailed_defense="Advanced",
                 per_mode_detailed="PerGame",
+                headers=_NBA_HEADERS,
+                timeout=60,
             )
             _sleep()
             df = advanced.get_data_frames()[0]
@@ -205,7 +241,10 @@ class NBAResearch:
     def get_team_game_log(self, team_id: int, last_n: int = 10) -> list[dict]:
         """Get recent game log for a team."""
         try:
-            log = teamgamelog.TeamGameLog(team_id=team_id, season=self.season)
+            log = teamgamelog.TeamGameLog(
+                team_id=team_id, season=self.season,
+                headers=_NBA_HEADERS, timeout=60,
+            )
             _sleep()
             df = log.get_data_frames()[0]
             records = df.head(last_n).to_dict("records")
@@ -223,6 +262,8 @@ class NBAResearch:
                 vs_team_id_nullable=team_b_id,
                 season_nullable=self.season,
                 season_type_nullable="Regular Season",
+                headers=_NBA_HEADERS,
+                timeout=60,
             ).get_data_frames()[0]
             _sleep()
 
