@@ -58,6 +58,8 @@ class PaperTracker:
             edge=edge,
             token_id=token_id,
             reasoning=analysis.get("reasoning", ""),
+            confidence=confidence,
+            fair_probability=analysis.get("fair_probability", 0.0),
         )
 
         # Send Telegram alert
@@ -93,6 +95,7 @@ class PaperTracker:
             if should_exit:
                 entry = position["entry_price"]
                 side = position["side"]
+                confidence = position.get("confidence", "medium")
                 if side == "YES":
                     pnl_pct = (current_price - entry) / entry if entry > 0 else 0
                 else:
@@ -106,14 +109,11 @@ class PaperTracker:
                     pnl_dollars = closed.get("pnl_dollars", 0)
                     closed["pnl_dollars"] = pnl_dollars
 
-                    if pnl_pct > 0:
-                        telegram.alert_early_exit(closed, reason, pnl_pct)
-                    else:
-                        telegram.alert_stop_loss(closed, pnl_pct)
+                    telegram.alert_early_exit(closed, reason, pnl_pct, confidence)
 
                     exits.append(closed)
                     self._save_trade_log(closed, "CLOSED")
-                    logger.info(f"Early exit: {reason} | P&L: ${pnl_dollars:+.2f}")
+                    logger.info(f"Early exit: {reason} | {confidence.upper()} conf | P&L: ${pnl_dollars:+.2f}")
 
         return exits
 

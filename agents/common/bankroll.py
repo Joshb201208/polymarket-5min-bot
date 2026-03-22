@@ -118,7 +118,8 @@ class BankrollManager:
 
     def open_position(self, market_id: str, question: str, side: str,
                       entry_price: float, size: float, edge: float,
-                      token_id: str = "", reasoning: str = "") -> dict:
+                      token_id: str = "", reasoning: str = "",
+                      confidence: str = "medium", fair_probability: float = 0.0) -> dict:
         """Open a new paper position."""
         self._reset_day_pnl_if_needed()
 
@@ -132,6 +133,8 @@ class BankrollManager:
             "size": size,
             "shares": size / entry_price if entry_price > 0 else 0,
             "edge": edge,
+            "confidence": confidence,
+            "fair_probability": fair_probability,
             "token_id": token_id,
             "reasoning": reasoning,
             "status": "OPEN",
@@ -192,37 +195,67 @@ class BankrollManager:
         return "EARLY_EXIT" if "early" in reason else "CLOSED_WIN"
 
     def should_early_exit(self, position: dict, current_price: float) -> tuple[bool, str]:
-        """Check if a position should be sold.
+        """Smart exit logic — confidence determines behavior.
 
-        Exit conditions:
-        1. Price moved 15%+ in our favor -> TAKE PROFIT
-        2. Price moved 20%+ against us -> STOP LOSS
-        3. Resolution within 2 hours and we're profitable -> EXIT
+        Philosophy: Early exit is a TOOL, not the default.
+        - HIGH confidence: Hold to resolution for max payout. Only exit on extreme moves.
+        - MEDIUM confidence: Moderate exit thresholds.
+        - LOW confidence: Quick exits to protect capital.
+        - Any confidence: Exit if edge has decayed (market moved, our thesis broke).
         """
         entry = position["entry_price"]
         side = position["side"]
+        confidence = position.get("confidence", "medium").lower()
 
+        # Calculate current P&L percentage
         if side == "YES":
             pnl_pct = (current_price - entry) / entry if entry > 0 else 0
         else:
             pnl_pct = (entry - current_price) / entry if entry > 0 else 0
 
+        # Get thresholds based on confidence
+        if confidence == "high":
+            tp = config.HIGH_CONF_TAKE_PROFIT
+            sl = config.HIGH_CONF_STOP_LOSS
+        elif confidence == "medium":
+            tp = config.MED_CONF_TAKE_PROFIT
+            sl = config.MED_CONF_STOP_LOSS
+        else:  # low
+            tp = config.LOW_CONF_TAKE_PROFIT
+            sl = config.LOW_CONF_STOP_LOSS
+
         # Take profit
-        if pnl_pct >= config.EARLY_EXIT_PROFIT_PCT:
-            return True, f"TAKE PROFIT (+{pnl_pct:.1%})"
+        if pnl_pct >= tp:
+            return True, f"TAKE PROFIT ({confidence.upper()}: +{pnl_pct:.1%}, threshold {tp:.0%})"
 
         # Stop loss
-        if pnl_pct <= -config.EARLY_EXIT_LOSS_PCT:
-            return True, f"STOP LOSS ({pnl_pct:.1%})"
+        if pnl_pct <= -sl:
+            return True, f"STOP LOSS ({confidence.upper()}: {pnl_pct:.1%}, threshold -{sl:.0%})"
 
-        # Near resolution and profitable
+        # Edge decay check: if original edge was stored, compare to current
+        original_edge = position.get("edge", 0)
+        if original_edge > 0 and current_price > 0:
+            # Recalculate approximate current edge
+            if side == "YES":
+                current_implied = current_price
+                fair_est = position.get("fair_probability", current_price + original_edge)
+                current_edge = fair_est - current_implied
+            else:
+                current_implied = 1 - current_price
+                fair_est = position.get("fair_probability", current_implied + original_edge)
+                current_edge = fair_est - current_implied
+
+            if current_edge < config.EDGE_DECAY_EXIT_THRESHOLD and pnl_pct > 0:
+                return True, f"EDGE DECAY (edge dropped to {current_edge:.1%}, locking in +{pnl_pct:.1%} profit)"
+
+        # Near resolution and profitable — exit regardless of confidence
         end_date_str = position.get("end_date", "")
         if end_date_str and pnl_pct > 0:
             try:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                 hours_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
                 if 0 < hours_left < 2:
-                    return True, f"NEAR RESOLUTION ({hours_left:.1f}h left, +{pnl_pct:.1%})"
+                    return True, f"NEAR RESOLUTION ({hours_left:.1f}h left, locking +{pnl_pct:.1%})"
             except Exception:
                 pass
 

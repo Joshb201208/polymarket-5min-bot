@@ -32,10 +32,31 @@ MIN_LIQUIDITY = 5000       # $5k minimum liquidity
 MIN_VOLUME_24H = 1000      # $1k minimum 24h volume
 PRICE_RANGE = (0.10, 0.90) # Only bet when price between 10c-90c
 
-# ── Early Exit ────────────────────────────────────────────────
-EARLY_EXIT_PROFIT_PCT = 0.15    # Sell if position up 15%+
-EARLY_EXIT_LOSS_PCT = 0.20      # Stop loss at 20%
+# ── Early Exit Strategy (confidence-tiered) ───────────────────
+# Philosophy: Early exit is a TOOL, not the default.
+# HIGH confidence: Hold to resolution — we believe in the edge, collect full payout
+# MEDIUM confidence: Only exit if price moves 25%+ in our favor OR 18% against
+# LOW confidence: More aggressive exits — take profit at 15%, stop loss at 12%
+
 EARLY_EXIT_CHECK_INTERVAL = 1800  # Check every 30 min
+
+# HIGH confidence exits (hold to resolution unless extreme move)
+HIGH_CONF_TAKE_PROFIT = 0.40   # Only sell if up 40%+ (near-certain win, lock it in)
+HIGH_CONF_STOP_LOSS = 0.25     # Only cut if down 25% (something went very wrong)
+HIGH_CONF_HOLD_TO_RESOLUTION = True  # Default: ride it out
+
+# MEDIUM confidence exits
+MED_CONF_TAKE_PROFIT = 0.25    # Sell if up 25%
+MED_CONF_STOP_LOSS = 0.18      # Cut if down 18%
+MED_CONF_HOLD_TO_RESOLUTION = False
+
+# LOW confidence exits (quickest to exit)
+LOW_CONF_TAKE_PROFIT = 0.15    # Sell if up 15%
+LOW_CONF_STOP_LOSS = 0.12      # Cut if down 12%
+LOW_CONF_HOLD_TO_RESOLUTION = False
+
+# Edge decay: if our recalculated edge drops below this, exit regardless of confidence
+EDGE_DECAY_EXIT_THRESHOLD = 0.02  # Exit if edge drops below 2%
 
 # ── Scan Intervals (seconds) ─────────────────────────────────
 SCAN_EVENTS = int(os.getenv("SCAN_EVENTS", "3600"))    # 1 hour

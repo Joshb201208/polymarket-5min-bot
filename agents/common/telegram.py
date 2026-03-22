@@ -80,12 +80,14 @@ def alert_paper_trade(action: str, market: dict, trade: dict) -> bool:
     return send_message(msg)
 
 
-def alert_early_exit(position: dict, reason: str, pnl_pct: float) -> bool:
+def alert_early_exit(position: dict, reason: str, pnl_pct: float,
+                     confidence: str = "medium") -> bool:
     """Alert when selling a position early."""
     emoji = "+" if pnl_pct >= 0 else ""
     msg = (
         f"<b>EARLY EXIT: {reason}</b>\n\n"
         f"{position.get('question', 'Unknown')}\n"
+        f"Confidence: <b>{confidence.upper()}</b>\n"
         f"Entry: {position.get('entry_price', 0):.2f} -> "
         f"Exit: {position.get('current_price', 0):.2f}\n"
         f"P&L: <b>{emoji}{pnl_pct:.1%}</b> "
