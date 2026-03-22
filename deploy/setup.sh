@@ -4,7 +4,7 @@ echo "=== Setting up NBA Polymarket Agent ==="
 
 # Install system packages
 apt-get update -qq
-apt-get install -y python3 python3-pip python3-venv git
+apt-get install -y python3 python3-pip python3-venv git nginx
 
 # Clone repo if not already present
 cd /root
@@ -43,12 +43,28 @@ chmod +x deploy/auto_update.sh
 (crontab -l 2>/dev/null | grep -v auto_update; echo "*/10 * * * * /root/polymarket-bot/deploy/auto_update.sh >> /var/log/auto_update.log 2>&1") | crontab -
 echo "Set up auto-updater cron."
 
-# Set up systemd service
+# Set up systemd service for the agent
 cp deploy/agents.service /etc/systemd/system/nba-agent.service
 systemctl daemon-reload
 systemctl enable nba-agent
 systemctl restart nba-agent
+
+# Set up dashboard (nginx + FastAPI)
+cp dashboard/nginx.conf /etc/nginx/sites-available/dashboard
+ln -sf /etc/nginx/sites-available/dashboard /etc/nginx/sites-enabled/dashboard
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl restart nginx
+echo "Configured nginx for dashboard."
+
+cp dashboard/dashboard.service /etc/systemd/system/nba-dashboard.service
+systemctl daemon-reload
+systemctl enable nba-dashboard
+systemctl restart nba-dashboard
+echo "Started dashboard API service."
+
 echo ""
-echo "=== Setup complete! Agent is running. ==="
-echo "Check status: systemctl status nba-agent"
-echo "View logs:    journalctl -u nba-agent -f"
+echo "=== Setup complete! Agent + Dashboard running. ==="
+echo "Check agent:     systemctl status nba-agent"
+echo "Check dashboard:  systemctl status nba-dashboard"
+echo "View agent logs:  journalctl -u nba-agent -f"
+echo "Dashboard URL:    http://144.126.192.118/"

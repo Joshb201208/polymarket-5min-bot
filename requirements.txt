@@ -3,3 +3,5 @@ py-clob-client>=0.15
 httpx>=0.24
 feedparser>=6.0
 python-dotenv>=1.0
+fastapi
+uvicorn[standard]

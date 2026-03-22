@@ -1,0 +1,15 @@
+[Unit]
+Description=NBA Agent Dashboard API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-bot
+ExecStart=/root/polymarket-bot/venv/bin/uvicorn dashboard.api:app --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

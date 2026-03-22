@@ -8,5 +8,6 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     git reset --hard origin/master
     venv/bin/pip install -r requirements.txt --quiet
     systemctl restart nba-agent
-    echo "$(date): Update complete"
+    systemctl restart nba-dashboard
+    echo "$(date): Update complete (agent + dashboard restarted)"
 fi
