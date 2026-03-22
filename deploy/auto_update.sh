@@ -6,7 +6,7 @@ REMOTE=$(git rev-parse origin/master)
 if [ "$LOCAL" != "$REMOTE" ]; then
     echo "$(date): New code detected, updating..."
     git reset --hard origin/master
-    pip install -r requirements.txt --quiet
+    venv/bin/pip install -r requirements.txt --quiet
     systemctl restart nba-agent
     echo "$(date): Update complete"
 fi

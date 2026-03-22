@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
-ExecStart=/usr/bin/python3 -m nba_agent.main
+ExecStart=/root/polymarket-bot/venv/bin/python -m nba_agent.main
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1
