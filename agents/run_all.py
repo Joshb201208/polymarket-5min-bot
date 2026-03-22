@@ -1,13 +1,14 @@
 """
-Orchestrator — Runs all agents on schedule.
+Orchestrator — Runs all agents on schedule with shared executor.
 
 Threads:
-1. Agent 1 (Events): every 1 hour
-2. Agent 2 (Soccer): every 30 minutes
-3. Agent 3 (NBA): every 30 minutes
+1. Agent 1 (Events): every 45 minutes
+2. Agent 2 (Soccer): every 20 minutes
+3. Agent 3 (NBA): every 20 minutes
 4. Early Exit Monitor: every 30 minutes
-5. Daily Summary: at 16:00 UTC (midnight SGT)
-6. Backtest Runner: once per day at 08:00 UTC (4pm SGT)
+5. Redemption Check: every 30 minutes
+6. Daily Summary: at 16:00 UTC (midnight SGT)
+7. Backtest Runner: once per day at 08:00 UTC (4pm SGT)
 """
 
 import logging
@@ -36,6 +37,7 @@ from agents.common import telegram
 from agents.common.bankroll import BankrollManager
 from agents.common.paper_tracker import PaperTracker
 from agents.common.backtester import Backtester
+from agents.common.executor import Executor
 from agents.agent1_events import main as agent1
 from agents.agent2_soccer import main as agent2
 from agents.agent3_nba import main as agent3
@@ -44,14 +46,17 @@ from agents.agent3_nba import main as agent3
 bankroll = BankrollManager()
 paper_tracker = PaperTracker(bankroll)
 backtester = Backtester()
+executor = Executor()
+
+shutdown = False
 
 
 def run_agent_loop(name: str, run_fn, interval: int):
     """Run an agent on a fixed interval."""
-    while True:
+    while not shutdown:
         try:
             logger.info(f"--- {name} cycle starting ---")
-            run_fn(bankroll, paper_tracker)
+            run_fn(bankroll, executor)
             logger.info(f"--- {name} cycle complete, sleeping {interval}s ---")
         except Exception as e:
             logger.error(f"{name} error: {e}", exc_info=True)
@@ -60,7 +65,7 @@ def run_agent_loop(name: str, run_fn, interval: int):
 
 def run_early_exit_monitor():
     """Monitor open positions for early exit conditions."""
-    while True:
+    while not shutdown:
         try:
             exits = paper_tracker.check_early_exits()
             if exits:
@@ -71,9 +76,35 @@ def run_early_exit_monitor():
         time.sleep(config.EARLY_EXIT_CHECK_INTERVAL)
 
 
+def run_redemption_check():
+    """Check for resolved markets and redeem winnings every 30 minutes."""
+    while not shutdown:
+        try:
+            _check_and_redeem_resolved()
+        except Exception as e:
+            logger.error(f"Redemption check error: {e}", exc_info=True)
+        time.sleep(1800)  # every 30 min
+
+
+def _check_and_redeem_resolved():
+    """Check open positions for resolved markets and redeem."""
+    for position in list(bankroll.positions):
+        if position["status"] != "OPEN":
+            continue
+        condition_id = position.get("condition_id", "")
+        if not condition_id:
+            continue
+        try:
+            result = executor.redeem(condition_id)
+            if result.get("success"):
+                logger.info(f"Redemption attempted for {position['question'][:50]}")
+        except Exception as e:
+            logger.debug(f"Redemption check failed for {condition_id}: {e}")
+
+
 def run_daily_summary():
     """Send daily summary at 16:00 UTC (midnight SGT)."""
-    while True:
+    while not shutdown:
         now = datetime.now(timezone.utc)
         # Target: 16:00 UTC
         if now.hour == 16 and now.minute < 5:
@@ -92,7 +123,7 @@ def run_daily_summary():
 
 def run_daily_backtest():
     """Run backtests at 08:00 UTC (4pm SGT)."""
-    while True:
+    while not shutdown:
         now = datetime.now(timezone.utc)
         if now.hour == 8 and now.minute < 5:
             try:
@@ -113,13 +144,20 @@ def main():
     (Path(__file__).parent.parent / "logs").mkdir(exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("Polymarket AI Betting Agents v2 — Starting")
-    logger.info(f"Bankroll: ${config.STARTING_BANKROLL:.2f}")
-    logger.info(f"Mode: {config.TRADING_MODE}")
+    logger.info("Polymarket AI Betting Agents v3 — Starting")
+    logger.info(f"Bankroll: ${bankroll.capital:.2f}")
+    logger.info(f"Mode: {executor.mode.upper()}")
     logger.info(f"Scan intervals: Events={config.SCAN_EVENTS}s, Soccer={config.SCAN_SOCCER}s, NBA={config.SCAN_NBA}s")
     logger.info("=" * 60)
 
-    telegram.send_startup_message("All Agents v2")
+    # Sync bankroll from chain on startup if live
+    if executor.mode == "live":
+        balance = executor.get_balance()
+        if balance > 0:
+            bankroll.sync_from_chain(balance)
+            logger.info(f"Bankroll synced from chain: ${balance:.2f}")
+
+    telegram.send_startup_message("All Agents v3", executor.mode)
 
     threads = [
         threading.Thread(
@@ -144,6 +182,11 @@ def main():
             target=run_early_exit_monitor,
             daemon=True,
             name="early-exit-monitor",
+        ),
+        threading.Thread(
+            target=run_redemption_check,
+            daemon=True,
+            name="redemption-check",
         ),
         threading.Thread(
             target=run_daily_summary,

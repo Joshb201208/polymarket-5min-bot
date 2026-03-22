@@ -1,6 +1,6 @@
 """
 Bankroll management with Kelly criterion sizing and early exit logic.
-The money engine — manages the $500 bankroll.
+The money engine — manages the bankroll.
 """
 
 import json
@@ -108,7 +108,7 @@ class BankrollManager:
         bet = fraction_kelly * available
         bet = max(bet, config.MIN_BET) if bet > 0 else 0
         bet = min(bet, config.MAX_BET)
-        bet = min(bet, available * config.MAX_SINGLE_BET_PCT / 0.10)  # 10% max
+        bet = min(bet, available * config.MAX_SINGLE_BET_PCT)
         bet = min(bet, available)  # Can't bet more than we have
 
         if bet < config.MIN_BET:
@@ -116,11 +116,29 @@ class BankrollManager:
 
         return round(bet, 2)
 
+    def kelly_from_price(self, edge: float, price: float, confidence: str = "medium") -> float:
+        """Kelly sizing from a market price (convenience wrapper).
+
+        Converts price to decimal odds and delegates to kelly_size().
+        """
+        if price <= 0 or price >= 1:
+            return 0.0
+        decimal_odds = 1.0 / price
+        return self.kelly_size(edge, decimal_odds, confidence)
+
+    def sync_from_chain(self, balance: float):
+        """Update capital from on-chain balance."""
+        if balance > 0:
+            self.capital = balance
+            self.save_state()
+            logger.info(f"Bankroll synced from chain: ${balance:.2f}")
+
     def open_position(self, market_id: str, question: str, side: str,
                       entry_price: float, size: float, edge: float,
                       token_id: str = "", reasoning: str = "",
-                      confidence: str = "medium", fair_probability: float = 0.0) -> dict:
-        """Open a new paper position."""
+                      confidence: str = "medium", fair_probability: float = 0.0,
+                      end_date: str = "") -> dict:
+        """Open a new position."""
         self._reset_day_pnl_if_needed()
 
         position = {
@@ -137,6 +155,7 @@ class BankrollManager:
             "fair_probability": fair_probability,
             "token_id": token_id,
             "reasoning": reasoning,
+            "end_date": end_date,
             "status": "OPEN",
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "closed_at": None,

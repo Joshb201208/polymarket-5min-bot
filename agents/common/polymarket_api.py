@@ -3,6 +3,7 @@ Polymarket API client — Gamma (events/markets) + CLOB (prices/trading).
 All public endpoints, no authentication needed for read-only.
 """
 
+import json
 import logging
 import httpx
 from typing import Optional
@@ -146,25 +147,46 @@ def get_trades(condition_id: str, limit: int = 50) -> list[dict]:
 
 # ── Helpers ───────────────────────────────────────────────────
 
+def get_token_ids(market_raw: dict) -> tuple[str, str]:
+    """Return (yes_token_id, no_token_id) from a raw Gamma market."""
+    raw = market_raw.get("clobTokenIds", "[]")
+    if isinstance(raw, str):
+        try:
+            tokens = json.loads(raw)
+        except Exception:
+            tokens = []
+    else:
+        tokens = list(raw)
+    yes_id = tokens[0] if len(tokens) > 0 else ""
+    no_id = tokens[1] if len(tokens) > 1 else ""
+    return yes_id, no_id
+
+
 def parse_market_data(market: dict) -> dict:
     """Extract key fields from a Gamma market object."""
     try:
         outcome_prices = market.get("outcomePrices", "[]")
         if isinstance(outcome_prices, str):
-            import json
             outcome_prices = json.loads(outcome_prices)
         yes_price = float(outcome_prices[0]) if outcome_prices else None
         no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else None
     except (ValueError, IndexError, TypeError):
         yes_price = no_price = None
 
+    # Reject effectively resolved markets (price at 0/1 with closed/not accepting)
+    if yes_price is not None and (yes_price <= 0.02 or yes_price >= 0.98):
+        if market.get("closed") or not market.get("acceptingOrders", True):
+            yes_price = None  # Mark as untradeable
+
     tokens = market.get("clobTokenIds", "[]")
     if isinstance(tokens, str):
-        import json
         try:
             tokens = json.loads(tokens)
         except Exception:
             tokens = []
+
+    yes_token = tokens[0] if len(tokens) > 0 else ""
+    no_token = tokens[1] if len(tokens) > 1 else ""
 
     return {
         "id": market.get("id", ""),
@@ -178,10 +200,15 @@ def parse_market_data(market: dict) -> dict:
         "end_date": market.get("endDate", ""),
         "active": market.get("active", False),
         "closed": market.get("closed", False),
+        "accepting_orders": market.get("acceptingOrders", True),
         "slug": market.get("slug", ""),
         "event_slug": market.get("eventSlug", ""),
         "condition_id": market.get("conditionId", ""),
         "token_ids": tokens,
+        "yes_token": yes_token,
+        "no_token": no_token,
+        "neg_risk": market.get("negRisk", False),
+        "tick_size": str(market.get("orderPriceMinTickSize", 0.01)),
         "one_day_change": float(market.get("oneDayPriceChange", 0) or 0),
         "one_week_change": float(market.get("oneWeekPriceChange", 0) or 0),
         "tags": market.get("tags", []),

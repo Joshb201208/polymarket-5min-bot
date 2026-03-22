@@ -1,5 +1,5 @@
 """
-All configuration for Polymarket AI Betting Agents v2.
+All configuration for Polymarket AI Betting Agents v3.
 Loads from environment variables with sensible defaults.
 """
 
@@ -18,19 +18,19 @@ CLOB_API = "https://clob.polymarket.com"
 
 # ── Bankroll ──────────────────────────────────────────────────
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "500.0"))
-MIN_EDGE = 0.05            # 5% minimum edge to alert
-MIN_EDGE_BET = 0.07        # 7% minimum to actually "paper bet"
-MAX_SINGLE_BET_PCT = 0.10  # Max 10% of bankroll per bet ($50 on $500)
+MIN_EDGE = 0.04            # 4% minimum edge to alert
+MIN_EDGE_BET = 0.05        # 5% minimum to actually bet
+MAX_SINGLE_BET_PCT = 0.15  # Max 15% of bankroll per bet
 KELLY_FRACTION = 0.25      # Quarter Kelly (conservative)
 MIN_BET = 5.0              # Minimum $5 bet
 MAX_BET = 75.0             # Hard cap
 
-# ── Market Filters ────────────────────────────────────────────
+# ── Market Filters — BIG MARKETS ONLY ────────────────────────
 MAX_RESOLUTION_DAYS = 120  # 4 months max — we can sell early for profit
 MIN_RESOLUTION_HOURS = 2   # Don't bet on markets closing in <2 hours
-MIN_LIQUIDITY = 5000       # $5k minimum liquidity
-MIN_VOLUME_24H = 1000      # $1k minimum 24h volume
-PRICE_RANGE = (0.10, 0.90) # Only bet when price between 10c-90c
+MIN_LIQUIDITY = 10000      # $10K minimum liquidity (was $5K)
+MIN_VOLUME_24H = 5000      # $5K minimum 24h volume (was $1K)
+PRICE_RANGE = (0.05, 0.95) # Wider range for futures markets
 
 # ── Early Exit Strategy (confidence-tiered) ───────────────────
 # Philosophy: Early exit is a TOOL, not the default.
@@ -58,10 +58,10 @@ LOW_CONF_HOLD_TO_RESOLUTION = False
 # Edge decay: if our recalculated edge drops below this, exit regardless of confidence
 EDGE_DECAY_EXIT_THRESHOLD = 0.02  # Exit if edge drops below 2%
 
-# ── Scan Intervals (seconds) ─────────────────────────────────
-SCAN_EVENTS = int(os.getenv("SCAN_EVENTS", "3600"))    # 1 hour
-SCAN_SOCCER = int(os.getenv("SCAN_SOCCER", "1800"))    # 30 min
-SCAN_NBA = int(os.getenv("SCAN_NBA", "1800"))          # 30 min
+# ── Scan Intervals (seconds) — more frequent ─────────────────
+SCAN_EVENTS = int(os.getenv("SCAN_EVENTS", "2700"))    # 45 minutes (was 1 hour)
+SCAN_SOCCER = int(os.getenv("SCAN_SOCCER", "1200"))    # 20 minutes (was 30 min)
+SCAN_NBA = int(os.getenv("SCAN_NBA", "1200"))          # 20 minutes (was 30 min)
 
 # ── Market Cooldown ───────────────────────────────────────────
 COOLDOWN_HOURS = 4  # Re-analyze same market after 4 hours

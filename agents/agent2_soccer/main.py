@@ -1,6 +1,6 @@
 """
 Agent 2 Main — Soccer agent entry point.
-Scans for soccer match markets and researches them for statistical edge.
+Scans for major league soccer markets and EXECUTES trades via executor.
 """
 
 import logging
@@ -10,18 +10,26 @@ from datetime import datetime, timezone, timedelta
 from agents.common import config
 from agents.common import telegram
 from agents.common.bankroll import BankrollManager
-from agents.common.paper_tracker import PaperTracker
+from agents.common.executor import Executor
 from .scanner import scan_soccer_markets
 from .researcher import research_market
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "Soccer"
+
 _analyzed_cache: dict[str, datetime] = {}
 
 
-def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
+def run_cycle(bankroll: BankrollManager, executor: Executor):
     """Run one analysis cycle for soccer markets."""
     logger.info("=== Agent 2 (Soccer): Starting scan ===")
+
+    # Sync bankroll from chain if live
+    if executor.mode == "live":
+        balance = executor.get_balance()
+        if balance > 0:
+            bankroll.sync_from_chain(balance)
 
     markets = scan_soccer_markets()
 
@@ -43,14 +51,71 @@ def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
             analyzed += 1
 
             if analysis:
-                opportunities += 1
                 edge = analysis["edge"]
+                price = analysis["price"]
+                side = analysis["side"]
+                confidence = analysis.get("confidence", "medium")
 
-                if edge >= config.MIN_EDGE:
-                    telegram.alert_opportunity("Soccer", market, analysis)
+                # Alert on edge between MIN_EDGE and MIN_EDGE_BET
+                if edge >= config.MIN_EDGE and edge < config.MIN_EDGE_BET:
+                    telegram.alert_opportunity(AGENT_NAME, market, analysis)
 
+                # EXECUTE trade on edge > MIN_EDGE_BET
                 if edge >= config.MIN_EDGE_BET:
-                    paper_tracker.place_trade(market, analysis)
+                    if price <= 0 or price >= 1:
+                        continue
+
+                    # Kelly size with proper decimal odds conversion
+                    decimal_odds = 1.0 / price
+                    bet_size = bankroll.kelly_size(edge, decimal_odds, confidence)
+
+                    if bet_size < config.MIN_BET:
+                        continue
+                    if bet_size > bankroll.available_capital():
+                        bet_size = bankroll.available_capital()
+                    if bet_size < config.MIN_BET:
+                        continue
+
+                    # Get token ID
+                    token_id = market.get("yes_token") if side == "YES" else market.get("no_token")
+                    if not token_id:
+                        continue
+
+                    # EXECUTE THE TRADE
+                    order = executor.place_buy(
+                        token_id, price, bet_size,
+                        neg_risk=market.get("neg_risk", False),
+                    )
+
+                    if order.get("success"):
+                        bankroll.open_position(
+                            market_id=market.get("slug", market_id),
+                            question=market.get("question", ""),
+                            side=side,
+                            entry_price=price,
+                            size=bet_size,
+                            edge=edge,
+                            token_id=token_id,
+                            confidence=confidence,
+                            fair_probability=analysis.get("fair_probability", 0),
+                            end_date=market.get("end_date", ""),
+                        )
+
+                        telegram.send_trade_executed(
+                            agent_name=AGENT_NAME,
+                            question=market.get("question", ""),
+                            side=side,
+                            price=price,
+                            size=bet_size,
+                            edge=edge,
+                            confidence=confidence,
+                            reasoning=analysis.get("reasoning", ""),
+                            mode=executor.mode,
+                            order_id=order.get("order_id", ""),
+                            balance=bankroll.available_capital(),
+                            url=market.get("url", ""),
+                        )
+                        opportunities += 1
 
             time.sleep(1)  # Rate limit
         except Exception as e:
@@ -59,7 +124,7 @@ def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
         if analyzed >= 10:
             break
 
-    logger.info(f"Agent 2 done: {analyzed} analyzed, {opportunities} opportunities")
+    logger.info(f"Agent 2 done: {analyzed} analyzed, {opportunities} trades executed")
     _clean_cache()
 
 

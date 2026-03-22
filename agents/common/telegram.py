@@ -1,6 +1,6 @@
 """
 Telegram alerts with rich formatting.
-Supports: opportunity alerts, early exit, stop loss, backtest reports, position updates, daily summary.
+Supports: trade execution alerts, early exit, stop loss, backtest reports, position updates, daily summary.
 """
 
 import logging
@@ -43,26 +43,56 @@ def send_message(text: str, parse_mode: str = "HTML") -> bool:
 
 # ── Alert Types ───────────────────────────────────────────────
 
+def send_trade_executed(agent_name: str, question: str, side: str,
+                        price: float, size: float, edge: float,
+                        confidence: str, reasoning, mode: str,
+                        order_id: str = "", balance: float = 0,
+                        url: str = "") -> bool:
+    """Alert for an executed trade (paper or live)."""
+    # Format reasoning
+    if isinstance(reasoning, list):
+        reasoning_text = "\n".join(reasoning)
+    else:
+        reasoning_text = str(reasoning)[:300]
+
+    price_cents = int(price * 100)
+    msg = (
+        f"<b>TRADE EXECUTED [{agent_name}]</b>\n\n"
+        f"<b>{question}</b>\n"
+        f"BUY {side} @ {price_cents}c | ${size:.2f}\n\n"
+        f"Edge: <b>{edge:.1%}</b> | Confidence: <b>{confidence.upper()}</b>\n\n"
+        f"<i>{reasoning_text[:300]}</i>\n\n"
+        f"Mode: <b>{mode.upper()}</b>"
+    )
+    if order_id:
+        msg += f" | Order: {order_id[:12]}"
+    msg += f"\nBalance: ${balance:.2f} remaining"
+    if url:
+        msg += f"\n{url}"
+    return send_message(msg)
+
+
 def alert_opportunity(agent: str, market: dict, analysis: dict) -> bool:
-    """Alert for a detected betting opportunity."""
+    """Alert for a detected betting opportunity (below bet threshold)."""
     side = analysis.get("side", "YES")
     price = analysis.get("price", 0)
     fair_prob = analysis.get("fair_probability", 0)
     edge = analysis.get("edge", 0)
-    bet_size = analysis.get("bet_size", 0)
     confidence = analysis.get("confidence", "medium")
     reasoning = analysis.get("reasoning", "")
     url = market.get("url", "")
 
+    if isinstance(reasoning, list):
+        reasoning = "\n".join(reasoning)
+
     msg = (
-        f"<b>NEW OPPORTUNITY [{agent}]</b>\n\n"
+        f"<b>EDGE DETECTED [{agent}]</b>\n\n"
         f"<b>{market.get('question', 'Unknown')}</b>\n"
         f"Side: <b>{side}</b> @ {price:.0%}\n"
         f"Fair value: {fair_prob:.0%} | Edge: <b>{edge:.1%}</b>\n"
-        f"Bet size: <b>${bet_size:.2f}</b> ({confidence})\n"
-        f"Liquidity: ${market.get('liquidity', 0):,.0f}\n"
-        f"Resolves: {market.get('end_date', 'Unknown')}\n\n"
-        f"<i>{reasoning[:300]}</i>\n\n"
+        f"Confidence: {confidence}\n"
+        f"Liquidity: ${market.get('liquidity', 0):,.0f}\n\n"
+        f"<i>{str(reasoning)[:300]}</i>\n\n"
         f"{url}"
     )
     return send_message(msg)
@@ -160,11 +190,12 @@ def send_daily_summary(bankroll: dict, positions: list, day_pnl: float) -> bool:
     return send_message(msg)
 
 
-def send_startup_message(agent_name: str) -> bool:
+def send_startup_message(agent_name: str, mode: str = "") -> bool:
     """Send startup notification."""
+    trading_mode = mode or config.TRADING_MODE
     msg = (
         f"<b>AGENT STARTED: {agent_name}</b>\n"
         f"Bankroll: ${config.STARTING_BANKROLL:.2f}\n"
-        f"Mode: {config.TRADING_MODE}\n"
+        f"Mode: <b>{trading_mode.upper()}</b>\n"
     )
     return send_message(msg)

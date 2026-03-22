@@ -2,7 +2,7 @@
 Agent 1 Researcher — Deep research on general event markets.
 
 STRATEGY: Find SHORT-TERM markets where news creates mispricing.
-Target: Markets resolving in 1-14 days with >7% edge.
+Target: Markets resolving in 1-14 days with >4% edge, bet at 5%+.
 
 Research pipeline:
 1. Parse market question + description + resolution criteria
@@ -14,6 +14,9 @@ Research pipeline:
 7. Crowd efficiency discount (high-volume = efficient pricing)
 8. Calculate fair probability and edge
 9. Kelly size the bet
+
+FIX: Variable edges — sentiment/momentum produce RANGE of edges,
+not flat 8% everywhere.
 """
 
 import logging
@@ -58,7 +61,7 @@ def research_market(market: dict) -> dict | None:
     sentiment = news_data.get("sentiment", 0)
     news_count = news_data.get("total_articles", 0)
 
-    # 6. Calculate fair probability
+    # 6. Calculate fair probability — VARIABLE edges
     fair_prob = _calculate_fair_probability(
         yes_price, sentiment, momentum, volume_signal, time_factor, news_count
     )
@@ -156,26 +159,38 @@ def _calculate_fair_probability(yes_price: float, sentiment: float,
     """Calculate our fair probability estimate.
 
     Start from market price, then adjust based on signals.
+    FIX: Variable adjustments instead of flat 8%.
     """
     fair = yes_price
 
-    # Sentiment adjustment (max +/- 8%)
-    fair += sentiment * 0.08
+    # Article count factor — more articles = stronger signal
+    article_count_factor = min(news_count / 10, 1.5) if news_count > 0 else 0.5
+    base_rate = 0.12  # Events base rate (higher than sports)
 
-    # Momentum: if price is trending, slight continuation bias
-    fair += momentum * 0.03
+    # Sentiment adjustment — VARIABLE based on article count
+    sentiment_adj = sentiment * article_count_factor * base_rate
+    fair += sentiment_adj
+
+    # Momentum: 1-day price change weighted
+    one_day_adj = momentum * 0.5
+    fair += one_day_adj * 0.03
+
+    # 1-week momentum adds smaller component
+    fair += momentum * 0.3 * 0.02
 
     # Volume surge with momentum = stronger signal
     if volume_signal > 0.3 and abs(momentum) > 0.3:
-        fair += momentum * volume_signal * 0.05
+        surge_bonus = 0.02 + (volume_signal * abs(momentum) * 0.03)
+        surge_bonus = min(surge_bonus, 0.05)
+        fair += surge_bonus if momentum > 0 else -surge_bonus
 
     # Time decay boost
     fair += time_factor
 
-    # Crowd efficiency discount: high-volume markets are more efficient
-    # Reduce our adjustment for very liquid markets
+    # Fewer articles = less certainty → reduce adjustment magnitude
     if news_count < 3:
-        fair *= 0.98  # Less news = less certain
+        # Pull back toward market price
+        fair = yes_price + (fair - yes_price) * 0.7
 
     # Clamp
     return max(0.05, min(0.95, fair))
@@ -191,10 +206,10 @@ def _assess_confidence(edge: float, news_count: int,
     elif edge > 0.10:
         score += 1
 
-    if news_count >= 5:
-        score += 1
-    elif news_count >= 10:
+    if news_count >= 10:
         score += 2
+    elif news_count >= 5:
+        score += 1
 
     if abs(momentum) > 0.5:
         score += 1

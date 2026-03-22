@@ -1,6 +1,6 @@
 """
 Agent 1 Main — Events agent entry point.
-Scans for short-term event markets and researches them for edge.
+Scans for high-quality event markets and EXECUTES trades via executor.
 """
 
 import logging
@@ -10,19 +10,27 @@ from datetime import datetime, timezone, timedelta
 from agents.common import config
 from agents.common import telegram
 from agents.common.bankroll import BankrollManager
-from agents.common.paper_tracker import PaperTracker
+from agents.common.executor import Executor
 from .scanner import scan_event_markets, scan_volume_surges
 from .researcher import research_market
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "Events"
+
 # Track recently analyzed markets to avoid re-analysis
 _analyzed_cache: dict[str, datetime] = {}
 
 
-def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
+def run_cycle(bankroll: BankrollManager, executor: Executor):
     """Run one analysis cycle for event markets."""
     logger.info("=== Agent 1 (Events): Starting scan ===")
+
+    # Sync bankroll from chain if live
+    if executor.mode == "live":
+        balance = executor.get_balance()
+        if balance > 0:
+            bankroll.sync_from_chain(balance)
 
     # Scan for qualifying markets
     markets = scan_event_markets()
@@ -54,16 +62,74 @@ def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
             analyzed += 1
 
             if analysis:
-                opportunities += 1
                 edge = analysis["edge"]
+                price = analysis["price"]
+                side = analysis["side"]
+                confidence = analysis.get("confidence", "medium")
 
-                # Alert on any edge > MIN_EDGE (5%)
-                if edge >= config.MIN_EDGE:
-                    telegram.alert_opportunity("Events", market, analysis)
+                # Alert on any edge > MIN_EDGE (4%)
+                if edge >= config.MIN_EDGE and edge < config.MIN_EDGE_BET:
+                    telegram.alert_opportunity(AGENT_NAME, market, analysis)
 
-                # Paper trade on edge > MIN_EDGE_BET (7%)
+                # EXECUTE trade on edge > MIN_EDGE_BET (5%)
                 if edge >= config.MIN_EDGE_BET:
-                    paper_tracker.place_trade(market, analysis)
+                    # Skip zero/one prices
+                    if price <= 0 or price >= 1:
+                        continue
+
+                    # Kelly size the bet using price -> decimal odds
+                    decimal_odds = 1.0 / price
+                    bet_size = bankroll.kelly_size(edge, decimal_odds, confidence)
+
+                    if bet_size < config.MIN_BET:
+                        continue
+                    if bet_size > bankroll.available_capital():
+                        bet_size = bankroll.available_capital()
+                    if bet_size < config.MIN_BET:
+                        continue
+
+                    # Get token ID
+                    token_id = market.get("yes_token") if side == "YES" else market.get("no_token")
+                    if not token_id:
+                        continue
+
+                    # EXECUTE THE TRADE
+                    order = executor.place_buy(
+                        token_id, price, bet_size,
+                        neg_risk=market.get("neg_risk", False),
+                    )
+
+                    if order.get("success"):
+                        # Track in bankroll
+                        bankroll.open_position(
+                            market_id=market.get("slug", market_id),
+                            question=market.get("question", ""),
+                            side=side,
+                            entry_price=price,
+                            size=bet_size,
+                            edge=edge,
+                            token_id=token_id,
+                            confidence=confidence,
+                            fair_probability=analysis.get("fair_probability", 0),
+                            end_date=market.get("end_date", ""),
+                        )
+
+                        # Send Telegram confirmation
+                        telegram.send_trade_executed(
+                            agent_name=AGENT_NAME,
+                            question=market.get("question", ""),
+                            side=side,
+                            price=price,
+                            size=bet_size,
+                            edge=edge,
+                            confidence=confidence,
+                            reasoning=analysis.get("reasoning", ""),
+                            mode=executor.mode,
+                            order_id=order.get("order_id", ""),
+                            balance=bankroll.available_capital(),
+                            url=market.get("url", ""),
+                        )
+                        opportunities += 1
 
             time.sleep(0.5)  # Rate limit between markets
         except Exception as e:
@@ -73,7 +139,7 @@ def run_cycle(bankroll: BankrollManager, paper_tracker: PaperTracker):
         if analyzed >= 15:
             break
 
-    logger.info(f"Agent 1 done: {analyzed} analyzed, {opportunities} opportunities")
+    logger.info(f"Agent 1 done: {analyzed} analyzed, {opportunities} trades executed")
 
     # Clean old cache entries
     _clean_cache()

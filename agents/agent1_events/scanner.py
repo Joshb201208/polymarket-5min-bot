@@ -1,6 +1,7 @@
 """
-Agent 1 Scanner — Find short-term event markets on Polymarket.
-Targets markets resolving in 1-14 days with sufficient liquidity.
+Agent 1 Scanner — Find HIGH QUALITY event markets on Polymarket.
+Targets: politics, geopolitics, crypto, major world events.
+Explicitly EXCLUDES all sports (handled by agents 2 and 3).
 """
 
 import logging
@@ -11,21 +12,32 @@ from agents.common import polymarket_api as pm
 
 logger = logging.getLogger(__name__)
 
-# Tags to search for short-term event markets
+# Tags to search — politics, crypto, world events only
 EVENT_TAGS = [
-    "politics", "crypto", "science", "sports",
-    "pop-culture", "business", "world",
+    "politics", "crypto", "science",
+    "business", "world",
+]
+
+# Explicitly EXCLUDE these keywords from event markets
+EXCLUDED_KEYWORDS = [
+    "ncaa", "college", "march madness", "basketball", "soccer", "football",
+    "premier league", "champions league", "nba", "nfl", "mlb", "nhl",
+    "la liga", "serie a", "bundesliga", "ligue 1", "mls",
+    "5-minute", "1-minute", "next 5", "next 1",
+    "meme", "tiktok", "youtube", "subscriber",
 ]
 
 
 def scan_event_markets() -> list[dict]:
-    """Scan Polymarket for short-term event markets that meet our criteria.
+    """Scan Polymarket for high-quality event markets.
 
     Filters:
-    - Resolves within MAX_RESOLUTION_DAYS (14 days)
-    - Not resolving in less than MIN_RESOLUTION_HOURS (2 hours)
-    - Minimum liquidity ($5k)
-    - Price between 10c-90c (not near-certain)
+    - Resolves within MAX_RESOLUTION_DAYS
+    - Not resolving in less than MIN_RESOLUTION_HOURS
+    - Minimum liquidity ($10k)
+    - Price between 5c-95c
+    - No sports markets
+    - Must be accepting orders
     """
     all_markets = []
     now = datetime.now(timezone.utc)
@@ -39,6 +51,10 @@ def scan_event_markets() -> list[dict]:
                     continue
 
                 for market_data in markets:
+                    # Skip markets not accepting orders
+                    if not market_data.get("acceptingOrders", False):
+                        continue
+
                     market = pm.parse_market_data(market_data)
                     if _passes_filters(market, now):
                         market["url"] = pm.get_market_url(market_data)
@@ -61,13 +77,24 @@ def scan_event_markets() -> list[dict]:
 
 def _passes_filters(market: dict, now: datetime) -> bool:
     """Check if a market passes all filters."""
-    # Must be active
+    # Must be active and accepting orders
     if not market.get("active") or market.get("closed"):
         return False
+    if not market.get("accepting_orders", True):
+        return False
+
+    # Exclude sports and junk keywords
+    question_lower = market.get("question", "").lower()
+    for keyword in EXCLUDED_KEYWORDS:
+        if keyword in question_lower:
+            return False
 
     # Price range check
     price = market.get("yes_price")
     if price is None:
+        return False
+    # Explicit zero/one check before range check
+    if price <= 0.02 or price >= 0.98:
         return False
     if not (config.PRICE_RANGE[0] <= price <= config.PRICE_RANGE[1]):
         return False
@@ -107,7 +134,16 @@ def scan_volume_surges() -> list[dict]:
         events = pm.search_events(limit=50)
         for event in events:
             for market_data in event.get("markets", []):
+                # Skip markets not accepting orders
+                if not market_data.get("acceptingOrders", False):
+                    continue
+
                 market = pm.parse_market_data(market_data)
+
+                # Exclude sports
+                question_lower = market.get("question", "").lower()
+                if any(kw in question_lower for kw in EXCLUDED_KEYWORDS):
+                    continue
 
                 volume_24h = market.get("volume_24h", 0)
                 total_volume = market.get("volume", 0)

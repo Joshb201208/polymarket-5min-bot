@@ -14,7 +14,9 @@ Research pipeline:
 6. Compare to traditional bookmaker odds (ESPN odds data)
 7. Calculate our fair odds using statistical model
 8. Compare to Polymarket price
-9. If gap > 7%, alert and paper trade
+9. If gap > 5%, execute trade
+
+FIX: Variable edge detection — sentiment/momentum produce RANGE of edges.
 """
 
 import logging
@@ -150,7 +152,6 @@ def _detect_league(question: str) -> str:
         "Serie A": ["serie a", "juventus", "inter", "milan", "napoli", "roma"],
         "Ligue 1": ["ligue 1", "psg", "marseille", "lyon"],
         "Champions League": ["champions league", "ucl"],
-        "MLS": ["mls", "inter miami", "la galaxy", "lafc"],
     }
 
     for league, keywords in league_keywords.items():
@@ -187,7 +188,10 @@ def _injury_adjustment(home_injuries: list, away_injuries: list,
 
 
 def _news_based_analysis(market: dict) -> dict | None:
-    """Fallback: analyze using news when team extraction fails."""
+    """Fallback: analyze using news when team extraction fails.
+
+    FIX: Variable edges — not flat 8%.
+    """
     question = market.get("question", "")
     yes_price = market.get("yes_price", 0.5)
 
@@ -195,10 +199,37 @@ def _news_based_analysis(market: dict) -> dict | None:
     news_data = news.get_comprehensive_news(" ".join(keywords[:5]))
 
     sentiment = news_data.get("sentiment", 0)
+    news_count = news_data.get("total_articles", 0)
+
     if abs(sentiment) < 0.2:
         return None  # No strong signal
 
-    fair_prob = yes_price + sentiment * 0.08
+    # Variable edge calculation
+    article_count_factor = min(news_count / 10, 1.5) if news_count > 0 else 0.5
+    base_rate = 0.08  # Sports base rate
+
+    # Sentiment adjustment varies with article count
+    sentiment_adj = sentiment * article_count_factor * base_rate
+
+    # Momentum from market data
+    one_day_change = market.get("one_day_change", 0)
+    one_week_change = market.get("one_week_change", 0)
+    momentum_adj = one_day_change * 0.5 + one_week_change * 0.3
+
+    # Volume surge bonus
+    volume_24h = market.get("volume_24h", 0)
+    total_volume = market.get("volume", 1)
+    volume_ratio = volume_24h / total_volume if total_volume > 0 else 0
+    volume_adj = 0
+    if volume_ratio > 0.3:  # 3x+ surge
+        volume_adj = min(0.05, 0.02 + volume_ratio * 0.02)
+
+    fair_prob = yes_price + sentiment_adj + momentum_adj
+    if sentiment > 0:
+        fair_prob += volume_adj
+    else:
+        fair_prob -= volume_adj
+
     fair_prob = max(0.05, min(0.95, fair_prob))
 
     edge = abs(fair_prob - yes_price)
@@ -214,5 +245,5 @@ def _news_based_analysis(market: dict) -> dict | None:
         "fair_probability": fair_prob,
         "edge": edge,
         "confidence": "low",
-        "reasoning": [f"News-based: {news_data['sentiment_label']} sentiment from {news_data['total_articles']} articles"],
+        "reasoning": [f"News-based: {news_data['sentiment_label']} sentiment from {news_count} articles, momentum {momentum_adj:+.2%}"],
     }

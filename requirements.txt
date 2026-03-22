@@ -3,3 +3,4 @@ feedparser>=6.0.0
 python-dotenv>=1.0.0
 nba_api>=1.4.0
 numpy>=1.26.0
+py-clob-client>=0.18.0
