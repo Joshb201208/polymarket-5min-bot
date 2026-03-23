@@ -56,8 +56,16 @@ class BankrollManager:
         if odds_against <= 0:
             return 0.0
 
-        kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly — aggressive growth for small bankroll
+        kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly
         bet_size = self.current_bankroll * kelly_fraction
+
+        # Vegas agreement boost: if Vegas and our model agree, size up
+        if edge_result.has_vegas_line and edge_result.vegas_agrees:
+            bet_size *= 1.4  # 40% larger when Vegas confirms our edge
+            logger.debug("Vegas agrees — boosting bet size by 40%%")
+        elif edge_result.has_vegas_line and not edge_result.vegas_agrees:
+            bet_size *= 0.7  # 30% smaller when we're going against Vegas
+            logger.debug("Vegas disagrees — reducing bet size by 30%%")
 
         # Apply maximum per-bet limit
         max_bet = self.current_bankroll * self.config.MAX_BET_PCT

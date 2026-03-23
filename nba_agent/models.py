@@ -181,6 +181,8 @@ class EdgeResult:
     side: str  # "YES" or "NO"
     side_index: int  # 0 or 1 — index into outcomes
     research: Optional[ResearchData] = None
+    has_vegas_line: bool = False   # Was a Vegas line available for this game?
+    vegas_agrees: bool = False     # Does Vegas agree with our bet direction?
 
     @property
     def has_edge(self) -> bool:

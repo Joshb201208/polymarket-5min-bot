@@ -196,7 +196,12 @@ class EdgeCalculator:
         away_edge = fair_away - away_market_price
         home_edge = fair_home - home_market_price
 
+        # Determine Vegas agreement for position sizing
+        has_vegas = vegas_fair_home is not None
+        vegas_home_favored = vegas_fair_home > 0.5 if has_vegas else False
+
         if home_edge > away_edge and home_edge > 0:
+            vegas_agrees = has_vegas and vegas_home_favored  # We're betting home, Vegas also favors home
             return EdgeResult(
                 market=market,
                 our_fair_price=fair_home,
@@ -206,8 +211,11 @@ class EdgeCalculator:
                 side="YES",
                 side_index=1,
                 research=research_data,
+                has_vegas_line=has_vegas,
+                vegas_agrees=vegas_agrees,
             )
         elif away_edge > 0:
+            vegas_agrees = has_vegas and not vegas_home_favored  # We're betting away, Vegas also favors away
             return EdgeResult(
                 market=market,
                 our_fair_price=fair_away,
@@ -217,6 +225,8 @@ class EdgeCalculator:
                 side="YES",
                 side_index=0,
                 research=research_data,
+                has_vegas_line=has_vegas,
+                vegas_agrees=vegas_agrees,
             )
 
         return None

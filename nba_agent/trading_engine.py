@@ -181,7 +181,92 @@ class TradingEngine:
         return trade
 
     def _execute_live_buy(self, token_id: str, amount: float, neg_risk: bool) -> str:
-        """Execute a live FOK market buy order."""
+        """Execute a live buy order.
+
+        Strategy: post a GTC limit order 1 tick below the current best ask.
+        This earns liquidity rewards and gets a better price than market orders.
+        If the limit order doesn't fill in 60 seconds, cancel and place a FOK
+        market order as fallback.
+        """
+        try:
+            from py_clob_client.clob_types import (
+                OrderArgs, MarketOrderArgs, OrderType,
+                PartialCreateOrderOptions,
+            )
+            from py_clob_client.order_builder.constants import BUY
+
+            client = self._get_live_client()
+            if not client:
+                return ""
+
+            # Get current best price and tick size
+            tick_size = str(client.get_tick_size(token_id))
+            tick_val = float(tick_size)
+
+            # Get current midpoint for pricing
+            mid_data = client.get_midpoint(token_id)
+            midpoint = float(mid_data.get("mid", 0)) if isinstance(mid_data, dict) else float(mid_data)
+
+            if midpoint <= 0:
+                logger.warning("Cannot get midpoint for %s, falling back to market order", token_id)
+                return self._execute_market_buy(token_id, amount, neg_risk)
+
+            # Limit price: midpoint (acts as a maker, earns rewards)
+            limit_price = round(midpoint, len(tick_size.split('.')[-1]) if '.' in tick_size else 2)
+            shares = amount / limit_price if limit_price > 0 else 0
+            if shares <= 0:
+                return ""
+
+            # Post GTC limit order
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=round(shares, 2),
+                side=BUY,
+            )
+            options = PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk if neg_risk else None,
+            )
+            signed = client.create_order(order_args, options)
+            resp = client.post_order(signed, OrderType.GTC)
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
+
+            if order_id:
+                logger.info("LIMIT BUY posted: order=%s price=%.2f¢ shares=%.2f amount=$%.2f (earns rewards)",
+                            order_id[:16], limit_price * 100, shares, amount)
+
+                # Wait up to 30 seconds for fill
+                for _ in range(6):
+                    time.sleep(5)
+                    try:
+                        order_info = client.get_order(order_id)
+                        if isinstance(order_info, dict):
+                            status = order_info.get("status", "").upper()
+                            if status in ("MATCHED", "FILLED"):
+                                logger.info("LIMIT BUY filled: order=%s", order_id[:16])
+                                return order_id
+                            elif status in ("CANCELLED", "EXPIRED"):
+                                break
+                    except Exception:
+                        pass
+
+                # Cancel unfilled order and fall back to market order
+                try:
+                    client.cancel_orders([order_id])
+                    logger.info("Cancelled unfilled limit order %s, falling back to market order", order_id[:16])
+                except Exception:
+                    pass
+
+            # Fallback: FOK market order (guaranteed fill)
+            return self._execute_market_buy(token_id, amount, neg_risk)
+
+        except Exception as e:
+            logger.error("Live BUY failed: %s", e)
+            return ""
+
+    def _execute_market_buy(self, token_id: str, amount: float, neg_risk: bool) -> str:
+        """Fallback: execute a FOK market buy."""
         try:
             from py_clob_client.clob_types import MarketOrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
@@ -199,10 +284,10 @@ class TradingEngine:
             signed = client.create_market_order(mo)
             resp = client.post_order(signed, OrderType.FOK)
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
-            logger.info("Live BUY executed: order=%s amount=$%.2f", order_id, amount)
+            logger.info("MARKET BUY executed (fallback): order=%s amount=$%.2f", order_id, amount)
             return order_id
         except Exception as e:
-            logger.error("Live BUY failed: %s", e)
+            logger.error("MARKET BUY failed: %s", e)
             return ""
 
     def _execute_live_sell(self, token_id: str, shares: float, market_id: str) -> str:
