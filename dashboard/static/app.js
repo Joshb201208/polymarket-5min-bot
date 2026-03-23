@@ -83,6 +83,7 @@ const fmt = {
     const ctx = canvas.getContext('2d');
 
     let w, h, particles, mouse, animId;
+    let burstQueue = [];  // {cx, cy, strength} — queued shockwaves
     mouse = { x: -1000, y: -1000 };
 
     function resize() {
@@ -130,6 +131,18 @@ const fmt = {
                 p.vy += (dyM / distM) * force;
             }
 
+            // Burst shockwaves (from typing)
+            for (const burst of burstQueue) {
+                const bx = p.x - burst.cx;
+                const by = p.y - burst.cy;
+                const bDist = Math.sqrt(bx * bx + by * by);
+                if (bDist < burst.radius && bDist > 0) {
+                    const bForce = (burst.radius - bDist) / burst.radius * burst.strength;
+                    p.vx += (bx / bDist) * bForce;
+                    p.vy += (by / bDist) * bForce;
+                }
+            }
+
             // Velocity damping
             p.vx *= 0.98;
             p.vy *= 0.98;
@@ -169,7 +182,25 @@ const fmt = {
             }
         }
 
+        // Clear processed bursts
+        burstQueue = [];
+
         animId = requestAnimationFrame(draw);
+    }
+
+    // Keystroke burst — ripple outward from the input field
+    function triggerKeystrokeBurst() {
+        const input = document.getElementById('passkeyInput');
+        if (!input) return;
+        const rect = input.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        burstQueue.push({
+            cx,
+            cy,
+            radius: 280 + Math.random() * 60,
+            strength: 1.8 + Math.random() * 0.8,
+        });
     }
 
     // Event listeners
@@ -183,6 +214,12 @@ const fmt = {
     document.getElementById('loginOverlay').addEventListener('mouseleave', () => {
         mouse.x = -1000;
         mouse.y = -1000;
+    });
+
+    // Typing triggers burst
+    document.getElementById('passkeyInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === 'Tab') return;
+        triggerKeystrokeBurst();
     });
 
     // Expose stop function for after login
