@@ -33,6 +33,9 @@ Chart.defaults.borderColor = "rgba(255,255,255,0.05)";
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
+// All dates displayed in Singapore time
+const TZ = "Asia/Singapore";
+
 const fmt = {
     usd: (v) => {
         if (v == null) return "--";
@@ -45,17 +48,17 @@ const fmt = {
     date: (ts) => {
         if (!ts) return "--";
         const d = new Date(ts);
-        return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+        return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: TZ });
     },
     time: (ts) => {
         if (!ts) return "--";
         const d = new Date(ts);
-        return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+        return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
     },
     datetime: (ts) => {
         if (!ts) return "--";
         const d = new Date(ts);
-        return `${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })} ${d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}`;
+        return `${d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: TZ })} ${d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: TZ })}`;
     },
     relative: (ts) => {
         if (!ts) return "--";
@@ -127,7 +130,8 @@ function updateStats(data) {
     cachedStats = data;
 
     // Daily P&L (today)
-    const today = new Date().toISOString().slice(0, 10);
+    // Get today's date in Singapore time
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: TZ }); // en-CA gives YYYY-MM-DD format
     const todayEntry = (data.daily_pnl || []).find((d) => d.date === today);
     const dailyPnl = todayEntry ? todayEntry.pnl : 0;
     const dailyEl = document.getElementById("kpiDailyPnl");
@@ -214,12 +218,12 @@ function updatePositions(data) {
             let gameDate = "--";
             if (p.game_start_time) {
                 const d = new Date(p.game_start_time);
-                gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+                gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: TZ });
             } else if (p.market_slug) {
                 const parts = p.market_slug.split("-");
                 if (parts.length >= 5) {
-                    const d = new Date(parts.slice(-3).join("-"));
-                    gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+                    const d = new Date(parts.slice(-3).join("-") + "T12:00:00Z");
+                    gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: TZ });
                 }
             }
 
@@ -334,7 +338,7 @@ function updateTrades(positions) {
                         </div>
                         <div class="trade-detail-item">
                             <span class="trade-detail-label">Game Date</span>
-                            <span class="trade-detail-value">${p.game_start_time ? new Date(p.game_start_time).toLocaleDateString("en-US", {weekday:"short",month:"short",day:"numeric"}) : "--"}</span>
+                            <span class="trade-detail-value">${p.game_start_time ? new Date(p.game_start_time).toLocaleDateString("en-US", {weekday:"short",month:"short",day:"numeric",timeZone:TZ}) : "--"}</span>
                         </div>
                         <div class="trade-detail-item">
                             <span class="trade-detail-label">Entry Time</span>

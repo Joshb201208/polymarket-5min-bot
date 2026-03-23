@@ -314,15 +314,19 @@ def get_performance(period: str) -> dict:
 
     closed = [p for p in positions if p.get("status") != "open"]
 
-    # Filter by period
+    # Filter by period — use Singapore time (UTC+8) for "today"
+    from datetime import timedelta as td
+    SGT = timezone(td(hours=8))
+    now_sgt = datetime.now(SGT)
     now = datetime.now(timezone.utc)
+
     if period == "today":
-        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Start of today in SGT, converted to UTC
+        sgt_midnight = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = sgt_midnight.astimezone(timezone.utc)
     elif period == "week":
-        from datetime import timedelta as td
         cutoff = now - td(days=7)
     elif period == "month":
-        from datetime import timedelta as td
         cutoff = now - td(days=30)
     else:  # all
         cutoff = datetime(2020, 1, 1, tzinfo=timezone.utc)
