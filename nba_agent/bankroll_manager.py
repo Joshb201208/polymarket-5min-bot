@@ -143,33 +143,47 @@ class BankrollManager:
         position: Position,
         current_price: float,
     ) -> tuple[bool, str]:
-        """Check if a position should be exited early based on confidence tiers."""
+        """Check if a position should be exited early.
+
+        Game-day bets: NEVER sell early — hold to resolution. The asymmetric
+        payoff (underdogs at 10-50c pay 2-10x) means one win covers many
+        losses. Selling early caps upside for no reason.
+
+        Futures bets (championship, MVP, conference): Use take-profit and
+        stop-loss since these resolve weeks/months away and conditions change.
+        """
         entry = position.entry_price
         if entry <= 0:
             return False, ""
 
-        pnl_pct = (current_price - entry) / entry
+        # Determine if this is a futures/long-term position
+        is_futures = False
+        slug = (position.market_slug or "").lower()
+        if any(kw in slug for kw in ("championship", "mvp", "conference", "finals", "award", "leader", "ppg", "rpg")):
+            is_futures = True
 
+        # Game-day bets: hold to resolution, never sell early
+        if not is_futures:
+            return False, ""
+
+        # Futures bets: apply take-profit / stop-loss
+        pnl_pct = (current_price - entry) / entry
         conf = position.confidence.upper()
 
         if conf == Confidence.HIGH.value:
-            if pnl_pct >= 0.40:
-                return True, "Price target reached (HIGH confidence, +40% threshold)"
-            if pnl_pct <= -0.20:
-                return True, "Stop loss hit (HIGH confidence, -20% threshold)"
+            if pnl_pct >= 0.50:
+                return True, "Futures take-profit (HIGH, +50%)"
+            if pnl_pct <= -0.30:
+                return True, "Futures stop-loss (HIGH, -30%)"
         elif conf == Confidence.MEDIUM.value:
-            if pnl_pct >= 0.25:
-                return True, "Price target reached (MEDIUM confidence, +25% threshold)"
-            if pnl_pct <= -0.15:
-                return True, "Stop loss hit (MEDIUM confidence, -15% threshold)"
+            if pnl_pct >= 0.35:
+                return True, "Futures take-profit (MEDIUM, +35%)"
+            if pnl_pct <= -0.25:
+                return True, "Futures stop-loss (MEDIUM, -25%)"
         else:  # LOW
-            if pnl_pct >= 0.15:
-                return True, "Price target reached (LOW confidence, +15% threshold)"
-            if pnl_pct <= -0.10:
-                return True, "Stop loss hit (LOW confidence, -10% threshold)"
-
-        # Line movement check: 10%+ against our position
-        if pnl_pct <= -0.10:
-            return True, "Line moved 10%+ against position"
+            if pnl_pct >= 0.25:
+                return True, "Futures take-profit (LOW, +25%)"
+            if pnl_pct <= -0.20:
+                return True, "Futures stop-loss (LOW, -20%)"
 
         return False, ""
