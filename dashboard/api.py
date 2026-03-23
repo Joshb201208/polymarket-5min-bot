@@ -146,10 +146,10 @@ def get_stats() -> dict:
 
     closed = [p for p in positions if p.get("status") != "open"]
 
-    # Basic counts
+    # Basic counts — determine win/loss from P&L, not status string
     total_closed = len(closed)
-    wins = [p for p in closed if p.get("status") == "won"]
-    losses = [p for p in closed if p.get("status") == "lost"]
+    wins = [p for p in closed if (p.get("pnl") or 0) > 0]
+    losses = [p for p in closed if (p.get("pnl") or 0) <= 0]
 
     win_count = len(wins)
     loss_count = len(losses)
@@ -225,7 +225,7 @@ def get_stats() -> dict:
         else:
             bet_type = "moneyline"
         type_total[bet_type] += 1
-        if p.get("status") == "won":
+        if (p.get("pnl") or 0) > 0:
             type_wins[bet_type] += 1
 
     win_rate_by_type = {}
@@ -243,7 +243,7 @@ def get_stats() -> dict:
     worst_streak = 0
     temp_streak = 0
     for p in sorted_closed:
-        is_win = p.get("status") == "won"
+        is_win = (p.get("pnl") or 0) > 0
         if temp_streak == 0:
             temp_streak = 1 if is_win else -1
         elif is_win and temp_streak > 0:
