@@ -231,19 +231,20 @@ class NBAAgent:
                     logger.info("Cannot get price for resolved position %s — will retry", pos.id)
                     continue
 
-                # Determine win/loss: price near 1.0 = win, near 0.0 = loss
-                if current_price >= 0.90:
-                    # WIN — our side won
-                    payout = pos.shares * 1.0  # Each share pays $1
+                # Only resolve when the outcome is final:
+                # price >= 0.99 = definitively won (market settled)
+                # price <= 0.01 = definitively lost (market settled)
+                # Anything in between = game still in progress or not yet settled
+                if current_price >= 0.99:
+                    payout = pos.shares * 1.0
                     pnl = payout - pos.cost
                     result = "WIN"
-                elif current_price <= 0.10:
-                    # LOSS — our side lost
+                elif current_price <= 0.01:
                     payout = 0.0
                     pnl = -pos.cost
                     result = "LOSS"
                 else:
-                    # Still uncertain — skip for now
+                    # Not yet settled — wait for final resolution
                     continue
 
                 # Close the position
