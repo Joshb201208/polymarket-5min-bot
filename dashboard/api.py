@@ -6,15 +6,18 @@ computed stats, positions, trades, and research data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Data directory — /root/polymarket-bot/data/ on VPS, ./data/ locally
@@ -50,6 +53,49 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+DASHBOARD_PASSKEY = os.environ.get("DASHBOARD_PASSKEY", "201208")
+_PASSKEY_HASH = hashlib.sha256(DASHBOARD_PASSKEY.encode()).hexdigest()
+
+# Simple in-memory token store (survives within a single process)
+_valid_tokens: set[str] = set()
+
+
+class LoginRequest(BaseModel):
+    passkey: str
+
+
+def _require_auth(request: Request) -> None:
+    """Dependency: reject requests without a valid Bearer token."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = auth.split(" ", 1)[1]
+    if token not in _valid_tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+@app.post("/api/login")
+def login(body: LoginRequest) -> dict:
+    """Validate passkey and return a session token."""
+    incoming_hash = hashlib.sha256(body.passkey.encode()).hexdigest()
+    if incoming_hash != _PASSKEY_HASH:
+        raise HTTPException(status_code=403, detail="Wrong passkey")
+    token = secrets.token_hex(32)
+    _valid_tokens.add(token)
+    return {"token": token}
+
+
+@app.post("/api/logout")
+def logout(request: Request) -> dict:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth.split(" ", 1)[1]
+        _valid_tokens.discard(token)
+    return {"ok": True}
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -79,7 +125,7 @@ def _parse_ts(ts: str | None) -> datetime | None:
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/api/status")
+@app.get("/api/status", dependencies=[Depends(_require_auth)])
 def get_status() -> dict:
     bankroll = _read_json("bankroll.json")
     positions = _read_json("positions.json").get("positions", [])
@@ -124,7 +170,7 @@ def get_status() -> dict:
     }
 
 
-@app.get("/api/positions")
+@app.get("/api/positions", dependencies=[Depends(_require_auth)])
 def get_positions() -> dict:
     positions = _read_json("positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
@@ -132,13 +178,13 @@ def get_positions() -> dict:
     return {"open": open_pos, "closed": closed_pos}
 
 
-@app.get("/api/trades")
+@app.get("/api/trades", dependencies=[Depends(_require_auth)])
 def get_trades() -> dict:
     trades = _read_json("trades.json").get("trades", [])
     return {"trades": trades}
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(_require_auth)])
 def get_stats() -> dict:
     positions = _read_json("positions.json").get("positions", [])
     bankroll_data = _read_json("bankroll.json")
@@ -292,7 +338,7 @@ def get_stats() -> dict:
     }
 
 
-@app.get("/api/research")
+@app.get("/api/research", dependencies=[Depends(_require_auth)])
 def get_research() -> dict:
     data = _read_json("research_log.json")
     research = data.get("research", [])
@@ -305,7 +351,7 @@ def get_research() -> dict:
 # Health check
 # ---------------------------------------------------------------------------
 
-@app.get("/api/performance/{period}")
+@app.get("/api/performance/{period}", dependencies=[Depends(_require_auth)])
 def get_performance(period: str) -> dict:
     """Return performance stats for a given period: today, week, month, all."""
     positions = _read_json("positions.json").get("positions", [])
@@ -372,7 +418,7 @@ def get_performance(period: str) -> dict:
     }
 
 
-@app.get("/api/calibration")
+@app.get("/api/calibration", dependencies=[Depends(_require_auth)])
 def get_calibration() -> dict:
     """Return self-learning calibration data."""
     cal_data = _read_json("calibration.json")

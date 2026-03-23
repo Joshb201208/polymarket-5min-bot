@@ -6,10 +6,13 @@
 // ---------------------------------------------------------------------------
 // API Base URL
 // ---------------------------------------------------------------------------
-// Use relative URLs — nginx proxies /api/ to the backend on port 8080
 const API = "";
-
 const REFRESH_INTERVAL = 30_000; // 30 seconds
+
+// ---------------------------------------------------------------------------
+// Auth State
+// ---------------------------------------------------------------------------
+let authToken = sessionStorage.getItem("nba_agent_token") || null;
 
 // ---------------------------------------------------------------------------
 // State
@@ -72,11 +75,202 @@ const fmt = {
 };
 
 // ---------------------------------------------------------------------------
+// Login Particle Canvas — Interactive Star Field
+// ---------------------------------------------------------------------------
+(function initLoginParticles() {
+    const canvas = document.getElementById('loginCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    let w, h, particles, mouse, animId;
+    mouse = { x: -1000, y: -1000 };
+
+    function resize() {
+        w = canvas.width = window.innerWidth;
+        h = canvas.height = window.innerHeight;
+    }
+
+    function createParticles() {
+        const count = Math.min(Math.floor((w * h) / 6000), 200);
+        particles = [];
+        for (let i = 0; i < count; i++) {
+            particles.push({
+                x: Math.random() * w,
+                y: Math.random() * h,
+                vx: (Math.random() - 0.5) * 0.3,
+                vy: (Math.random() - 0.5) * 0.3,
+                r: Math.random() * 1.5 + 0.5,
+                // Color: mix of cyan, purple, green
+                color: [
+                    'rgba(0, 240, 255,',
+                    'rgba(139, 92, 246,',
+                    'rgba(0, 255, 136,',
+                ][Math.floor(Math.random() * 3)],
+                baseAlpha: Math.random() * 0.5 + 0.2,
+            });
+        }
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, w, h);
+
+        const connectDist = 120;
+        const mouseDist = 180;
+
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+
+            // Mouse repulsion
+            const dxM = p.x - mouse.x;
+            const dyM = p.y - mouse.y;
+            const distM = Math.sqrt(dxM * dxM + dyM * dyM);
+            if (distM < mouseDist && distM > 0) {
+                const force = (mouseDist - distM) / mouseDist * 0.8;
+                p.vx += (dxM / distM) * force;
+                p.vy += (dyM / distM) * force;
+            }
+
+            // Velocity damping
+            p.vx *= 0.98;
+            p.vy *= 0.98;
+
+            // Move
+            p.x += p.vx;
+            p.y += p.vy;
+
+            // Wrap edges
+            if (p.x < -10) p.x = w + 10;
+            if (p.x > w + 10) p.x = -10;
+            if (p.y < -10) p.y = h + 10;
+            if (p.y > h + 10) p.y = -10;
+
+            // Draw particle with glow
+            const alpha = p.baseAlpha + (distM < mouseDist ? (mouseDist - distM) / mouseDist * 0.4 : 0);
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+            ctx.fillStyle = p.color + Math.min(alpha, 0.9) + ')';
+            ctx.fill();
+
+            // Connect nearby particles with lines
+            for (let j = i + 1; j < particles.length; j++) {
+                const p2 = particles[j];
+                const dx = p.x - p2.x;
+                const dy = p.y - p2.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < connectDist) {
+                    const lineAlpha = (1 - dist / connectDist) * 0.15;
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.strokeStyle = 'rgba(0, 240, 255,' + lineAlpha + ')';
+                    ctx.lineWidth = 0.5;
+                    ctx.stroke();
+                }
+            }
+        }
+
+        animId = requestAnimationFrame(draw);
+    }
+
+    // Event listeners
+    window.addEventListener('resize', () => { resize(); createParticles(); });
+
+    document.getElementById('loginOverlay').addEventListener('mousemove', (e) => {
+        mouse.x = e.clientX;
+        mouse.y = e.clientY;
+    });
+
+    document.getElementById('loginOverlay').addEventListener('mouseleave', () => {
+        mouse.x = -1000;
+        mouse.y = -1000;
+    });
+
+    // Expose stop function for after login
+    window._stopLoginParticles = function() {
+        if (animId) cancelAnimationFrame(animId);
+    };
+
+    resize();
+    createParticles();
+    draw();
+})();
+
+// ---------------------------------------------------------------------------
+// Login Logic
+// ---------------------------------------------------------------------------
+function showLogin() {
+    document.getElementById("loginOverlay").classList.remove("hidden");
+    document.getElementById("dashboardContent").className = "dashboard-hidden";
+}
+
+function showDashboard() {
+    document.getElementById("loginOverlay").classList.add("hidden");
+    document.getElementById("dashboardContent").className = "dashboard-visible";
+    // Stop particle animation to save CPU
+    if (window._stopLoginParticles) window._stopLoginParticles();
+}
+
+async function handleLogin(passkey) {
+    const errorEl = document.getElementById("loginError");
+    const btn = document.getElementById("loginBtn");
+    const input = document.getElementById("passkeyInput");
+
+    btn.disabled = true;
+    btn.querySelector(".login-btn-text").textContent = "VERIFYING...";
+    errorEl.textContent = "";
+
+    try {
+        const res = await fetch(`${API}/api/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ passkey }),
+        });
+
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || "Wrong passkey");
+        }
+
+        const data = await res.json();
+        authToken = data.token;
+        sessionStorage.setItem("nba_agent_token", authToken);
+
+        showDashboard();
+        refresh();
+    } catch (err) {
+        errorEl.textContent = err.message || "Authentication failed";
+        input.classList.add("shake");
+        setTimeout(() => input.classList.remove("shake"), 500);
+        input.value = "";
+        input.focus();
+    } finally {
+        btn.disabled = false;
+        btn.querySelector(".login-btn-text").textContent = "UNLOCK";
+    }
+}
+
+// Wire up the login form
+document.getElementById("loginForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const passkey = document.getElementById("passkeyInput").value.trim();
+    if (passkey) handleLogin(passkey);
+});
+
+// ---------------------------------------------------------------------------
 // Fetch helpers
 // ---------------------------------------------------------------------------
 async function fetchJSON(endpoint) {
     try {
-        const res = await fetch(`${API}${endpoint}`);
+        const headers = {};
+        if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+        const res = await fetch(`${API}${endpoint}`, { headers });
+        if (res.status === 401) {
+            // Token expired or invalid — show login
+            authToken = null;
+            sessionStorage.removeItem("nba_agent_token");
+            showLogin();
+            return null;
+        }
         if (!res.ok) throw new Error(`${res.status}`);
         return await res.json();
     } catch (err) {
@@ -485,7 +679,9 @@ function initPeriodTabs() {
 
 async function fetchPerformance(period) {
     try {
-        const resp = await fetch(`${API}/api/performance/${period}`);
+        const headers = {};
+        if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+        const resp = await fetch(`${API}/api/performance/${period}`, { headers });
         if (!resp.ok) return;
         const data = await resp.json();
         updatePerformanceGrid(data);
@@ -853,17 +1049,26 @@ async function refresh() {
     updateDailySummary(stats, research);
 }
 
-// Initial load
+// ---------------------------------------------------------------------------
+// Init — check if already authenticated
+// ---------------------------------------------------------------------------
 initPeriodTabs();
-refresh();
 
-// Auto-refresh
-setInterval(refresh, REFRESH_INTERVAL);
+if (authToken) {
+    // Try a quick auth check against a protected endpoint
+    fetchJSON("/api/status").then((data) => {
+        if (data) {
+            showDashboard();
+            refresh();
+        } else {
+            showLogin();
+        }
+    });
+} else {
+    showLogin();
+}
 
-// Update "last update" time every 10s
+// Auto-refresh (only runs when dashboard is visible)
 setInterval(() => {
-    const el = document.getElementById("lastUpdate");
-    if (el.textContent !== "--") {
-        // Just refresh the relative time display
-    }
-}, 10000);
+    if (authToken) refresh();
+}, REFRESH_INTERVAL);
