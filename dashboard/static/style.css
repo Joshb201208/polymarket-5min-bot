@@ -797,10 +797,11 @@ body::after {
 /* Period tabs */
 .period-tabs {
     display: flex;
-    gap: 4px;
-    background: rgba(255, 255, 255, 0.04);
-    border-radius: 8px;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
     padding: 3px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .period-tab {
@@ -809,27 +810,29 @@ body::after {
     color: var(--text-muted);
     font-size: 12px;
     font-weight: 500;
-    padding: 6px 14px;
-    border-radius: 6px;
+    padding: 7px 18px;
+    border-radius: 8px;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: all 0.25s ease;
     font-family: var(--font);
 }
 
 .period-tab:hover {
     color: var(--text);
+    background: rgba(255, 255, 255, 0.04);
 }
 
 .period-tab.active {
-    background: var(--accent);
+    background: #00f0ff;
     color: #0a0b0f;
-    font-weight: 600;
+    font-weight: 700;
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.3);
 }
 
 .summary-grid {
     display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 16px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
 }
 
 .summary-item {
