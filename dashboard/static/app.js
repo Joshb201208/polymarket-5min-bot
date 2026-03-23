@@ -208,14 +208,29 @@ function updatePositions(data) {
             const confClass =
                 p.confidence === "HIGH" ? "conf-high" :
                 p.confidence === "MEDIUM" ? "conf-medium" : "conf-low";
-            // Unrealized P&L is unknown for open positions — show as awaiting
             const cardClass = "pos-neutral";
+
+            // Extract game date from slug (nba-away-home-YYYY-MM-DD) or game_start_time
+            let gameDate = "--";
+            if (p.game_start_time) {
+                const d = new Date(p.game_start_time);
+                gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+            } else if (p.market_slug) {
+                const parts = p.market_slug.split("-");
+                if (parts.length >= 5) {
+                    const d = new Date(parts.slice(-3).join("-"));
+                    gameDate = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+                }
+            }
 
             return `
             <div class="position-card ${cardClass}">
                 <div class="pos-header">
                     <div class="pos-market">${escHtml(p.market_question)}</div>
-                    <span class="pos-conf badge ${confClass}">${p.confidence}</span>
+                    <div class="pos-header-right">
+                        <span class="pos-game-date">${gameDate}</span>
+                        <span class="pos-conf badge ${confClass}">${p.confidence}</span>
+                    </div>
                 </div>
                 <div class="pos-details">
                     <div class="pos-detail">
@@ -316,6 +331,10 @@ function updateTrades(positions) {
                         <div class="trade-detail-item">
                             <span class="trade-detail-label">Position ID</span>
                             <span class="trade-detail-value">${p.id}</span>
+                        </div>
+                        <div class="trade-detail-item">
+                            <span class="trade-detail-label">Game Date</span>
+                            <span class="trade-detail-value">${p.game_start_time ? new Date(p.game_start_time).toLocaleDateString("en-US", {weekday:"short",month:"short",day:"numeric"}) : "--"}</span>
                         </div>
                         <div class="trade-detail-item">
                             <span class="trade-detail-label">Entry Time</span>

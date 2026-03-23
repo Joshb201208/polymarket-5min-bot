@@ -450,6 +450,19 @@ body::after {
     margin-right: 8px;
 }
 
+.pos-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.pos-game-date {
+    font-size: 11px;
+    color: #71717a;
+    white-space: nowrap;
+}
+
 .pos-conf {
     padding: 2px 8px;
     border-radius: 12px;
