@@ -305,6 +305,69 @@ def get_research() -> dict:
 # Health check
 # ---------------------------------------------------------------------------
 
+@app.get("/api/performance/{period}")
+def get_performance(period: str) -> dict:
+    """Return performance stats for a given period: today, week, month, all."""
+    positions = _read_json("positions.json").get("positions", [])
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+
+    closed = [p for p in positions if p.get("status") != "open"]
+
+    # Filter by period
+    now = datetime.now(timezone.utc)
+    if period == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        from datetime import timedelta as td
+        cutoff = now - td(days=7)
+    elif period == "month":
+        from datetime import timedelta as td
+        cutoff = now - td(days=30)
+    else:  # all
+        cutoff = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    filtered = []
+    for p in closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts and exit_ts >= cutoff:
+            filtered.append(p)
+
+    total = len(filtered)
+    wins = [p for p in filtered if (p.get("pnl") or 0) > 0]
+    losses = [p for p in filtered if (p.get("pnl") or 0) <= 0]
+    win_count = len(wins)
+    loss_count = len(losses)
+
+    pnls = [p.get("pnl", 0) or 0 for p in filtered]
+    total_pnl = round(sum(pnls), 2)
+    total_invested = sum(p.get("cost", 0) or 0 for p in filtered)
+    roi = round((total_pnl / total_invested * 100) if total_invested > 0 else 0, 1)
+
+    win_pnls = [p.get("pnl", 0) or 0 for p in wins]
+    loss_pnls = [p.get("pnl", 0) or 0 for p in losses]
+    avg_win = round(sum(win_pnls) / len(win_pnls), 2) if win_pnls else 0
+    avg_loss = round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0
+
+    gross_profit = sum(p for p in win_pnls if p > 0)
+    gross_loss = abs(sum(p for p in loss_pnls if p < 0))
+    pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
+
+    return {
+        "period": period,
+        "bets": total,
+        "wins": win_count,
+        "losses": loss_count,
+        "win_rate": round((win_count / total * 100) if total > 0 else 0, 1),
+        "pnl": total_pnl,
+        "roi": roi,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_factor": pf,
+        "total_invested": round(total_invested, 2),
+    }
+
+
 @app.get("/api/calibration")
 def get_calibration() -> dict:
     """Return self-learning calibration data."""

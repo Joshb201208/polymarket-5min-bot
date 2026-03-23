@@ -465,37 +465,60 @@ function updateResearch(data) {
         .join("");
 }
 
+// Performance summary with period tabs
+let currentPeriod = "today";
+
+function initPeriodTabs() {
+    document.querySelectorAll(".period-tab").forEach((tab) => {
+        tab.addEventListener("click", () => {
+            document.querySelectorAll(".period-tab").forEach((t) => t.classList.remove("active"));
+            tab.classList.add("active");
+            currentPeriod = tab.dataset.period;
+            fetchPerformance(currentPeriod);
+        });
+    });
+}
+
+async function fetchPerformance(period) {
+    try {
+        const resp = await fetch(`${API}/api/performance/${period}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        updatePerformanceGrid(data);
+    } catch (e) {
+        // silent
+    }
+}
+
+function updatePerformanceGrid(data) {
+    document.getElementById("perfBets").textContent = data.bets || 0;
+    document.getElementById("perfWL").textContent = `${data.wins || 0} / ${data.losses || 0}`;
+    document.getElementById("perfWinRate").textContent = fmt.pct(data.win_rate);
+
+    const pnlEl = document.getElementById("perfPnl");
+    const pnl = data.pnl || 0;
+    pnlEl.textContent = (pnl >= 0 ? "+" : "") + fmt.usd(pnl);
+    pnlEl.className = `summary-value ${pnl >= 0 ? "pnl-positive" : "pnl-negative"}`;
+
+    const roiEl = document.getElementById("perfRoi");
+    const roi = data.roi || 0;
+    roiEl.textContent = (roi >= 0 ? "+" : "") + fmt.pct(roi);
+    roiEl.className = `summary-value ${roi >= 0 ? "pnl-positive" : "pnl-negative"}`;
+
+    const awEl = document.getElementById("perfAvgWin");
+    awEl.textContent = fmt.usd(data.avg_win);
+    awEl.className = "summary-value pnl-positive";
+
+    const alEl = document.getElementById("perfAvgLoss");
+    alEl.textContent = fmt.usd(data.avg_loss);
+    alEl.className = "summary-value pnl-negative";
+
+    document.getElementById("perfPF").textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) + "x" : "--";
+}
+
 function updateDailySummary(stats, research) {
-    const today = new Date().toISOString().slice(0, 10);
-    document.getElementById("summaryDate").textContent = today;
-
-    if (stats) {
-        const todayEntry = (stats.daily_pnl || []).find((d) => d.date === today);
-        const todayPnl = todayEntry ? todayEntry.pnl : 0;
-
-        // Count today's wins/losses from positions
-        const todayPositions = (cachedPositions?.closed || []).filter((p) => {
-            return p.exit_time && p.exit_time.startsWith(today);
-        });
-        const todayWins = todayPositions.filter((p) => p.status === "won").length;
-        const todayLosses = todayPositions.filter((p) => p.status === "lost").length;
-
-        document.getElementById("summaryBets").textContent = todayPositions.length;
-        document.getElementById("summaryWL").textContent = `${todayWins} / ${todayLosses}`;
-
-        const pnlEl = document.getElementById("summaryPnl");
-        pnlEl.textContent = (todayPnl >= 0 ? "+" : "") + fmt.usd(todayPnl);
-        pnlEl.className = `summary-value ${todayPnl >= 0 ? "pnl-positive" : "pnl-negative"}`;
-    }
-
-    if (research) {
-        const todayResearch = (research.research || []).filter((r) => {
-            return r.timestamp && r.timestamp.startsWith(today);
-        });
-        document.getElementById("summaryAnalyzed").textContent = todayResearch.length;
-        document.getElementById("summaryEdges").textContent = todayResearch.filter((r) => r.bet_placed).length;
-        document.getElementById("summaryPassed").textContent = todayResearch.filter((r) => !r.bet_placed).length;
-    }
+    // Fetch performance for current tab
+    fetchPerformance(currentPeriod);
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +850,7 @@ async function refresh() {
 }
 
 // Initial load
+initPeriodTabs();
 refresh();
 
 // Auto-refresh

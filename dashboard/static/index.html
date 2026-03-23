@@ -240,37 +240,50 @@
     </section>
 
     <!-- ============================================= -->
-    <!-- DAILY SUMMARY                                 -->
+    <!-- PERFORMANCE SUMMARY                            -->
     <!-- ============================================= -->
-    <section class="card daily-summary">
+    <section class="card">
         <div class="card-header">
-            <h2 class="card-title">Daily Summary</h2>
-            <span class="badge" id="summaryDate">--</span>
+            <h2 class="card-title">Performance Summary</h2>
+            <div class="period-tabs">
+                <button class="period-tab active" data-period="today">Today</button>
+                <button class="period-tab" data-period="week">This Week</button>
+                <button class="period-tab" data-period="month">This Month</button>
+                <button class="period-tab" data-period="all">All Time</button>
+            </div>
         </div>
-        <div class="summary-grid" id="summaryGrid">
+        <div class="summary-grid" id="perfGrid">
             <div class="summary-item">
-                <div class="summary-label">Bets Placed Today</div>
-                <div class="summary-value" id="summaryBets">0</div>
+                <div class="summary-label">Bets</div>
+                <div class="summary-value" id="perfBets">0</div>
             </div>
             <div class="summary-item">
                 <div class="summary-label">Wins / Losses</div>
-                <div class="summary-value" id="summaryWL">0 / 0</div>
+                <div class="summary-value" id="perfWL">0 / 0</div>
             </div>
             <div class="summary-item">
-                <div class="summary-label">Today's P&L</div>
-                <div class="summary-value" id="summaryPnl">$0.00</div>
+                <div class="summary-label">Win Rate</div>
+                <div class="summary-value" id="perfWinRate">0%</div>
             </div>
             <div class="summary-item">
-                <div class="summary-label">Games Analyzed</div>
-                <div class="summary-value" id="summaryAnalyzed">0</div>
+                <div class="summary-label">P&L</div>
+                <div class="summary-value" id="perfPnl">$0.00</div>
             </div>
             <div class="summary-item">
-                <div class="summary-label">Edges Found</div>
-                <div class="summary-value" id="summaryEdges">0</div>
+                <div class="summary-label">ROI</div>
+                <div class="summary-value" id="perfRoi">0%</div>
             </div>
             <div class="summary-item">
-                <div class="summary-label">Edges Passed</div>
-                <div class="summary-value" id="summaryPassed">0</div>
+                <div class="summary-label">Avg Win</div>
+                <div class="summary-value" id="perfAvgWin">$0.00</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Avg Loss</div>
+                <div class="summary-value" id="perfAvgLoss">$0.00</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Profit Factor</div>
+                <div class="summary-value" id="perfPF">--</div>
             </div>
         </div>
     </section>
