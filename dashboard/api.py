@@ -221,13 +221,19 @@ def get_stats() -> dict:
     gross_loss = abs(sum(p for p in loss_pnls if p < 0))
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf")
 
-    # Equity curve — build daily P&L
+    # Equity curve — build daily P&L and trade counts
     daily_map: dict[str, float] = defaultdict(float)
+    daily_count: dict[str, int] = defaultdict(int)
     for p in closed:
         exit_ts = _parse_ts(p.get("exit_time"))
         if exit_ts:
-            day = exit_ts.strftime("%Y-%m-%d")
+            # Use SGT (UTC+8) for daily grouping
+            from datetime import timedelta as _td
+            _sgt = timezone(_td(hours=8))
+            exit_sgt = exit_ts.astimezone(_sgt)
+            day = exit_sgt.strftime("%Y-%m-%d")
             daily_map[day] += p.get("pnl", 0) or 0
+            daily_count[day] += 1
 
     sorted_days = sorted(daily_map.keys())
     equity_curve = []
@@ -238,6 +244,7 @@ def get_stats() -> dict:
             "date": day,
             "pnl": round(daily_map[day], 2),
             "bankroll": round(running, 2),
+            "trades": daily_count[day],
         })
 
     # Max drawdown

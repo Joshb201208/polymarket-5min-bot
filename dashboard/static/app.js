@@ -369,8 +369,9 @@ function updateStats(data) {
     dailyEl.textContent = (dailyPnl >= 0 ? "+" : "") + fmt.usd(dailyPnl);
     dailyEl.className = `kpi-value ${dailyPnl >= 0 ? "pnl-positive" : "pnl-negative"}`;
 
-    // Count today's trades
-    const todayTrades = (data.daily_pnl || []).filter((d) => d.date === today).length;
+    // Count today's trades (use the trades field from daily_pnl, not array length)
+    const todayEntry2 = (data.daily_pnl || []).find((d) => d.date === today);
+    const todayTrades = todayEntry2 ? (todayEntry2.trades || 1) : 0;
     document.getElementById("kpiDailyPnlSub").textContent = `${todayTrades} trade${todayTrades !== 1 ? "s" : ""} today`;
 
     // Win rate
