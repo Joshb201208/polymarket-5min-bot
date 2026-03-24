@@ -701,6 +701,96 @@ function updateResearch(data) {
         .join("");
 }
 
+// ---------------------------------------------------------------------------
+// Redeem Checklist
+// ---------------------------------------------------------------------------
+function getRedeemedSet() {
+    try {
+        return new Set(JSON.parse(localStorage.getItem('nba_agent_redeemed') || '[]'));
+    } catch { return new Set(); }
+}
+
+function saveRedeemedSet(set) {
+    try {
+        localStorage.setItem('nba_agent_redeemed', JSON.stringify([...set]));
+    } catch {}
+}
+
+function toggleRedeemed(posId) {
+    const set = getRedeemedSet();
+    if (set.has(posId)) {
+        set.delete(posId);
+    } else {
+        set.add(posId);
+    }
+    saveRedeemedSet(set);
+    if (cachedPositions) updateRedeemChecklist(cachedPositions);
+}
+
+function updateRedeemChecklist(positions) {
+    const closed = positions.closed || [];
+    const container = document.getElementById('redeemList');
+    const redeemed = getRedeemedSet();
+
+    if (closed.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-text">No positions to redeem</div>
+                <div class="empty-sub">Resolved positions will appear here</div>
+            </div>`;
+        document.getElementById('redeemWinCount').textContent = '0 to collect';
+        document.getElementById('redeemLossCount').textContent = '0 to clear';
+        return;
+    }
+
+    // Sort: unchecked first, then by date desc
+    const sorted = closed.slice().sort((a, b) => {
+        const aChecked = redeemed.has(a.id) ? 1 : 0;
+        const bChecked = redeemed.has(b.id) ? 1 : 0;
+        if (aChecked !== bChecked) return aChecked - bChecked;
+        return (b.exit_time || '').localeCompare(a.exit_time || '');
+    });
+
+    const wins = sorted.filter(p => (p.pnl || 0) > 0);
+    const losses = sorted.filter(p => (p.pnl || 0) <= 0);
+    const uncheckedWins = wins.filter(p => !redeemed.has(p.id)).length;
+    const uncheckedLosses = losses.filter(p => !redeemed.has(p.id)).length;
+
+    document.getElementById('redeemWinCount').textContent = `${uncheckedWins} to collect`;
+    document.getElementById('redeemLossCount').textContent = `${uncheckedLosses} to clear`;
+
+    container.innerHTML = sorted.map(p => {
+        const pnl = p.pnl || 0;
+        const isWin = pnl > 0;
+        const isChecked = redeemed.has(p.id);
+        const typeClass = isWin ? 'win' : 'loss';
+        const checkedClass = isChecked ? 'checked' : '';
+        const shares = p.shares ? p.shares.toFixed(2) : '--';
+        const redeemValue = isWin ? `+${fmt.usd(p.shares)}` : fmt.usd(0);
+
+        return `
+        <div class="redeem-item ${typeClass} ${checkedClass}" onclick="toggleRedeemed('${p.id}')">
+            <div class="redeem-check">
+                <svg class="redeem-check-icon" viewBox="0 0 12 12" fill="none">
+                    <path d="M2 6l3 3 5-6" stroke="${isWin ? '#0a0b0f' : '#fff'}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </div>
+            <div class="redeem-info">
+                <span class="redeem-market">${escHtml(p.market_question)}</span>
+                <div class="redeem-meta">
+                    <span class="redeem-date">${fmt.date(p.exit_time)}</span>
+                    <span class="redeem-side">${p.side}</span>
+                    <span class="redeem-amount ${typeClass}">${isWin ? '+' : ''}${fmt.usd(pnl)}</span>
+                    <span class="redeem-type ${isWin ? 'collect' : 'clear'}">${isWin ? 'COLLECT' : 'CLEAR'}</span>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// Expose toggle for onclick
+window.toggleRedeemed = toggleRedeemed;
+
 // Performance summary with period tabs
 let currentPeriod = "today";
 
@@ -1082,6 +1172,7 @@ async function refresh() {
     if (positions) {
         updatePositions(positions);
         updateTrades(positions);
+        updateRedeemChecklist(positions);
     }
     if (research) updateResearch(research);
     updateDailySummary(stats, research);

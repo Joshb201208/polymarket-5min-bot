@@ -1271,6 +1271,166 @@ body::after {
     font-family: var(--mono);
 }
 
+/* --- Redeem Checklist --- */
+.redeem-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.redeem-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+    cursor: pointer;
+    user-select: none;
+}
+
+.redeem-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: var(--border-hover);
+}
+
+.redeem-item.checked {
+    opacity: 0.35;
+    text-decoration: line-through;
+    border-color: rgba(255, 255, 255, 0.04);
+}
+
+.redeem-item.checked:hover {
+    opacity: 0.5;
+}
+
+.redeem-check {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    border: 2px solid var(--text-dim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    background: transparent;
+}
+
+.redeem-item.win .redeem-check {
+    border-color: rgba(0, 255, 136, 0.4);
+}
+
+.redeem-item.loss .redeem-check {
+    border-color: rgba(255, 51, 102, 0.4);
+}
+
+.redeem-item.checked .redeem-check {
+    background: var(--profit);
+    border-color: var(--profit);
+}
+
+.redeem-item.checked.loss .redeem-check {
+    background: var(--text-dim);
+    border-color: var(--text-dim);
+}
+
+.redeem-check-icon {
+    display: none;
+    width: 12px;
+    height: 12px;
+}
+
+.redeem-item.checked .redeem-check-icon {
+    display: block;
+}
+
+.redeem-info {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+}
+
+.redeem-market {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.redeem-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+}
+
+.redeem-side {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.redeem-amount {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.redeem-amount.win {
+    color: var(--profit);
+}
+
+.redeem-amount.loss {
+    color: var(--loss);
+}
+
+.redeem-type {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+}
+
+.redeem-type.collect {
+    background: var(--profit-dim);
+    color: var(--profit);
+    border: 1px solid rgba(0, 255, 136, 0.2);
+}
+
+.redeem-type.clear {
+    background: var(--loss-dim);
+    color: var(--loss);
+    border: 1px solid rgba(255, 51, 102, 0.2);
+}
+
+.redeem-date {
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+    .redeem-info {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+    }
+    .redeem-meta {
+        gap: 8px;
+    }
+}
+
 /* --- Footer --- */
 .footer {
     display: flex;
