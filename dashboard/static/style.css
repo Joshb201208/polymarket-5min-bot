@@ -1275,18 +1275,18 @@ body::after {
 .redeem-list {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 4px;
 }
 
 .redeem-item {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 12px 16px;
-    background: rgba(255, 255, 255, 0.02);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    transition: all var(--transition);
+    gap: 10px;
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.015);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--radius-xs);
+    transition: all 0.2s ease;
     cursor: pointer;
     user-select: none;
 }
@@ -1297,34 +1297,41 @@ body::after {
 }
 
 .redeem-item.checked {
-    opacity: 0.35;
+    opacity: 0.3;
+    border-color: transparent;
+}
+
+.redeem-item.checked .redeem-market,
+.redeem-item.checked .redeem-side,
+.redeem-item.checked .redeem-amount,
+.redeem-item.checked .redeem-date {
     text-decoration: line-through;
-    border-color: rgba(255, 255, 255, 0.04);
 }
 
 .redeem-item.checked:hover {
-    opacity: 0.5;
+    opacity: 0.45;
 }
 
+/* Checkbox — small, inline, minimal */
 .redeem-check {
     flex-shrink: 0;
-    width: 20px;
-    height: 20px;
-    border-radius: 4px;
-    border: 2px solid var(--text-dim);
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1.5px solid var(--text-dim);
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s ease;
+    transition: all 0.15s ease;
     background: transparent;
 }
 
 .redeem-item.win .redeem-check {
-    border-color: rgba(0, 255, 136, 0.4);
+    border-color: rgba(0, 255, 136, 0.35);
 }
 
 .redeem-item.loss .redeem-check {
-    border-color: rgba(255, 51, 102, 0.4);
+    border-color: rgba(255, 51, 102, 0.3);
 }
 
 .redeem-item.checked .redeem-check {
@@ -1339,14 +1346,15 @@ body::after {
 
 .redeem-check-icon {
     display: none;
-    width: 12px;
-    height: 12px;
+    width: 9px;
+    height: 9px;
 }
 
 .redeem-item.checked .redeem-check-icon {
     display: block;
 }
 
+/* Content layout */
 .redeem-info {
     flex: 1;
     display: flex;
@@ -1357,7 +1365,7 @@ body::after {
 }
 
 .redeem-market {
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 500;
     white-space: nowrap;
     overflow: hidden;
@@ -1367,19 +1375,19 @@ body::after {
 .redeem-meta {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     flex-shrink: 0;
 }
 
 .redeem-side {
-    font-size: 11px;
+    font-size: 10px;
     color: var(--text-muted);
     white-space: nowrap;
 }
 
 .redeem-amount {
     font-family: var(--mono);
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
     white-space: nowrap;
 }
@@ -1393,28 +1401,26 @@ body::after {
 }
 
 .redeem-type {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 1px;
-    padding: 2px 8px;
-    border-radius: 10px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    padding: 2px 7px;
+    border-radius: 8px;
     white-space: nowrap;
 }
 
 .redeem-type.collect {
     background: var(--profit-dim);
     color: var(--profit);
-    border: 1px solid rgba(0, 255, 136, 0.2);
 }
 
 .redeem-type.clear {
     background: var(--loss-dim);
     color: var(--loss);
-    border: 1px solid rgba(255, 51, 102, 0.2);
 }
 
 .redeem-date {
-    font-size: 11px;
+    font-size: 10px;
     font-family: var(--mono);
     color: var(--text-dim);
     white-space: nowrap;
@@ -1427,7 +1433,10 @@ body::after {
         gap: 4px;
     }
     .redeem-meta {
-        gap: 8px;
+        gap: 6px;
+    }
+    .redeem-item {
+        padding: 8px 10px;
     }
 }
 
