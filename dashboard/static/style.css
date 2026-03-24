@@ -1426,6 +1426,29 @@ body::after {
     white-space: nowrap;
 }
 
+.redeem-clear-btn {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-family: var(--font);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 12px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.redeem-clear-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text);
+    border-color: var(--border-hover);
+}
+
+.redeem-clear-btn:active {
+    transform: scale(0.97);
+}
+
 @media (max-width: 768px) {
     .redeem-info {
         flex-direction: column;

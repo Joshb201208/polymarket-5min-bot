@@ -817,8 +817,18 @@ function updateRedeemChecklist(positions) {
     }).join('');
 }
 
-// Expose toggle for onclick
+function clearAllRedeemed() {
+    if (!cachedPositions) return;
+    const closed = cachedPositions.closed || [];
+    const set = getRedeemedSet();
+    closed.forEach(p => set.add(p.id));
+    saveRedeemedSet(set);
+    updateRedeemChecklist(cachedPositions);
+}
+
+// Expose for onclick
 window.toggleRedeemed = toggleRedeemed;
+window.clearAllRedeemed = clearAllRedeemed;
 
 // Performance summary with period tabs
 let currentPeriod = "today";
