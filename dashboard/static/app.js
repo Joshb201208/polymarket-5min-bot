@@ -25,6 +25,7 @@ let sortDirection = "desc";
 let expandedTradeId = null;
 let cachedPositions = null;
 let cachedStats = null;
+let cachedStatus = null;
 
 // ---------------------------------------------------------------------------
 // Chart.js Defaults
@@ -329,6 +330,31 @@ function setConnected(ok) {
 }
 
 // ---------------------------------------------------------------------------
+// Portfolio Value (computed from status + positions)
+// ---------------------------------------------------------------------------
+function updatePortfolioValue() {
+    if (!cachedStatus) return;
+    const cash = cachedStatus.bankroll || 0;
+    const starting = cachedStatus.starting_bankroll || 0;
+
+    // Sum up cost of open positions to get deployed capital
+    let deployed = 0;
+    if (cachedPositions && cachedPositions.open) {
+        deployed = cachedPositions.open.reduce((sum, p) => sum + (p.cost || 0), 0);
+    }
+
+    const portfolioValue = cash + deployed;
+    const pnlFromStart = portfolioValue - starting;
+
+    const el = document.getElementById("kpiPortfolio");
+    el.textContent = fmt.usd(portfolioValue);
+
+    const subEl = document.getElementById("kpiPortfolioSub");
+    const pnlSign = pnlFromStart >= 0 ? "+" : "";
+    subEl.textContent = `Cash: ${fmt.usd(cash)} \u00b7 Bets: ${fmt.usd(deployed)} \u00b7 ${pnlSign}${fmt.usd(pnlFromStart)} from start`;
+}
+
+// ---------------------------------------------------------------------------
 // Update Functions
 // ---------------------------------------------------------------------------
 
@@ -346,9 +372,11 @@ function updateStatus(data) {
         modeText.textContent = "PAPER";
     }
 
-    // Balance
-    document.getElementById("kpiBalance").textContent = fmt.usd(data.bankroll);
-    document.getElementById("kpiBalanceSub").textContent = `Starting: ${fmt.usd(data.starting_bankroll)}`;
+    // Portfolio Value = starting bankroll + total realized P&L
+    // (which equals: available cash + cost of open positions)
+    // We compute it from status data: bankroll is cash, open positions cost is the deployed part
+    cachedStatus = data;
+    updatePortfolioValue();
 
     // Last update
     document.getElementById("lastUpdate").textContent = data.last_scan
@@ -418,6 +446,7 @@ function updateStats(data) {
 function updatePositions(data) {
     if (!data) return;
     cachedPositions = data;
+    updatePortfolioValue();  // Recalculate with fresh position data
 
     const open = data.open || [];
     const grid = document.getElementById("positionsGrid");
