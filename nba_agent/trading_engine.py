@@ -13,6 +13,45 @@ from nba_agent.utils import utcnow
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Polymarket taker fee calculation
+# fee = C * p * feeRate * (p * (1 - p))^exponent
+# NBA markets are currently fee-free (base_fee=0).
+# If fees are enabled later, the CLOB client handles them in the order.
+# This function estimates fees for P&L tracking only.
+# ---------------------------------------------------------------------------
+import functools
+import urllib.request
+
+@functools.lru_cache(maxsize=256)
+def _get_fee_rate(token_id: str) -> float:
+    """Fetch the fee rate from Polymarket CLOB for a token. Cached."""
+    try:
+        url = f"https://clob.polymarket.com/fee-rate?token_id={token_id}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            import json
+            data = json.loads(resp.read())
+            return float(data.get("base_fee", 0))
+    except Exception:
+        return 0.0
+
+
+def _polymarket_taker_fee(shares: float, price: float, token_id: str = "") -> float:
+    """Estimate Polymarket taker fee for a trade.
+
+    Fetches the real fee rate from the CLOB. Returns 0 for fee-free
+    markets (currently all NBA).
+    """
+    if price <= 0 or price >= 1 or shares <= 0:
+        return 0.0
+    fee_rate = _get_fee_rate(token_id) if token_id else 0.0
+    if fee_rate <= 0:
+        return 0.0
+    fee = shares * price * fee_rate * (price * (1 - price))
+    return round(fee, 4)
+
+
 class TradingEngine:
     """Executes trades in paper or live mode."""
 
@@ -82,6 +121,9 @@ class TradingEngine:
         now_str = utcnow().isoformat()
         shares = bet_size / price
 
+        # Estimate taker fee on entry
+        entry_fee = _polymarket_taker_fee(shares, price, token_id)
+
         if self.config.is_paper:
             order_id = f"paper_{int(time.time())}"
             logger.info(
@@ -115,6 +157,7 @@ class TradingEngine:
             game_start_time=market.game_start_time,
             market_end_date=market.end_date,
             market_slug=market.slug,
+            fees_paid=entry_fee,
         )
 
         trade = Trade(
@@ -152,15 +195,21 @@ class TradingEngine:
             if not order_id:
                 return None
 
-        # Calculate P&L
+        # Calculate P&L (including fees)
         exit_value = position.shares * current_price
-        pnl = exit_value - position.cost
+        exit_fee = _polymarket_taker_fee(position.shares, current_price, position.token_id)
+        total_fees = position.fees_paid + exit_fee  # entry fee + exit fee
+        pnl = exit_value - position.cost - total_fees
 
         position.status = "closed"
         position.exit_price = current_price
         position.exit_time = now_str
         position.pnl = round(pnl, 2)
         position.exit_reason = reason
+        position.fees_paid = round(total_fees, 4)
+
+        logger.info("P&L: $%.2f (fees: $%.4f = entry $%.4f + exit $%.4f)",
+                    pnl, total_fees, total_fees - exit_fee, exit_fee)
 
         trade = Trade(
             id=f"trade_{int(time.time())}",

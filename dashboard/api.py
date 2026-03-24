@@ -314,12 +314,17 @@ def get_stats() -> dict:
     current_streak = abs(temp_streak)
     streak_type = "W" if temp_streak > 0 else "L"
 
+    # Total fees paid across all positions (open + closed)
+    all_positions = _read_json("positions.json").get("positions", [])
+    total_fees = round(sum(p.get("fees_paid", 0) or 0 for p in all_positions), 2)
+
     return {
         "total_trades": total_closed,
         "wins": win_count,
         "losses": loss_count,
         "win_rate": win_rate,
         "total_pnl": total_pnl,
+        "total_fees": total_fees,
         "roi": roi,
         "avg_edge": avg_edge,
         "avg_win": avg_win,

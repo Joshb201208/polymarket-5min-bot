@@ -213,6 +213,7 @@ class Position:
     pnl: Optional[float] = None
     exit_reason: Optional[str] = None
     market_slug: str = ""
+    fees_paid: float = 0.0  # Total Polymarket taker fees (entry + exit)
 
     def to_dict(self) -> dict:
         return asdict(self)
