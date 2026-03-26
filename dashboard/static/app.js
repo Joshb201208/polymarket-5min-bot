@@ -345,14 +345,39 @@ function updatePortfolioValue() {
     }
 
     const portfolioValue = cash + deployed;
-    const pnlFromStart = portfolioValue - starting;
 
     const el = document.getElementById("kpiPortfolio");
     el.textContent = fmt.usd(portfolioValue);
 
     const subEl = document.getElementById("kpiPortfolioSub");
-    const pnlSign = pnlFromStart >= 0 ? "+" : "";
-    subEl.textContent = `Cash: ${fmt.usd(cash)} \u00b7 Bets: ${fmt.usd(deployed)} \u00b7 ${pnlSign}${fmt.usd(pnlFromStart)} from start`;
+    subEl.textContent = `Cash: ${fmt.usd(cash)} \u00b7 Bets: ${fmt.usd(deployed)}`;
+
+    // Unrealized P&L — computed from live data
+    updateUnrealizedPnl();
+}
+
+function updateUnrealizedPnl() {
+    const openPositions = (cachedPositions && cachedPositions.open) ? cachedPositions.open : [];
+    let unrealized = 0;
+    let hasLiveData = false;
+
+    for (const p of openPositions) {
+        const live = cachedLive[p.id];
+        if (live && live.pnl_live != null) {
+            unrealized += live.pnl_live;
+            hasLiveData = true;
+        }
+    }
+
+    const el = document.getElementById("kpiUnrealizedPnl");
+    if (hasLiveData) {
+        el.textContent = (unrealized >= 0 ? "+" : "") + fmt.usd(unrealized);
+        el.className = `kpi-value ${unrealized >= 0 ? "pnl-positive" : "pnl-negative"}`;
+    } else {
+        el.textContent = "--";
+        el.className = "kpi-value";
+    }
+    document.getElementById("kpiUnrealizedSub").textContent = `${openPositions.length} open position${openPositions.length !== 1 ? "s" : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,20 +428,18 @@ function updateStats(data) {
     const todayTrades = todayEntry2 ? (todayEntry2.trades || 1) : 0;
     document.getElementById("kpiDailyPnlSub").textContent = `${todayTrades} trade${todayTrades !== 1 ? "s" : ""} today`;
 
-    // Win rate
-    document.getElementById("kpiWinRate").textContent = fmt.pct(data.win_rate);
-    document.getElementById("kpiWinBar").style.width = `${data.win_rate || 0}%`;
+    // Realized P&L
+    const realizedEl = document.getElementById("kpiRealizedPnl");
+    const realizedPnl = data.total_pnl || 0;
+    realizedEl.textContent = (realizedPnl >= 0 ? "+" : "") + fmt.usd(realizedPnl);
+    realizedEl.className = `kpi-value ${realizedPnl >= 0 ? "pnl-positive" : "pnl-negative"}`;
+    document.getElementById("kpiRealizedSub").textContent = `ROI: ${(data.roi >= 0 ? "+" : "")}${fmt.pct(data.roi)}`;
 
-    // Total trades
+    // Win rate + trades (combined into one card)
+    document.getElementById("kpiWinRate").textContent = fmt.pct(data.win_rate);
     document.getElementById("kpiTotalTrades").textContent = data.total_trades || 0;
     document.getElementById("kpiWins").textContent = data.wins || 0;
     document.getElementById("kpiLosses").textContent = data.losses || 0;
-
-    // ROI
-    const roiEl = document.getElementById("kpiRoi");
-    roiEl.textContent = (data.roi >= 0 ? "+" : "") + fmt.pct(data.roi);
-    roiEl.className = `kpi-value ${data.roi >= 0 ? "pnl-positive" : "pnl-negative"}`;
-    document.getElementById("kpiPnlTotal").textContent = `P&L: ${fmt.usd(data.total_pnl)}`;
 
     // Badges
     document.getElementById("drawdownBadge").textContent = `Max DD: ${fmt.pct(data.max_drawdown)}`;
@@ -1223,6 +1246,7 @@ async function refresh() {
         for (const lp of liveData.positions) {
             cachedLive[lp.id] = lp;
         }
+        updateUnrealizedPnl();
     }
 
     if (positions) {

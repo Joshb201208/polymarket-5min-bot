@@ -162,7 +162,17 @@
         <div class="kpi-card kpi-balance">
             <div class="kpi-label">Portfolio Value</div>
             <div class="kpi-value balance-glow" id="kpiPortfolio">$0.00</div>
-            <div class="kpi-sub" id="kpiPortfolioSub">Cash: $0 · Deployed: $0</div>
+            <div class="kpi-sub" id="kpiPortfolioSub">Cash: $0 · Bets: $0</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Realized P&L</div>
+            <div class="kpi-value" id="kpiRealizedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiRealizedSub">ROI: 0%</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Unrealized P&L</div>
+            <div class="kpi-value" id="kpiUnrealizedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiUnrealizedSub">0 open positions</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-label">Today's P&L</div>
@@ -172,19 +182,7 @@
         <div class="kpi-card">
             <div class="kpi-label">Win Rate</div>
             <div class="kpi-value" id="kpiWinRate">0%</div>
-            <div class="kpi-bar-container">
-                <div class="kpi-bar" id="kpiWinBar" style="width: 0%"></div>
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Total Trades</div>
-            <div class="kpi-value" id="kpiTotalTrades">0</div>
-            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">ROI</div>
-            <div class="kpi-value" id="kpiRoi">0%</div>
-            <div class="kpi-sub" id="kpiPnlTotal">P&L: $0.00</div>
+            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L · <span id="kpiTotalTrades">0</span> trades</div>
         </div>
     </section>
 
