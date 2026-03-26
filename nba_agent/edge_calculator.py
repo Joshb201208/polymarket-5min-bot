@@ -196,11 +196,20 @@ class EdgeCalculator:
         away_edge = fair_away - away_market_price
         home_edge = fair_home - home_market_price
 
+        # MINIMUM PRICE FLOOR: block heavy underdogs under 20¢.
+        # Live data: 0W/8L on <15¢, 2W/7L on 15-30¢ (barely breakeven).
+        # Only the 20-50¢ range has positive expectation.
+        MIN_ENTRY_PRICE = 0.20
+
         # Determine Vegas agreement for position sizing
         has_vegas = vegas_fair_home is not None
         vegas_home_favored = vegas_fair_home > 0.5 if has_vegas else False
 
         if home_edge > away_edge and home_edge > 0:
+            if home_market_price < MIN_ENTRY_PRICE:
+                logger.debug("Skipping %s home: price %.1f¢ below 20¢ floor",
+                             market.question, home_market_price * 100)
+                return None
             vegas_agrees = has_vegas and vegas_home_favored  # We're betting home, Vegas also favors home
             return EdgeResult(
                 market=market,
@@ -215,6 +224,10 @@ class EdgeCalculator:
                 vegas_agrees=vegas_agrees,
             )
         elif away_edge > 0:
+            if away_market_price < MIN_ENTRY_PRICE:
+                logger.debug("Skipping %s away: price %.1f¢ below 20¢ floor",
+                             market.question, away_market_price * 100)
+                return None
             vegas_agrees = has_vegas and not vegas_home_favored  # We're betting away, Vegas also favors away
             return EdgeResult(
                 market=market,

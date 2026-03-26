@@ -31,7 +31,7 @@ class Config:
 
     # Bankroll
     STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "500"))
-    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.08"))
+    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.03"))  # Capped from 8% to 3% — prevents outsized single losses
     MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.12"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 

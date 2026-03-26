@@ -59,15 +59,13 @@ class BankrollManager:
         kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly
         bet_size = self.current_bankroll * kelly_fraction
 
-        # HIGH confidence cap: these are typically heavy underdogs with
-        # large calculated edges (>10%). Live data shows 0W/6L on HIGH
-        # bets — the edge calculator overvalues these. Cap their sizing
-        # to match MEDIUM-tier bets so they don't dominate losses.
+        # HIGH confidence BLOCKED: 0W/9L in live trading (-$59.60).
+        # The edge calculator fundamentally overvalues these — they represent
+        # heavy underdogs with large calculated edges that never materialize.
         if edge_result.confidence == Confidence.HIGH:
-            medium_cap = self.current_bankroll * 0.015  # ~1.5% of bankroll max
-            if bet_size > medium_cap:
-                logger.info("HIGH conf bet capped: $%.2f → $%.2f (1.5%% cap)", bet_size, medium_cap)
-                bet_size = medium_cap
+            logger.info("BLOCKED: HIGH confidence bet on %s (0/9 in live data)",
+                        edge_result.market.question)
+            return 0.0
 
         # Vegas agreement boost: if Vegas and our model agree, size up
         if edge_result.has_vegas_line and edge_result.vegas_agrees:
