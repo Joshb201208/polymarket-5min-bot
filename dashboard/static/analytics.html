@@ -1051,18 +1051,18 @@
         // -------------------------------------------------------
         function renderTierCards(data) {
             const grid = document.getElementById('tierGrid');
-            if (!data || !Array.isArray(data) || data.length === 0) return;
+            if (!data || Object.keys(data).length === 0) return;
 
             const tiers = ['HIGH', 'MEDIUM', 'LOW'];
             const labelClass = { HIGH: 'tier-label-HIGH', MEDIUM: 'tier-label-MEDIUM', LOW: 'tier-label-LOW' };
 
             grid.innerHTML = tiers.map(tier => {
-                const d = data.find(r => r.tier === tier) || {};
+                const d = data[tier] || {};
                 const trades = d.trades ?? 0;
                 const wins   = d.wins ?? 0;
                 const losses = d.losses ?? 0;
-                const pnl    = d.total_pnl ?? null;
-                const wagered = d.total_wagered ?? null;
+                const pnl    = d.pnl ?? null;
+                const wagered = d.wagered ?? null;
 
                 return `
                 <div class="tier-card">
@@ -1086,21 +1086,21 @@
         // -------------------------------------------------------
         function renderPriceRangeCards(data) {
             const grid = document.getElementById('priceRangeGrid');
-            if (!data || !Array.isArray(data) || data.length === 0) return;
+            if (!data || Object.keys(data).length === 0) return;
 
+            const rangeKeys = ['<15c', '15-30c', '30-50c', '>50c'];
             const rangeLabels = {
-                'lt15': '<15¢',
-                '15_30': '15–30¢',
-                '30_50': '30–50¢',
-                'gt50': '>50¢',
+                '<15c': '<15¢',
+                '15-30c': '15–30¢',
+                '30-50c': '30–50¢',
+                '>50c': '>50¢',
             };
-            const rangeKeys = ['lt15', '15_30', '30_50', 'gt50'];
 
             grid.innerHTML = rangeKeys.map(key => {
-                const d = data.find(r => r.range === key || r.price_range === key) || {};
-                const wins   = d.wins ?? 0;
-                const losses = d.losses ?? 0;
-                const pnl    = d.total_pnl ?? null;
+                const d = data[key] || {};
+                const wins   = d.w ?? 0;
+                const losses = d.l ?? 0;
+                const pnl    = d.pnl ?? null;
                 const trades = (wins + losses) || 0;
 
                 return `
