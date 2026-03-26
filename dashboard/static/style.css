@@ -911,6 +911,42 @@ body::after {
     font-weight: 500;
 }
 
+/* Live score bar */
+.pos-score {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 10px;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius-xs);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.pos-score-teams {
+    font-size: 12px;
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: 0.3px;
+}
+
+.pos-score-status {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+}
+
+.pos-score-live {
+    color: var(--profit);
+    animation: pulse-dot 2s infinite;
+}
+
+.pos-score-final {
+    color: var(--text-dim);
+}
+
 /* Empty state */
 .empty-state {
     display: flex;

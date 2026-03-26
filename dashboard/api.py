@@ -178,6 +178,115 @@ def get_positions() -> dict:
     return {"open": open_pos, "closed": closed_pos}
 
 
+@app.get("/api/live", dependencies=[Depends(_require_auth)])
+def get_live_data() -> dict:
+    """Fetch live prices from Polymarket CLOB and scores from ESPN."""
+    import urllib.request
+
+    positions = _read_json("positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+
+    # --- Fetch live market prices from Polymarket CLOB ---
+    prices = {}
+    for p in open_pos:
+        token_id = p.get("token_id", "")
+        if not token_id:
+            continue
+        try:
+            url = f"https://clob.polymarket.com/midpoint?token_id={token_id}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                mid = float(data.get("mid", 0)) if isinstance(data, dict) else float(data)
+                prices[p["id"]] = mid
+        except Exception:
+            prices[p["id"]] = None
+
+    # --- Fetch live NBA scores from ESPN ---
+    scores = {}
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            espn = json.loads(resp.read())
+            for event in espn.get("events", []):
+                # Get team names and scores
+                comps = event.get("competitions", [{}])[0]
+                teams = comps.get("competitors", [])
+                status_obj = comps.get("status", {})
+                status_type = status_obj.get("type", {})
+                status_name = status_type.get("name", "")  # STATUS_SCHEDULED, STATUS_IN_PROGRESS, STATUS_FINAL
+                status_detail = status_obj.get("type", {}).get("shortDetail", status_obj.get("displayClock", ""))
+                # Try to get a better detail string
+                status_detail = status_type.get("shortDetail", "")
+                if not status_detail:
+                    status_detail = status_obj.get("displayClock", "")
+                    period = status_obj.get("period", 0)
+                    if period > 0 and status_name == "STATUS_IN_PROGRESS":
+                        status_detail = f"Q{period} {status_detail}"
+
+                home_team = ""
+                away_team = ""
+                home_score = 0
+                away_score = 0
+                for t in teams:
+                    name = t.get("team", {}).get("displayName", "")
+                    score = int(t.get("score", 0) or 0)
+                    if t.get("homeAway") == "home":
+                        home_team = name
+                        home_score = score
+                    else:
+                        away_team = name
+                        away_score = score
+
+                game_key = f"{away_team} vs. {home_team}".lower()
+                scores[game_key] = {
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "status": status_name,
+                    "detail": status_detail,
+                }
+    except Exception as e:
+        pass  # scores remain empty
+
+    # --- Match scores to positions ---
+    result = []
+    for p in open_pos:
+        q = (p.get("market_question") or "").lower()
+        live_price = prices.get(p["id"])
+        current_value = None
+        pnl_live = None
+        if live_price and live_price > 0:
+            current_value = round(p.get("shares", 0) * live_price, 2)
+            pnl_live = round(current_value - p.get("cost", 0), 2)
+
+        # Try to match ESPN score
+        matched_score = None
+        for game_key, score_data in scores.items():
+            # Match by checking if both team names appear in the question
+            home_short = score_data["home_team"].split()[-1].lower()  # e.g. "Celtics"
+            away_short = score_data["away_team"].split()[-1].lower()
+            if home_short in q and away_short in q:
+                matched_score = score_data
+                break
+
+        result.append({
+            "id": p["id"],
+            "market_question": p.get("market_question"),
+            "live_price": live_price,
+            "entry_price": p.get("entry_price"),
+            "cost": p.get("cost"),
+            "shares": p.get("shares"),
+            "current_value": current_value,
+            "pnl_live": pnl_live,
+            "score": matched_score,
+        })
+
+    return {"positions": result}
+
+
 @app.get("/api/trades", dependencies=[Depends(_require_auth)])
 def get_trades() -> dict:
     trades = _read_json("trades.json").get("trades", [])

@@ -26,6 +26,7 @@ let expandedTradeId = null;
 let cachedPositions = null;
 let cachedStats = null;
 let cachedStatus = null;
+let cachedLive = {};  // { posId: { live_price, current_value, pnl_live, score } }
 
 // ---------------------------------------------------------------------------
 // Chart.js Defaults
@@ -473,7 +474,9 @@ function updatePositions(data) {
             const confClass =
                 p.confidence === "HIGH" ? "conf-high" :
                 p.confidence === "MEDIUM" ? "conf-medium" : "conf-low";
-            const cardClass = "pos-neutral";
+            const live = cachedLive[p.id] || null;
+            const cardClass = live && live.pnl_live > 0 ? "pos-profit" :
+                              live && live.pnl_live < 0 ? "pos-loss" : "pos-neutral";
 
             // Extract game date from slug (nba-away-home-YYYY-MM-DD) or game_start_time
             let gameDate = "--";
@@ -507,22 +510,27 @@ function updatePositions(data) {
                         <span class="pos-detail-value">${fmt.price(p.entry_price)}</span>
                     </div>
                     <div class="pos-detail">
+                        <span class="pos-detail-label">Now</span>
+                        <span class="pos-detail-value">${live ? fmt.price(live.live_price) : '--'}</span>
+                    </div>
+                    <div class="pos-detail">
                         <span class="pos-detail-label">Cost</span>
                         <span class="pos-detail-value">${fmt.usd(p.cost)}</span>
                     </div>
                     <div class="pos-detail">
-                        <span class="pos-detail-label">Edge</span>
-                        <span class="pos-detail-value">${fmt.edge(p.edge_at_entry)}</span>
+                        <span class="pos-detail-label">Value</span>
+                        <span class="pos-detail-value ${live && live.pnl_live > 0 ? 'pnl-positive' : live && live.pnl_live < 0 ? 'pnl-negative' : ''}">${live ? fmt.usd(live.current_value) : '--'}</span>
                     </div>
                     <div class="pos-detail">
-                        <span class="pos-detail-label">Fair Price</span>
-                        <span class="pos-detail-value">${fmt.price(p.our_fair_price)}</span>
-                    </div>
-                    <div class="pos-detail">
-                        <span class="pos-detail-label">Hold Time</span>
-                        <span class="pos-detail-value">${holdTime}</span>
+                        <span class="pos-detail-label">P&L</span>
+                        <span class="pos-detail-value ${live && live.pnl_live > 0 ? 'pnl-positive' : live && live.pnl_live < 0 ? 'pnl-negative' : ''}">${live ? (live.pnl_live >= 0 ? '+' : '') + fmt.usd(live.pnl_live) : '--'}</span>
                     </div>
                 </div>
+                ${live && live.score ? `
+                <div class="pos-score">
+                    <span class="pos-score-teams">${escHtml(live.score.away_team)} ${live.score.away_score} — ${live.score.home_score} ${escHtml(live.score.home_team)}</span>
+                    <span class="pos-score-status ${live.score.status === 'STATUS_IN_PROGRESS' ? 'pos-score-live' : live.score.status === 'STATUS_FINAL' ? 'pos-score-final' : ''}">${escHtml(live.score.detail || (live.score.status === 'STATUS_SCHEDULED' ? 'Scheduled' : live.score.status === 'STATUS_FINAL' ? 'Final' : 'Live'))}</span>
+                </div>` : ''}
             </div>`;
         })
         .join("");
@@ -1196,11 +1204,12 @@ function escHtml(str) {
 // Main refresh loop
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [status, positions, stats, research] = await Promise.all([
+    const [status, positions, stats, research, liveData] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/positions"),
         fetchJSON("/api/stats"),
         fetchJSON("/api/research"),
+        fetchJSON("/api/live"),
     ]);
 
     const anySuccess = status || positions || stats || research;
@@ -1208,6 +1217,14 @@ async function refresh() {
 
     if (status) updateStatus(status);
     if (stats) updateStats(stats);
+    // Update live data cache before rendering positions
+    if (liveData && liveData.positions) {
+        cachedLive = {};
+        for (const lp of liveData.positions) {
+            cachedLive[lp.id] = lp;
+        }
+    }
+
     if (positions) {
         updatePositions(positions);
         updateTrades(positions);
