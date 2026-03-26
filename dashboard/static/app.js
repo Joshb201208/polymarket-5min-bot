@@ -1256,6 +1256,19 @@ async function refresh() {
     }
     if (research) updateResearch(research);
     updateDailySummary(stats, research);
+
+    // API health check (runs less frequently — piggybacks on refresh)
+    fetchJSON("/api/api-health").then((h) => {
+        if (!h || !h.sources) return;
+        const map = { dotEspn: "espn", dotOdds: "odds_api", dotBdl: "balldontlie", dotPoly: "polymarket" };
+        for (const [elId, key] of Object.entries(map)) {
+            const el = document.getElementById(elId);
+            if (!el) continue;
+            const src = h.sources[key];
+            el.className = `api-dot ${src && src.status === "ok" ? "ok" : "error"}`;
+            el.title = `${key}: ${src ? src.status : "unknown"}`;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

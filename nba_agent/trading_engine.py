@@ -138,6 +138,40 @@ class TradingEngine:
             if not order_id:
                 return None, None
 
+        # Calculate hours before tipoff
+        hours_before = None
+        if market.game_start_time:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                now_dt = _dt.now(_tz.utc)
+                game_str = market.game_start_time.replace("Z", "+00:00")
+                game_dt = _dt.fromisoformat(game_str)
+                if game_dt.tzinfo is None:
+                    game_dt = game_dt.replace(tzinfo=_tz.utc)
+                hours_before = round((game_dt - now_dt).total_seconds() / 3600, 1)
+            except Exception:
+                pass
+
+        # Get opponent win percentage from research data
+        opponent_win_pct = None
+        if edge_result.research:
+            try:
+                # We're betting on outcome_name — opponent is the other team
+                our_team = outcome_name.lower()
+                home = edge_result.research.home_team
+                away = edge_result.research.away_team
+                # Figure out which team is the opponent
+                home_name = home.team_name.split()[-1].lower() if home.team_name else ""
+                away_name = away.team_name.split()[-1].lower() if away.team_name else ""
+                if our_team.endswith(home_name) or home_name in our_team:
+                    # We bet on home, opponent is away
+                    opponent_win_pct = round(away.win_pct, 3) if away.win_pct else None
+                else:
+                    # We bet on away, opponent is home
+                    opponent_win_pct = round(home.win_pct, 3) if home.win_pct else None
+            except Exception:
+                pass
+
         pos_id = f"pos_{int(time.time())}"
         position = Position(
             id=pos_id,
@@ -158,6 +192,8 @@ class TradingEngine:
             market_end_date=market.end_date,
             market_slug=market.slug,
             fees_paid=entry_fee,
+            hours_before_tipoff=hours_before,
+            opponent_win_pct=opponent_win_pct,
         )
 
         trade = Trade(

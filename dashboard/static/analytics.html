@@ -1,0 +1,1473 @@
+<!--
+   ______                            __
+  / ____/___  ____ ___  ____  __  __/ /____  _____
+ / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
+/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
+\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
+                    /_/
+        Created with Perplexity Computer
+        https://www.perplexity.ai/computer
+-->
+
+<!-- Perplexity Computer Attribution — SEO Meta Tags -->
+<meta name="generator" content="Perplexity Computer">
+<meta name="author" content="Perplexity Computer">
+<meta property="og:see_also" content="https://www.perplexity.ai/computer">
+<link rel="author" href="https://www.perplexity.ai/computer">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NBA Agent — Analytics</title>
+    <meta name="description" content="Deep analytics for NBA Polymarket betting agent — confidence tiers, timing, price drift, opponent strength">
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Styles -->
+    <link rel="stylesheet" href="style.css">
+
+    <style>
+        /* ============================================= */
+        /* Analytics-specific layout                     */
+        /* ============================================= */
+
+        .analytics-main {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px 24px 48px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .analytics-page-title {
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            padding: 20px 24px 0;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Tier / price-range cards row */
+        .tier-grid {
+            display: grid;
+            gap: 16px;
+        }
+        .tier-grid-3 { grid-template-columns: repeat(3, 1fr); }
+        .tier-grid-4 { grid-template-columns: repeat(4, 1fr); }
+
+        @media (max-width: 900px) {
+            .tier-grid-3 { grid-template-columns: repeat(2, 1fr); }
+            .tier-grid-4 { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 560px) {
+            .tier-grid-3,
+            .tier-grid-4 { grid-template-columns: 1fr; }
+        }
+
+        .tier-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            transition: border-color var(--transition);
+        }
+        .tier-card:hover {
+            border-color: var(--border-hover);
+        }
+
+        .tier-label {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .tier-label-HIGH { color: var(--primary); }
+        .tier-label-MEDIUM { color: var(--secondary); }
+        .tier-label-LOW { color: var(--text-muted); }
+        .tier-label-range { color: var(--text-muted); }
+
+        .tier-pnl {
+            font-family: var(--mono);
+            font-size: 26px;
+            font-weight: 600;
+            line-height: 1;
+        }
+        .tier-pnl.positive { color: var(--profit); }
+        .tier-pnl.negative { color: var(--loss); }
+        .tier-pnl.neutral   { color: var(--text-muted); }
+
+        .tier-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .tier-meta-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .tier-meta-row span:last-child {
+            font-family: var(--mono);
+            color: var(--text);
+        }
+
+        .tier-wl {
+            display: flex;
+            gap: 8px;
+            margin-top: 2px;
+        }
+        .wl-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 20px;
+            font-family: var(--mono);
+        }
+        .wl-pill.win {
+            background: var(--profit-dim);
+            color: var(--profit);
+        }
+        .wl-pill.loss {
+            background: var(--loss-dim);
+            color: var(--loss);
+        }
+
+        /* Chart section */
+        .chart-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 0;
+            overflow: hidden;
+        }
+        .chart-section .card-header {
+            padding: 16px 22px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .chart-section .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--text);
+            margin: 0;
+        }
+        .chart-section .chart-container {
+            padding: 16px 22px 20px;
+            position: relative;
+            height: 300px;
+        }
+        .chart-section .chart-container canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+
+        /* Empty state for charts */
+        .chart-empty {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            color: var(--text-muted);
+        }
+        .chart-empty svg { opacity: 0.3; }
+        .chart-empty-label {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-muted);
+        }
+        .chart-empty-sub {
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+
+        /* API Health section */
+        .api-health-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+        }
+        @media (max-width: 900px) {
+            .api-health-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 560px) {
+            .api-health-grid { grid-template-columns: 1fr; }
+        }
+
+        .health-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 18px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            transition: border-color var(--transition);
+        }
+        .health-card:hover { border-color: var(--border-hover); }
+
+        .health-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .health-card-name {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text);
+        }
+        .health-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-dim);
+            flex-shrink: 0;
+        }
+        .health-status-dot.ok {
+            background: var(--profit);
+            box-shadow: 0 0 6px rgba(0,255,136,0.5);
+        }
+        .health-status-dot.error {
+            background: var(--loss);
+            box-shadow: 0 0 6px rgba(255,51,102,0.5);
+        }
+        .health-status-dot.warn {
+            background: #f59e0b;
+            box-shadow: 0 0 6px rgba(245,158,11,0.5);
+        }
+
+        .health-detail {
+            font-size: 11px;
+            color: var(--text-muted);
+            font-family: var(--mono);
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .health-status-text {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .health-status-text.ok { color: var(--profit); }
+        .health-status-text.error { color: var(--loss); }
+        .health-status-text.warn { color: #f59e0b; }
+
+        /* Calibrator section */
+        .calibrator-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+        }
+        @media (max-width: 700px) {
+            .calibrator-grid { grid-template-columns: 1fr; }
+        }
+
+        .cal-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .cal-label {
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .cal-value {
+            font-family: var(--mono);
+            font-size: 28px;
+            font-weight: 600;
+            color: var(--text);
+            line-height: 1;
+        }
+        .cal-sub {
+            font-size: 11px;
+            color: var(--text-dim);
+            margin-top: 2px;
+        }
+        .cal-status-active {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            width: fit-content;
+            margin-top: 4px;
+        }
+        .cal-status-active.active {
+            background: var(--profit-dim);
+            color: var(--profit);
+        }
+        .cal-status-active.inactive {
+            background: var(--loss-dim);
+            color: var(--loss);
+        }
+        .cal-status-active::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        /* Section-level card wrapper */
+        .section-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .section-card .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 22px;
+            border-bottom: 1px solid var(--border);
+        }
+        .section-card .section-title {
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--text);
+            margin: 0;
+        }
+        .section-card .section-body {
+            padding: 20px 22px;
+        }
+
+        /* badge variant */
+        .badge-analytics {
+            background: rgba(0, 240, 255, 0.08);
+            color: var(--primary);
+            border: 1px solid rgba(0, 240, 255, 0.2);
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            padding: 3px 8px;
+            border-radius: 20px;
+            text-transform: uppercase;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ============================================= -->
+    <!-- LOGIN SCREEN                                  -->
+    <!-- ============================================= -->
+    <div id="loginOverlay" class="login-overlay">
+        <!-- Interactive particle canvas -->
+        <canvas id="loginCanvas"></canvas>
+
+        <!-- Floating aurora orbs -->
+        <div class="login-orb login-orb-1"></div>
+        <div class="login-orb login-orb-2"></div>
+        <div class="login-orb login-orb-3"></div>
+
+        <!-- Subtle grid overlay -->
+        <div class="login-grid-bg"></div>
+
+        <!-- Horizontal scan line -->
+        <div class="login-scanline"></div>
+
+        <!-- Card -->
+        <div class="login-container">
+            <!-- Rotating ring behind logo -->
+            <div class="login-ring-wrap">
+                <svg class="login-ring" width="120" height="120" viewBox="0 0 120 120" fill="none">
+                    <circle cx="60" cy="60" r="56" stroke="url(#ringGrad)" stroke-width="1" stroke-dasharray="6 8" opacity="0.4"/>
+                    <circle cx="60" cy="60" r="46" stroke="url(#ringGrad2)" stroke-width="0.75" stroke-dasharray="3 6" opacity="0.3"/>
+                    <defs>
+                        <linearGradient id="ringGrad" x1="0" y1="0" x2="120" y2="120">
+                            <stop offset="0%" stop-color="#00f0ff"/>
+                            <stop offset="100%" stop-color="#8b5cf6"/>
+                        </linearGradient>
+                        <linearGradient id="ringGrad2" x1="120" y1="0" x2="0" y2="120">
+                            <stop offset="0%" stop-color="#8b5cf6"/>
+                            <stop offset="100%" stop-color="#00f0ff"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <!-- Core logo -->
+                <div class="login-logo-core">
+                    <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
+                        <circle cx="16" cy="16" r="12" stroke="#00f0ff" stroke-width="1.5" fill="none" opacity="0.5"/>
+                        <circle cx="16" cy="16" r="6" stroke="#00f0ff" stroke-width="1.5" fill="none"/>
+                        <circle cx="16" cy="16" r="2.5" fill="#00f0ff"/>
+                        <line x1="16" y1="4" x2="16" y2="10" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="16" y1="22" x2="16" y2="28" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="4" y1="16" x2="10" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="22" y1="16" x2="28" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                    </svg>
+                </div>
+            </div>
+
+            <div class="login-text">
+                <div class="login-title">NBA AGENT</div>
+                <div class="login-subtitle">POLYMARKET DASHBOARD</div>
+            </div>
+
+            <form id="loginForm" class="login-form" autocomplete="off">
+                <div class="login-input-group">
+                    <label class="login-label" for="passkey">PASSKEY</label>
+                    <div class="login-input-wrap">
+                        <input type="password" id="passkeyInput" class="login-input" placeholder="• • • • • •" autofocus autocomplete="off">
+                        <div class="login-input-glow"></div>
+                    </div>
+                </div>
+                <div class="login-error" id="loginError"></div>
+                <button type="submit" class="login-btn" id="loginBtn">
+                    <span class="login-btn-text">UNLOCK</span>
+                    <svg class="login-btn-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div class="login-footer">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style="opacity:0.5">
+                    <rect x="1" y="5" width="10" height="6" rx="1.5" stroke="#71717a" stroke-width="1"/>
+                    <path d="M3 5V3.5a3 3 0 0 1 6 0V5" stroke="#71717a" stroke-width="1" stroke-linecap="round"/>
+                </svg>
+                <span>Secured access only</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================= -->
+    <!-- DASHBOARD (hidden until auth)                 -->
+    <!-- ============================================= -->
+    <div id="dashboardContent" class="dashboard-hidden">
+
+    <!-- ============================================= -->
+    <!-- HEADER                                        -->
+    <!-- ============================================= -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="NBA Agent Logo">
+                    <circle cx="16" cy="16" r="14" stroke="#00f0ff" stroke-width="2" fill="none" opacity="0.3"/>
+                    <circle cx="16" cy="16" r="8" stroke="#00f0ff" stroke-width="2" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="#00f0ff"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                </svg>
+                <div class="logo-text">
+                    <span class="logo-title">NBA AGENT</span>
+                    <span class="logo-subtitle">POLYMARKET</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-center">
+            <a href="/" class="nav-link">Overview</a>
+            <a href="/analytics.html" class="nav-link active">Analytics</a>
+        </div>
+        <div class="header-right">
+            <div class="api-health" id="apiHealth" title="API Status">
+                <span class="api-dot" id="dotEspn" title="ESPN"></span>
+                <span class="api-dot" id="dotOdds" title="Odds API"></span>
+                <span class="api-dot" id="dotBdl" title="BallDontLie"></span>
+                <span class="api-dot" id="dotPoly" title="Polymarket"></span>
+            </div>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot connected"></span>
+                <span class="status-text">Live</span>
+            </div>
+            <div class="last-update" id="lastUpdate">--</div>
+        </div>
+    </header>
+
+    <!-- ============================================= -->
+    <!-- PAGE TITLE                                    -->
+    <!-- ============================================= -->
+    <div class="analytics-page-title">Deep Analytics</div>
+
+    <!-- ============================================= -->
+    <!-- MAIN CONTENT                                  -->
+    <!-- ============================================= -->
+    <main class="analytics-main">
+
+        <!-- ==========================================
+             SECTION 1: P&L by Confidence Tier
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">P&amp;L by Confidence Tier</h2>
+                <span class="badge-analytics">All Time</span>
+            </div>
+            <div class="section-body">
+                <div class="tier-grid tier-grid-3" id="tierGrid">
+                    <!-- Rendered by JS -->
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-HIGH">HIGH</div>
+                        <div class="tier-pnl neutral">--</div>
+                        <div class="tier-meta">
+                            <div class="tier-meta-row"><span>Trades</span><span>--</span></div>
+                            <div class="tier-meta-row"><span>Total Wagered</span><span>--</span></div>
+                        </div>
+                    </div>
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-MEDIUM">MEDIUM</div>
+                        <div class="tier-pnl neutral">--</div>
+                        <div class="tier-meta">
+                            <div class="tier-meta-row"><span>Trades</span><span>--</span></div>
+                            <div class="tier-meta-row"><span>Total Wagered</span><span>--</span></div>
+                        </div>
+                    </div>
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-LOW">LOW</div>
+                        <div class="tier-pnl neutral">--</div>
+                        <div class="tier-meta">
+                            <div class="tier-meta-row"><span>Trades</span><span>--</span></div>
+                            <div class="tier-meta-row"><span>Total Wagered</span><span>--</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 2: P&L by Entry Price Range
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">P&amp;L by Entry Price Range</h2>
+                <span class="badge-analytics">Cents</span>
+            </div>
+            <div class="section-body">
+                <div class="tier-grid tier-grid-4" id="priceRangeGrid">
+                    <!-- Rendered by JS -->
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-range">&lt;15¢</div>
+                        <div class="tier-pnl neutral">--</div>
+                    </div>
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-range">15–30¢</div>
+                        <div class="tier-pnl neutral">--</div>
+                    </div>
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-range">30–50¢</div>
+                        <div class="tier-pnl neutral">--</div>
+                    </div>
+                    <div class="tier-card" style="opacity:0.4">
+                        <div class="tier-label tier-label-range">&gt;50¢</div>
+                        <div class="tier-pnl neutral">--</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 3: Entry Timing Analysis
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Entry Timing Analysis</h2>
+                <span class="badge-analytics">Hours Before Tipoff</span>
+            </div>
+            <div class="section-body" style="padding: 0 22px 20px;">
+                <div style="position:relative; height:300px;">
+                    <canvas id="timingChart"></canvas>
+                    <div class="chart-empty" id="timingEmpty" style="display:none;">
+                        <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+                            <circle cx="20" cy="20" r="16" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
+                            <path d="M20 13v7l4 4" stroke="#71717a" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                        <div class="chart-empty-label">Collecting data...</div>
+                        <div class="chart-empty-sub">Timing data appears once bets resolve</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 4: Price Drift Analysis
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Price Drift Analysis</h2>
+                <span class="badge-analytics">Entry → Game Time</span>
+            </div>
+            <div class="section-body" style="padding: 0 22px 20px;">
+                <div style="position:relative; height:300px;">
+                    <canvas id="driftChart"></canvas>
+                    <div class="chart-empty" id="driftEmpty" style="display:none;">
+                        <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+                            <circle cx="20" cy="20" r="16" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
+                            <path d="M12 28l6-8 4 4 6-10" stroke="#71717a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <div class="chart-empty-label">Collecting data...</div>
+                        <div class="chart-empty-sub">Price drift data appears once bets resolve</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 5: Opponent Strength
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Opponent Strength</h2>
+                <span class="badge-analytics">Win % vs P&amp;L</span>
+            </div>
+            <div class="section-body" style="padding: 0 22px 20px;">
+                <div style="position:relative; height:300px;">
+                    <canvas id="opponentChart"></canvas>
+                    <div class="chart-empty" id="opponentEmpty" style="display:none;">
+                        <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+                            <circle cx="20" cy="20" r="16" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
+                            <circle cx="14" cy="22" r="2.5" stroke="#71717a" stroke-width="1.5"/>
+                            <circle cx="22" cy="16" r="2.5" stroke="#71717a" stroke-width="1.5"/>
+                            <circle cx="28" cy="20" r="2.5" stroke="#71717a" stroke-width="1.5"/>
+                        </svg>
+                        <div class="chart-empty-label">Collecting data...</div>
+                        <div class="chart-empty-sub">Opponent data appears once bets resolve</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 6: API Health Status
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">API Health Status</h2>
+                <span class="badge-analytics" id="apiHealthRefresh">Live</span>
+            </div>
+            <div class="section-body">
+                <div class="api-health-grid" id="apiHealthGrid">
+                    <!-- Rendered by JS -->
+                    <div class="health-card" style="opacity:0.4">
+                        <div class="health-card-header">
+                            <span class="health-card-name">ESPN</span>
+                            <span class="health-status-dot"></span>
+                        </div>
+                        <div class="health-detail">Loading...</div>
+                    </div>
+                    <div class="health-card" style="opacity:0.4">
+                        <div class="health-card-header">
+                            <span class="health-card-name">Odds API</span>
+                            <span class="health-status-dot"></span>
+                        </div>
+                        <div class="health-detail">Loading...</div>
+                    </div>
+                    <div class="health-card" style="opacity:0.4">
+                        <div class="health-card-header">
+                            <span class="health-card-name">BallDontLie</span>
+                            <span class="health-status-dot"></span>
+                        </div>
+                        <div class="health-detail">Loading...</div>
+                    </div>
+                    <div class="health-card" style="opacity:0.4">
+                        <div class="health-card-header">
+                            <span class="health-card-name">Polymarket</span>
+                            <span class="health-status-dot"></span>
+                        </div>
+                        <div class="health-detail">Loading...</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 7: Calibrator Status
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Calibrator Status</h2>
+                <span class="badge-analytics" id="calStatusBadge">Loading</span>
+            </div>
+            <div class="section-body">
+                <div class="calibrator-grid" id="calibratorGrid">
+                    <div class="cal-card">
+                        <div class="cal-label">Total Resolved</div>
+                        <div class="cal-value" id="calTotalResolved">--</div>
+                        <div class="cal-sub">Bets with known outcomes</div>
+                    </div>
+                    <div class="cal-card">
+                        <div class="cal-label">Bets Until Active</div>
+                        <div class="cal-value" id="calBetsUntilActive">--</div>
+                        <div class="cal-sub">Min samples needed to calibrate</div>
+                    </div>
+                    <div class="cal-card">
+                        <div class="cal-label">Status</div>
+                        <div id="calActiveStatus" class="cal-status-active inactive">Inactive</div>
+                        <div class="cal-sub" id="calActiveNote">Calibrator not yet active</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- ============================================= -->
+    <!-- FOOTER                                        -->
+    <!-- ============================================= -->
+    <footer class="footer">
+        <span class="footer-text">NBA Agent Analytics — Auto-refreshes every 60s</span>
+        <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener noreferrer" class="footer-link">
+            Created with Perplexity Computer
+        </a>
+    </footer>
+
+    </div> <!-- end #dashboardContent -->
+
+    <!-- ============================================= -->
+    <!-- INLINE JAVASCRIPT                             -->
+    <!-- ============================================= -->
+    <script>
+    (function () {
+        'use strict';
+
+        // -------------------------------------------------------
+        // Config
+        // -------------------------------------------------------
+        const API = '';
+        const REFRESH_INTERVAL = 60_000;
+
+        // -------------------------------------------------------
+        // Auth State
+        // -------------------------------------------------------
+        let authToken = sessionStorage.getItem('nba_agent_token') || null;
+
+        // -------------------------------------------------------
+        // Chart.js Defaults
+        // -------------------------------------------------------
+        Chart.defaults.font.family = "'Inter', sans-serif";
+        Chart.defaults.color = '#71717a';
+        Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
+
+        // -------------------------------------------------------
+        // Chart instances (so we can destroy & re-render)
+        // -------------------------------------------------------
+        let timingChartInst = null;
+        let driftChartInst  = null;
+        let opponentChartInst = null;
+
+        // -------------------------------------------------------
+        // Formatters
+        // -------------------------------------------------------
+        const fmt = {
+            usd: (v) => {
+                if (v == null) return '--';
+                const sign = v >= 0 ? '' : '-';
+                return `${sign}$${Math.abs(v).toFixed(2)}`;
+            },
+            pct: (v) => (v == null ? '--' : `${v.toFixed(1)}%`),
+            cents: (v) => (v == null ? '--' : `¢${(v * 100).toFixed(1)}`),
+        };
+
+        // -------------------------------------------------------
+        // Login Particle Canvas
+        // -------------------------------------------------------
+        (function initLoginParticles() {
+            const canvas = document.getElementById('loginCanvas');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+
+            let w, h, particles, animId;
+            let burstQueue = [];
+            let mouse = { x: -1000, y: -1000 };
+
+            function resize() {
+                w = canvas.width = window.innerWidth;
+                h = canvas.height = window.innerHeight;
+            }
+
+            function createParticles() {
+                const count = Math.min(Math.floor((w * h) / 6000), 200);
+                particles = [];
+                for (let i = 0; i < count; i++) {
+                    particles.push({
+                        x: Math.random() * w,
+                        y: Math.random() * h,
+                        vx: (Math.random() - 0.5) * 0.3,
+                        vy: (Math.random() - 0.5) * 0.3,
+                        r: Math.random() * 1.5 + 0.5,
+                        color: [
+                            'rgba(0, 240, 255,',
+                            'rgba(139, 92, 246,',
+                            'rgba(0, 255, 136,',
+                        ][Math.floor(Math.random() * 3)],
+                        baseAlpha: Math.random() * 0.5 + 0.2,
+                    });
+                }
+            }
+
+            function draw() {
+                ctx.clearRect(0, 0, w, h);
+                const connectDist = 120;
+                const mouseDist = 180;
+
+                for (let i = 0; i < particles.length; i++) {
+                    const p = particles[i];
+
+                    const dxM = p.x - mouse.x;
+                    const dyM = p.y - mouse.y;
+                    const distM = Math.sqrt(dxM * dxM + dyM * dyM);
+                    if (distM < mouseDist && distM > 0) {
+                        const force = (mouseDist - distM) / mouseDist * 0.8;
+                        p.vx += (dxM / distM) * force;
+                        p.vy += (dyM / distM) * force;
+                    }
+
+                    for (const burst of burstQueue) {
+                        const bx = p.x - burst.cx;
+                        const by = p.y - burst.cy;
+                        const bDist = Math.sqrt(bx * bx + by * by);
+                        if (bDist < burst.radius && bDist > 0) {
+                            const bForce = (burst.radius - bDist) / burst.radius * burst.strength;
+                            p.vx += (bx / bDist) * bForce;
+                            p.vy += (by / bDist) * bForce;
+                        }
+                    }
+
+                    p.vx *= 0.98;
+                    p.vy *= 0.98;
+                    p.x += p.vx;
+                    p.y += p.vy;
+
+                    if (p.x < -10) p.x = w + 10;
+                    if (p.x > w + 10) p.x = -10;
+                    if (p.y < -10) p.y = h + 10;
+                    if (p.y > h + 10) p.y = -10;
+
+                    const alpha = p.baseAlpha + (distM < mouseDist ? (mouseDist - distM) / mouseDist * 0.4 : 0);
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                    ctx.fillStyle = p.color + Math.min(alpha, 0.9) + ')';
+                    ctx.fill();
+
+                    for (let j = i + 1; j < particles.length; j++) {
+                        const p2 = particles[j];
+                        const dx = p.x - p2.x;
+                        const dy = p.y - p2.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < connectDist) {
+                            const lineAlpha = (1 - dist / connectDist) * 0.15;
+                            ctx.beginPath();
+                            ctx.moveTo(p.x, p.y);
+                            ctx.lineTo(p2.x, p2.y);
+                            ctx.strokeStyle = 'rgba(0, 240, 255,' + lineAlpha + ')';
+                            ctx.lineWidth = 0.5;
+                            ctx.stroke();
+                        }
+                    }
+                }
+
+                burstQueue = [];
+                animId = requestAnimationFrame(draw);
+            }
+
+            function triggerKeystrokeBurst() {
+                const input = document.getElementById('passkeyInput');
+                if (!input) return;
+                const rect = input.getBoundingClientRect();
+                burstQueue.push({
+                    cx: rect.left + rect.width / 2,
+                    cy: rect.top + rect.height / 2,
+                    radius: 280 + Math.random() * 60,
+                    strength: 1.8 + Math.random() * 0.8,
+                });
+            }
+
+            window.addEventListener('resize', () => { resize(); createParticles(); });
+
+            document.getElementById('loginOverlay').addEventListener('mousemove', (e) => {
+                mouse.x = e.clientX;
+                mouse.y = e.clientY;
+            });
+            document.getElementById('loginOverlay').addEventListener('mouseleave', () => {
+                mouse.x = -1000;
+                mouse.y = -1000;
+            });
+            document.getElementById('passkeyInput').addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === 'Tab') return;
+                triggerKeystrokeBurst();
+            });
+
+            window._stopLoginParticles = function () {
+                if (animId) cancelAnimationFrame(animId);
+            };
+
+            resize();
+            createParticles();
+            draw();
+        })();
+
+        // -------------------------------------------------------
+        // Auth flow
+        // -------------------------------------------------------
+        function showLogin() {
+            document.getElementById('loginOverlay').classList.remove('hidden');
+            document.getElementById('dashboardContent').className = 'dashboard-hidden';
+        }
+
+        function showDashboard() {
+            document.getElementById('loginOverlay').classList.add('hidden');
+            document.getElementById('dashboardContent').className = 'dashboard-visible';
+            if (window._stopLoginParticles) window._stopLoginParticles();
+        }
+
+        async function handleLogin(passkey) {
+            const errorEl = document.getElementById('loginError');
+            const btn = document.getElementById('loginBtn');
+            const input = document.getElementById('passkeyInput');
+
+            btn.disabled = true;
+            btn.querySelector('.login-btn-text').textContent = 'VERIFYING...';
+            errorEl.textContent = '';
+
+            try {
+                const res = await fetch(`${API}/api/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ passkey }),
+                });
+
+                if (!res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    throw new Error(data.detail || 'Wrong passkey');
+                }
+
+                const data = await res.json();
+                authToken = data.token;
+                sessionStorage.setItem('nba_agent_token', authToken);
+
+                showDashboard();
+                refresh();
+            } catch (err) {
+                errorEl.textContent = err.message || 'Authentication failed';
+                input.classList.add('shake');
+                setTimeout(() => input.classList.remove('shake'), 500);
+                input.value = '';
+                input.focus();
+            } finally {
+                btn.disabled = false;
+                btn.querySelector('.login-btn-text').textContent = 'UNLOCK';
+            }
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const passkey = document.getElementById('passkeyInput').value.trim();
+            if (passkey) handleLogin(passkey);
+        });
+
+        // -------------------------------------------------------
+        // Fetch helper
+        // -------------------------------------------------------
+        async function fetchJSON(endpoint) {
+            try {
+                const headers = {};
+                if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+                const res = await fetch(`${API}${endpoint}`, { headers });
+                if (res.status === 401) {
+                    authToken = null;
+                    sessionStorage.removeItem('nba_agent_token');
+                    showLogin();
+                    return null;
+                }
+                if (!res.ok) throw new Error(`${res.status}`);
+                return await res.json();
+            } catch (err) {
+                console.error(`Fetch ${endpoint} failed:`, err);
+                return null;
+            }
+        }
+
+        // -------------------------------------------------------
+        // Connection status
+        // -------------------------------------------------------
+        function setConnected(ok) {
+            const dot = document.querySelector('#connectionStatus .status-dot');
+            const text = document.querySelector('#connectionStatus .status-text');
+            if (ok) {
+                dot.classList.add('connected');
+                text.textContent = 'Live';
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'Offline';
+            }
+        }
+
+        function updateLastUpdate() {
+            const el = document.getElementById('lastUpdate');
+            const now = new Date();
+            el.textContent = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // -------------------------------------------------------
+        // Helper: dollar color class
+        // -------------------------------------------------------
+        function pnlClass(v) {
+            if (v > 0) return 'positive';
+            if (v < 0) return 'negative';
+            return 'neutral';
+        }
+
+        // -------------------------------------------------------
+        // RENDER: P&L by Confidence Tier
+        // -------------------------------------------------------
+        function renderTierCards(data) {
+            const grid = document.getElementById('tierGrid');
+            if (!data || !Array.isArray(data) || data.length === 0) return;
+
+            const tiers = ['HIGH', 'MEDIUM', 'LOW'];
+            const labelClass = { HIGH: 'tier-label-HIGH', MEDIUM: 'tier-label-MEDIUM', LOW: 'tier-label-LOW' };
+
+            grid.innerHTML = tiers.map(tier => {
+                const d = data.find(r => r.tier === tier) || {};
+                const trades = d.trades ?? 0;
+                const wins   = d.wins ?? 0;
+                const losses = d.losses ?? 0;
+                const pnl    = d.total_pnl ?? null;
+                const wagered = d.total_wagered ?? null;
+
+                return `
+                <div class="tier-card">
+                    <div class="tier-label ${labelClass[tier]}">${tier}</div>
+                    <div class="tier-pnl ${pnl != null ? pnlClass(pnl) : 'neutral'}">${fmt.usd(pnl)}</div>
+                    <div class="tier-wl">
+                        <span class="wl-pill win">${wins}W</span>
+                        <span class="wl-pill loss">${losses}L</span>
+                    </div>
+                    <div class="tier-meta">
+                        <div class="tier-meta-row"><span>Trades</span><span>${trades}</span></div>
+                        <div class="tier-meta-row"><span>Wagered</span><span>${fmt.usd(wagered)}</span></div>
+                        <div class="tier-meta-row"><span>Win Rate</span><span>${trades > 0 ? ((wins / trades) * 100).toFixed(1) + '%' : '--'}</span></div>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // -------------------------------------------------------
+        // RENDER: P&L by Price Range
+        // -------------------------------------------------------
+        function renderPriceRangeCards(data) {
+            const grid = document.getElementById('priceRangeGrid');
+            if (!data || !Array.isArray(data) || data.length === 0) return;
+
+            const rangeLabels = {
+                'lt15': '<15¢',
+                '15_30': '15–30¢',
+                '30_50': '30–50¢',
+                'gt50': '>50¢',
+            };
+            const rangeKeys = ['lt15', '15_30', '30_50', 'gt50'];
+
+            grid.innerHTML = rangeKeys.map(key => {
+                const d = data.find(r => r.range === key || r.price_range === key) || {};
+                const wins   = d.wins ?? 0;
+                const losses = d.losses ?? 0;
+                const pnl    = d.total_pnl ?? null;
+                const trades = (wins + losses) || 0;
+
+                return `
+                <div class="tier-card">
+                    <div class="tier-label tier-label-range">${rangeLabels[key]}</div>
+                    <div class="tier-pnl ${pnl != null ? pnlClass(pnl) : 'neutral'}">${fmt.usd(pnl)}</div>
+                    <div class="tier-wl">
+                        <span class="wl-pill win">${wins}W</span>
+                        <span class="wl-pill loss">${losses}L</span>
+                    </div>
+                    <div class="tier-meta">
+                        <div class="tier-meta-row"><span>Win Rate</span><span>${trades > 0 ? ((wins / trades) * 100).toFixed(1) + '%' : '--'}</span></div>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // -------------------------------------------------------
+        // Common scatter chart config factory
+        // -------------------------------------------------------
+        function makeScatterConfig({ xLabel, yLabel, datasets }) {
+            return {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'top',
+                            labels: {
+                                color: '#71717a',
+                                boxWidth: 10,
+                                padding: 16,
+                                font: { size: 11 },
+                            },
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(18,19,26,0.95)',
+                            borderColor: 'rgba(255,255,255,0.08)',
+                            borderWidth: 1,
+                            titleColor: '#e4e4e7',
+                            bodyColor: '#71717a',
+                            padding: 10,
+                        },
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: 'rgba(255,255,255,0.04)' },
+                            ticks: { color: '#71717a', font: { size: 11 } },
+                            title: {
+                                display: true,
+                                text: xLabel,
+                                color: '#52525b',
+                                font: { size: 11 },
+                            },
+                        },
+                        y: {
+                            grid: { color: 'rgba(255,255,255,0.04)' },
+                            ticks: { color: '#71717a', font: { size: 11 } },
+                            title: {
+                                display: true,
+                                text: yLabel,
+                                color: '#52525b',
+                                font: { size: 11 },
+                            },
+                        },
+                    },
+                },
+            };
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Entry Timing Chart
+        // -------------------------------------------------------
+        function renderTimingChart(data) {
+            const emptyEl = document.getElementById('timingEmpty');
+            const canvas = document.getElementById('timingChart');
+
+            if (!data || !Array.isArray(data) || data.length === 0) {
+                canvas.style.display = 'none';
+                emptyEl.style.display = 'flex';
+                return;
+            }
+            canvas.style.display = '';
+            emptyEl.style.display = 'none';
+
+            const wins  = data.filter(d => d.won).map(d => ({ x: d.hours_before_tipoff, y: d.pnl }));
+            const losses = data.filter(d => !d.won).map(d => ({ x: d.hours_before_tipoff, y: d.pnl }));
+
+            if (timingChartInst) timingChartInst.destroy();
+            timingChartInst = new Chart(canvas, makeScatterConfig({
+                xLabel: 'Hours Before Tipoff',
+                yLabel: 'P&L ($)',
+                datasets: [
+                    {
+                        label: 'Wins',
+                        data: wins,
+                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                    {
+                        label: 'Losses',
+                        data: losses,
+                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                ],
+            }));
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Price Drift Chart
+        // -------------------------------------------------------
+        function renderDriftChart(data) {
+            const emptyEl = document.getElementById('driftEmpty');
+            const canvas = document.getElementById('driftChart');
+
+            if (!data || !Array.isArray(data) || data.length === 0) {
+                canvas.style.display = 'none';
+                emptyEl.style.display = 'flex';
+                return;
+            }
+            canvas.style.display = '';
+            emptyEl.style.display = 'none';
+
+            const wins   = data.filter(d => d.won).map(d => ({ x: d.entry_price_cents, y: d.drift_cents }));
+            const losses = data.filter(d => !d.won).map(d => ({ x: d.entry_price_cents, y: d.drift_cents }));
+
+            if (driftChartInst) driftChartInst.destroy();
+            driftChartInst = new Chart(canvas, makeScatterConfig({
+                xLabel: 'Entry Price (¢)',
+                yLabel: 'Price Drift (¢)',
+                datasets: [
+                    {
+                        label: 'Wins',
+                        data: wins,
+                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                    {
+                        label: 'Losses',
+                        data: losses,
+                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                ],
+            }));
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Opponent Strength Chart
+        // -------------------------------------------------------
+        function renderOpponentChart(data) {
+            const emptyEl = document.getElementById('opponentEmpty');
+            const canvas = document.getElementById('opponentChart');
+
+            if (!data || !Array.isArray(data) || data.length === 0) {
+                canvas.style.display = 'none';
+                emptyEl.style.display = 'flex';
+                return;
+            }
+            canvas.style.display = '';
+            emptyEl.style.display = 'none';
+
+            const wins   = data.filter(d => d.won).map(d => ({ x: d.opponent_win_pct, y: d.pnl }));
+            const losses = data.filter(d => !d.won).map(d => ({ x: d.opponent_win_pct, y: d.pnl }));
+
+            if (opponentChartInst) opponentChartInst.destroy();
+            opponentChartInst = new Chart(canvas, makeScatterConfig({
+                xLabel: 'Opponent Win %',
+                yLabel: 'P&L ($)',
+                datasets: [
+                    {
+                        label: 'Wins',
+                        data: wins,
+                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                    {
+                        label: 'Losses',
+                        data: losses,
+                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        pointRadius: 5,
+                        pointHoverRadius: 7,
+                    },
+                ],
+            }));
+        }
+
+        // -------------------------------------------------------
+        // RENDER: API Health
+        // -------------------------------------------------------
+        function renderApiHealth(data) {
+            const grid = document.getElementById('apiHealthGrid');
+
+            // Support both array and object (keyed) responses
+            let sources = [];
+            if (Array.isArray(data)) {
+                sources = data;
+            } else if (data && typeof data === 'object') {
+                // e.g. { espn: { status: 'ok', detail: '...' }, ... }
+                sources = Object.entries(data).map(([name, info]) => ({
+                    name,
+                    ...(typeof info === 'object' ? info : { status: info }),
+                }));
+            }
+
+            if (sources.length === 0) return;
+
+            // Name display map
+            const nameMap = {
+                espn: 'ESPN',
+                odds: 'Odds API',
+                odds_api: 'Odds API',
+                balldontlie: 'BallDontLie',
+                bdl: 'BallDontLie',
+                ball_dont_lie: 'BallDontLie',
+                polymarket: 'Polymarket',
+                poly: 'Polymarket',
+            };
+
+            grid.innerHTML = sources.map(src => {
+                const rawName = (src.name || src.source || '').toLowerCase().replace(/[\s-]/g, '_');
+                const displayName = nameMap[rawName] || src.name || src.source || 'Unknown';
+                const status = (src.status || '').toLowerCase();
+                const isOk   = status === 'ok' || status === 'healthy' || status === 'up';
+                const isWarn = status === 'warn' || status === 'warning' || status === 'degraded';
+                const dotClass = isOk ? 'ok' : isWarn ? 'warn' : 'error';
+                const detail = src.detail || src.message || src.error || src.info || '';
+
+                return `
+                <div class="health-card">
+                    <div class="health-card-header">
+                        <span class="health-card-name">${displayName}</span>
+                        <span class="health-status-dot ${dotClass}"></span>
+                    </div>
+                    <div class="health-status-text ${dotClass}">${isOk ? 'OK' : isWarn ? 'DEGRADED' : 'ERROR'}</div>
+                    ${detail ? `<div class="health-detail">${detail}</div>` : ''}
+                </div>`;
+            }).join('');
+
+            // Also update header API dots
+            updateHeaderApiDots(sources);
+        }
+
+        function updateHeaderApiDots(sources) {
+            const dotMap = {
+                espn: 'dotEspn',
+                odds: 'dotOdds',
+                odds_api: 'dotOdds',
+                balldontlie: 'dotBdl',
+                bdl: 'dotBdl',
+                ball_dont_lie: 'dotBdl',
+                polymarket: 'dotPoly',
+                poly: 'dotPoly',
+            };
+            for (const src of sources) {
+                const rawName = (src.name || src.source || '').toLowerCase().replace(/[\s-]/g, '_');
+                const dotId = dotMap[rawName];
+                if (!dotId) continue;
+                const el = document.getElementById(dotId);
+                if (!el) continue;
+                const status = (src.status || '').toLowerCase();
+                const isOk = status === 'ok' || status === 'healthy' || status === 'up';
+                el.style.background = isOk ? 'var(--profit)' : 'var(--loss)';
+                el.style.boxShadow = isOk ? '0 0 6px rgba(0,255,136,0.6)' : '0 0 6px rgba(255,51,102,0.6)';
+            }
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Calibrator Status
+        // -------------------------------------------------------
+        function renderCalibration(data) {
+            if (!data) return;
+
+            const totalEl   = document.getElementById('calTotalResolved');
+            const untilEl   = document.getElementById('calBetsUntilActive');
+            const statusEl  = document.getElementById('calActiveStatus');
+            const noteEl    = document.getElementById('calActiveNote');
+            const badgeEl   = document.getElementById('calStatusBadge');
+
+            const total  = data.total_resolved ?? data.resolved_count ?? '--';
+            const until  = data.bets_until_active ?? data.samples_needed ?? '--';
+            const active = data.active ?? data.is_active ?? false;
+
+            totalEl.textContent = total;
+            untilEl.textContent = until === '--' ? '--' : (active ? '0' : until);
+
+            statusEl.textContent = active ? 'Active' : 'Inactive';
+            statusEl.className = `cal-status-active ${active ? 'active' : 'inactive'}`;
+
+            if (active) {
+                noteEl.textContent = 'Calibrator is adjusting confidence scores';
+                badgeEl.textContent = 'Active';
+                badgeEl.style.color = 'var(--profit)';
+            } else {
+                const remaining = until === '--' ? '' : ` — ${until} more needed`;
+                noteEl.textContent = `Needs more resolved bets${remaining}`;
+                badgeEl.textContent = 'Inactive';
+                badgeEl.style.color = 'var(--text-muted)';
+            }
+        }
+
+        // -------------------------------------------------------
+        // Main Refresh
+        // -------------------------------------------------------
+        async function refresh() {
+            const [analytics, apiHealth, calibration] = await Promise.all([
+                fetchJSON('/api/analytics'),
+                fetchJSON('/api/api-health'),
+                fetchJSON('/api/calibration'),
+            ]);
+
+            const anyOk = analytics || apiHealth || calibration;
+            setConnected(!!anyOk);
+
+            if (analytics) {
+                renderTierCards(analytics.pnl_by_tier);
+                renderPriceRangeCards(analytics.pnl_by_price_range);
+                renderTimingChart(analytics.entry_timing);
+                renderDriftChart(analytics.price_drift);
+                renderOpponentChart(analytics.opponent_strength);
+            } else {
+                // Show empty states for charts if no data
+                ['timingEmpty', 'driftEmpty', 'opponentEmpty'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.style.display = 'flex';
+                });
+                ['timingChart', 'driftChart', 'opponentChart'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.style.display = 'none';
+                });
+            }
+
+            if (apiHealth) {
+                renderApiHealth(apiHealth);
+            }
+
+            if (calibration) {
+                renderCalibration(calibration);
+            }
+
+            updateLastUpdate();
+        }
+
+        // -------------------------------------------------------
+        // Init
+        // -------------------------------------------------------
+        if (authToken) {
+            showDashboard();
+            refresh();
+        } else {
+            showLogin();
+        }
+
+        // Auto-refresh every 60 seconds
+        setInterval(() => {
+            if (authToken) refresh();
+        }, REFRESH_INTERVAL);
+
+    })();
+    </script>
+</body>
+</html>

@@ -587,6 +587,164 @@ def get_calibration() -> dict:
     }
 
 
+@app.get("/api/analytics", dependencies=[Depends(_require_auth)])
+def get_analytics() -> dict:
+    """Analytics data: entry timing, price drift, opponent strength, P&L by tier."""
+    import urllib.request as _urlreq
+
+    positions = _read_json("positions.json").get("positions", [])
+    closed = [p for p in positions if p.get("status") != "open"]
+
+    # --- Entry timing vs outcome ---
+    timing_data = []
+    for p in closed:
+        hours = p.get("hours_before_tipoff")
+        if hours is not None:
+            timing_data.append({
+                "hours": hours,
+                "won": (p.get("pnl") or 0) > 0,
+                "pnl": p.get("pnl", 0),
+                "market": p.get("market_question", ""),
+            })
+
+    # --- Price drift ---
+    drift_data = []
+    for p in closed:
+        gametime_price = p.get("price_at_gametime")
+        if gametime_price is not None:
+            entry = p.get("entry_price", 0)
+            drift = round((gametime_price - entry) * 100, 1)  # in cents
+            drift_data.append({
+                "entry_price": entry,
+                "gametime_price": gametime_price,
+                "drift_cents": drift,
+                "won": (p.get("pnl") or 0) > 0,
+                "market": p.get("market_question", ""),
+            })
+
+    # --- Opponent strength ---
+    opp_data = []
+    for p in closed:
+        opp_wr = p.get("opponent_win_pct")
+        if opp_wr is not None:
+            opp_data.append({
+                "opponent_win_pct": opp_wr,
+                "won": (p.get("pnl") or 0) > 0,
+                "pnl": p.get("pnl", 0),
+                "market": p.get("market_question", ""),
+            })
+
+    # --- P&L by confidence tier ---
+    tier_pnl = {}
+    for p in closed:
+        conf = p.get("confidence", "LOW")
+        if conf not in tier_pnl:
+            tier_pnl[conf] = {"wins": 0, "losses": 0, "pnl": 0, "trades": 0, "wagered": 0}
+        tier_pnl[conf]["trades"] += 1
+        tier_pnl[conf]["pnl"] += p.get("pnl", 0) or 0
+        tier_pnl[conf]["wagered"] += p.get("cost", 0) or 0
+        if (p.get("pnl") or 0) > 0:
+            tier_pnl[conf]["wins"] += 1
+        else:
+            tier_pnl[conf]["losses"] += 1
+    for v in tier_pnl.values():
+        v["pnl"] = round(v["pnl"], 2)
+        v["wagered"] = round(v["wagered"], 2)
+
+    # --- P&L by entry price range ---
+    range_pnl = {"<15c": {"w": 0, "l": 0, "pnl": 0}, "15-30c": {"w": 0, "l": 0, "pnl": 0},
+                 "30-50c": {"w": 0, "l": 0, "pnl": 0}, ">50c": {"w": 0, "l": 0, "pnl": 0}}
+    for p in closed:
+        ep = p.get("entry_price", 0)
+        pnl_val = p.get("pnl", 0) or 0
+        if ep < 0.15:
+            bucket = "<15c"
+        elif ep < 0.30:
+            bucket = "15-30c"
+        elif ep < 0.50:
+            bucket = "30-50c"
+        else:
+            bucket = ">50c"
+        range_pnl[bucket]["pnl"] += pnl_val
+        if pnl_val > 0:
+            range_pnl[bucket]["w"] += 1
+        else:
+            range_pnl[bucket]["l"] += 1
+    for v in range_pnl.values():
+        v["pnl"] = round(v["pnl"], 2)
+
+    return {
+        "entry_timing": timing_data,
+        "price_drift": drift_data,
+        "opponent_strength": opp_data,
+        "pnl_by_tier": tier_pnl,
+        "pnl_by_price_range": range_pnl,
+    }
+
+
+@app.get("/api/api-health", dependencies=[Depends(_require_auth)])
+def get_api_health() -> dict:
+    """Check connectivity to all external data sources."""
+    import urllib.request as _urlreq
+
+    sources = {}
+
+    # ESPN
+    try:
+        req = _urlreq.Request(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+            headers={"Accept": "application/json"},
+        )
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            sources["espn"] = {"status": "ok", "code": resp.status}
+    except Exception as e:
+        sources["espn"] = {"status": "error", "error": str(e)[:80]}
+
+    # The Odds API
+    odds_key = os.environ.get("ODDS_API_KEY", "")
+    if odds_key:
+        try:
+            req = _urlreq.Request(
+                f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={odds_key}&regions=us&markets=h2h&oddsFormat=decimal&bookmakers=draftkings",
+                headers={"Accept": "application/json"},
+            )
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                remaining = resp.headers.get("x-requests-remaining", "?")
+                sources["odds_api"] = {"status": "ok", "credits_remaining": remaining}
+        except Exception as e:
+            sources["odds_api"] = {"status": "error", "error": str(e)[:80]}
+    else:
+        sources["odds_api"] = {"status": "no_key"}
+
+    # BallDontLie
+    bdl_key = os.environ.get("BALLDONTLIE_API_KEY", "")
+    if bdl_key:
+        try:
+            req = _urlreq.Request(
+                "https://api.balldontlie.io/v1/teams",
+                headers={"Accept": "application/json", "Authorization": bdl_key},
+            )
+            with _urlreq.urlopen(req, timeout=5) as resp:
+                sources["balldontlie"] = {"status": "ok", "code": resp.status}
+        except Exception as e:
+            sources["balldontlie"] = {"status": "error", "error": str(e)[:80]}
+    else:
+        sources["balldontlie"] = {"status": "no_key"}
+
+    # Polymarket Gamma API
+    try:
+        req = _urlreq.Request(
+            "https://gamma-api.polymarket.com/markets/1",
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            sources["polymarket"] = {"status": "ok", "code": resp.status}
+    except Exception as e:
+        sources["polymarket"] = {"status": "error", "error": str(e)[:80]}
+
+    return {"sources": sources}
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "data_dir": str(DATA_DIR), "exists": DATA_DIR.exists()}

@@ -183,24 +183,32 @@ class TelegramBot:
         else:
             calibration = "NEEDS REVIEW (model overestimates)"
 
+        losses = total_bets - wins
+        gross_wins = total_pnl + abs(total_pnl) if total_pnl > 0 else 0  # approximate
+        profit_factor_str = f"{roi:.1f}%" if total_bets > 0 else "--"
+
         text = (
-            f"📈 <b>WEEKLY SUMMARY — {week_str}</b>\n\n"
-            f"Total Bets: {total_bets}\n"
-            f"Win Rate: {win_rate:.1f}% ({wins}/{total_bets})\n"
-            f"Total P&L: {pnl_sign}{format_dollars(total_pnl)} ({pnl_sign}{roi:.1f}%)\n"
+            f"📈 <b>WEEKLY REPORT — {week_str}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Performance</b>\n"
+            f"Bets: {total_bets} ({wins}W / {losses}L)\n"
+            f"Win Rate: {win_rate:.1f}%\n"
+            f"P&L: {pnl_sign}{format_dollars(total_pnl)}\n"
             f"ROI: {pnl_sign}{roi:.1f}%\n"
             f"Bankroll: {format_dollars(bankroll)}\n"
         )
 
         if biggest_win:
-            text += f"\n🏆 Biggest Win: {biggest_win}"
+            text += f"\n🏆 Best: {biggest_win}"
         if biggest_loss:
-            text += f"\n💀 Biggest Loss: {biggest_loss}"
+            text += f"\n💀 Worst: {biggest_loss}"
 
         text += (
-            f"\n\nExpected Win Rate (by edge): {expected_wr:.1f}%\n"
-            f"Actual Win Rate: {actual_wr:.1f}%\n"
+            f"\n\n<b>Model Health</b>\n"
+            f"Expected WR: {expected_wr:.1f}%\n"
+            f"Actual WR: {actual_wr:.1f}%\n"
             f"Calibration: {calibration}\n\n"
+            f"Dashboard: http://139.59.26.34\n"
             f"Mode: {mode.upper()}"
         )
 

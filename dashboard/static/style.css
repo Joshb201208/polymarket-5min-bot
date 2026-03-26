@@ -560,6 +560,62 @@ body::after {
     color: var(--text-muted);
 }
 
+/* Nav links */
+.header-center {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.nav-link {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    transition: all 0.2s ease;
+}
+
+.nav-link:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.nav-link.active {
+    color: var(--primary);
+    background: var(--primary-dim);
+}
+
+/* API health dots */
+.api-health {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+}
+
+.api-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    transition: background 0.3s;
+}
+
+.api-dot.ok {
+    background: var(--profit);
+    box-shadow: 0 0 4px rgba(0, 255, 136, 0.4);
+}
+
+.api-dot.error {
+    background: var(--loss);
+    box-shadow: 0 0 4px rgba(255, 51, 102, 0.4);
+}
+
 .header-right {
     display: flex;
     align-items: center;

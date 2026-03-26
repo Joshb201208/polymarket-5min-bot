@@ -94,13 +94,16 @@ class NBAAgent:
         """Single cycle: scan, evaluate, trade, check exits, send summaries."""
         now = utcnow()
 
-        # 1. Check for early exits on existing positions
+        # 1. Snapshot game-time prices for drift tracking
+        await self._snapshot_gametime_prices()
+
+        # 2. Check for early exits on existing positions
         await self._check_exits()
 
-        # 2. Check for resolved positions (auto-collects winnings)
+        # 3. Check for resolved positions (auto-collects winnings)
         await self._check_resolutions()
 
-        # 3. Scan for new opportunities
+        # 4. Scan for new opportunities
         await self._scan_and_trade()
 
         # 4. Daily summary at 4pm UTC (midnight SGT)
@@ -181,6 +184,44 @@ class NBAAgent:
 
             except Exception as e:
                 logger.error("Error processing market %s: %s", market.id, e, exc_info=True)
+
+    async def _snapshot_gametime_prices(self) -> None:
+        """Record market price at game time for drift tracking.
+
+        For each open position where game_start_time has passed but
+        price_at_gametime hasn't been recorded yet, snapshot the current
+        market price. This lets us analyze how much the price drifted
+        between our entry and the actual game start.
+        """
+        now = utcnow()
+        open_positions = self.tracker.get_open_positions()
+
+        for pos in open_positions:
+            if pos.price_at_gametime is not None:
+                continue  # Already recorded
+            if not pos.game_start_time:
+                continue
+
+            try:
+                game_str = pos.game_start_time.replace("Z", "+00:00")
+                game_dt = datetime.fromisoformat(game_str)
+                if game_dt.tzinfo is None:
+                    game_dt = game_dt.replace(tzinfo=now.tzinfo)
+
+                # Record if game has started (within 30 min window)
+                if now >= game_dt and (now - game_dt).total_seconds() < 1800:
+                    price = await self.scanner.get_market_price(pos.token_id)
+                    if price is not None:
+                        pos.price_at_gametime = round(price, 4)
+                        self.tracker.save_position(pos)
+                        drift = (pos.price_at_gametime - pos.entry_price) * 100
+                        logger.info(
+                            "PRICE DRIFT: %s | entry=%.1f¢ gametime=%.1f¢ drift=%+.1f¢",
+                            pos.market_question, pos.entry_price * 100,
+                            pos.price_at_gametime * 100, drift,
+                        )
+            except Exception as e:
+                logger.debug("Gametime snapshot error for %s: %s", pos.id, e)
 
     async def _check_exits(self) -> None:
         """Check all open positions for early exit conditions."""

@@ -214,6 +214,9 @@ class Position:
     exit_reason: Optional[str] = None
     market_slug: str = ""
     fees_paid: float = 0.0  # Total Polymarket taker fees (entry + exit)
+    hours_before_tipoff: Optional[float] = None  # Hours between entry and game start
+    opponent_win_pct: Optional[float] = None  # Opponent team's win percentage at entry time
+    price_at_gametime: Optional[float] = None  # Market price at game start (for drift tracking)
 
     def to_dict(self) -> dict:
         return asdict(self)
