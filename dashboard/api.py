@@ -186,21 +186,46 @@ def get_live_data() -> dict:
     positions = _read_json("positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
 
-    # --- Fetch live market prices from Polymarket CLOB ---
+    # --- Fetch live market prices from Polymarket Gamma API ---
+    # CLOB API is geoblocked from Bengaluru VPS, so use Gamma API
+    # which returns outcomePrices per market
     prices = {}
-    for p in open_pos:
-        token_id = p.get("token_id", "")
-        if not token_id:
-            continue
+    # Deduplicate market IDs
+    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
+    market_prices = {}  # token_id -> price
+
+    for mkt_id in market_ids:
         try:
-            url = f"https://clob.polymarket.com/midpoint?token_id={token_id}"
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                mid = float(data.get("mid", 0)) if isinstance(data, dict) else float(data)
-                prices[p["id"]] = mid
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, tok in enumerate(token_list):
+                    if i < len(outcome_prices):
+                        try:
+                            market_prices[tok] = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
         except Exception:
-            prices[p["id"]] = None
+            pass
+
+    # Map token prices to position IDs
+    for p in open_pos:
+        tok = p.get("token_id", "")
+        if tok in market_prices:
+            prices[p["id"]] = market_prices[tok]
 
     # --- Fetch live NBA scores from ESPN ---
     scores = {}
