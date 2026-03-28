@@ -10,6 +10,7 @@ from typing import Optional
 
 class NHLMarketType(str, Enum):
     MONEYLINE = "moneyline"
+    FUTURES = "futures"
     UNKNOWN = "unknown"
 
 
@@ -73,6 +74,14 @@ class NHLMarket:
 
     def detect_market_type(self) -> NHLMarketType:
         slug = self.slug.lower()
+        event = self.event_slug.lower()
+        combined = slug + " " + event
+
+        # NHL futures: Stanley Cup, Hart Trophy, Calder Trophy, etc.
+        _FUTURES_KEYWORDS = ("stanley-cup", "champion", "trophy", "winner", "mvp")
+        if any(kw in combined for kw in _FUTURES_KEYWORDS):
+            return NHLMarketType.FUTURES
+
         # NHL moneyline: nhl-{away}-{home}-{date}
         if slug.startswith("nhl-"):
             parts = slug.split("-")
@@ -91,8 +100,14 @@ class NHLMarket:
         return self.market_type == NHLMarketType.MONEYLINE
 
     @property
+    def is_futures_market(self) -> bool:
+        return self.market_type == NHLMarketType.FUTURES
+
+    @property
     def min_edge(self) -> float:
-        return 0.04  # 4% for all NHL game markets
+        if self.market_type == NHLMarketType.FUTURES:
+            return 0.06  # 6% for futures (capital locked longer)
+        return 0.04  # 4% for game markets
 
 
 @dataclass
@@ -191,6 +206,7 @@ class NHLPosition:
     pnl: Optional[float] = None
     exit_reason: Optional[str] = None
     market_slug: str = ""
+    market_type: str = "moneyline"
     fees_paid: float = 0.0
     hours_before_faceoff: Optional[float] = None
     opponent_win_pct: Optional[float] = None

@@ -133,6 +133,50 @@ class NHLBankrollManager:
 
         return round(bet_size, 2)
 
+    def calculate_futures_bet_size(self, edge_result: NHLEdgeResult) -> float:
+        """Calculate bet size for futures markets — capped at 4% of bankroll."""
+        self.reload()
+
+        if self.is_paused:
+            return 0.0
+
+        edge = edge_result.edge
+        market_price = edge_result.market_price
+
+        if market_price <= 0 or market_price >= 1:
+            return 0.0
+
+        odds_against = (1.0 - market_price) / market_price
+        if odds_against <= 0:
+            return 0.0
+
+        kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly
+        bet_size = self.current_bankroll * kelly_fraction
+
+        # Vegas agreement boost (smaller for futures)
+        if edge_result.has_vegas_line and edge_result.vegas_agrees:
+            bet_size *= 1.2
+        elif edge_result.has_vegas_line and not edge_result.vegas_agrees:
+            bet_size *= 0.6
+
+        # Cap at 4% of bankroll for futures (half the game market limit)
+        max_bet = self.current_bankroll * self.config.MAX_FUTURES_BET_PCT
+        bet_size = min(bet_size, max_bet)
+
+        if self.is_reduced:
+            bet_size *= 0.5
+
+        # Floor at $1
+        if bet_size < 1.0:
+            return 0.0
+
+        # Cross-sport exposure check
+        if not check_total_exposure_ok(bet_size, self.config.MAX_TOTAL_EXPOSURE_PCT):
+            logger.info("NHL futures bet blocked: would exceed total exposure limit")
+            return 0.0
+
+        return round(bet_size, 2)
+
     def check_game_exposure(
         self,
         game_slug: str,

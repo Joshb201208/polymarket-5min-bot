@@ -94,12 +94,22 @@ class NHLPolymarketScanner:
         """Check if this event is NHL."""
         slug_lower = slug.lower()
         title_lower = title.lower()
-        return slug_lower.startswith("nhl-") or "nhl" in title_lower
+        if slug_lower.startswith("nhl-") or "nhl" in title_lower:
+            return True
+        # Also match Stanley Cup futures events
+        if "stanley-cup" in slug_lower or "stanley cup" in title_lower:
+            return True
+        return False
 
     def _passes_filters(self, market: NHLMarket) -> bool:
         """Apply all filtering rules to a market."""
         slug_lower = market.slug.lower()
+        event_slug_lower = market.event_slug.lower()
         now = utcnow()
+
+        # Futures markets have different filter rules
+        if market.market_type == NHLMarketType.FUTURES:
+            return self._passes_futures_filters(market)
 
         # Reject player props, period markets, non-NHL
         for pattern in _REJECT_CONTAINS:
@@ -142,6 +152,36 @@ class NHLPolymarketScanner:
         # Skip unknown market types
         if market.market_type == NHLMarketType.UNKNOWN:
             return False
+
+        return True
+
+    def _passes_futures_filters(self, market: NHLMarket) -> bool:
+        """Filtering rules for NHL futures markets (Stanley Cup only)."""
+        event_slug = market.event_slug.lower()
+        now = utcnow()
+
+        if not market.active or market.closed:
+            return False
+
+        if not market.accepting_orders:
+            return False
+
+        # Only Stanley Cup futures — skip Hart Trophy, Calder Trophy (low liquidity)
+        if "stanley-cup" not in event_slug:
+            return False
+
+        # Liquidity floor: $10K for futures
+        if market.liquidity < 10000:
+            return False
+
+        # End date must be in the future
+        if market.end_date:
+            try:
+                end_dt = parse_utc(market.end_date)
+                if end_dt <= now:
+                    return False
+            except ValueError:
+                pass
 
         return True
 

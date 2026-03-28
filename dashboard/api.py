@@ -881,6 +881,13 @@ def get_nhl_positions() -> dict:
     positions = _read_json("nhl_positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
     closed_pos = [p for p in positions if p.get("status") != "open"]
+
+    # Tag futures positions with badge and expected resolution
+    for p in open_pos + closed_pos:
+        if p.get("market_type") == "futures":
+            p["badge"] = "FUTURES"
+            p["expected_resolution"] = "June 2026"
+
     return {"open": open_pos, "closed": closed_pos}
 
 
@@ -907,9 +914,43 @@ def get_nhl_edges() -> dict:
                 "status": p.get("status", ""),
                 "pnl": p.get("pnl"),
                 "entry_time": p.get("entry_time", ""),
+                "market_type": p.get("market_type", "moneyline"),
             })
     edges.sort(key=lambda e: e.get("entry_time", ""), reverse=True)
     return {"edges": edges[:50]}
+
+
+@app.get("/api/nhl/futures", dependencies=[Depends(_require_auth)])
+def get_nhl_futures() -> dict:
+    """NHL futures positions and evaluations (Stanley Cup, etc.)."""
+    positions = _read_json("nhl_positions.json").get("positions", [])
+
+    futures_open = [
+        p for p in positions
+        if p.get("market_type") == "futures" and p.get("status") == "open"
+    ]
+    futures_closed = [
+        p for p in positions
+        if p.get("market_type") == "futures" and p.get("status") != "open"
+    ]
+
+    # Enrich open futures with expected resolution date
+    for p in futures_open:
+        p["expected_resolution"] = "June 2026"
+        p["badge"] = "FUTURES"
+
+    for p in futures_closed:
+        p["badge"] = "FUTURES"
+
+    # Total futures exposure
+    futures_exposure = round(sum(p.get("cost", 0) for p in futures_open), 2)
+
+    return {
+        "open": futures_open,
+        "closed": futures_closed,
+        "futures_exposure": futures_exposure,
+        "expected_resolution": "June 2026",
+    }
 
 
 @app.get("/api/nhl/stats", dependencies=[Depends(_require_auth)])

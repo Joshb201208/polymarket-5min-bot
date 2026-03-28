@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.the-odds-api.com/v4"
 _SPORT = "icehockey_nhl"
+_FUTURES_SPORT = "icehockey_nhl_championship_winner"
 _REGIONS = "us,us2,eu"
 _MARKETS = "h2h"
 
@@ -89,6 +90,10 @@ class NHLOddsClient:
         self._cache_ts: datetime | None = None
         self._cache_ttl = timedelta(minutes=8)
         self._remaining_requests: int | None = None
+        # Stanley Cup futures cache (longer TTL)
+        self._futures_cache: dict[str, float] = {}  # team_name -> implied probability
+        self._futures_cache_ts: datetime | None = None
+        self._futures_cache_ttl = timedelta(hours=6)
 
     @property
     def is_configured(self) -> bool:
@@ -151,6 +156,72 @@ class NHLOddsClient:
                 return game
 
         return None
+
+    def get_stanley_cup_odds(self) -> dict[str, float]:
+        """Fetch Stanley Cup championship winner odds. Cached for 6 hours.
+
+        Returns dict mapping team name (lowercase) → implied probability from Vegas.
+        """
+        if not self.is_configured:
+            return {}
+
+        now = datetime.now(timezone.utc)
+        if (self._futures_cache
+                and self._futures_cache_ts
+                and (now - self._futures_cache_ts) < self._futures_cache_ttl):
+            return dict(self._futures_cache)
+
+        try:
+            resp = httpx.get(
+                f"{_BASE_URL}/sports/{_FUTURES_SPORT}/odds",
+                params={
+                    "apiKey": self.api_key,
+                    "regions": _REGIONS,
+                    "markets": "outrights",
+                    "oddsFormat": "american",
+                },
+                timeout=20.0,
+            )
+            resp.raise_for_status()
+
+            self._remaining_requests = int(resp.headers.get("x-requests-remaining", -1))
+            if self._remaining_requests >= 0:
+                logger.info("NHL Futures Odds API: %d credits remaining", self._remaining_requests)
+
+            events = resp.json()
+            team_probs: dict[str, list[float]] = {}  # team_name_lower -> list of probs
+
+            for event in events:
+                for bm in event.get("bookmakers", []):
+                    for market in bm.get("markets", []):
+                        if market.get("key") != "outrights":
+                            continue
+                        for outcome in market.get("outcomes", []):
+                            name = outcome.get("name", "")
+                            price = outcome.get("price", 0)
+                            if not name or not price:
+                                continue
+                            dec = _american_to_decimal(price)
+                            prob = _decimal_to_implied(dec)
+                            name_lower = name.lower()
+                            if name_lower not in team_probs:
+                                team_probs[name_lower] = []
+                            team_probs[name_lower].append(prob)
+
+            # Average across bookmakers for each team
+            result: dict[str, float] = {}
+            for team, probs in team_probs.items():
+                if probs:
+                    result[team] = round(sum(probs) / len(probs), 6)
+
+            self._futures_cache = result
+            self._futures_cache_ts = now
+            logger.info("NHL Futures: loaded Stanley Cup odds for %d teams", len(result))
+            return dict(result)
+
+        except Exception as e:
+            logger.error("NHL Futures odds fetch failed: %s", e)
+            return dict(self._futures_cache)
 
     def _parse_event(self, event: dict) -> NHLGameOdds | None:
         """Parse a single event from the API response."""

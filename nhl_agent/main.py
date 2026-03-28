@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from nhl_agent.config import NHLConfig
 from nhl_agent.calibrator import NHLCalibrator
 from nhl_agent.edge_calculator import NHLEdgeCalculator
+from nhl_agent.models import NHLMarketType
 from nhl_agent.nhl_research import NHLResearch
 from nhl_agent.odds_client import NHLOddsClient
 from nhl_agent.performance_tracker import NHLPerformanceTracker
@@ -127,7 +128,9 @@ class NHLAgent:
             return
 
         markets = await self.scanner.scan()
-        logger.info("NHL evaluating %d markets", len(markets))
+        logger.info("NHL evaluating %d markets (%d futures)",
+                     len(markets),
+                     sum(1 for m in markets if m.market_type == NHLMarketType.FUTURES))
 
         open_positions = self.tracker.get_open_positions()
 
@@ -156,8 +159,12 @@ class NHLAgent:
                 if edge_result is None or not edge_result.has_edge:
                     continue
 
+                is_futures = market.market_type == NHLMarketType.FUTURES
+                label = "NHL FUTURES" if is_futures else "NHL EDGE"
+
                 logger.info(
-                    "NHL EDGE: %s | edge=%.1f%% conf=%s fair=%.2f market=%.2f",
+                    "%s: %s | edge=%.1f%% conf=%s fair=%.3f market=%.3f",
+                    label,
                     market.question,
                     edge_result.edge * 100,
                     edge_result.confidence.value,
@@ -165,26 +172,45 @@ class NHLAgent:
                     edge_result.market_price,
                 )
 
-                bet_size = self.bankroll.calculate_bet_size(edge_result)
-                if bet_size <= 0:
-                    continue
-
-                if not self.bankroll.check_game_exposure(market.slug, open_positions, bet_size):
-                    logger.info("NHL game exposure limit for %s", market.slug)
-                    continue
+                # Futures-specific sizing: 4% max per bet (half of game limit)
+                if is_futures:
+                    bet_size = self.bankroll.calculate_futures_bet_size(edge_result)
+                    if bet_size <= 0:
+                        continue
+                    # Check total futures exposure: 15% max
+                    futures_exposure = sum(
+                        p.cost for p in open_positions
+                        if p.status == "open" and p.market_type == "futures"
+                    )
+                    max_futures = self.bankroll.current_bankroll * self.config.MAX_FUTURES_EXPOSURE_PCT
+                    if futures_exposure + bet_size > max_futures:
+                        logger.info("NHL futures exposure limit reached (%.1f%% of bankroll)",
+                                    futures_exposure / self.bankroll.current_bankroll * 100)
+                        continue
+                else:
+                    bet_size = self.bankroll.calculate_bet_size(edge_result)
+                    if bet_size <= 0:
+                        continue
+                    if not self.bankroll.check_game_exposure(market.slug, open_positions, bet_size):
+                        logger.info("NHL game exposure limit for %s", market.slug)
+                        continue
 
                 position, trade = self.engine.execute_buy(edge_result, bet_size)
                 if position and trade:
+                    # Tag futures positions
+                    if is_futures:
+                        position.market_type = "futures"
                     self.tracker.save_position(position)
                     self.tracker.log_trade(trade)
 
                     self.bankroll.current_bankroll -= bet_size
                     self.bankroll.save_state()
 
-                    logger.info("NHL BET: %s | $%.2f @ %.2f¢ | edge=%.1f%% | conf=%s",
+                    logger.info("NHL BET: %s | $%.2f @ %.2f¢ | edge=%.1f%% | conf=%s | type=%s",
                                 position.market_question, bet_size,
                                 position.entry_price * 100, edge_result.edge * 100,
-                                edge_result.confidence.value)
+                                edge_result.confidence.value,
+                                "futures" if is_futures else "game")
 
                     open_positions = self.tracker.get_open_positions()
 

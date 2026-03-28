@@ -64,6 +64,8 @@ class NHLEdgeCalculator:
         try:
             if market.market_type == NHLMarketType.MONEYLINE:
                 return await self._evaluate_moneyline(market)
+            elif market.market_type == NHLMarketType.FUTURES:
+                return await self._evaluate_futures(market)
             return None
         except Exception as e:
             logger.error("NHL edge calculation failed for %s: %s", market.slug, e)
@@ -191,6 +193,182 @@ class NHLEdgeCalculator:
             )
 
         return None
+
+    async def _evaluate_futures(self, market: NHLMarket) -> NHLEdgeResult | None:
+        """Calculate edge for an NHL Stanley Cup futures market.
+
+        Blend: 70% Vegas / 30% model (standings pace + xGF%).
+        Min edge: 6%. Confidence: HIGH >15%, MEDIUM >10%, LOW >6%.
+        """
+        # Parse team name from question
+        # e.g. "Will the Carolina Hurricanes win the 2026 NHL Stanley Cup?"
+        team_name = self._parse_futures_team(market.question)
+        if not team_name:
+            logger.debug("Could not parse team from futures question: %s", market.question)
+            return None
+
+        team_info = find_nhl_team_by_name(team_name)
+        if not team_info:
+            logger.debug("Could not find NHL team for: %s", team_name)
+            return None
+
+        # Get Polymarket YES price (first outcome is typically YES)
+        if not market.outcome_prices:
+            return None
+        yes_index = 0
+        for i, outcome in enumerate(market.outcomes):
+            if outcome.lower() == "yes":
+                yes_index = i
+                break
+        if yes_index >= len(market.outcome_prices):
+            return None
+        poly_price = market.outcome_prices[yes_index]
+
+        # Get Vegas Stanley Cup odds for this team
+        cup_odds = self.odds_client.get_stanley_cup_odds()
+        vegas_prob = self._match_futures_team(team_info, cup_odds)
+
+        # Get model component: standings points pace + xGF%
+        model_prob = await self._compute_futures_model_prob(team_info["abbr"])
+
+        # Blend: 70% Vegas, 30% model (Vegas more reliable for futures)
+        if vegas_prob is not None and vegas_prob > 0:
+            fair_prob = 0.70 * vegas_prob + 0.30 * model_prob
+            has_vegas = True
+        else:
+            # No Vegas data — use model only (less reliable)
+            fair_prob = model_prob
+            has_vegas = False
+
+        edge = fair_prob - poly_price
+        if edge <= 0:
+            return None
+
+        # Vegas agrees if Vegas prob > Polymarket price
+        vegas_agrees = has_vegas and vegas_prob is not None and vegas_prob > poly_price
+
+        confidence = self._classify_futures_confidence(edge, has_vegas, vegas_agrees)
+
+        logger.info(
+            "NHL FUTURES: %s Stanley Cup | edge=%.1f%% fair=%.3f market=%.3f vegas=%.3f",
+            team_info["name"], edge * 100, fair_prob, poly_price,
+            vegas_prob if vegas_prob else 0,
+        )
+
+        return NHLEdgeResult(
+            market=market,
+            our_fair_price=fair_prob,
+            market_price=poly_price,
+            edge=edge,
+            confidence=confidence,
+            side="YES",
+            side_index=yes_index,
+            research=None,
+            has_vegas_line=has_vegas,
+            vegas_agrees=vegas_agrees,
+        )
+
+    def _parse_futures_team(self, question: str) -> str | None:
+        """Extract team name from a futures market question.
+
+        Examples:
+        - "Will the Carolina Hurricanes win the 2026 NHL Stanley Cup?" → "Carolina Hurricanes"
+        - "Carolina Hurricanes" (bare outcome name) → "Carolina Hurricanes"
+        """
+        import re
+        # Pattern: "Will the <TEAM> win ..."
+        m = re.search(r"[Ww]ill the (.+?) win", question)
+        if m:
+            return m.group(1).strip()
+        # Pattern: "Will <TEAM> win ..."
+        m = re.search(r"[Ww]ill (.+?) win", question)
+        if m:
+            return m.group(1).strip()
+        # Fallback: just try the whole question as a team name
+        return question.strip() if len(question) < 40 else None
+
+    def _match_futures_team(
+        self, team_info: dict, cup_odds: dict[str, float]
+    ) -> float | None:
+        """Match an NHL team to the Vegas futures odds dict (lowercase keys)."""
+        if not cup_odds:
+            return None
+
+        team_name = team_info["name"].lower()
+        city = team_info.get("city", "").lower()
+        nickname = team_info["name"].split()[-1].lower()
+
+        # Direct match
+        if team_name in cup_odds:
+            return cup_odds[team_name]
+
+        # Partial match: check if any key contains the team name or vice versa
+        for key, prob in cup_odds.items():
+            if team_name in key or key in team_name:
+                return prob
+            if nickname in key or city in key:
+                return prob
+
+        return None
+
+    async def _compute_futures_model_prob(self, team_abbr: str) -> float:
+        """Compute model probability for a team winning the Stanley Cup.
+
+        Uses current standings points pace and MoneyPuck xGF%.
+        Returns a rough probability estimate (not calibrated, blended with Vegas).
+        """
+        try:
+            stats = await self.research.get_team_stats(team_abbr)
+            if not stats:
+                return 1 / 32  # League average for 32 teams
+
+            gp = stats.wins + stats.losses + stats.ot_losses
+            if gp < 10:
+                return 1 / 32
+
+            # Points pace: project to 82 games
+            max_pts = gp * 2
+            pts_pct = stats.points / max_pts if max_pts > 0 else 0.5
+            projected_pts = pts_pct * 164  # max 164 points in 82 games
+
+            # xGF% as quality signal (50% is average)
+            xgf_factor = stats.xgf_pct / 100.0 if stats.xgf_pct > 0 else 0.5
+
+            # Convert projected points to rough strength rating
+            # ~120+ pts = contender, ~100 = average, ~80 = bottom
+            # Normalize: (projected - 70) / (130 - 70) clamped to 0.05-0.95
+            pts_strength = max(0.05, min(0.95, (projected_pts - 70) / 60))
+
+            # Combine points pace (60%) and xGF% (40%)
+            strength = 0.60 * pts_strength + 0.40 * xgf_factor
+
+            # Convert strength to championship probability
+            # Top team ~15%, average ~3%, bad team ~0.5%
+            # Use exponential scaling: prob = A * exp(B * strength) / sum
+            import math
+            raw_prob = math.exp(3.0 * strength)
+
+            # Approximate normalization: assume 32 teams with average strength 0.5
+            avg_raw = math.exp(3.0 * 0.5)
+            normalized = raw_prob / (32 * avg_raw)
+
+            # Clamp to reasonable range
+            return max(0.005, min(0.25, normalized))
+
+        except Exception as e:
+            logger.warning("Futures model prob failed for %s: %s", team_abbr, e)
+            return 1 / 32
+
+    def _classify_futures_confidence(
+        self, edge: float, has_vegas: bool, vegas_agrees: bool
+    ) -> Confidence:
+        """Classify confidence for futures bets."""
+        if edge > 0.15 and has_vegas and vegas_agrees:
+            return Confidence.HIGH
+        elif edge > 0.10:
+            return Confidence.MEDIUM
+        else:
+            return Confidence.LOW
 
     def _compute_power_rating(self, stats: NHLTeamStats, is_home: bool) -> float:
         """Compute NHL power rating.
