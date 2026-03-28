@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
 from shared.config import SharedConfig
 
 
 class NHLConfig(SharedConfig):
     """NHL-specific configuration."""
+
+    # NHL-specific trading mode override
+    # Set NHL_TRADING_MODE=paper in .env to paper trade NHL while NBA is live
+    # If not set, falls back to the shared TRADING_MODE
+    NHL_TRADING_MODE: str = os.getenv("NHL_TRADING_MODE", "")
+
+    @property
+    def TRADING_MODE(self) -> str:  # type: ignore[override]
+        return self.NHL_TRADING_MODE or super().TRADING_MODE
 
     # NHL scan interval (minutes)
     NHL_SCAN_INTERVAL: int = 12
