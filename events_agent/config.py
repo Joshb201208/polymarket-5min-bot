@@ -35,7 +35,7 @@ class EventsConfig:
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 
     # Scan interval (minutes)
-    SCAN_INTERVAL: int = int(os.getenv("EVENTS_SCAN_INTERVAL_MINUTES", "45"))
+    SCAN_INTERVAL: int = int(os.getenv("EVENTS_SCAN_INTERVAL_MINUTES", "10"))
 
     # Edge thresholds
     MIN_EDGE: float = float(os.getenv("EVENTS_MIN_EDGE", "0.05"))
