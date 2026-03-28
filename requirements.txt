@@ -5,3 +5,6 @@ feedparser>=6.0
 python-dotenv>=1.0
 fastapi
 uvicorn[standard]
+websockets>=12.0
+pytrends>=4.9.0
+thefuzz>=0.20.0
