@@ -48,7 +48,7 @@ else:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Polymarket NBA Agent Dashboard API", version="2.0.0")
+app = FastAPI(title="Polymarket Agent Dashboard API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -918,11 +918,126 @@ def get_system_health() -> dict:
 
     return {
         "nba_last_scan": nba_last_scan,
+        "events_last_scan": system_status.get("events_last_scan"),
         "odds_api_credits": odds_api_credits,
         "uptime_hours": uptime_hours,
         "apis": apis,
         "bankroll": bankroll.get("current_bankroll", 0),
         "is_paused": bankroll.get("is_paused", False),
+    }
+
+
+# ===========================================================================
+# Events Agent Endpoints
+# ===========================================================================
+
+@app.get("/api/events/status", dependencies=[Depends(_require_auth)])
+def get_events_status() -> dict:
+    """Status for events agent."""
+    system_status = _read_json("system_status.json")
+    bankroll = _read_json("bankroll.json")
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_trades = _read_json("events_trades.json").get("trades", [])
+
+    mode = "paper"
+    if events_trades:
+        mode = events_trades[-1].get("mode", "paper")
+
+    return {
+        "mode": mode,
+        "events_last_scan": system_status.get("events_last_scan"),
+        "open_positions": len([p for p in events_positions if p.get("status") == "open"]),
+        "total_positions": len(events_positions),
+        "bankroll": bankroll.get("current_bankroll", 0),
+    }
+
+
+@app.get("/api/events/positions", dependencies=[Depends(_require_auth)])
+def get_events_positions() -> dict:
+    """Events positions (open + closed)."""
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+    closed_pos = [p for p in positions if p.get("status") != "open"]
+    return {"open": open_pos, "closed": closed_pos}
+
+
+@app.get("/api/events/trades", dependencies=[Depends(_require_auth)])
+def get_events_trades() -> dict:
+    """Events trades + closed positions for history table."""
+    trades = _read_json("events_trades.json").get("trades", [])
+    positions = _read_json("events_positions.json").get("positions", [])
+    closed = [p for p in positions if p.get("status") != "open"]
+    return {"trades": trades, "closed_positions": closed}
+
+
+@app.get("/api/events/stats", dependencies=[Depends(_require_auth)])
+def get_events_stats() -> dict:
+    """Events stats — P&L, win rate, category breakdown, exit analysis."""
+    positions = _read_json("events_positions.json").get("positions", [])
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 500)
+
+    closed = [p for p in positions if p.get("status") != "open"]
+
+    total_closed = len(closed)
+    wins = [p for p in closed if (p.get("pnl") or 0) > 0]
+    losses = [p for p in closed if (p.get("pnl") or 0) <= 0]
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = round((win_count / total_closed * 100) if total_closed > 0 else 0, 1)
+
+    pnls = [p.get("pnl", 0) or 0 for p in closed]
+    total_pnl = round(sum(pnls), 2)
+    total_invested = sum(p.get("cost", 0) or 0 for p in closed)
+    roi = round((total_pnl / starting * 100) if starting > 0 else 0, 1)
+
+    # Category breakdown (count of all positions by category)
+    category_breakdown: dict[str, int] = {}
+    for p in positions:
+        cat = p.get("category", "other")
+        category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
+
+    # Exit reason breakdown
+    exit_reasons: dict[str, int] = {}
+    for p in closed:
+        reason = p.get("exit_reason", "Unknown")
+        # Simplify reason
+        if "take profit" in reason.lower() or "Take profit" in reason:
+            key = "Take profit"
+        elif "stop loss" in reason.lower() or "Stop loss" in reason:
+            key = "Stop loss"
+        elif "WIN" in reason:
+            key = "Market resolved: WIN"
+        elif "LOSS" in reason:
+            key = "Market resolved: LOSS"
+        elif "liquidity" in reason.lower():
+            key = "Low liquidity exit"
+        else:
+            key = reason[:30]
+        exit_reasons[key] = exit_reasons.get(key, 0) + 1
+
+    # Average hold time (hours) for closed positions
+    avg_hold_hours = None
+    hold_times = []
+    for p in closed:
+        entry = _parse_ts(p.get("entry_time"))
+        exit_t = _parse_ts(p.get("exit_time"))
+        if entry and exit_t:
+            hours = (exit_t - entry).total_seconds() / 3600
+            hold_times.append(hours)
+    if hold_times:
+        avg_hold_hours = round(sum(hold_times) / len(hold_times), 1)
+
+    return {
+        "total_trades": total_closed,
+        "wins": win_count,
+        "losses": loss_count,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "roi": roi,
+        "category_breakdown": category_breakdown,
+        "exit_reasons": exit_reasons,
+        "avg_hold_hours": avg_hold_hours,
     }
 
 

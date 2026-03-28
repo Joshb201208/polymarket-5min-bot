@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "=== Setting up Polymarket Agent (NBA + NHL) ==="
+echo "=== Setting up Polymarket Agent (NBA + Events Orchestrator) ==="
 
 # Install system packages
 apt-get update -qq
@@ -67,7 +67,7 @@ systemctl restart nba-dashboard
 echo "Started dashboard API service."
 
 echo ""
-echo "=== Setup complete! Orchestrator (NBA + NHL) + Dashboard running. ==="
+echo "=== Setup complete! Orchestrator (NBA + Events) + Dashboard running. ==="
 echo "Check agent:     systemctl status nba-agent"
 echo "Check dashboard:  systemctl status nba-dashboard"
 echo "View agent logs:  journalctl -u nba-agent -f"
