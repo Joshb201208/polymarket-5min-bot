@@ -765,8 +765,17 @@ def deploy() -> dict:
     project_dir = Path("/root/polymarket-bot")
     results = {}
 
-    # Git fetch + reset (more robust than pull — avoids ref conflicts)
+    # Git fetch + reset (clean refs first to avoid corruption)
     try:
+        # Remove stale ref file that causes "unable to update local ref"
+        ref_file = project_dir / ".git" / "refs" / "remotes" / "origin" / "master"
+        if ref_file.exists():
+            ref_file.unlink()
+        # Prune stale remote refs
+        subprocess.run(
+            ["git", "remote", "prune", "origin"],
+            cwd=project_dir, capture_output=True, timeout=10,
+        )
         fetch = subprocess.run(
             ["git", "fetch", "--all"],
             cwd=project_dir,
@@ -789,21 +798,32 @@ def deploy() -> dict:
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
 
-    # Restart systemd services (agent + dashboard)
-    for svc in ("nba-agent", "nba-dashboard"):
-        try:
-            restart = subprocess.run(
-                ["systemctl", "restart", svc],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            results[f"restart_{svc}"] = {
-                "ok": restart.returncode == 0,
-                "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
-            }
-        except Exception as e:
-            results[f"restart_{svc}"] = {"ok": False, "error": str(e)[:200]}
+    # Reload nginx to pick up any static file changes
+    try:
+        nginx_reload = subprocess.run(
+            ["systemctl", "reload", "nginx"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        results["nginx_reload"] = {"ok": nginx_reload.returncode == 0}
+    except Exception as e:
+        results["nginx_reload"] = {"ok": False, "error": str(e)[:100]}
+
+    # Restart agent service (dashboard restarts itself via auto_update cron)
+    try:
+        restart = subprocess.run(
+            ["systemctl", "restart", "nba-agent"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        results["restart_nba-agent"] = {
+            "ok": restart.returncode == 0,
+            "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
+        }
+    except Exception as e:
+        results["restart_nba-agent"] = {"ok": False, "error": str(e)[:200]}
 
     results["status"] = "deployed" if all(
         r.get("ok") for r in results.values()
