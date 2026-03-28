@@ -1041,6 +1041,521 @@ def get_events_stats() -> dict:
     }
 
 
+@app.get("/api/events/portfolio_value", dependencies=[Depends(_require_auth)])
+def get_events_portfolio_value() -> dict:
+    """Mark-to-market portfolio value: cash + current value of all positions."""
+    import urllib.request as _urlreq
+
+    bankroll_data = _read_json("bankroll.json")
+    total_bankroll = bankroll_data.get("current_bankroll", 0)
+    starting = bankroll_data.get("starting_bankroll", 500)
+
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+    closed_pos = [p for p in positions if p.get("status") != "open"]
+
+    # Fetch live prices for open positions
+    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
+    market_prices: dict[str, float] = {}
+    for mkt_id in market_ids:
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, tok in enumerate(token_list):
+                    if i < len(outcome_prices):
+                        try:
+                            market_prices[tok] = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    # Calculate position values
+    deployed = 0.0
+    current_value_total = 0.0
+    unrealized_pnl = 0.0
+    positions_up = 0
+    positions_down = 0
+    best_pos = None
+    best_pnl_pct = -999
+    worst_pos = None
+    worst_pnl_pct = 999
+
+    for p in open_pos:
+        cost = p.get("cost", 0) or 0
+        deployed += cost
+        tok = p.get("token_id", "")
+        shares = p.get("shares", 0) or 0
+        live_price = market_prices.get(tok)
+        entry_price = p.get("entry_price", 0) or 0
+
+        if live_price and shares > 0:
+            cv = shares * live_price
+            pnl = cv - cost
+            pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+            current_value_total += cv
+            unrealized_pnl += pnl
+            if pnl >= 0:
+                positions_up += 1
+            else:
+                positions_down += 1
+            if pnl_pct > best_pnl_pct:
+                best_pnl_pct = pnl_pct
+                best_pos = {"question": (p.get("market_question") or "")[:50], "pnl_pct": round(pnl_pct, 1)}
+            if pnl_pct < worst_pnl_pct:
+                worst_pnl_pct = pnl_pct
+                worst_pos = {"question": (p.get("market_question") or "")[:50], "pnl_pct": round(pnl_pct, 1)}
+        else:
+            current_value_total += cost
+
+    cash = max(0, total_bankroll - deployed)
+    portfolio_value = cash + current_value_total
+
+    # Realized P&L
+    realized_pnl = sum(p.get("pnl", 0) or 0 for p in closed_pos)
+
+    # Avg hold time for open positions
+    avg_hold_hours = None
+    hold_times = []
+    now = datetime.now(timezone.utc)
+    for p in open_pos:
+        entry = _parse_ts(p.get("entry_time"))
+        if entry:
+            hold_times.append((now - entry).total_seconds() / 3600)
+    if hold_times:
+        avg_hold_hours = round(sum(hold_times) / len(hold_times), 1)
+
+    return {
+        "portfolio_value": round(portfolio_value, 2),
+        "starting_bankroll": starting,
+        "cash": round(cash, 2),
+        "cash_pct": round(cash / total_bankroll * 100, 1) if total_bankroll > 0 else 100,
+        "deployed": round(deployed, 2),
+        "deployed_pct": round(deployed / total_bankroll * 100, 1) if total_bankroll > 0 else 0,
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "unrealized_pnl_pct": round(unrealized_pnl / deployed * 100, 1) if deployed > 0 else 0,
+        "realized_pnl": round(realized_pnl, 2),
+        "positions_up": positions_up,
+        "positions_down": positions_down,
+        "active_positions": len(open_pos),
+        "best_position": best_pos,
+        "worst_position": worst_pos,
+        "avg_hold_hours": avg_hold_hours,
+        "total_bankroll": round(total_bankroll, 2),
+    }
+
+
+@app.get("/api/events/unrealized", dependencies=[Depends(_require_auth)])
+def get_events_unrealized() -> dict:
+    """Per-position unrealized P&L with current prices."""
+    import urllib.request as _urlreq
+
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+
+    # Fetch live prices
+    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
+    market_prices: dict[str, float] = {}
+    for mkt_id in market_ids:
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, tok in enumerate(token_list):
+                    if i < len(outcome_prices):
+                        try:
+                            market_prices[tok] = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
+    result = []
+    for p in open_pos:
+        tok = p.get("token_id", "")
+        live_price = market_prices.get(tok)
+        cost = p.get("cost", 0) or 0
+        shares = p.get("shares", 0) or 0
+        entry_price = p.get("entry_price", 0) or 0
+
+        current_value = None
+        pnl = None
+        pnl_pct = None
+        if live_price and shares > 0:
+            current_value = round(shares * live_price, 2)
+            pnl = round(current_value - cost, 2)
+            pnl_pct = round(pnl / cost * 100, 1) if cost > 0 else 0
+
+        # Hold duration
+        hold_hours = None
+        entry_ts = _parse_ts(p.get("entry_time"))
+        if entry_ts:
+            hold_hours = round((now - entry_ts).total_seconds() / 3600, 1)
+
+        result.append({
+            "id": p.get("id"),
+            "market_id": p.get("market_id"),
+            "market_question": p.get("market_question"),
+            "category": p.get("category", "other"),
+            "side": p.get("side"),
+            "entry_price": entry_price,
+            "current_price": live_price,
+            "cost": cost,
+            "shares": shares,
+            "current_value": current_value,
+            "unrealized_pnl": pnl,
+            "unrealized_pnl_pct": pnl_pct,
+            "peak_pnl_pct": p.get("peak_pnl_pct"),
+            "trailing_stop_pct": p.get("trailing_stop_pct"),
+            "hold_hours": hold_hours,
+            "entry_time": p.get("entry_time"),
+            "entry_signals": p.get("entry_signals", []),
+            "entry_composite": p.get("entry_composite"),
+            "last_composite": p.get("last_composite"),
+            "confidence": p.get("confidence"),
+            "edge_at_entry": p.get("edge_at_entry"),
+            "edge_source": p.get("edge_source"),
+        })
+
+    return {"positions": result}
+
+
+@app.get("/api/events/position/{position_id}", dependencies=[Depends(_require_auth)])
+def get_events_position_detail(position_id: str) -> dict:
+    """Deep-dive single position with full history, signals, exit status."""
+    import urllib.request as _urlreq
+
+    positions = _read_json("events_positions.json").get("positions", [])
+    position = None
+    for p in positions:
+        if p.get("id") == position_id:
+            position = p
+            break
+
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    # Fetch live price
+    live_price = None
+    mkt_id = position.get("market_id", "")
+    tok = position.get("token_id", "")
+    if mkt_id:
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, t in enumerate(token_list):
+                    if t == tok and i < len(outcome_prices):
+                        try:
+                            live_price = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    # Calculate unrealized P&L
+    cost = position.get("cost", 0) or 0
+    shares = position.get("shares", 0) or 0
+    current_value = None
+    unrealized_pnl = None
+    unrealized_pnl_pct = None
+    if live_price and shares > 0:
+        current_value = round(shares * live_price, 2)
+        unrealized_pnl = round(current_value - cost, 2)
+        unrealized_pnl_pct = round(unrealized_pnl / cost * 100, 1) if cost > 0 else 0
+
+    # Lifecycle & regime
+    lc_data = _read_json("lifecycle_assessments.json")
+    rg_data = _read_json("regime_assessments.json")
+    lifecycle = (lc_data.get("assessments", {}) or {}).get(mkt_id, {})
+    regime = (rg_data.get("assessments", {}) or {}).get(mkt_id, {})
+
+    # Hold duration
+    now = datetime.now(timezone.utc)
+    entry_ts = _parse_ts(position.get("entry_time"))
+    hold_hours = round((now - entry_ts).total_seconds() / 3600, 1) if entry_ts else None
+
+    return {
+        **position,
+        "live_price": live_price,
+        "current_value": current_value,
+        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pnl_pct": unrealized_pnl_pct,
+        "hold_hours": hold_hours,
+        "lifecycle": lifecycle,
+        "regime": regime,
+    }
+
+
+@app.get("/api/events/exit_status", dependencies=[Depends(_require_auth)])
+def get_events_exit_status() -> dict:
+    """Exit proximity for all open positions."""
+    import urllib.request as _urlreq
+
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+
+    # Fetch live prices
+    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
+    market_prices: dict[str, float] = {}
+    for mkt_id in market_ids:
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, tok in enumerate(token_list):
+                    if i < len(outcome_prices):
+                        try:
+                            market_prices[tok] = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    result = []
+    for p in open_pos:
+        tok = p.get("token_id", "")
+        live_price = market_prices.get(tok)
+        cost = p.get("cost", 0) or 0
+        shares = p.get("shares", 0) or 0
+
+        pnl_pct = 0
+        if live_price and shares > 0 and cost > 0:
+            cv = shares * live_price
+            pnl_pct = (cv - cost) / cost * 100
+
+        # Determine zone
+        if pnl_pct >= 15:
+            zone = "tp_zone"
+            zone_label = "TP Zone"
+            zone_icon = "\U0001f7e2"
+        elif pnl_pct <= -15:
+            zone = "sl_zone"
+            zone_label = "SL Zone"
+            zone_icon = "\U0001f534"
+        else:
+            zone = "monitoring"
+            zone_label = "Monitoring"
+            zone_icon = "\U0001f7e1"
+
+        result.append({
+            "id": p.get("id"),
+            "market_question": p.get("market_question"),
+            "pnl_pct": round(pnl_pct, 1),
+            "zone": zone,
+            "zone_label": zone_label,
+            "zone_icon": zone_icon,
+        })
+
+    return {"positions": result}
+
+
+@app.get("/api/events/categories", dependencies=[Depends(_require_auth)])
+def get_events_categories() -> dict:
+    """Category breakdown with $ amount and count per category."""
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+
+    categories: dict[str, dict] = {}
+    for p in open_pos:
+        cat = p.get("category", "other")
+        if cat not in categories:
+            categories[cat] = {"count": 0, "amount": 0.0}
+        categories[cat]["count"] += 1
+        categories[cat]["amount"] += p.get("cost", 0) or 0
+
+    # Round amounts
+    for v in categories.values():
+        v["amount"] = round(v["amount"], 2)
+
+    return {"categories": categories}
+
+
+@app.get("/api/events/ticker", dependencies=[Depends(_require_auth)])
+def get_events_ticker() -> dict:
+    """Live price ticker data for active positions."""
+    import urllib.request as _urlreq
+
+    positions = _read_json("events_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+
+    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
+    market_prices: dict[str, float] = {}
+    for mkt_id in market_ids:
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
+            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=8) as resp:
+                m = json.loads(resp.read())
+                try:
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                try:
+                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    token_list = []
+                for i, tok in enumerate(token_list):
+                    if i < len(outcome_prices):
+                        try:
+                            market_prices[tok] = float(outcome_prices[i])
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    ticker = []
+    for p in open_pos:
+        tok = p.get("token_id", "")
+        live_price = market_prices.get(tok)
+        entry_price = p.get("entry_price", 0) or 0
+        question = p.get("market_question", "")
+        # Shorten question for ticker
+        short_q = question[:30] + ("..." if len(question) > 30 else "")
+
+        change_pct = 0
+        direction = "\u2192"
+        if live_price and entry_price > 0:
+            change_pct = (live_price - entry_price) / entry_price * 100
+            if change_pct > 0.5:
+                direction = "\u2191"
+            elif change_pct < -0.5:
+                direction = "\u2193"
+
+        ticker.append({
+            "id": p.get("id"),
+            "question": short_q,
+            "price": round(live_price, 4) if live_price else None,
+            "entry_price": entry_price,
+            "change_pct": round(change_pct, 1),
+            "direction": direction,
+            "highlight": abs(change_pct) > 3,
+        })
+
+    return {"ticker": ticker, "count": len(ticker)}
+
+
+@app.get("/api/events/trade/{trade_id}", dependencies=[Depends(_require_auth)])
+def get_events_trade_detail(trade_id: str) -> dict:
+    """Single trade with signal attribution."""
+    positions = _read_json("events_positions.json").get("positions", [])
+    closed = [p for p in positions if p.get("status") != "open"]
+
+    trade = None
+    for p in closed:
+        if p.get("id") == trade_id:
+            trade = p
+            break
+
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    # Hold duration
+    entry_ts = _parse_ts(trade.get("entry_time"))
+    exit_ts = _parse_ts(trade.get("exit_time"))
+    hold_hours = None
+    if entry_ts and exit_ts:
+        hold_hours = round((exit_ts - entry_ts).total_seconds() / 3600, 1)
+
+    # Signal accuracy: if entry signals predicted the correct direction and trade was profitable
+    pnl = trade.get("pnl", 0) or 0
+    signals_correct = pnl > 0
+
+    return {
+        **trade,
+        "hold_hours": hold_hours,
+        "signals_correct": signals_correct,
+    }
+
+
+@app.post("/api/events/close/{position_id}", dependencies=[Depends(_require_auth)])
+def close_events_position(position_id: str) -> dict:
+    """Manually close a position — triggers smart executor exit."""
+    positions_data = _read_json("events_positions.json")
+    positions = positions_data.get("positions", [])
+
+    target = None
+    for p in positions:
+        if p.get("id") == position_id and p.get("status") == "open":
+            target = p
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Open position not found")
+
+    # Write a close request file that the executor will pick up
+    close_request = {
+        "position_id": position_id,
+        "market_id": target.get("market_id"),
+        "token_id": target.get("token_id"),
+        "side": target.get("side"),
+        "shares": target.get("shares"),
+        "reason": "manual_close_dashboard",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    close_file = DATA_DIR / "close_requests.json"
+    existing = []
+    if close_file.exists():
+        try:
+            existing = json.loads(close_file.read_text())
+            if not isinstance(existing, list):
+                existing = []
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    existing.append(close_request)
+    try:
+        close_file.write_text(json.dumps(existing, indent=2))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write close request: {e}")
+
+    return {"ok": True, "message": f"Close request queued for position {position_id}", "position_id": position_id}
+
+
 # ===========================================================================
 # Intelligence Endpoints
 # ===========================================================================

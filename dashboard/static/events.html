@@ -87,23 +87,23 @@
         <div class="header-left">
             <div class="logo">
                 <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-                    <circle cx="16" cy="16" r="14" stroke="#00f0ff" stroke-width="2" fill="none" opacity="0.3"/>
-                    <circle cx="16" cy="16" r="8" stroke="#00f0ff" stroke-width="2" fill="none"/>
-                    <circle cx="16" cy="16" r="3" fill="#00f0ff"/>
-                    <line x1="16" y1="2" x2="16" y2="8" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="16" y1="24" x2="16" y2="30" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="2" y1="16" x2="8" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="24" y1="16" x2="30" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <circle cx="16" cy="16" r="14" stroke="#8b5cf6" stroke-width="2" fill="none" opacity="0.3"/>
+                    <circle cx="16" cy="16" r="8" stroke="#8b5cf6" stroke-width="2" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="#8b5cf6"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#8b5cf6" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#8b5cf6" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#8b5cf6" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#8b5cf6" stroke-width="1.5" opacity="0.5"/>
                 </svg>
                 <div class="logo-text">
-                    <span class="logo-title">POLYMARKET</span>
+                    <span class="logo-title" style="color:#8b5cf6;">POLYMARKET</span>
                     <span class="logo-subtitle">EVENTS</span>
                 </div>
             </div>
         </div>
         <div class="header-center">
             <a href="/nba.html" class="nav-link">NBA</a>
-            <a href="/events.html" class="nav-link active">Events</a>
+            <a href="/events.html" class="nav-link active" style="color:#8b5cf6;background:rgba(139,92,246,0.15);">Events</a>
             <a href="/intelligence.html" class="nav-link">Intelligence</a>
             <a href="/analytics.html" class="nav-link">Analytics</a>
         </div>
@@ -120,32 +120,54 @@
         </div>
     </header>
 
-    <!-- HERO KPIs -->
-    <section class="hero-stats">
-        <div class="kpi-card kpi-balance">
-            <div class="kpi-label">Events Exposure</div>
-            <div class="kpi-value balance-glow" id="kpiExposure">$0.00</div>
-            <div class="kpi-sub" id="kpiExposureSub">0 open positions</div>
+    <!-- LIVE PRICE TICKER -->
+    <div class="ev-ticker-bar" id="tickerBar">
+        <div class="ev-ticker-track" id="tickerTrack">
+            <span class="ev-ticker-empty">Waiting for position data...</span>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Events P&L</div>
-            <div class="kpi-value" id="kpiPnl">$0.00</div>
-            <div class="kpi-sub" id="kpiPnlSub">All time</div>
+    </div>
+
+    <!-- ENHANCED KPI BAR — Row 1 -->
+    <section class="hero-stats ev-hero-stats-8">
+        <div class="kpi-card kpi-balance ev-kpi-purple">
+            <div class="kpi-label">Portfolio Value</div>
+            <div class="kpi-value balance-glow ev-purple-glow" id="kpiPortfolioValue">$0.00</div>
+            <div class="kpi-sub" id="kpiPortfolioSub">mark-to-market</div>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Win Rate</div>
-            <div class="kpi-value" id="kpiWinRate">0%</div>
-            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L</div>
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Unrealized P&L</div>
+            <div class="kpi-value" id="kpiUnrealizedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiUnrealizedSub">0 up / 0 down</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Cash Available</div>
+            <div class="kpi-value" id="kpiCash">$0.00</div>
+            <div class="kpi-sub" id="kpiCashSub">0% of bankroll</div>
+        </div>
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Deployed</div>
+            <div class="kpi-value" id="kpiDeployed">$0.00</div>
+            <div class="kpi-sub" id="kpiDeployedSub">0% of bankroll</div>
+        </div>
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Best Position</div>
+            <div class="kpi-value pnl-positive" id="kpiBestPos">--</div>
+            <div class="kpi-sub" id="kpiBestPosSub">--</div>
+        </div>
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Worst Position</div>
+            <div class="kpi-value pnl-negative" id="kpiWorstPos">--</div>
+            <div class="kpi-sub" id="kpiWorstPosSub">--</div>
+        </div>
+        <div class="kpi-card ev-kpi-purple">
             <div class="kpi-label">Avg Hold Time</div>
             <div class="kpi-value" id="kpiAvgHold">--</div>
-            <div class="kpi-sub" id="kpiAvgHoldSub">Closed positions</div>
+            <div class="kpi-sub" id="kpiAvgHoldSub">open positions</div>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Last Scan</div>
-            <div class="kpi-value" id="kpiLastScan">--</div>
-            <div class="kpi-sub" id="kpiLastScanSub">Events scanner</div>
+        <div class="kpi-card ev-kpi-purple">
+            <div class="kpi-label">Active Positions</div>
+            <div class="kpi-value" id="kpiActiveCount" style="color:#8b5cf6;">0</div>
+            <div class="kpi-sub" id="kpiLastScanSub">Last scan: --</div>
         </div>
     </section>
 
@@ -154,7 +176,7 @@
         <div class="card-header">
             <h2 class="card-title">Active Events Positions</h2>
             <div class="card-header-right">
-                <span class="badge badge-cyan" id="openCount">0 open</span>
+                <span class="badge badge-purple" id="openCount">0 open</span>
             </div>
         </div>
         <div class="positions-grid" id="positionsGrid">
@@ -171,18 +193,7 @@
         </div>
     </section>
 
-    <!-- LIFECYCLE & REGIME STATUS -->
-    <section class="card" id="lifecycleSection" style="display:none;">
-        <div class="card-header">
-            <h2 class="card-title">Lifecycle &amp; Regime</h2>
-            <div class="card-header-right">
-                <span class="badge badge-cyan" id="lifecycleCount">0 markets</span>
-            </div>
-        </div>
-        <div id="lifecycleGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;padding:16px 20px;"></div>
-    </section>
-
-    <!-- CATEGORY BREAKDOWN -->
+    <!-- CATEGORY BREAKDOWN + EXIT ANALYSIS -->
     <section class="charts-grid">
         <div class="card">
             <div class="card-header">
@@ -202,6 +213,46 @@
         </div>
     </section>
 
+    <!-- OVERVIEW KPI ROW -->
+    <section class="stats-row ev-overview-row" id="overviewRow">
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Active Positions</div>
+            <div class="stat-mini-value" id="ovActive">0</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Unrealized P&L</div>
+            <div class="stat-mini-value" id="ovUnrealized">$0.00</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Realized P&L</div>
+            <div class="stat-mini-value" id="ovRealized">$0.00</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Win Rate</div>
+            <div class="stat-mini-value" id="ovWinRate">0%</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Avg Hold Time</div>
+            <div class="stat-mini-value" id="ovAvgHold">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Total Exposure</div>
+            <div class="stat-mini-value" id="ovExposure">$0.00</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Best Trade</div>
+            <div class="stat-mini-value pnl-positive" id="ovBestTrade">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Worst Trade</div>
+            <div class="stat-mini-value pnl-negative" id="ovWorstTrade">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Profit Factor</div>
+            <div class="stat-mini-value" id="ovProfitFactor">--</div>
+        </div>
+    </section>
+
     <!-- TRADE HISTORY -->
     <section class="card">
         <div class="card-header">
@@ -214,14 +265,16 @@
             <table class="trade-table">
                 <thead>
                     <tr>
-                        <th>Date</th>
+                        <th class="sortable" data-sort="date">Date <span class="sort-arrow">&#x25B2;</span></th>
                         <th>Market</th>
                         <th>Category</th>
+                        <th>Entry Signals</th>
                         <th>Entry</th>
                         <th>Exit</th>
-                        <th>P&L</th>
-                        <th>Edge</th>
+                        <th class="sortable" data-sort="pnl">P&L <span class="sort-arrow">&#x25B2;</span></th>
+                        <th class="sortable" data-sort="hold">Hold Time <span class="sort-arrow">&#x25B2;</span></th>
                         <th>Exit Reason</th>
+                        <th>Accuracy</th>
                     </tr>
                 </thead>
                 <tbody id="tradeTableBody"></tbody>
