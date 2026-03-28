@@ -22,8 +22,6 @@ from nba_agent.polymarket_scanner import PolymarketScanner
 from nba_agent.telegram_alerts import TelegramBot
 from nba_agent.trading_engine import TradingEngine
 from nba_agent.utils import utcnow
-from shared.config import SharedConfig
-from shared import line_tracker, whale_detector, odds_snapshots
 
 logger = logging.getLogger("nba_agent")
 
@@ -109,35 +107,24 @@ class NBAAgent:
         except Exception:
             pass
 
-        # 1. Record line movement snapshots for all open positions
-        await self._record_line_snapshots()
-
-        # 2. Check whale / sharp money movements
-        await self._check_whale_movements()
-
-        # 3. Snapshot game-time prices for drift tracking
+        # 1. Snapshot game-time prices for drift tracking
         await self._snapshot_gametime_prices()
 
-        # 4. Check for resolved/expired positions (bankroll-based)
+        # 2. Check for early exits on existing positions
         await self._check_exits()
 
-        # 5. Check for resolved positions (auto-collects winnings)
+        # 3. Check for resolved positions (auto-collects winnings)
         await self._check_resolutions()
 
-        # 6. Scan for new opportunities (also records odds snapshots)
+        # 4. Scan for new opportunities
         await self._scan_and_trade()
 
-        # 7. Prune old tracking data periodically
-        line_tracker.prune_old_data()
-        whale_detector.prune_old_data()
-        odds_snapshots.prune_old_data()
-
-        # 8. Daily summary at 4pm UTC (midnight SGT)
+        # 5. Daily summary at 4pm UTC (midnight SGT)
         if now.hour == 16 and (self._last_daily is None or (now - self._last_daily) > timedelta(hours=12)):
             await self._send_daily_summary()
             self._last_daily = now
 
-        # 9. Weekly summary on Monday at 4pm UTC
+        # 6. Weekly summary on Monday at 4pm UTC
         if now.weekday() == 0 and now.hour == 16 and (self._last_weekly is None or (now - self._last_weekly) > timedelta(days=5)):
             await self._send_weekly_summary()
             self._last_weekly = now
@@ -162,21 +149,6 @@ class NBAAgent:
 
                 # Evaluate edge
                 edge_result = await self.edge_calc.evaluate(market)
-
-                # Record odds snapshot for every evaluated market (even without edge)
-                if edge_result is not None:
-                    try:
-                        odds_snapshots.record_from_evaluation(
-                            sport="nba",
-                            market_question=market.question,
-                            market_slug=market.slug,
-                            game_date=market.end_date[:10] if market.end_date else "",
-                            outcome_prices=market.outcome_prices,
-                            our_fair_price=edge_result.our_fair_price,
-                            side_index=edge_result.side_index,
-                        )
-                    except Exception as e:
-                        logger.debug("Odds snapshot error: %s", e)
 
                 if edge_result is None or not edge_result.has_edge:
                     continue
@@ -226,61 +198,6 @@ class NBAAgent:
 
             except Exception as e:
                 logger.error("Error processing market %s: %s", market.id, e, exc_info=True)
-
-    async def _record_line_snapshots(self) -> None:
-        """Record current market price for all open positions (line tracking)."""
-        open_positions = self.tracker.get_open_positions()
-        config = SharedConfig()
-
-        for pos in open_positions:
-            try:
-                current_price = await self.scanner.get_market_price(pos.token_id)
-                if current_price is None:
-                    continue
-
-                alert = line_tracker.record_snapshot(
-                    position_id=pos.id,
-                    token_id=pos.token_id,
-                    entry_price=pos.entry_price,
-                    current_price=current_price,
-                    entry_time=pos.entry_time,
-                    game_start_time=pos.game_start_time,
-                    sport="nba",
-                    market_question=pos.market_question,
-                )
-
-                if alert:
-                    await line_tracker.send_line_alert(alert, config)
-            except Exception as e:
-                logger.debug("Line snapshot error for %s: %s", pos.id, e)
-
-    async def _check_whale_movements(self) -> None:
-        """Check all scanned markets for sharp price movements."""
-        try:
-            markets = await self.scanner.scan()
-            open_positions = self.tracker.get_open_positions()
-            position_token_ids = {pos.token_id for pos in open_positions}
-
-            market_dicts = []
-            for m in markets:
-                market_dicts.append({
-                    "id": m.id,
-                    "question": m.question,
-                    "outcome_prices": m.outcome_prices,
-                    "clob_token_ids": m.clob_token_ids,
-                })
-
-            movements = whale_detector.check_movements(
-                markets=market_dicts,
-                open_position_token_ids=position_token_ids,
-                sport="nba",
-            )
-
-            config = SharedConfig()
-            for movement in movements:
-                await whale_detector.send_whale_alert(movement, config)
-        except Exception as e:
-            logger.debug("Whale detector error: %s", e)
 
     async def _snapshot_gametime_prices(self) -> None:
         """Record market price at game time for drift tracking.

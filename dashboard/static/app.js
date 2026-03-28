@@ -1,5 +1,5 @@
 /* ===================================================================
-   NBA + NHL Agent Dashboard — app.js
+   NBA Agent Dashboard — app.js
    Fetches all API endpoints every 30s, updates DOM, draws charts.
    =================================================================== */
 
@@ -24,15 +24,9 @@ let sortColumn = "date";
 let sortDirection = "desc";
 let expandedTradeId = null;
 let cachedPositions = null;    // NBA positions { open, closed }
-let cachedNhlPositions = null; // NHL positions { open, closed }
-let cachedCombined = null;     // /api/combined/status data
 let cachedStats = null;
 let cachedStatus = null;
 let cachedLive = {};  // { posId: { live_price, current_value, pnl_live, score } }
-
-// Sport filter state: 'all' | 'nba' | 'nhl'
-let sportFilterPositions = 'all';
-let sportFilterTrades = 'all';
 
 // ---------------------------------------------------------------------------
 // Chart.js Defaults
@@ -340,12 +334,11 @@ function setConnected(ok) {
 // Portfolio Value (computed from status + positions)
 // ---------------------------------------------------------------------------
 function updatePortfolioValue() {
-    if (!cachedStatus && !cachedCombined) return;
+    if (!cachedStatus) return;
 
-    // Prefer combined status for bankroll (shared across sports)
-    const cash = cachedCombined ? (cachedCombined.bankroll || 0) : (cachedStatus ? cachedStatus.bankroll || 0 : 0);
+    const cash = cachedStatus.bankroll || 0;
 
-    // Sum up cost of open positions across both sports
+    // Sum up cost of open NBA positions
     const merged = getMergedPositions();
     const deployed = merged.open.reduce((sum, p) => sum + (p.cost || 0), 0);
 
@@ -478,17 +471,10 @@ function updatePositions(data) {
     renderMergedPositions();
 }
 
-function updateNhlPositions(data) {
-    if (!data) return;
-    cachedNhlPositions = data;
-    updatePortfolioValue();
-    renderMergedPositions();
-}
-
 function renderMergedPositions() {
     const merged = getMergedPositions();
     const allOpen = merged.open;
-    const filtered = filterBySport(allOpen, sportFilterPositions);
+    const filtered = allOpen;
 
     const grid = document.getElementById("positionsGrid");
     document.getElementById("openCount").textContent = `${allOpen.length} open`;
@@ -589,7 +575,7 @@ function updateTrades(positions) {
 
 function renderMergedTrades() {
     const merged = getMergedPositions();
-    const closed = filterBySport(merged.closed, sportFilterTrades).slice();
+    const closed = merged.closed.slice();
 
     // Sort
     closed.sort((a, b) => {
@@ -892,37 +878,6 @@ function clearAllRedeemed() {
 // Expose for onclick
 window.toggleRedeemed = toggleRedeemed;
 window.clearAllRedeemed = clearAllRedeemed;
-
-// ---------------------------------------------------------------------------
-// Combined Status + Sport Breakdown
-// ---------------------------------------------------------------------------
-function updateCombinedStatus(data) {
-    if (!data) return;
-    cachedCombined = data;
-    updatePortfolioValue();
-
-    // Update KPI cards with combined data
-    const combined = data.combined || {};
-    const totalPnl = combined.total_pnl || 0;
-
-    // Sport breakdown row
-    const nba = data.nba || {};
-    const nhl = data.nhl || {};
-
-    const nbaPnlEl = document.getElementById("nbaPnl");
-    const nbaPnlVal = nba.total_pnl || 0;
-    nbaPnlEl.textContent = (nbaPnlVal >= 0 ? "+" : "") + fmt.usd(nbaPnlVal);
-    nbaPnlEl.className = `sport-stat-value ${nbaPnlVal >= 0 ? "pnl-positive" : "pnl-negative"}`;
-    document.getElementById("nbaOpen").textContent = nba.open_positions || 0;
-    document.getElementById("nbaExposure").textContent = fmt.usd(nba.exposure || 0);
-
-    const nhlPnlEl = document.getElementById("nhlPnl");
-    const nhlPnlVal = nhl.total_pnl || 0;
-    nhlPnlEl.textContent = (nhlPnlVal >= 0 ? "+" : "") + fmt.usd(nhlPnlVal);
-    nhlPnlEl.className = `sport-stat-value ${nhlPnlVal >= 0 ? "pnl-positive" : "pnl-negative"}`;
-    document.getElementById("nhlOpen").textContent = nhl.open_positions || 0;
-    document.getElementById("nhlExposure").textContent = fmt.usd(nhl.exposure || 0);
-}
 
 // Performance summary with period tabs
 let currentPeriod = "today";
@@ -1294,9 +1249,8 @@ function getSport(position) {
 }
 
 function sportBadgeHtml(sport) {
-    const cls = sport === 'nhl' ? 'badge-nhl' : 'badge-nba';
-    const label = sport.toUpperCase();
-    return `<span class="sport-badge ${cls}">${label}</span>`;
+    const label = (sport || 'nba').toUpperCase();
+    return `<span class="sport-badge badge-nba">${label}</span>`;
 }
 
 function tagPositions(positions, sport) {
@@ -1308,57 +1262,26 @@ function tagPositions(positions, sport) {
 }
 
 function getMergedPositions() {
-    const nba = tagPositions(cachedPositions, 'nba');
-    const nhl = tagPositions(cachedNhlPositions, 'nhl');
-    return {
-        open: [...nba.open, ...nhl.open],
-        closed: [...nba.closed, ...nhl.closed],
-    };
+    return tagPositions(cachedPositions, 'nba');
 }
-
-function filterBySport(arr, sport) {
-    if (sport === 'all') return arr;
-    return arr.filter(p => getSport(p) === sport);
-}
-
-// Sport filter button handler
-window.setSportFilter = function(section, sport) {
-    if (section === 'positions') {
-        sportFilterPositions = sport;
-        // Update active button
-        document.querySelectorAll('#positionFilters .filter-btn').forEach(b => {
-            b.classList.toggle('active', b.dataset.sport === sport);
-        });
-        renderMergedPositions();
-    } else if (section === 'trades') {
-        sportFilterTrades = sport;
-        document.querySelectorAll('#tradeFilters .filter-btn').forEach(b => {
-            b.classList.toggle('active', b.dataset.sport === sport);
-        });
-        renderMergedTrades();
-    }
-};
 
 // ---------------------------------------------------------------------------
 // Main refresh loop
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [status, positions, stats, research, liveData, nhlPositions, combinedStatus] = await Promise.all([
+    const [status, positions, stats, research, liveData] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/positions"),
         fetchJSON("/api/stats"),
         fetchJSON("/api/research"),
         fetchJSON("/api/live"),
-        fetchJSON("/api/nhl/positions"),
-        fetchJSON("/api/combined/status"),
     ]);
 
-    const anySuccess = status || positions || stats || research || nhlPositions || combinedStatus;
+    const anySuccess = status || positions || stats || research;
     setConnected(anySuccess);
 
     if (status) updateStatus(status);
     if (stats) updateStats(stats);
-    if (combinedStatus) updateCombinedStatus(combinedStatus);
 
     // Update live data cache before rendering positions
     if (liveData && liveData.positions) {
@@ -1373,12 +1296,8 @@ async function refresh() {
     if (positions) {
         updatePositions(positions);
     }
-    // Update NHL positions
-    if (nhlPositions) {
-        updateNhlPositions(nhlPositions);
-    }
 
-    // Render merged trades and redeem checklist from both sports
+    // Render trades and redeem checklist
     renderMergedTrades();
     const merged = getMergedPositions();
     updateRedeemChecklist({ open: merged.open, closed: merged.closed });
@@ -1404,22 +1323,6 @@ async function refresh() {
         }
     });
 
-    // NHL-specific API health
-    fetchJSON("/api/nhl/status").then((nhlStatus) => {
-        if (!nhlStatus) return;
-        const sources = nhlStatus.data_sources || [];
-        const nhlApiEl = document.getElementById("dotNhlApi");
-        const moneyPuckEl = document.getElementById("dotMoneyPuck");
-        // If we got a response, the NHL API is working
-        if (nhlApiEl) {
-            nhlApiEl.className = `api-dot ${sources.includes("NHL API") ? "ok" : "error"}`;
-            nhlApiEl.title = "NHL API: " + (sources.includes("NHL API") ? "ok" : "unknown");
-        }
-        if (moneyPuckEl) {
-            moneyPuckEl.className = `api-dot ${sources.includes("MoneyPuck") ? "ok" : "error"}`;
-            moneyPuckEl.title = "MoneyPuck: " + (sources.includes("MoneyPuck") ? "ok" : "unknown");
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------

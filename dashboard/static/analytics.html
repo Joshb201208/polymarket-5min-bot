@@ -20,7 +20,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Polymarket Agent — Analytics</title>
-    <meta name="description" content="Deep analytics for NBA + NHL Polymarket betting agents — confidence tiers, timing, cross-sport, vegas agreement">
+    <meta name="description" content="Deep analytics for NBA Polymarket betting agents — confidence tiers, timing, cross-sport, vegas agreement">
 
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -497,9 +497,7 @@
             </div>
         </div>
         <div class="header-center">
-            <a href="/" class="nav-link">Overview</a>
             <a href="/nba.html" class="nav-link">NBA</a>
-            <a href="/nhl.html" class="nav-link">NHL</a>
             <a href="/analytics.html" class="nav-link active">Analytics</a>
         </div>
         <div class="header-right">
@@ -663,44 +661,6 @@
                         </svg>
                         <div class="chart-empty-label">Collecting data...</div>
                         <div class="chart-empty-sub">Opponent data appears once bets resolve</div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- ==========================================
-             SECTION 6: Cross-Sport Comparison
-             ========================================== -->
-        <section class="section-card">
-            <div class="section-header">
-                <h2 class="section-title">Cross-Sport Comparison</h2>
-                <span class="badge-analytics">NBA vs NHL</span>
-            </div>
-            <div class="section-body">
-                <div class="cross-sport-grid" id="crossSportGrid">
-                    <div class="cross-sport-card cross-sport-card-nba">
-                        <div class="cross-sport-title">
-                            <span class="sport-badge badge-nba" style="font-size:10px;padding:2px 8px">NBA</span>
-                            <span style="color:#00f0ff">Basketball</span>
-                        </div>
-                        <div class="cross-sport-stats">
-                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="csNbaPnl">--</div></div>
-                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="csNbaWinRate">--</div></div>
-                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="csNbaTrades">--</div></div>
-                            <div><span class="cross-sport-stat-label">ROI</span><div class="cross-sport-stat-value" id="csNbaRoi">--</div></div>
-                        </div>
-                    </div>
-                    <div class="cross-sport-card cross-sport-card-nhl">
-                        <div class="cross-sport-title">
-                            <span class="sport-badge badge-nhl" style="font-size:10px;padding:2px 8px">NHL</span>
-                            <span style="color:#f59e0b">Hockey</span>
-                        </div>
-                        <div class="cross-sport-stats">
-                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="csNhlPnl">--</div></div>
-                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="csNhlWinRate">--</div></div>
-                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="csNhlTrades">--</div></div>
-                            <div><span class="cross-sport-stat-label">ROI</span><div class="cross-sport-stat-value" id="csNhlRoi">--</div></div>
-                        </div>
                     </div>
                 </div>
             </div>
@@ -1520,34 +1480,6 @@
         }
 
         // -------------------------------------------------------
-        // RENDER: Cross-Sport Comparison
-        // -------------------------------------------------------
-        function renderCrossSport(nbaStats, nhlStats) {
-            function setStat(id, val) {
-                const el = document.getElementById(id);
-                if (el) el.textContent = val;
-            }
-            if (nbaStats) {
-                const pnl = nbaStats.total_pnl || 0;
-                setStat('csNbaPnl', (pnl >= 0 ? '+' : '') + fmt.usd(pnl));
-                const pnlEl = document.getElementById('csNbaPnl');
-                if (pnlEl) pnlEl.style.color = pnl >= 0 ? 'var(--profit)' : 'var(--loss)';
-                setStat('csNbaWinRate', fmt.pct(nbaStats.win_rate));
-                setStat('csNbaTrades', nbaStats.total_trades || 0);
-                setStat('csNbaRoi', (nbaStats.roi >= 0 ? '+' : '') + fmt.pct(nbaStats.roi));
-            }
-            if (nhlStats) {
-                const pnl = nhlStats.total_pnl || 0;
-                setStat('csNhlPnl', (pnl >= 0 ? '+' : '') + fmt.usd(pnl));
-                const pnlEl = document.getElementById('csNhlPnl');
-                if (pnlEl) pnlEl.style.color = pnl >= 0 ? 'var(--profit)' : 'var(--loss)';
-                setStat('csNhlWinRate', fmt.pct(nhlStats.win_rate));
-                setStat('csNhlTrades', nhlStats.total_trades || 0);
-                setStat('csNhlRoi', (nhlStats.roi >= 0 ? '+' : '') + fmt.pct(nhlStats.roi));
-            }
-        }
-
-        // -------------------------------------------------------
         // RENDER: Confidence Tier Bar Chart
         // -------------------------------------------------------
         function renderConfBars(tierData) {
@@ -1605,12 +1537,11 @@
         // Main Refresh
         // -------------------------------------------------------
         async function refresh() {
-            const [analytics, apiHealth, calibration, nbaStats, nhlStats] = await Promise.all([
+            const [analytics, apiHealth, calibration, nbaStats] = await Promise.all([
                 fetchJSON('/api/analytics'),
                 fetchJSON('/api/api-health'),
                 fetchJSON('/api/calibration'),
                 fetchJSON('/api/stats'),
-                fetchJSON('/api/nhl/stats'),
             ]);
 
             const anyOk = analytics || apiHealth || calibration;
@@ -1641,9 +1572,6 @@
                     if (el) el.style.display = 'none';
                 });
             }
-
-            // Cross-sport comparison
-            renderCrossSport(nbaStats, nhlStats);
 
             if (apiHealth) {
                 renderApiHealth(apiHealth);
