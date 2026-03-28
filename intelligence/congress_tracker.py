@@ -46,33 +46,41 @@ class CongressTracker:
 
         self._load_seen_actions()
         signals: list[Signal] = []
+        logger.info("Congress tracker scanning %d active markets", len(active_markets))
 
         # 1. Fetch executive orders from Federal Register (free, no key)
         try:
+            logger.info("Scanning Federal Register for executive orders (no API key needed)...")
             eo_signals = await asyncio.wait_for(
                 self._scan_executive_orders(active_markets),
                 timeout=self.config.MODULE_TIMEOUT,
             )
             signals.extend(eo_signals)
+            logger.info("Executive order scan complete: %d signals generated", len(eo_signals))
         except asyncio.TimeoutError:
-            logger.warning("Executive order scan timed out")
+            logger.warning("Executive order scan timed out after %ds", self.config.MODULE_TIMEOUT)
         except Exception as e:
-            logger.error("Executive order scan failed: %s", e)
+            logger.error("Executive order scan failed: %s", e, exc_info=True)
 
         # 2. Fetch bill activity from Congress API (optional key)
         if self.config.CONGRESS_API_KEY:
             try:
+                logger.info("Scanning Congress API for bill activity (API key present)...")
                 bill_signals = await asyncio.wait_for(
                     self._scan_bill_activity(active_markets),
                     timeout=self.config.MODULE_TIMEOUT,
                 )
                 signals.extend(bill_signals)
+                logger.info("Bill activity scan complete: %d signals generated", len(bill_signals))
             except asyncio.TimeoutError:
-                logger.warning("Bill activity scan timed out")
+                logger.warning("Bill activity scan timed out after %ds", self.config.MODULE_TIMEOUT)
             except Exception as e:
-                logger.error("Bill activity scan failed: %s", e)
+                logger.error("Bill activity scan failed: %s", e, exc_info=True)
+        else:
+            logger.info("Congress API key not set — skipping bill activity scan (executive orders still active)")
 
         self._save_seen_actions()
+        logger.info("Congress tracker complete: %d total signals, %d seen actions tracked", len(signals), len(self._seen_actions))
         return signals
 
     async def _scan_executive_orders(self, active_markets: list) -> list[Signal]:
@@ -91,16 +99,21 @@ class CongressTracker:
                 resp.raise_for_status()
                 data = resp.json()
                 documents = data.get("results", [])
+                logger.info("Federal Register returned %d documents", len(documents))
         except httpx.HTTPError as e:
-            logger.error("Federal Register API failed: %s", e)
+            logger.error("Federal Register API failed: %s (url=%s)", e, url)
             return []
 
         signals: list[Signal] = []
         now = utcnow()
+        skipped_old = 0
+        skipped_seen = 0
+        checked_markets = 0
 
         for doc in documents:
             doc_id = doc.get("document_number", "")
             if doc_id in self._seen_actions:
+                skipped_seen += 1
                 continue
 
             title = doc.get("title", "")
@@ -112,14 +125,20 @@ class CongressTracker:
                 try:
                     pub_dt = datetime.strptime(pub_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                     if (now - pub_dt).days > 2:
+                        skipped_old += 1
                         continue
                 except ValueError:
                     pass
+
+            checked_markets += 1
 
             # Match to active markets
             matched = self._match_to_markets(
                 title + " " + abstract, active_markets,
             )
+
+            if matched:
+                logger.debug("EO '%s' matched %d markets", title[:60], len(matched))
 
             for market, relevance_score in matched:
                 market_id = getattr(market, "id", "")
@@ -145,7 +164,10 @@ class CongressTracker:
 
             self._seen_actions.add(doc_id)
 
-        logger.info("Executive orders: %d documents, %d signals", len(documents), len(signals))
+        logger.info(
+            "Executive orders: %d fetched, %d already seen, %d too old, %d checked, %d signals",
+            len(documents), skipped_seen, skipped_old, checked_markets, len(signals),
+        )
         return signals
 
     async def _scan_bill_activity(self, active_markets: list) -> list[Signal]:

@@ -21,6 +21,94 @@ from nba_agent.utils import atomic_json_write, load_json, utcnow
 logger = logging.getLogger("intelligence.metaculus")
 
 
+import re as _re
+
+# Synonym mappings for common prediction-market topics
+_KEYWORD_SYNONYMS = {
+    "bitcoin": {"btc", "bitcoin", "crypto"},
+    "btc": {"btc", "bitcoin", "crypto"},
+    "federal reserve": {"fed", "federal reserve", "fomc"},
+    "fed": {"fed", "federal reserve", "fomc"},
+    "crude oil": {"oil", "crude oil", "oil price", "petroleum"},
+    "oil": {"oil", "crude oil", "oil price", "petroleum"},
+    "interest rate": {"interest rate", "fed rate", "rates", "fomc"},
+    "trump": {"trump", "donald trump"},
+    "biden": {"biden", "joe biden"},
+    "inflation": {"inflation", "cpi", "consumer price"},
+    "gdp": {"gdp", "economic growth", "gross domestic product"},
+    "ukraine": {"ukraine", "russia ukraine", "kyiv"},
+    "china": {"china", "beijing", "prc"},
+    "taiwan": {"taiwan", "strait"},
+}
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text for comparison: lowercase, strip punctuation."""
+    return _re.sub(r"[^\w\s]", " ", text.lower()).strip()
+
+
+def _extract_entities(text: str) -> set[str]:
+    """Extract key entities: capitalized words, numbers, dates, known terms."""
+    entities: set[str] = set()
+    normalized = _normalize_text(text)
+    words = normalized.split()
+
+    # Numbers (years, percentages, amounts)
+    for w in words:
+        if _re.match(r"\d{4}$", w):  # Year
+            entities.add(w)
+        elif _re.match(r"\d+", w):  # Any number
+            entities.add(w)
+
+    # Named entities: words that were capitalized in original text
+    for match in _re.finditer(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text):
+        entities.add(match.group().lower())
+
+    # Known synonym keys
+    for key in _KEYWORD_SYNONYMS:
+        if key in normalized:
+            entities.update(_KEYWORD_SYNONYMS[key])
+
+    return entities
+
+
+def _keyword_overlap_score(a: str, b: str) -> int:
+    """Score based on meaningful keyword overlap between two strings.
+
+    Returns a score 0-100 where:
+    - Entity overlap (names, numbers, known terms) is weighted heavily
+    - Common content words are weighted normally
+    """
+    norm_a = _normalize_text(a)
+    norm_b = _normalize_text(b)
+
+    # Extract entities
+    entities_a = _extract_entities(a)
+    entities_b = _extract_entities(b)
+    entity_overlap = len(entities_a & entities_b)
+
+    # Content word overlap (exclude very common words)
+    stop_words = {
+        "will", "the", "a", "an", "be", "is", "are", "was", "were", "by",
+        "in", "on", "at", "to", "for", "of", "with", "and", "or", "that",
+        "this", "it", "do", "does", "did", "has", "have", "had", "not", "no",
+        "yes", "before", "after", "than", "more", "most", "what", "when",
+        "where", "who", "how", "which", "there", "here", "if",
+    }
+    words_a = {w for w in norm_a.split() if w not in stop_words and len(w) > 2}
+    words_b = {w for w in norm_b.split() if w not in stop_words and len(w) > 2}
+
+    if not words_a or not words_b:
+        return 0
+
+    word_overlap = len(words_a & words_b)
+    total_unique = len(words_a | words_b)
+
+    # Weighted score: entity matches count 3x
+    raw_score = (word_overlap + entity_overlap * 3) / (total_unique + entity_overlap * 2) if total_unique > 0 else 0
+    return int(min(raw_score * 100, 100))
+
+
 def _fuzzy_ratio(a: str, b: str) -> int:
     """Fuzzy string match ratio. Uses thefuzz if available, else simple fallback."""
     try:
@@ -84,26 +172,45 @@ class MetaculusCompare:
         return signals
 
     async def _fetch_metaculus_questions(self) -> list[dict]:
-        """Fetch open binary questions from Metaculus API."""
+        """Fetch open binary questions from Metaculus API.
+
+        Fetches using multiple sort orders to get broader coverage.
+        """
         url = f"{self.config.METACULUS_BASE_URL}/questions/"
-        params = {
-            "status": "open",
-            "type": "binary",
-            "limit": 100,
-            "order_by": "-activity",
-        }
+        all_questions: dict[str, dict] = {}  # keyed by question ID to dedup
+
+        # Try multiple sort orders for broader coverage
+        sort_orders = ["-activity", "-publish_time", "-forecasters_count"]
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                questions = data.get("results", [])
-                logger.info("Fetched %d Metaculus questions", len(questions))
-                return questions
+                for sort_order in sort_orders:
+                    try:
+                        params = {
+                            "status": "open",
+                            "type": "binary",
+                            "limit": 200,
+                            "order_by": sort_order,
+                        }
+                        resp = await client.get(url, params=params)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        questions = data.get("results", [])
+                        for q in questions:
+                            qid = str(q.get("id", ""))
+                            if qid and qid not in all_questions:
+                                all_questions[qid] = q
+                        logger.debug("Metaculus fetch (%s): %d questions", sort_order, len(questions))
+                    except Exception as e:
+                        logger.warning("Metaculus fetch (%s) failed: %s", sort_order, e)
+
         except httpx.HTTPError as e:
             logger.error("Metaculus API request failed: %s", e)
             return []
+
+        result = list(all_questions.values())
+        logger.info("Fetched %d unique Metaculus questions (across %d sort orders)", len(result), len(sort_orders))
+        return result
 
     async def _compare_market(
         self, market, meta_questions: list[dict]
@@ -190,14 +297,28 @@ class MetaculusCompare:
         return signal, div_record
 
     def _fuzzy_match(self, poly_question: str, meta_questions: list[dict]) -> dict | None:
-        """Find the best Metaculus question match for a Polymarket question."""
-        threshold = self.config.METACULUS_FUZZY_THRESHOLD
+        """Find the best Metaculus question match for a Polymarket question.
+
+        Uses a combined approach:
+        1. Standard fuzzy string ratio
+        2. Keyword/entity overlap scoring
+        Takes the max of both methods, with a lowered threshold (40) to catch
+        matches where platforms word things very differently.
+        """
+        threshold = min(self.config.METACULUS_FUZZY_THRESHOLD, 40)
         best_match = None
         best_score = 0
 
         for q in meta_questions:
             meta_title = q.get("title", "")
-            score = _fuzzy_ratio(poly_question, meta_title)
+            if not meta_title:
+                continue
+
+            # Score using both methods, take the best
+            fuzzy_score = _fuzzy_ratio(poly_question, meta_title)
+            keyword_score = _keyword_overlap_score(poly_question, meta_title)
+            score = max(fuzzy_score, keyword_score)
+
             if score > best_score and score >= threshold:
                 best_score = score
                 best_match = q

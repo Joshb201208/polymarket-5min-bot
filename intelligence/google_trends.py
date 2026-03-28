@@ -64,7 +64,7 @@ class GoogleTrendsTracker:
             if keywords:
                 market_keywords.append((market, keywords))
 
-        # Process in batches of 5 (pytrends limit)
+        # Process in batches of 3 (reduced from 5 to avoid rate limits)
         for market, keywords in market_keywords:
             if self._query_count >= self.config.GOOGLE_TRENDS_MAX_QUERIES:
                 logger.info("Google Trends query limit reached (%d)", self._query_count)
@@ -149,30 +149,45 @@ class GoogleTrendsTracker:
         return signals
 
     def _fetch_trends_sync(self, keywords: list[str]) -> dict[str, float] | None:
-        """Synchronous pytrends fetch — run in executor."""
+        """Synchronous pytrends fetch with retry logic — run in executor."""
+        import time
+
         try:
             from pytrends.request import TrendReq
-            pytrends = TrendReq(hl="en-US", tz=480, timeout=(10, 15))
-            # Take up to 5 keywords (pytrends limit)
-            kw_list = keywords[:5]
-            pytrends.build_payload(kw_list, timeframe="now 7-d")
-            df = pytrends.interest_over_time()
-
-            if df is None or df.empty:
-                return None
-
-            # Get most recent value for each keyword
-            result = {}
-            for kw in kw_list:
-                if kw in df.columns:
-                    recent_values = df[kw].tail(24)  # Last 24 data points
-                    if not recent_values.empty:
-                        result[kw] = float(recent_values.iloc[-1])
-
-            return result if result else None
-        except Exception as e:
-            logger.warning("pytrends error: %s", e)
+        except ImportError:
             return None
+
+        # Reduce batch size to 3 to avoid rate limits
+        kw_list = keywords[:3]
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                pytrends = TrendReq(hl="en-US", tz=480, timeout=(10, 15))
+                pytrends.build_payload(kw_list, timeframe="now 7-d")
+                df = pytrends.interest_over_time()
+
+                if df is None or df.empty:
+                    return None
+
+                # Get most recent value for each keyword
+                result = {}
+                for kw in kw_list:
+                    if kw in df.columns:
+                        recent_values = df[kw].tail(24)  # Last 24 data points
+                        if not recent_values.empty:
+                            result[kw] = float(recent_values.iloc[-1])
+
+                return result if result else None
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    backoff = (2 ** attempt) * 2  # 2s, 4s
+                    logger.debug("pytrends attempt %d failed, retrying in %ds: %s", attempt + 1, backoff, e)
+                    time.sleep(backoff)
+
+        logger.warning("pytrends failed after 3 attempts: %s", last_error)
+        return None
 
     def _extract_keywords(self, market_question: str) -> list[str]:
         """NLP-lite keyword extraction from a market question."""
@@ -207,20 +222,35 @@ class GoogleTrendsTracker:
         return unique[:3]
 
     def _calculate_velocity(self, keyword: str, current_interest: float) -> float:
-        """Calculate velocity: current_interest / avg_last_24h."""
+        """Calculate velocity: current_interest / avg_interest.
+
+        Uses 24h average if available, falls back to 7-day average.
+        If current interest is 2x+ the average, it's a significant spike.
+        """
         history = self._history.get(keyword, [])
         if not history:
+            # No history yet — if interest is high enough, treat as a spike
+            # (first observation of a trending topic)
+            if current_interest >= 75:
+                return 2.0
             return 0.0
 
-        # Average of last 24h entries
-        cutoff = (utcnow() - timedelta(hours=24)).isoformat()
-        past_entries = [h for h in history if h["timestamp"] > cutoff]
+        now = utcnow()
 
-        if not past_entries:
-            return 0.0
+        # Try 24h average first
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
+        past_24h = [h for h in history if h["timestamp"] > cutoff_24h]
 
-        avg_interest = sum(h["interest"] for h in past_entries) / len(past_entries)
+        if past_24h:
+            avg_interest = sum(h["interest"] for h in past_24h) / len(past_24h)
+        else:
+            # Fall back to 7-day average
+            avg_interest = sum(h["interest"] for h in history) / len(history)
+
         if avg_interest <= 0:
+            # If average was zero but current is non-trivial, it's a spike
+            if current_interest >= 50:
+                return 3.0
             return 0.0
 
         return current_interest / avg_interest

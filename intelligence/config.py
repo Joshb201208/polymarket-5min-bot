@@ -80,7 +80,7 @@ class IntelligenceConfig:
     METACULUS_DIVERGENCE_THRESHOLD: float = float(
         os.getenv("METACULUS_DIVERGENCE_THRESHOLD", "0.05")
     )
-    METACULUS_FUZZY_THRESHOLD: int = int(os.getenv("METACULUS_FUZZY_THRESHOLD", "70"))
+    METACULUS_FUZZY_THRESHOLD: int = int(os.getenv("METACULUS_FUZZY_THRESHOLD", "40"))
 
     # Google Trends
     GOOGLE_TRENDS_VELOCITY_THRESHOLD: float = float(

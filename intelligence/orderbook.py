@@ -14,6 +14,8 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
+import httpx
+
 from intelligence.config import IntelligenceConfig
 from intelligence.models import Signal
 from nba_agent.utils import atomic_json_write, load_json, utcnow
@@ -349,6 +351,110 @@ class OrderbookIntelligence:
                     expires_at=now + timedelta(minutes=15),
                 ))
 
+        return signals
+
+    async def scan(self, active_markets: list) -> list[Signal]:
+        """REST-based fallback scan using CLOB /book endpoint.
+
+        When the WebSocket is connected, signals come via get_pending_signals().
+        This scan() method provides a fallback that queries the CLOB REST API
+        for orderbook depth, detecting imbalances and spread opportunities.
+        """
+        if not self.config.is_enabled("orderbook"):
+            return []
+
+        # If WebSocket is connected and producing data, skip REST fallback
+        if self._connected and self.orderbooks:
+            logger.debug("Orderbook WS active — skipping REST fallback scan")
+            return []
+
+        signals: list[Signal] = []
+        now = utcnow()
+
+        # Query CLOB book endpoint for each market's token
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for market in active_markets[:20]:  # Limit to avoid rate limiting
+                token_id = ""
+                tokens = getattr(market, "clob_token_ids", None) or getattr(market, "token_ids", None)
+                if tokens and isinstance(tokens, list) and tokens:
+                    token_id = tokens[0]
+                if not token_id:
+                    continue
+
+                market_id = getattr(market, "id", "")
+                question = getattr(market, "question", "")
+
+                try:
+                    resp = await client.get(
+                        f"https://clob.polymarket.com/book",
+                        params={"token_id": token_id},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    book_data = resp.json()
+                except Exception:
+                    continue
+
+                bids = book_data.get("bids", [])
+                asks = book_data.get("asks", [])
+                if not bids or not asks:
+                    continue
+
+                # Calculate depth
+                bid_total = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids)
+                ask_total = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks)
+
+                # Imbalance detection
+                if ask_total > 0:
+                    ratio = bid_total / ask_total
+                    if ratio > self.config.IMBALANCE_RATIO or ratio < (1.0 / self.config.IMBALANCE_RATIO):
+                        direction = "YES" if ratio > 1.0 else "NO"
+                        signals.append(Signal(
+                            source="orderbook",
+                            market_id=market_id,
+                            market_question=question,
+                            signal_type="orderbook_imbalance",
+                            direction=direction,
+                            strength=min(max(ratio, 1.0 / ratio) / 10.0, 1.0),
+                            confidence=0.5,
+                            details={
+                                "bid_total": round(bid_total, 2),
+                                "ask_total": round(ask_total, 2),
+                                "ratio": round(ratio, 2),
+                                "source": "rest_fallback",
+                            },
+                            timestamp=now,
+                            expires_at=now + timedelta(minutes=10),
+                        ))
+
+                # Spread detection
+                if bids and asks:
+                    best_bid = max(float(b.get("price", 0)) for b in bids)
+                    best_ask = min(float(a.get("price", 0)) for a in asks)
+                    spread = best_ask - best_bid
+                    if spread > self.config.SPREAD_OPPORTUNITY_THRESHOLD:
+                        signals.append(Signal(
+                            source="orderbook",
+                            market_id=market_id,
+                            market_question=question,
+                            signal_type="spread_opportunity",
+                            direction="NEUTRAL",
+                            strength=min(spread / 0.15, 1.0),
+                            confidence=0.8,
+                            details={
+                                "spread": round(spread, 4),
+                                "best_bid": best_bid,
+                                "best_ask": best_ask,
+                                "source": "rest_fallback",
+                            },
+                            timestamp=now,
+                            expires_at=now + timedelta(minutes=5),
+                        ))
+
+                await asyncio.sleep(0.2)  # Rate limit
+
+        if signals:
+            logger.info("Orderbook REST fallback: %d signals from %d markets", len(signals), len(active_markets))
         return signals
 
     def get_pending_signals(self) -> list[Signal]:

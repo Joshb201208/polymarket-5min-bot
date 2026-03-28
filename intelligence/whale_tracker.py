@@ -42,9 +42,14 @@ class WhaleTracker:
             return []
 
         self._load_wallets()
+
+        # Auto-discover whales if wallet list is empty (one-time bootstrap)
         if not self._whale_wallets:
-            logger.info("No whale wallets to track — run discover_whales() first")
-            return []
+            logger.info("No whale wallets — running auto-discovery via large trades")
+            try:
+                await self.discover_whales()
+            except Exception as e:
+                logger.warning("Whale auto-discovery failed: %s", e)
 
         signals: list[Signal] = []
 
@@ -126,12 +131,26 @@ class WhaleTracker:
         return signals
 
     async def _fetch_whale_activity(self) -> list[dict]:
-        """Fetch recent ERC1155 transfers on CTF contract for whale wallets."""
+        """Fetch recent whale activity from available sources."""
         trades: list[dict] = []
 
+        # Always try direct large-trade fetching first (no wallets needed)
+        try:
+            direct_trades = await self._fetch_large_trades_direct()
+            trades.extend(direct_trades)
+            logger.info("Direct trade fetch: %d large trades found", len(direct_trades))
+        except Exception as e:
+            logger.warning("Direct large-trade fetch failed: %s", e)
+
         if not self.config.POLYGONSCAN_API_KEY:
-            # Try Polymarket Data API as fallback (no key needed)
-            return await self._fetch_via_data_api()
+            # Also try Data API wallet-based positions if we have wallets
+            if self._whale_wallets:
+                try:
+                    api_trades = await self._fetch_via_data_api()
+                    trades.extend(api_trades)
+                except Exception as e:
+                    logger.warning("Data API fallback failed: %s", e)
+            return trades
 
         # Use Polygonscan API for ERC1155 transfers
         for wallet_info in self._whale_wallets[:20]:  # Limit to top 20 whales
@@ -252,16 +271,103 @@ class WhaleTracker:
             logger.warning("Failed to get positions for %s: %s", wallet[:10], e)
             return []
 
-    async def discover_whales(self) -> None:
-        """Discover new whale wallets from top position holders on active markets.
+    async def _fetch_large_trades_direct(self) -> list[dict]:
+        """Fetch large recent trades directly from Polymarket Data API.
 
-        Should be called periodically (e.g., once per day) to update the wallet list.
+        This works without any pre-discovered wallets — it queries the public
+        trades endpoint and filters for trades above the whale threshold.
         """
-        logger.info("Starting whale discovery...")
-        # This would scan Polymarket leaderboard / top holders
-        # For now, load from file and supplement with defaults
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"limit": 200},
+                )
+                resp.raise_for_status()
+                all_trades = resp.json()
+
+                large_trades = []
+                for t in all_trades:
+                    try:
+                        size = float(t.get("size", 0))
+                        price = float(t.get("price", 0))
+                        value = size * price
+                    except (ValueError, TypeError):
+                        continue
+
+                    if value < self.config.WHALE_MIN_TRADE_SIZE:
+                        continue
+
+                    # Parse timestamp — handle both epoch seconds and ISO strings
+                    raw_ts = t.get("timestamp", t.get("matchedAt", 0))
+                    if isinstance(raw_ts, (int, float)) and raw_ts > 0:
+                        ts_str = datetime.fromtimestamp(raw_ts, tz=timezone.utc).isoformat()
+                    elif isinstance(raw_ts, str) and raw_ts:
+                        ts_str = raw_ts
+                    else:
+                        ts_str = datetime.now(tz=timezone.utc).isoformat()
+
+                    large_trades.append({
+                        "wallet": t.get("proxyWallet", t.get("maker", "")),
+                        "token_id": t.get("asset", t.get("tokenId", "")),
+                        "market_id": t.get("market", t.get("conditionId", "")),
+                        "direction": "YES" if t.get("outcome", t.get("side", "")) in ("Yes", "BUY") else "NO",
+                        "value": value,
+                        "side": t.get("side", ""),
+                        "timestamp": ts_str,
+                    })
+
+                return large_trades
+        except Exception as e:
+            logger.warning("Direct trade fetch failed: %s", e)
+            return []
+
+    async def discover_whales(self) -> None:
+        """Discover whale wallets from recent large trades on Polymarket.
+
+        Queries the public trades endpoint, finds wallets making large trades,
+        and adds them to the tracked wallet list. No API key required.
+        """
+        logger.info("Starting whale discovery via large trades...")
         self._load_wallets()
-        logger.info("Whale discovery complete: %d wallets tracked", len(self._whale_wallets))
+
+        try:
+            large_trades = await self._fetch_large_trades_direct()
+            if not large_trades:
+                logger.info("Whale discovery: no large trades found in recent data")
+                return
+
+            # Extract unique wallets from large trades
+            wallet_counts: dict[str, int] = defaultdict(int)
+            wallet_values: dict[str, float] = defaultdict(float)
+            for trade in large_trades:
+                wallet = trade.get("wallet", "")
+                if wallet:
+                    wallet_counts[wallet] += 1
+                    wallet_values[wallet] += trade.get("value", 0)
+
+            # Add discovered wallets (sorted by total value, descending)
+            existing_addresses = {w.get("address", "") for w in self._whale_wallets}
+            new_wallets = []
+            for wallet in sorted(wallet_values, key=wallet_values.get, reverse=True):
+                if wallet not in existing_addresses:
+                    new_wallets.append({
+                        "address": wallet,
+                        "total_trades": wallet_counts[wallet],
+                        "total_value": round(wallet_values[wallet], 2),
+                        "discovered_at": datetime.now(tz=timezone.utc).isoformat(),
+                    })
+                    existing_addresses.add(wallet)
+
+            if new_wallets:
+                self._whale_wallets.extend(new_wallets)
+                # Persist discovered wallets
+                self._save_wallets()
+                logger.info("Whale discovery: added %d new wallets (total: %d)", len(new_wallets), len(self._whale_wallets))
+            else:
+                logger.info("Whale discovery: no new wallets found (tracking %d)", len(self._whale_wallets))
+        except Exception as e:
+            logger.warning("Whale discovery failed: %s", e)
 
     def _load_wallets(self) -> None:
         """Load whale wallets from disk."""
@@ -271,6 +377,15 @@ class WhaleTracker:
             self._whale_wallets = wallets
         else:
             self._whale_wallets = _DEFAULT_WHALE_WALLETS[:]
+
+    def _save_wallets(self) -> None:
+        """Persist whale wallets to disk."""
+        try:
+            # Keep at most 100 wallets
+            wallets = self._whale_wallets[:100]
+            atomic_json_write(self._wallets_path, {"wallets": wallets})
+        except Exception as e:
+            logger.warning("Failed to save whale wallets: %s", e)
 
     def _save_signals(self, signals: list[Signal]) -> None:
         """Persist whale signals for dashboard consumption."""
