@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
+ExecStartPre=/usr/bin/git -C /root/polymarket-bot pull --ff-only origin master
 ExecStart=/root/polymarket-bot/venv/bin/python orchestrator.py
 Restart=always
 RestartSec=30

@@ -757,6 +757,53 @@ def health() -> dict:
     return {"status": "ok", "data_dir": str(DATA_DIR), "exists": DATA_DIR.exists()}
 
 
+@app.post("/api/deploy", dependencies=[Depends(_require_auth)])
+def deploy() -> dict:
+    """Pull latest code from GitHub and restart the agent service."""
+    import subprocess
+
+    project_dir = Path("/root/polymarket-bot")
+    results = {}
+
+    # Git pull
+    try:
+        pull = subprocess.run(
+            ["git", "pull", "origin", "master"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        results["git_pull"] = {
+            "ok": pull.returncode == 0,
+            "stdout": pull.stdout.strip()[-500:],
+            "stderr": pull.stderr.strip()[-200:] if pull.returncode != 0 else "",
+        }
+    except Exception as e:
+        results["git_pull"] = {"ok": False, "error": str(e)[:200]}
+
+    # Restart systemd service
+    try:
+        restart = subprocess.run(
+            ["systemctl", "restart", "agents"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        results["restart"] = {
+            "ok": restart.returncode == 0,
+            "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
+        }
+    except Exception as e:
+        results["restart"] = {"ok": False, "error": str(e)[:200]}
+
+    results["status"] = "deployed" if all(
+        r.get("ok") for r in results.values()
+    ) else "partial"
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # NHL Endpoints
 # ---------------------------------------------------------------------------
