@@ -176,6 +176,7 @@ function renderPositions() {
                 <div class="pos-detail"><span class="pos-detail-label">Cost</span><span class="pos-detail-value">${fmt.usd(p.cost)}</span></div>
                 <div class="pos-detail"><span class="pos-detail-label">Edge</span><span class="pos-detail-value">${fmt.edge(p.edge_at_entry)}</span></div>
             </div>
+            <div class="pos-line-chart"><canvas id="nhl-line-spark-${p.id}" height="36"></canvas></div>
         </div>`;
     }).join("");
 }
@@ -431,8 +432,8 @@ function drawDailyPnlChart(dailyPnl) {
     const ctx = document.getElementById("dailyPnlChart").getContext("2d");
     const labels = dailyPnl.map((d) => d.date);
     const values = dailyPnl.map((d) => d.pnl);
-    const colors = values.map((v) => (v >= 0 ? "#00ff88" : "#ff3366"));
-    const bgColors = values.map((v) => v >= 0 ? "rgba(0,255,136,0.7)" : "rgba(255,51,102,0.7)");
+    const colors = values.map((v) => (v >= 0 ? "#22c55e" : "#ef4444"));
+    const bgColors = values.map((v) => v >= 0 ? "rgba(34,197,94,0.7)" : "rgba(239,68,68,0.7)");
 
     if (dailyPnlChart) {
         dailyPnlChart.data.labels = labels;
@@ -509,6 +510,95 @@ function drawWinRateTypeChart(winRateByType) {
 }
 
 // ---------------------------------------------------------------------------
+// Line Movement Sparklines
+// ---------------------------------------------------------------------------
+let nhlLineCharts = {};
+
+function renderNhlLineMovements(lineData) {
+    if (!lineData || !lineData.movements) return;
+    const movements = lineData.movements || [];
+    const openPositions = cachedPositions?.open || [];
+
+    for (const p of openPositions) {
+        const canvasEl = document.getElementById(`nhl-line-spark-${p.id}`);
+        if (!canvasEl) continue;
+
+        const match = movements.find(m =>
+            m.position_id === p.id || m.market_slug === p.market_slug
+        );
+        if (!match || !match.prices || match.prices.length < 2) continue;
+
+        const prices = match.prices;
+        const trending = prices[prices.length - 1] >= prices[0];
+        const color = trending ? "#22c55e" : "#ef4444";
+
+        if (nhlLineCharts[p.id]) {
+            nhlLineCharts[p.id].data.datasets[0].data = prices;
+            nhlLineCharts[p.id].data.labels = prices.map((_, i) => i);
+            nhlLineCharts[p.id].update("none");
+        } else {
+            nhlLineCharts[p.id] = new Chart(canvasEl.getContext("2d"), {
+                type: "line",
+                data: {
+                    labels: prices.map((_, i) => i),
+                    datasets: [{
+                        data: prices, borderColor: color, borderWidth: 1.5,
+                        backgroundColor: "transparent", fill: false,
+                        tension: 0.3, pointRadius: 0,
+                    }],
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    animation: false,
+                    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                    scales: { x: { display: false }, y: { display: false } },
+                },
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NHL Odds Comparison Table
+// ---------------------------------------------------------------------------
+function renderNhlOddsTable(data) {
+    const tbody = document.getElementById("nhlOddsTableBody");
+    if (!tbody) return;
+    const snapshots = ((data && data.snapshots) || []).filter(s =>
+        s.sport && s.sport.toLowerCase() === "nhl"
+    );
+    const countEl = document.getElementById("nhlOddsCount");
+    if (countEl) countEl.textContent = `${snapshots.length} games`;
+
+    if (snapshots.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-table-cell">No NHL games being evaluated</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = snapshots.map(s => {
+        const edge = s.edge || 0;
+        const edgePct = (edge * 100).toFixed(1);
+        const rowClass = edge > 0.03 ? "odds-row-edge" : "";
+
+        let statusBadge = '<span class="odds-status odds-status-noedge">NO EDGE</span>';
+        if (s.status === "bet_placed" || s.bet_placed) {
+            statusBadge = '<span class="odds-status odds-status-bet">BET PLACED</span>';
+        } else if (edge > 0.03 || s.status === "watching") {
+            statusBadge = '<span class="odds-status odds-status-watching">WATCHING</span>';
+        }
+
+        return `<tr class="${rowClass}">
+            <td class="td-market">${escHtml(s.game || s.matchup || '')}</td>
+            <td class="mono">${s.polymarket_price != null ? (s.polymarket_price * 100).toFixed(1) + '¢' : '--'}</td>
+            <td class="mono">${s.vegas_price != null ? (s.vegas_price * 100).toFixed(1) + '¢' : '--'}</td>
+            <td class="mono">${s.fair_value != null ? (s.fair_value * 100).toFixed(1) + '¢' : '--'}</td>
+            <td class="mono ${edge > 0.03 ? 'pnl-positive' : edge < -0.03 ? 'pnl-negative' : ''}">${edgePct}%</td>
+            <td>${statusBadge}</td>
+        </tr>`;
+    }).join("");
+}
+
+// ---------------------------------------------------------------------------
 // Sort + Expand handlers
 // ---------------------------------------------------------------------------
 window.toggleTradeDetail = function (id) {
@@ -535,11 +625,13 @@ document.addEventListener("click", (e) => {
 // Main refresh loop — NHL endpoints
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [status, positions, stats, edges] = await Promise.all([
+    const [status, positions, stats, edges, lineData, oddsData] = await Promise.all([
         fetchJSON("/api/nhl/status"),
         fetchJSON("/api/nhl/positions"),
         fetchJSON("/api/nhl/stats"),
         fetchJSON("/api/nhl/edges"),
+        fetchJSON("/api/line-movements"),
+        fetchJSON("/api/odds-snapshots"),
     ]);
 
     const anySuccess = status || positions || stats;
@@ -554,8 +646,12 @@ async function refresh() {
         updateRedeemChecklist(positions);
     }
 
+    // Line movement sparklines (after positions rendered)
+    if (lineData) renderNhlLineMovements(lineData);
+
     if (stats) updateStats(stats);
     if (edges) updateEdges(edges);
+    if (oddsData) renderNhlOddsTable(oddsData);
 }
 
 // ---------------------------------------------------------------------------

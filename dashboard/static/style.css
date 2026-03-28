@@ -5,8 +5,8 @@
 
 /* --- Custom Properties --- */
 :root {
-    --bg: #0a0b0f;
-    --surface: #12131a;
+    --bg: #0a0e17;
+    --surface: #111827;
     --surface-alpha: rgba(18, 19, 26, 0.8);
     --surface-hover: #1a1b24;
     --border: rgba(255, 255, 255, 0.08);
@@ -18,10 +18,10 @@
     --secondary: #8b5cf6;
     --secondary-dim: rgba(139, 92, 246, 0.15);
 
-    --profit: #00ff88;
-    --profit-dim: rgba(0, 255, 136, 0.12);
-    --loss: #ff3366;
-    --loss-dim: rgba(255, 51, 102, 0.12);
+    --profit: #22c55e;
+    --profit-dim: rgba(34, 197, 94, 0.12);
+    --loss: #ef4444;
+    --loss-dim: rgba(239, 68, 68, 0.12);
 
     --text: #e4e4e7;
     --text-muted: #71717a;
@@ -2042,4 +2042,588 @@ body::after {
 .sport-link-card:hover .sport-link-arrow {
     color: var(--primary);
     transform: translateX(4px);
+}
+
+/* ===================================================================
+   OVERVIEW PAGE — New Component Styles
+   =================================================================== */
+
+/* --- Hero Stats 5-column --- */
+.hero-stats-5 {
+    grid-template-columns: repeat(5, 1fr);
+}
+
+@media (max-width: 1100px) {
+    .hero-stats-5 { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 700px) {
+    .hero-stats-5 { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* --- Sport Cards Grid --- */
+.sport-cards-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    padding: 0 24px 20px;
+    position: relative;
+    z-index: 1;
+}
+
+@media (max-width: 768px) {
+    .sport-cards-grid { grid-template-columns: 1fr; }
+}
+
+.sport-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    text-decoration: none;
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    transition: all var(--transition);
+    cursor: pointer;
+}
+
+.sport-card:hover {
+    border-color: var(--border-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+}
+
+.sport-card-nba {
+    border-left: 3px solid #00f0ff;
+}
+
+.sport-card-nba:hover {
+    box-shadow: 0 8px 30px rgba(0, 240, 255, 0.1);
+}
+
+.sport-card-nhl {
+    border-left: 3px solid #f59e0b;
+}
+
+.sport-card-nhl:hover {
+    box-shadow: 0 8px 30px rgba(245, 158, 11, 0.1);
+}
+
+.sport-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.sport-card-pnl {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sport-card-pnl-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-muted);
+}
+
+.sport-card-pnl-value {
+    font-size: 28px;
+    font-weight: 700;
+    font-family: var(--font);
+    font-variant-numeric: tabular-nums;
+}
+
+.sport-card-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+}
+
+.sport-card-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sport-card-stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+}
+
+.sport-card-stat-value {
+    font-size: 14px;
+    font-family: var(--mono);
+    font-weight: 500;
+}
+
+.sport-card-sparkline {
+    height: 40px;
+    width: 100%;
+}
+
+.sport-card-link {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    transition: color 0.2s;
+}
+
+.sport-card:hover .sport-card-link {
+    color: var(--text);
+}
+
+.sport-card-nba:hover .sport-card-link { color: #00f0ff; }
+.sport-card-nhl:hover .sport-card-link { color: #f59e0b; }
+
+/* Mode badge inline */
+.mode-badge-inline {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    padding: 3px 10px;
+    border-radius: 20px;
+}
+
+.mode-live {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.mode-paper {
+    background: rgba(139, 92, 246, 0.15);
+    color: #8b5cf6;
+    border: 1px solid rgba(139, 92, 246, 0.3);
+}
+
+/* --- Sport Badges --- */
+.sport-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+}
+
+.badge-nba {
+    background: rgba(0, 240, 255, 0.12);
+    color: #00f0ff;
+    border: 1px solid rgba(0, 240, 255, 0.25);
+}
+
+.badge-nhl {
+    background: rgba(245, 158, 11, 0.12);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+/* --- Calendar Heatmap --- */
+.heatmap-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-x: auto;
+}
+
+.heatmap-months {
+    position: relative;
+    height: 16px;
+    margin-left: 36px;
+}
+
+.heatmap-months span {
+    position: absolute;
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 0.5px;
+}
+
+.heatmap-body {
+    display: flex;
+    gap: 6px;
+}
+
+.heatmap-days {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 30px;
+    flex-shrink: 0;
+}
+
+.heatmap-days span {
+    height: 14px;
+    font-size: 9px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+}
+
+.heatmap-svg {
+    display: block;
+}
+
+.heatmap-cell {
+    cursor: pointer;
+    transition: opacity 0.15s;
+}
+
+.heatmap-cell:hover {
+    opacity: 0.8;
+    stroke: rgba(255, 255, 255, 0.3);
+    stroke-width: 1;
+}
+
+.heatmap-legend {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 36px;
+    margin-top: 4px;
+}
+
+.heatmap-legend-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin: 0 4px;
+}
+
+.heatmap-legend-cell {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+}
+
+.heatmap-tooltip {
+    display: none;
+    position: fixed;
+    background: rgba(18, 19, 26, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text);
+    pointer-events: none;
+    z-index: 1000;
+    white-space: nowrap;
+}
+
+/* --- Activity Feed --- */
+.activity-feed {
+    max-height: 400px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.activity-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--radius-xs);
+    background: rgba(255, 255, 255, 0.02);
+    transition: background 0.15s;
+}
+
+.activity-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.activity-icon {
+    font-size: 14px;
+    width: 20px;
+    text-align: center;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.activity-type-badge {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+.activity-type-bet_placed { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+.activity-type-market_resolved { background: rgba(139, 92, 246, 0.15); color: #8b5cf6; }
+.activity-type-auto_hedge { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.activity-type-whale_alert { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.activity-type-line_movement { background: rgba(0, 240, 255, 0.15); color: #00f0ff; }
+.activity-type-default { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); }
+
+.activity-desc {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.activity-time {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--text-dim);
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+/* --- Odds Comparison Table --- */
+.odds-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.odds-table thead th {
+    text-align: left;
+    padding: 10px 12px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.odds-table tbody td {
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    color: var(--text);
+    vertical-align: middle;
+}
+
+.odds-table tbody tr:hover {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.odds-row-edge {
+    background: rgba(34, 197, 94, 0.04);
+}
+
+.odds-row-edge:hover {
+    background: rgba(34, 197, 94, 0.08) !important;
+}
+
+.empty-table-cell {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 24px 12px !important;
+}
+
+.mono {
+    font-family: var(--mono);
+}
+
+.odds-status {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.odds-status-bet {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+}
+
+.odds-status-watching {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+}
+
+.odds-status-noedge {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-dim);
+}
+
+/* --- System Health Bar --- */
+.system-health-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    flex-wrap: wrap;
+    padding: 16px 24px;
+    margin: 0 24px 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    position: relative;
+    z-index: 1;
+}
+
+.health-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+}
+
+.health-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    flex-shrink: 0;
+}
+
+.health-ok {
+    background: #22c55e;
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.5);
+}
+
+.health-error {
+    background: #ef4444;
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.5);
+}
+
+.health-label {
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.health-value {
+    font-family: var(--mono);
+    color: var(--text);
+    font-weight: 500;
+}
+
+/* --- Line Movement Sparkline in Position Cards --- */
+.pos-line-chart {
+    margin-top: 8px;
+    height: 36px;
+    width: 100%;
+}
+
+/* --- Odds Comparison Section in Sport Pages --- */
+.odds-section {
+    margin-top: 0;
+}
+
+/* --- NHL Theme Overrides for new profit/loss colors --- */
+.nhl-theme .sport-card-nhl { border-left-color: #f59e0b; }
+.nhl-theme .balance-glow {
+    color: #f59e0b;
+    text-shadow: 0 0 20px rgba(245, 158, 11, 0.4), 0 0 40px rgba(245, 158, 11, 0.2);
+}
+
+/* --- Cross-sport comparison cards for analytics --- */
+.cross-sport-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+@media (max-width: 700px) {
+    .cross-sport-grid { grid-template-columns: 1fr; }
+}
+
+.cross-sport-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.cross-sport-card-nba { border-top: 3px solid #00f0ff; }
+.cross-sport-card-nhl { border-top: 3px solid #f59e0b; }
+
+.cross-sport-title {
+    font-size: 14px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.cross-sport-stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+}
+
+.cross-sport-stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+}
+
+.cross-sport-stat-value {
+    font-size: 16px;
+    font-family: var(--mono);
+    font-weight: 600;
+}
+
+/* --- Confidence tier bar chart (analytics) --- */
+.conf-bar-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.conf-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.conf-bar-label {
+    width: 70px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+}
+
+.conf-bar-track {
+    flex: 1;
+    height: 24px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+}
+
+.conf-bar-fill {
+    height: 100%;
+    border-radius: 6px;
+    transition: width 0.8s ease;
+    display: flex;
+    align-items: center;
+    padding-left: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--mono);
+    color: #fff;
+}
+
+.conf-bar-value {
+    font-size: 13px;
+    font-family: var(--mono);
+    font-weight: 600;
+    width: 50px;
+    text-align: right;
+    flex-shrink: 0;
 }

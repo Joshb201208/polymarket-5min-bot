@@ -19,8 +19,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NBA Agent — Analytics</title>
-    <meta name="description" content="Deep analytics for NBA Polymarket betting agent — confidence tiers, timing, price drift, opponent strength">
+    <title>Polymarket Agent — Analytics</title>
+    <meta name="description" content="Deep analytics for NBA + NHL Polymarket betting agents — confidence tiers, timing, cross-sport, vegas agreement">
 
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -669,7 +669,106 @@
         </section>
 
         <!-- ==========================================
-             SECTION 6: API Health Status
+             SECTION 6: Cross-Sport Comparison
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Cross-Sport Comparison</h2>
+                <span class="badge-analytics">NBA vs NHL</span>
+            </div>
+            <div class="section-body">
+                <div class="cross-sport-grid" id="crossSportGrid">
+                    <div class="cross-sport-card cross-sport-card-nba">
+                        <div class="cross-sport-title">
+                            <span class="sport-badge badge-nba" style="font-size:10px;padding:2px 8px">NBA</span>
+                            <span style="color:#00f0ff">Basketball</span>
+                        </div>
+                        <div class="cross-sport-stats">
+                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="csNbaPnl">--</div></div>
+                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="csNbaWinRate">--</div></div>
+                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="csNbaTrades">--</div></div>
+                            <div><span class="cross-sport-stat-label">ROI</span><div class="cross-sport-stat-value" id="csNbaRoi">--</div></div>
+                        </div>
+                    </div>
+                    <div class="cross-sport-card cross-sport-card-nhl">
+                        <div class="cross-sport-title">
+                            <span class="sport-badge badge-nhl" style="font-size:10px;padding:2px 8px">NHL</span>
+                            <span style="color:#f59e0b">Hockey</span>
+                        </div>
+                        <div class="cross-sport-stats">
+                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="csNhlPnl">--</div></div>
+                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="csNhlWinRate">--</div></div>
+                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="csNhlTrades">--</div></div>
+                            <div><span class="cross-sport-stat-label">ROI</span><div class="cross-sport-stat-value" id="csNhlRoi">--</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 7: Confidence Tier Win Rate Bars
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Confidence Tier Performance</h2>
+                <span class="badge-analytics">Win Rate</span>
+            </div>
+            <div class="section-body">
+                <div class="conf-bar-container" id="confBarContainer">
+                    <div class="conf-bar-row">
+                        <span class="conf-bar-label" style="color:#00f0ff">HIGH</span>
+                        <div class="conf-bar-track"><div class="conf-bar-fill" id="confBarHigh" style="width:0%;background:#00f0ff">0%</div></div>
+                        <span class="conf-bar-value" id="confBarHighVal">--</span>
+                    </div>
+                    <div class="conf-bar-row">
+                        <span class="conf-bar-label" style="color:#8b5cf6">MEDIUM</span>
+                        <div class="conf-bar-track"><div class="conf-bar-fill" id="confBarMed" style="width:0%;background:#8b5cf6">0%</div></div>
+                        <span class="conf-bar-value" id="confBarMedVal">--</span>
+                    </div>
+                    <div class="conf-bar-row">
+                        <span class="conf-bar-label" style="color:#71717a">LOW</span>
+                        <div class="conf-bar-track"><div class="conf-bar-fill" id="confBarLow" style="width:0%;background:#71717a">0%</div></div>
+                        <span class="conf-bar-value" id="confBarLowVal">--</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 8: Vegas Agreement Analysis
+             ========================================== -->
+        <section class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">Vegas Agreement Analysis</h2>
+                <span class="badge-analytics">Win Rate Comparison</span>
+            </div>
+            <div class="section-body">
+                <div class="cross-sport-grid" id="vegasAgreementGrid">
+                    <div class="cross-sport-card" style="border-top:3px solid #22c55e">
+                        <div class="cross-sport-title" style="color:#22c55e">Vegas Agrees</div>
+                        <div class="cross-sport-stats">
+                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="vegasAgreeWR">--</div></div>
+                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="vegasAgreeTrades">--</div></div>
+                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="vegasAgreePnl">--</div></div>
+                            <div><span class="cross-sport-stat-label">Avg Edge</span><div class="cross-sport-stat-value" id="vegasAgreeEdge">--</div></div>
+                        </div>
+                    </div>
+                    <div class="cross-sport-card" style="border-top:3px solid #ef4444">
+                        <div class="cross-sport-title" style="color:#ef4444">Vegas Disagrees</div>
+                        <div class="cross-sport-stats">
+                            <div><span class="cross-sport-stat-label">Win Rate</span><div class="cross-sport-stat-value" id="vegasDisagreeWR">--</div></div>
+                            <div><span class="cross-sport-stat-label">Trades</span><div class="cross-sport-stat-value" id="vegasDisagreeTrades">--</div></div>
+                            <div><span class="cross-sport-stat-label">P&L</span><div class="cross-sport-stat-value" id="vegasDisagreePnl">--</div></div>
+                            <div><span class="cross-sport-stat-label">Avg Edge</span><div class="cross-sport-stat-value" id="vegasDisagreeEdge">--</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==========================================
+             SECTION 9: API Health Status
              ========================================== -->
         <section class="section-card">
             <div class="section-header">
@@ -784,8 +883,8 @@
         // Chart.js Defaults
         // -------------------------------------------------------
         Chart.defaults.font.family = "'Inter', sans-serif";
-        Chart.defaults.color = '#71717a';
-        Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
+        Chart.defaults.color = '#a1a1aa';
+        Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
 
         // -------------------------------------------------------
         // Chart instances (so we can destroy & re-render)
@@ -1209,14 +1308,14 @@
                     {
                         label: 'Wins',
                         data: wins,
-                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        backgroundColor: 'rgba(34,197,94,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
                     {
                         label: 'Losses',
                         data: losses,
-                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        backgroundColor: 'rgba(239,68,68,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
@@ -1250,14 +1349,14 @@
                     {
                         label: 'Wins',
                         data: wins,
-                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        backgroundColor: 'rgba(34,197,94,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
                     {
                         label: 'Losses',
                         data: losses,
-                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        backgroundColor: 'rgba(239,68,68,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
@@ -1291,14 +1390,14 @@
                     {
                         label: 'Wins',
                         data: wins,
-                        backgroundColor: 'rgba(0,255,136,0.55)',
+                        backgroundColor: 'rgba(34,197,94,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
                     {
                         label: 'Losses',
                         data: losses,
-                        backgroundColor: 'rgba(255,51,102,0.55)',
+                        backgroundColor: 'rgba(239,68,68,0.55)',
                         pointRadius: 5,
                         pointHoverRadius: 7,
                     },
@@ -1421,13 +1520,97 @@
         }
 
         // -------------------------------------------------------
+        // RENDER: Cross-Sport Comparison
+        // -------------------------------------------------------
+        function renderCrossSport(nbaStats, nhlStats) {
+            function setStat(id, val) {
+                const el = document.getElementById(id);
+                if (el) el.textContent = val;
+            }
+            if (nbaStats) {
+                const pnl = nbaStats.total_pnl || 0;
+                setStat('csNbaPnl', (pnl >= 0 ? '+' : '') + fmt.usd(pnl));
+                const pnlEl = document.getElementById('csNbaPnl');
+                if (pnlEl) pnlEl.style.color = pnl >= 0 ? 'var(--profit)' : 'var(--loss)';
+                setStat('csNbaWinRate', fmt.pct(nbaStats.win_rate));
+                setStat('csNbaTrades', nbaStats.total_trades || 0);
+                setStat('csNbaRoi', (nbaStats.roi >= 0 ? '+' : '') + fmt.pct(nbaStats.roi));
+            }
+            if (nhlStats) {
+                const pnl = nhlStats.total_pnl || 0;
+                setStat('csNhlPnl', (pnl >= 0 ? '+' : '') + fmt.usd(pnl));
+                const pnlEl = document.getElementById('csNhlPnl');
+                if (pnlEl) pnlEl.style.color = pnl >= 0 ? 'var(--profit)' : 'var(--loss)';
+                setStat('csNhlWinRate', fmt.pct(nhlStats.win_rate));
+                setStat('csNhlTrades', nhlStats.total_trades || 0);
+                setStat('csNhlRoi', (nhlStats.roi >= 0 ? '+' : '') + fmt.pct(nhlStats.roi));
+            }
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Confidence Tier Bar Chart
+        // -------------------------------------------------------
+        function renderConfBars(tierData) {
+            if (!tierData) return;
+            const tiers = [
+                { key: 'HIGH', barId: 'confBarHigh', valId: 'confBarHighVal' },
+                { key: 'MEDIUM', barId: 'confBarMed', valId: 'confBarMedVal' },
+                { key: 'LOW', barId: 'confBarLow', valId: 'confBarLowVal' },
+            ];
+            for (const t of tiers) {
+                const d = tierData[t.key] || {};
+                const trades = d.trades || 0;
+                const wins = d.wins || 0;
+                const wr = trades > 0 ? (wins / trades) * 100 : 0;
+                const bar = document.getElementById(t.barId);
+                const val = document.getElementById(t.valId);
+                if (bar) {
+                    bar.style.width = wr + '%';
+                    bar.textContent = wr.toFixed(1) + '%';
+                }
+                if (val) val.textContent = `${wins}W / ${trades - wins}L`;
+            }
+        }
+
+        // -------------------------------------------------------
+        // RENDER: Vegas Agreement
+        // -------------------------------------------------------
+        function renderVegasAgreement(data) {
+            if (!data) return;
+            function setStat(id, val) {
+                const el = document.getElementById(id);
+                if (el) el.textContent = val;
+            }
+            const agree = data.agrees || {};
+            const disagree = data.disagrees || {};
+
+            setStat('vegasAgreeWR', fmt.pct(agree.win_rate));
+            setStat('vegasAgreeTrades', agree.trades || 0);
+            const aPnl = agree.pnl || 0;
+            setStat('vegasAgreePnl', (aPnl >= 0 ? '+' : '') + fmt.usd(aPnl));
+            const aPnlEl = document.getElementById('vegasAgreePnl');
+            if (aPnlEl) aPnlEl.style.color = aPnl >= 0 ? 'var(--profit)' : 'var(--loss)';
+            setStat('vegasAgreeEdge', fmt.pct(agree.avg_edge));
+
+            setStat('vegasDisagreeWR', fmt.pct(disagree.win_rate));
+            setStat('vegasDisagreeTrades', disagree.trades || 0);
+            const dPnl = disagree.pnl || 0;
+            setStat('vegasDisagreePnl', (dPnl >= 0 ? '+' : '') + fmt.usd(dPnl));
+            const dPnlEl = document.getElementById('vegasDisagreePnl');
+            if (dPnlEl) dPnlEl.style.color = dPnl >= 0 ? 'var(--profit)' : 'var(--loss)';
+            setStat('vegasDisagreeEdge', fmt.pct(disagree.avg_edge));
+        }
+
+        // -------------------------------------------------------
         // Main Refresh
         // -------------------------------------------------------
         async function refresh() {
-            const [analytics, apiHealth, calibration] = await Promise.all([
+            const [analytics, apiHealth, calibration, nbaStats, nhlStats] = await Promise.all([
                 fetchJSON('/api/analytics'),
                 fetchJSON('/api/api-health'),
                 fetchJSON('/api/calibration'),
+                fetchJSON('/api/stats'),
+                fetchJSON('/api/nhl/stats'),
             ]);
 
             const anyOk = analytics || apiHealth || calibration;
@@ -1439,6 +1622,14 @@
                 renderTimingChart(analytics.entry_timing);
                 renderDriftChart(analytics.price_drift);
                 renderOpponentChart(analytics.opponent_strength);
+
+                // Confidence bars use same tier data
+                renderConfBars(analytics.pnl_by_tier);
+
+                // Vegas agreement
+                if (analytics.vegas_agreement) {
+                    renderVegasAgreement(analytics.vegas_agreement);
+                }
             } else {
                 // Show empty states for charts if no data
                 ['timingEmpty', 'driftEmpty', 'opponentEmpty'].forEach(id => {
@@ -1450,6 +1641,9 @@
                     if (el) el.style.display = 'none';
                 });
             }
+
+            // Cross-sport comparison
+            renderCrossSport(nbaStats, nhlStats);
 
             if (apiHealth) {
                 renderApiHealth(apiHealth);

@@ -345,6 +345,33 @@
         </div>
     </section>
 
+    <!-- ODDS COMPARISON -->
+    <section class="card odds-section">
+        <div class="card-header">
+            <h2 class="card-title">NBA Odds Comparison</h2>
+            <div class="card-header-right">
+                <span class="badge badge-info" id="nbaOddsCount">0 games</span>
+            </div>
+        </div>
+        <div class="table-wrapper">
+            <table class="odds-table">
+                <thead>
+                    <tr>
+                        <th>Game</th>
+                        <th>Polymarket</th>
+                        <th>Vegas</th>
+                        <th>Fair Value</th>
+                        <th>Edge</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody id="nbaOddsTableBody">
+                    <tr><td colspan="6" class="empty-table-cell">Loading odds data...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
     <!-- FOOTER -->
     <footer class="footer">
         <span class="footer-text">Polymarket Agent — NBA Dashboard — Auto-refreshes every 30s</span>

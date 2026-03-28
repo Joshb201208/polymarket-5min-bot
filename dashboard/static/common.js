@@ -29,8 +29,8 @@ let authToken = localStorage.getItem("nba_agent_token") || null;
 // ---------------------------------------------------------------------------
 if (typeof Chart !== "undefined") {
     Chart.defaults.font.family = "'Inter', sans-serif";
-    Chart.defaults.color = "#71717a";
-    Chart.defaults.borderColor = "rgba(255,255,255,0.05)";
+    Chart.defaults.color = "#a1a1aa";
+    Chart.defaults.borderColor = "rgba(255,255,255,0.06)";
 }
 
 // ---------------------------------------------------------------------------
