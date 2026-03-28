@@ -254,8 +254,9 @@ class EventsAgent:
 
                 # Entry price zone filter: only enter if recommended side's
                 # price is in the backtest-derived profitable zone
-                yes_price = edge_result.market_price
-                recommended_price = yes_price if edge_result.side == "YES" else (1.0 - yes_price)
+                # NOTE: edge_result.market_price is ALREADY the price of our
+                # recommended side (YES price if side=YES, NO price if side=NO)
+                recommended_price = edge_result.market_price
                 if recommended_price < self.config.MIN_ENTRY_PRICE or recommended_price > self.config.MAX_ENTRY_PRICE:
                     logger.info(
                         "Skipping %s: entry price %.2f outside profitable zone [%.2f, %.2f]",
