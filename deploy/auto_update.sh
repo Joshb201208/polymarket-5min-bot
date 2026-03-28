@@ -12,6 +12,9 @@ if [ "$LOCAL" != "$REMOTE" ] && [ "$REMOTE" != "unknown" ]; then
     echo "$(date): New code detected ($LOCAL -> $REMOTE), updating..."
     git reset --hard origin/master
     venv/bin/pip install -r requirements.txt --quiet
+    # Update service file if changed
+    cp deploy/agents.service /etc/systemd/system/nba-agent.service
+    systemctl daemon-reload
     systemctl restart nba-agent
     systemctl restart nba-dashboard
     echo "$(date): Update complete (agent + dashboard restarted)"

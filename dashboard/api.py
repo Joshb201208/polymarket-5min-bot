@@ -798,6 +798,22 @@ def deploy() -> dict:
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
 
+    # Copy service file + daemon-reload (in case service config changed)
+    try:
+        svc_src = project_dir / "deploy" / "agents.service"
+        if svc_src.exists():
+            subprocess.run(
+                ["cp", str(svc_src), "/etc/systemd/system/nba-agent.service"],
+                capture_output=True, timeout=5,
+            )
+            subprocess.run(
+                ["systemctl", "daemon-reload"],
+                capture_output=True, timeout=5,
+            )
+            results["service_updated"] = {"ok": True}
+    except Exception as e:
+        results["service_updated"] = {"ok": False, "error": str(e)[:100]}
+
     # Reload nginx to pick up any static file changes
     try:
         nginx_reload = subprocess.run(
@@ -810,7 +826,7 @@ def deploy() -> dict:
     except Exception as e:
         results["nginx_reload"] = {"ok": False, "error": str(e)[:100]}
 
-    # Restart agent service (dashboard restarts itself via auto_update cron)
+    # Restart agent service
     try:
         restart = subprocess.run(
             ["systemctl", "restart", "nba-agent"],
