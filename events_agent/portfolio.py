@@ -90,13 +90,14 @@ class PortfolioManager:
         self,
         position: Position,
         current_price: float,
+        lifecycle=None,
     ) -> tuple[bool, str]:
         """Check if an events position should be exited early.
 
         Events markets CAN be sold early (unlike game-day sports bets).
         Exit triggers:
-        - Take profit at +30% gain
-        - Stop loss at -25% loss
+        - Take profit (lifecycle-adjusted or default +30%)
+        - Stop loss (lifecycle-adjusted or default -25%)
         - Liquidity concern (handled externally via scanner)
         """
         entry = position.entry_price
@@ -105,15 +106,54 @@ class PortfolioManager:
 
         pnl_pct = (current_price - entry) / entry
 
+        # Use lifecycle-adjusted TP/SL if available
+        tp = self.config.TAKE_PROFIT
+        sl = self.config.STOP_LOSS
+        if lifecycle:
+            if hasattr(lifecycle, "take_profit"):
+                tp = lifecycle.take_profit
+            elif isinstance(lifecycle, dict):
+                tp = lifecycle.get("take_profit", tp)
+            if hasattr(lifecycle, "stop_loss"):
+                sl = lifecycle.stop_loss
+            elif isinstance(lifecycle, dict):
+                sl = lifecycle.get("stop_loss", sl)
+
+            # Hold-to-resolution strategy: don't exit early
+            hold_strategy = ""
+            if hasattr(lifecycle, "hold_strategy"):
+                hold_strategy = lifecycle.hold_strategy
+            elif isinstance(lifecycle, dict):
+                hold_strategy = lifecycle.get("hold_strategy", "")
+            if hold_strategy == "hold_to_resolution":
+                return False, ""
+
         # Take profit
-        if pnl_pct >= self.config.TAKE_PROFIT:
+        if pnl_pct >= tp:
             return True, f"Take profit (+{pnl_pct * 100:.1f}%)"
 
         # Stop loss
-        if pnl_pct <= -self.config.STOP_LOSS:
+        if pnl_pct <= -sl:
             return True, f"Stop loss ({pnl_pct * 100:.1f}%)"
 
         return False, ""
+
+    # ------------------------------------------------------------------
+    # Pending tranches check (delegates to SmartExecutor)
+    # ------------------------------------------------------------------
+
+    async def check_pending_tranches(self, scanner=None) -> list:
+        """Check and execute any ready pending tranches."""
+        try:
+            from events_agent.smart_executor import SmartExecutor
+            executor = SmartExecutor(self.config)
+            trades = await executor.execute_pending_tranches(scanner)
+            for trade in trades:
+                self.log_trade(trade)
+            return trades
+        except Exception as e:
+            logger.error("Error checking pending tranches: %s", e)
+            return []
 
     # ------------------------------------------------------------------
     # Resolution checking

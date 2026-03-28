@@ -235,11 +235,20 @@ class EventsAnalyzer:
         self,
         market: EventMarket,
         intelligence_report,
+        lifecycle=None,
+        regime=None,
+        quality_adjustments=None,
     ) -> EdgeResult | None:
-        """Enhanced analysis blending base edge with intelligence signals.
+        """Full intelligence pipeline analysis.
 
-        final_edge = 0.4 * base_edge + 0.6 * intelligence_edge
-        Intelligence-weighted, since that's where the real alpha is.
+        Pipeline:
+        1. Base edge from existing strategies
+        2. Composite intelligence score (already deduped/decayed by caller)
+        3. Apply quality weight adjustments
+        4. Blend base + intel
+        5. Apply correlation penalty
+        6. Apply regime multipliers
+        7. Check edge vs lifecycle-adjusted threshold
         """
         try:
             # 1. Get base edge from existing strategies
@@ -268,23 +277,18 @@ class EventsAnalyzer:
                 return base_result
 
             # 3. Compute intelligence edge
-            # The composite score (0-1) represents how strongly signals indicate direction
-            # Convert to edge: intel_edge = composite * 0.15 (max 15% edge from intel)
             intel_edge = intel_score * 0.15
 
             # 4. Blend: final_edge = 0.4 * base_edge + 0.6 * intel_edge
             if base_edge > 0 and intel_direction == base_side:
-                # Both agree on direction — blend
                 final_edge = 0.4 * base_edge + 0.6 * intel_edge
             elif intel_edge > base_edge:
-                # Intelligence disagrees but is stronger — follow intel
                 final_edge = intel_edge * 0.6
                 base_side = intel_direction
             else:
-                # Base is stronger — follow base with minor intel boost
                 final_edge = base_edge * 0.8
                 if intel_direction != base_side:
-                    final_edge *= 0.7  # Penalty for conflicting signals
+                    final_edge *= 0.7
 
             # 5. Apply correlation penalty if over-concentrated
             correlation = intelligence_report.correlation if hasattr(intelligence_report, "correlation") else None
@@ -299,20 +303,46 @@ class EventsAnalyzer:
                     q_lower = market.question.lower()
                     for theme in warnings:
                         if isinstance(theme, str) and theme.lower() in q_lower:
-                            final_edge *= 0.7  # 30% penalty for concentrated themes
+                            final_edge *= 0.7
                             logger.info(
                                 "Correlation penalty applied for theme '%s' on %s",
                                 theme, market.slug,
                             )
                             break
 
-            if final_edge < self.config.MIN_EDGE:
+            # 6. Apply regime multipliers
+            if regime:
+                edge_mult = 1.0
+                if hasattr(regime, "edge_multiplier"):
+                    edge_mult = regime.edge_multiplier
+                elif isinstance(regime, dict):
+                    edge_mult = regime.get("edge_multiplier", 1.0)
+                # Regime edge_multiplier scales the min_edge threshold, not the edge itself
+                # We'll apply this when comparing below
+
+            # 7. Determine lifecycle-adjusted min_edge threshold
+            min_edge = self.config.MIN_EDGE
+            if lifecycle:
+                if hasattr(lifecycle, "min_edge"):
+                    min_edge = lifecycle.min_edge
+                elif isinstance(lifecycle, dict):
+                    min_edge = lifecycle.get("min_edge", min_edge)
+
+            # Apply regime edge multiplier to the threshold
+            if regime:
+                regime_mult = 1.0
+                if hasattr(regime, "edge_multiplier"):
+                    regime_mult = regime.edge_multiplier
+                elif isinstance(regime, dict):
+                    regime_mult = regime.get("edge_multiplier", 1.0)
+                min_edge *= regime_mult
+
+            if final_edge < min_edge:
                 return None
 
-            # 6. Set confidence from intelligence tier
+            # 8. Set confidence from intelligence tier
             confidence = _INTEL_TIER_CONFIDENCE.get(intel_tier, Confidence.LOW)
 
-            # Determine side index
             side_index = 0 if base_side == "YES" else 1
             market_price = market.outcome_prices[side_index] if side_index < len(market.outcome_prices) else 0
 
@@ -329,7 +359,6 @@ class EventsAnalyzer:
 
         except Exception as e:
             logger.error("Intelligence analysis failed for %s: %s", market.slug, e)
-            # Fall back to base analysis
             return await self.evaluate(market)
 
     def _classify_confidence(

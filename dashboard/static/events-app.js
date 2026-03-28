@@ -26,20 +26,23 @@ let exitChart = null;
 // Main Refresh
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [positions, trades, status, stats] = await Promise.all([
+    const [positions, trades, status, stats, lifecycle, regime] = await Promise.all([
         fetchJSON("/api/events/positions"),
         fetchJSON("/api/events/trades"),
         fetchJSON("/api/events/status"),
         fetchJSON("/api/events/stats"),
+        fetchJSON("/api/events/lifecycle"),
+        fetchJSON("/api/events/regime"),
     ]);
 
     const ok = positions || trades || status;
     setConnected(!!ok);
 
     if (status) renderStatus(status);
-    if (positions) renderPositions(positions);
+    if (positions) renderPositions(positions, lifecycle, regime);
     if (stats) renderStats(stats);
     if (trades) renderTrades(trades);
+    if (lifecycle || regime) renderLifecycleRegime(lifecycle, regime);
 
     const el = document.getElementById("lastUpdate");
     if (el) el.textContent = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
@@ -63,7 +66,7 @@ function renderStatus(data) {
 // ---------------------------------------------------------------------------
 // Positions
 // ---------------------------------------------------------------------------
-function renderPositions(data) {
+function renderPositions(data, lifecycleData, regimeData) {
     const open = data.open || [];
     const closed = data.closed || [];
     const grid = document.getElementById("positionsGrid");
@@ -85,18 +88,42 @@ function renderPositions(data) {
     }
     if (emptyEl) emptyEl.style.display = "none";
 
+    const lifecycleAssessments = (lifecycleData && lifecycleData.assessments) || {};
+    const regimeAssessments = (regimeData && regimeData.assessments) || {};
+
+    const stageColors = {
+        early: "#3b82f6", developing: "#8b5cf6", mature: "#f59e0b",
+        late: "#f97316", terminal: "#ef4444", unknown: "#71717a",
+    };
+    const regimeIcons = {
+        trending: ">>", volatile: "!!", stale: "--", converging: "><",
+    };
+
     let html = "";
     for (const p of open) {
-        const pnlPct = p.entry_price > 0 ? ((p.entry_price - p.entry_price) / p.entry_price * 100) : 0;
         const cat = p.category || "other";
         const tpLevel = (p.entry_price * 1.30).toFixed(1);
         const slLevel = (p.entry_price * 0.75).toFixed(1);
+
+        // Lifecycle badge
+        const lc = lifecycleAssessments[p.market_id] || {};
+        const stage = lc.stage || "";
+        const stageColor = stageColors[stage] || "#71717a";
+        const stageBadge = stage ? `<span class="badge" style="background:${stageColor}20;color:${stageColor};border:1px solid ${stageColor}40;font-size:10px;padding:2px 6px;border-radius:10px;text-transform:uppercase;font-weight:600;letter-spacing:0.05em;">${stage}</span>` : "";
+
+        // Regime chip
+        const rg = regimeAssessments[p.market_id] || {};
+        const regime = rg.regime || "";
+        const regimeChip = regime ? `<span style="font-size:10px;color:var(--text-muted);font-family:var(--mono);">${regimeIcons[regime] || "??"} ${regime}</span>` : "";
 
         html += `
         <div class="position-card">
             <div class="position-header">
                 <span class="position-market">${escHtml(p.market_question)}</span>
-                <span class="badge badge-purple">${escHtml(cat)}</span>
+                <div style="display:flex;gap:6px;align-items:center;">
+                    ${stageBadge}
+                    <span class="badge badge-purple">${escHtml(cat)}</span>
+                </div>
             </div>
             <div class="position-details">
                 <div class="position-detail">
@@ -126,7 +153,10 @@ function renderPositions(data) {
             </div>
             <div class="position-footer">
                 <span class="position-time">${fmt.relative(p.entry_time)}</span>
-                <span class="position-edge-source">${escHtml(p.edge_source || "")}</span>
+                <span style="display:flex;gap:8px;align-items:center;">
+                    ${regimeChip}
+                    <span class="position-edge-source">${escHtml(p.edge_source || "")}</span>
+                </span>
             </div>
         </div>`;
     }
@@ -303,4 +333,53 @@ function renderTrades(data) {
         </tr>`;
     }
     if (tbody) tbody.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle & Regime Panel
+// ---------------------------------------------------------------------------
+function renderLifecycleRegime(lifecycleData, regimeData) {
+    const section = document.getElementById("lifecycleSection");
+    const grid = document.getElementById("lifecycleGrid");
+    const countEl = document.getElementById("lifecycleCount");
+    if (!section || !grid) return;
+
+    const lcAssessments = (lifecycleData && lifecycleData.assessments) || {};
+    const rgAssessments = (regimeData && regimeData.assessments) || {};
+
+    const allIds = new Set([...Object.keys(lcAssessments), ...Object.keys(rgAssessments)]);
+    if (allIds.size === 0) {
+        section.style.display = "none";
+        return;
+    }
+    section.style.display = "";
+    if (countEl) countEl.textContent = `${allIds.size} markets`;
+
+    const stageColors = {
+        early: "#3b82f6", developing: "#8b5cf6", mature: "#f59e0b",
+        late: "#f97316", terminal: "#ef4444", unknown: "#71717a",
+    };
+
+    let html = "";
+    for (const id of allIds) {
+        const lc = lcAssessments[id] || {};
+        const rg = rgAssessments[id] || {};
+        const question = (lc.market_question || rg.market_question || id).slice(0, 55);
+        const stage = lc.stage || "unknown";
+        const stageColor = stageColors[stage] || "#71717a";
+        const days = lc.days_remaining != null ? `${Math.round(lc.days_remaining)}d` : "--";
+        const regime = rg.regime || "--";
+        const rec = rg.recommendation || "--";
+
+        html += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px 14px;">
+            <div style="font-size:12px;color:var(--text);font-weight:500;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(question)}</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <span style="background:${stageColor}20;color:${stageColor};border:1px solid ${stageColor}40;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;text-transform:uppercase;">${stage}</span>
+                <span style="font-size:11px;color:var(--text-muted);font-family:var(--mono);">${days} left</span>
+                <span style="font-size:10px;color:var(--text-dim);font-family:var(--mono);">regime: ${regime}</span>
+                <span style="font-size:10px;color:var(--text-dim);font-family:var(--mono);">${rec}</span>
+            </div>
+        </div>`;
+    }
+    grid.innerHTML = html;
 }

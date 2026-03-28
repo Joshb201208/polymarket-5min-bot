@@ -944,6 +944,16 @@
             </div>
         </section>
 
+        <!-- CALIBRATION WEIGHT EVOLUTION CHART -->
+        <section class="chart-section" id="calEvolutionSection" style="display:none;">
+            <div class="card-header">
+                <h2 class="card-title">Calibration Weight Evolution</h2>
+            </div>
+            <div class="chart-container">
+                <canvas id="calEvolutionChart"></canvas>
+            </div>
+        </section>
+
     </main>
 
     <!-- ============================================= -->
@@ -1952,11 +1962,82 @@
         }
 
         // -------------------------------------------------------
+        // RENDER: Calibration Weight Evolution
+        // -------------------------------------------------------
+        let calEvolutionChartInstance = null;
+        function renderCalEvolutionChart(data) {
+            const section = document.getElementById('calEvolutionSection');
+            const canvas = document.getElementById('calEvolutionChart');
+            if (!section || !canvas) return;
+
+            const history = data.history || [];
+            if (history.length < 2) { section.style.display = 'none'; return; }
+            section.style.display = '';
+
+            const sourceColors = {
+                polymarket_history: '#00f0ff',
+                news_sentiment: '#8b5cf6',
+                social_signals: '#ec4899',
+                market_fundamentals: '#22c55e',
+                cross_market: '#f59e0b',
+                web_search: '#3b82f6',
+                expert_analysis: '#f97316',
+                statistical_model: '#ef4444',
+                insider_flow: '#71717a',
+            };
+
+            // Collect all source names across history entries
+            const allSources = new Set();
+            for (const entry of history) {
+                const w = entry.weights || {};
+                for (const s of Object.keys(w)) allSources.add(s);
+            }
+
+            const labels = history.map(h => {
+                const d = new Date(h.timestamp || h.date || '');
+                return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            });
+
+            const datasets = [];
+            for (const source of allSources) {
+                datasets.push({
+                    label: source.replace(/_/g, ' '),
+                    data: history.map(h => (h.weights || {})[source] || 0),
+                    borderColor: sourceColors[source] || '#71717a',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    pointRadius: 2,
+                    tension: 0.3,
+                });
+            }
+
+            if (calEvolutionChartInstance) calEvolutionChartInstance.destroy();
+            calEvolutionChartInstance = new Chart(canvas, {
+                type: 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: { boxWidth: 12, padding: 8, font: { size: 11 } },
+                        },
+                    },
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Weight', font: { size: 11 } } },
+                        x: { ticks: { font: { size: 10 } } },
+                    },
+                },
+            });
+        }
+
+        // -------------------------------------------------------
         // Main Refresh
         // -------------------------------------------------------
         async function refresh() {
             const [analytics, apiHealth, calibration, nbaStats,
-                   equityCurve, correlation, allocation, risk, signalPerf, backtest] = await Promise.all([
+                   equityCurve, correlation, allocation, risk, signalPerf, backtest, intelCalibration] = await Promise.all([
                 fetchJSON('/api/analytics'),
                 fetchJSON('/api/api-health'),
                 fetchJSON('/api/calibration'),
@@ -1967,6 +2048,7 @@
                 fetchJSON('/api/analytics/risk'),
                 fetchJSON('/api/analytics/signal_performance'),
                 fetchJSON('/api/intelligence/backtest?days=30'),
+                fetchJSON('/api/intelligence/calibration'),
             ]);
 
             const anyOk = analytics || apiHealth || calibration;
@@ -2013,6 +2095,7 @@
             renderRisk(risk);
             renderSignalPerf(signalPerf);
             renderBacktest(backtest);
+            if (intelCalibration) renderCalEvolutionChart(intelCalibration);
 
             updateLastUpdate();
         }

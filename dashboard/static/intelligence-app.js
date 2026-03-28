@@ -51,10 +51,13 @@ const SOURCE_LABELS = {
 // Main Refresh
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [signalsData, scoresData, healthData] = await Promise.all([
+    const [signalsData, scoresData, healthData, calibrationData, qualityData, dedupData] = await Promise.all([
         fetchJSON("/api/intelligence/signals"),
         fetchJSON("/api/intelligence/scores"),
         fetchJSON("/api/intelligence/health"),
+        fetchJSON("/api/intelligence/calibration"),
+        fetchJSON("/api/intelligence/quality"),
+        fetchJSON("/api/intelligence/dedup"),
     ]);
 
     const ok = signalsData || scoresData || healthData;
@@ -74,6 +77,11 @@ async function refresh() {
     if (selectedMarketId) {
         loadSpotlight(selectedMarketId);
     }
+
+    // Render new advanced panels
+    if (calibrationData) renderCalibrationPanel(calibrationData);
+    if (qualityData) renderQualityPanel(qualityData);
+    if (dedupData) renderDedupPanel(dedupData);
 
     const el = document.getElementById("lastUpdate");
     if (el) el.textContent = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
@@ -564,4 +572,145 @@ function renderHealth(healthData) {
         </div>`;
     }
     grid.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration Panel
+// ---------------------------------------------------------------------------
+function renderCalibrationPanel(data) {
+    const section = document.getElementById("calibrationSection");
+    const grid = document.getElementById("calibrationGrid");
+    const meta = document.getElementById("calibrationMeta");
+    if (!section || !grid) return;
+
+    const dw = data.default_weights || {};
+    const cw = data.current_weights || {};
+    const acc = data.source_accuracy || {};
+
+    if (Object.keys(cw).length === 0) {
+        section.style.display = "none";
+        return;
+    }
+    section.style.display = "";
+
+    let html = "";
+    for (const source of Object.keys(dw)) {
+        const defW = dw[source] || 0;
+        const curW = cw[source] || defW;
+        const srcAcc = acc[source] || {};
+        const accuracy = srcAcc.accuracy || 0;
+
+        const diff = curW - defW;
+        const arrow = diff > 0.005 ? "▲" : diff < -0.005 ? "▼" : "=";
+        const arrowColor = diff > 0.005 ? "#22c55e" : diff < -0.005 ? "#ef4444" : "#71717a";
+        const label = SOURCE_LABELS[source] || source;
+        const color = SOURCE_COLORS[source] || "#71717a";
+
+        html += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;">
+            <div style="font-size:11px;font-weight:600;color:${color};margin-bottom:6px;">${escHtml(label)}</div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;font-family:var(--mono);">
+                <span style="color:var(--text-muted);">${(defW*100).toFixed(0)}%</span>
+                <span style="color:${arrowColor};font-weight:600;">${arrow} ${(curW*100).toFixed(0)}%</span>
+            </div>
+            <div style="margin-top:4px;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden;">
+                <div style="height:100%;width:${Math.min(accuracy*100, 100)}%;background:${accuracy > 0.55 ? '#22c55e' : accuracy < 0.45 ? '#ef4444' : '#f59e0b'};border-radius:2px;"></div>
+            </div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Accuracy: ${(accuracy*100).toFixed(0)}%</div>
+        </div>`;
+    }
+    grid.innerHTML = html;
+
+    if (meta) {
+        const resolved = data.total_resolved || 0;
+        const lastCal = data.last_calibrated ? fmt.relative(data.last_calibrated) : "never";
+        meta.textContent = `${resolved} resolved trades | Last calibrated: ${lastCal}`;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quality Panel (heatmap)
+// ---------------------------------------------------------------------------
+function renderQualityPanel(data) {
+    const section = document.getElementById("qualitySection");
+    const grid = document.getElementById("qualityGrid");
+    if (!section || !grid) return;
+
+    const sources = data.sources || {};
+    if (Object.keys(sources).length === 0) {
+        section.style.display = "none";
+        return;
+    }
+    section.style.display = "";
+
+    let html = "";
+    for (const [source, info] of Object.entries(sources)) {
+        const acc = info.accuracy_7d || 0;
+        const signals = info.signals_7d || 0;
+        const status = info.status || "normal";
+        const mult = info.multiplier || 1.0;
+        const label = SOURCE_LABELS[source] || source;
+
+        // Color based on accuracy (red → yellow → green)
+        let bgColor;
+        if (acc >= 0.65) bgColor = "rgba(34,197,94,0.15)";
+        else if (acc >= 0.40) bgColor = "rgba(245,158,11,0.15)";
+        else bgColor = "rgba(239,68,68,0.15)";
+
+        let borderColor;
+        if (acc >= 0.65) borderColor = "rgba(34,197,94,0.3)";
+        else if (acc >= 0.40) borderColor = "rgba(245,158,11,0.3)";
+        else borderColor = "rgba(239,68,68,0.3)";
+
+        const statusLabel = {hot: "HOT", normal: "OK", cold: "COLD", insufficient_data: "N/A"}[status] || status;
+
+        html += `<div style="background:${bgColor};border:1px solid ${borderColor};border-radius:8px;padding:10px 12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span style="font-size:11px;font-weight:600;color:var(--text);">${escHtml(label)}</span>
+                <span style="font-size:10px;font-weight:700;letter-spacing:0.05em;">${statusLabel}</span>
+            </div>
+            <div style="font-family:var(--mono);font-size:20px;font-weight:600;color:var(--text);">${(acc*100).toFixed(0)}%</div>
+            <div style="font-size:10px;color:var(--text-dim);">${signals} signals | ${mult.toFixed(2)}x weight</div>
+        </div>`;
+    }
+    grid.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Dedup Stats
+// ---------------------------------------------------------------------------
+function renderDedupPanel(data) {
+    const section = document.getElementById("dedupSection");
+    const container = document.getElementById("dedupStats");
+    if (!section || !container) return;
+
+    if (!data.total_raw_signals && !data.total_after_dedup) {
+        section.style.display = "none";
+        return;
+    }
+    section.style.display = "";
+
+    const raw = data.total_raw_signals || 0;
+    const deduped = data.total_after_dedup || 0;
+    const dropped = data.decay_dropped || 0;
+    const reduction = raw > 0 ? ((raw - deduped) / raw * 100).toFixed(0) : 0;
+
+    container.innerHTML = `
+        <div style="text-align:center;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;">Raw Signals</div>
+            <div style="font-family:var(--mono);font-size:24px;font-weight:600;color:var(--text);">${raw}</div>
+        </div>
+        <div style="font-size:20px;color:var(--text-muted);align-self:center;">→</div>
+        <div style="text-align:center;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;">After Dedup</div>
+            <div style="font-family:var(--mono);font-size:24px;font-weight:600;color:#8B5CF6;">${deduped}</div>
+        </div>
+        <div style="text-align:center;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;">Reduction</div>
+            <div style="font-family:var(--mono);font-size:24px;font-weight:600;color:#f59e0b;">${reduction}%</div>
+        </div>
+        <div style="text-align:center;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;">Decay Dropped</div>
+            <div style="font-family:var(--mono);font-size:24px;font-weight:600;color:#ef4444;">${dropped}</div>
+        </div>
+    `;
 }

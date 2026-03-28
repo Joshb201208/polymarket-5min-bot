@@ -1151,6 +1151,91 @@ def get_intelligence_backtest(days: int = 30) -> dict:
 
 
 # ===========================================================================
+# Advanced Intelligence Endpoints (lifecycle, regime, calibration, quality, dedup)
+# ===========================================================================
+
+@app.get("/api/events/lifecycle", dependencies=[Depends(_require_auth)])
+def get_events_lifecycle() -> dict:
+    """Lifecycle stages for all active markets."""
+    data = _read_json("lifecycle_assessments.json")
+    return {"assessments": data.get("assessments", {})}
+
+
+@app.get("/api/events/regime", dependencies=[Depends(_require_auth)])
+def get_events_regime() -> dict:
+    """Regime detection data for all active markets."""
+    data = _read_json("regime_assessments.json")
+    return {"assessments": data.get("assessments", {})}
+
+
+@app.get("/api/intelligence/calibration", dependencies=[Depends(_require_auth)])
+def get_intelligence_calibration() -> dict:
+    """Calibrator weights, accuracy, and history."""
+    history = _read_json("calibration_history.json")
+    entries = history.get("entries", [])
+
+    # Default weights for comparison
+    default_weights = {
+        "metaculus": 0.25, "x_scanner": 0.20, "orderbook": 0.15,
+        "whale_tracker": 0.15, "google_trends": 0.10, "congress": 0.08,
+        "cross_market": 0.07,
+    }
+
+    latest = entries[-1] if entries else {}
+    return {
+        "default_weights": default_weights,
+        "current_weights": latest.get("weights", default_weights),
+        "source_accuracy": latest.get("source_accuracy", {}),
+        "last_calibrated": latest.get("timestamp"),
+        "total_resolved": latest.get("total_resolved", 0),
+        "history": entries[-30:],  # Last 30 calibration snapshots
+    }
+
+
+@app.get("/api/intelligence/quality", dependencies=[Depends(_require_auth)])
+def get_intelligence_quality() -> dict:
+    """Live signal quality scores for each source."""
+    data = _read_json("live_quality_log.json")
+    report = data.get("health_report", {})
+
+    # If no pre-computed report, build a simple one from log entries
+    if not report:
+        entries = data.get("entries", [])
+        by_source: dict[str, dict] = {}
+        for e in entries[-200:]:  # Last 200 entries
+            src = e.get("source", "")
+            if src not in by_source:
+                by_source[src] = {"correct": 0, "total": 0}
+            by_source[src]["total"] += 1
+            if e.get("outcome") == "correct":
+                by_source[src]["correct"] += 1
+
+        for src, info in by_source.items():
+            acc = info["correct"] / info["total"] if info["total"] > 0 else 0
+            report[src] = {
+                "accuracy_7d": round(acc, 3),
+                "signals_7d": info["total"],
+                "status": "hot" if acc > 0.65 else ("cold" if acc < 0.40 else "normal"),
+                "multiplier": min(1.3, max(0.5, acc / 0.5)) if info["total"] >= 3 else 1.0,
+            }
+
+    return {"sources": report}
+
+
+@app.get("/api/intelligence/dedup", dependencies=[Depends(_require_auth)])
+def get_intelligence_dedup() -> dict:
+    """Dedup cluster stats from the latest scan cycle."""
+    data = _read_json("dedup_stats.json")
+    return {
+        "total_raw_signals": data.get("total_raw", 0),
+        "total_after_dedup": data.get("total_deduped", 0),
+        "clusters": data.get("clusters", []),
+        "decay_dropped": data.get("decay_dropped", 0),
+        "timestamp": data.get("timestamp"),
+    }
+
+
+# ===========================================================================
 # Cross-Agent Analytics Endpoints
 # ===========================================================================
 

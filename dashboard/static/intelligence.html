@@ -945,6 +945,42 @@
         </div>
     </section>
 
+    <!-- CALIBRATION PANEL -->
+    <section class="health-monitor" id="calibrationSection" style="display:none;">
+        <div class="health-monitor-card">
+            <div class="health-monitor-header">
+                <span class="health-monitor-title">Calibration Weights</span>
+                <span class="intel-badge">Self-Learning</span>
+            </div>
+            <div style="padding:16px 20px;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;" id="calibrationGrid"></div>
+                <div style="margin-top:12px;font-size:11px;color:var(--text-dim);" id="calibrationMeta"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- LIVE QUALITY HEATMAP -->
+    <section class="health-monitor" id="qualitySection" style="display:none;">
+        <div class="health-monitor-card">
+            <div class="health-monitor-header">
+                <span class="health-monitor-title">Signal Quality (7-day)</span>
+                <span class="intel-badge">Live</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;padding:16px 20px;" id="qualityGrid"></div>
+        </div>
+    </section>
+
+    <!-- DEDUP STATS -->
+    <section class="health-monitor" id="dedupSection" style="display:none;">
+        <div class="health-monitor-card">
+            <div class="health-monitor-header">
+                <span class="health-monitor-title">Signal Dedup &amp; Decay</span>
+                <span class="intel-badge">Pipeline</span>
+            </div>
+            <div style="display:flex;gap:24px;padding:16px 20px;flex-wrap:wrap;" id="dedupStats"></div>
+        </div>
+    </section>
+
     <!-- FOOTER -->
     <footer class="footer">
         <span class="footer-text">Intelligence Feed — Auto-refreshes every 15s</span>
