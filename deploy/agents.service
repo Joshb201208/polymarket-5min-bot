@@ -1,12 +1,14 @@
 [Unit]
 Description=Polymarket Betting Agent (NBA + NHL)
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
-ExecStartPre=/usr/bin/git -C /root/polymarket-bot pull --ff-only origin master
+ExecStartPre=/usr/bin/git -C /root/polymarket-bot fetch --all
+ExecStartPre=/usr/bin/git -C /root/polymarket-bot reset --hard origin/master
 ExecStart=/root/polymarket-bot/venv/bin/python orchestrator.py
 Restart=always
 RestartSec=30

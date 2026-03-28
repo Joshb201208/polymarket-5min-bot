@@ -782,20 +782,21 @@ def deploy() -> dict:
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
 
-    # Restart systemd service
-    try:
-        restart = subprocess.run(
-            ["systemctl", "restart", "agents"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        results["restart"] = {
-            "ok": restart.returncode == 0,
-            "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
-        }
-    except Exception as e:
-        results["restart"] = {"ok": False, "error": str(e)[:200]}
+    # Restart systemd services (agent + dashboard)
+    for svc in ("nba-agent", "nba-dashboard"):
+        try:
+            restart = subprocess.run(
+                ["systemctl", "restart", svc],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            results[f"restart_{svc}"] = {
+                "ok": restart.returncode == 0,
+                "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
+            }
+        except Exception as e:
+            results[f"restart_{svc}"] = {"ok": False, "error": str(e)[:200]}
 
     results["status"] = "deployed" if all(
         r.get("ok") for r in results.values()
