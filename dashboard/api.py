@@ -15,9 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Load .env so API health checks can read ODDS_API_KEY, BALLDONTLIE_API_KEY, etc.
+_project_root = Path(__file__).resolve().parent.parent
+load_dotenv(_project_root / ".env")
 
 # ---------------------------------------------------------------------------
 # Data directory — /root/polymarket-bot/data/ on VPS, ./data/ locally
@@ -147,9 +152,11 @@ def get_status() -> dict:
                 (datetime.now(timezone.utc) - earliest).total_seconds() / 3600, 1
             )
 
-    # Last scan time = most recent trade timestamp
-    last_scan = None
-    if trades:
+    # Last scan time — prefer system_status.json (written each tick)
+    system_status = _read_json("system_status.json")
+    last_scan = system_status.get("nba_last_scan")
+    # Fallback: most recent trade timestamp
+    if not last_scan and trades:
         timestamps_str = [t.get("timestamp") for t in trades if t.get("timestamp")]
         if timestamps_str:
             last_scan = max(timestamps_str)
@@ -734,7 +741,7 @@ def get_api_health() -> dict:
     # Polymarket Gamma API
     try:
         req = _urlreq.Request(
-            "https://gamma-api.polymarket.com/markets/1",
+            "https://gamma-api.polymarket.com/markets?limit=1&active=true",
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
         )
         with _urlreq.urlopen(req, timeout=5) as resp:
@@ -767,11 +774,20 @@ def get_nhl_status() -> dict:
 
     open_positions = [p for p in positions if p.get("status") == "open"]
 
-    last_scan = None
-    if trades:
+    # Last scan time — prefer system_status.json (written each tick)
+    system_status = _read_json("system_status.json")
+    last_scan = system_status.get("nhl_last_scan")
+    # Fallback: most recent trade timestamp
+    if not last_scan and trades:
         timestamps_str = [t.get("timestamp") for t in trades if t.get("timestamp")]
         if timestamps_str:
             last_scan = max(timestamps_str)
+
+    # Mode from env override or last trade
+    import os as _os
+    nhl_mode = _os.environ.get("NHL_TRADING_MODE", "").lower()
+    if nhl_mode in ("paper", "live"):
+        mode = nhl_mode
 
     return {
         "bankroll": bankroll.get("current_bankroll", 0),
@@ -1151,7 +1167,7 @@ def get_system_health() -> dict:
 
     try:
         req = _urlreq.Request(
-            "https://gamma-api.polymarket.com/markets/1",
+            "https://gamma-api.polymarket.com/markets?limit=1&active=true",
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
         )
         with _urlreq.urlopen(req, timeout=5) as resp:

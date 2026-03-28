@@ -118,29 +118,26 @@ class NBAAgent:
         # 3. Snapshot game-time prices for drift tracking
         await self._snapshot_gametime_prices()
 
-        # 4. Auto-hedge / stop-loss early exits
-        await self._check_early_exits()
-
-        # 5. Check for early exits on existing positions (bankroll-based)
+        # 4. Check for resolved/expired positions (bankroll-based)
         await self._check_exits()
 
-        # 6. Check for resolved positions (auto-collects winnings)
+        # 5. Check for resolved positions (auto-collects winnings)
         await self._check_resolutions()
 
-        # 7. Scan for new opportunities (also records odds snapshots)
+        # 6. Scan for new opportunities (also records odds snapshots)
         await self._scan_and_trade()
 
-        # 8. Prune old tracking data periodically
+        # 7. Prune old tracking data periodically
         line_tracker.prune_old_data()
         whale_detector.prune_old_data()
         odds_snapshots.prune_old_data()
 
-        # 9. Daily summary at 4pm UTC (midnight SGT)
+        # 8. Daily summary at 4pm UTC (midnight SGT)
         if now.hour == 16 and (self._last_daily is None or (now - self._last_daily) > timedelta(hours=12)):
             await self._send_daily_summary()
             self._last_daily = now
 
-        # 10. Weekly summary on Monday at 4pm UTC
+        # 9. Weekly summary on Monday at 4pm UTC
         if now.weekday() == 0 and now.hour == 16 and (self._last_weekly is None or (now - self._last_weekly) > timedelta(days=5)):
             await self._send_weekly_summary()
             self._last_weekly = now
@@ -284,70 +281,6 @@ class NBAAgent:
                 await whale_detector.send_whale_alert(movement, config)
         except Exception as e:
             logger.debug("Whale detector error: %s", e)
-
-    async def _check_early_exits(self) -> None:
-        """Check open positions for auto-hedge (+30%) and stop-loss (-50%) exits."""
-        open_positions = self.tracker.get_open_positions()
-        config = SharedConfig()
-
-        for pos in open_positions:
-            try:
-                current_price = await self.scanner.get_market_price(pos.token_id)
-                if current_price is None:
-                    continue
-
-                # Calculate unrealized P&L
-                current_value = pos.shares * current_price
-                unrealized_pnl = current_value - pos.cost
-                unrealized_pct = unrealized_pnl / pos.cost if pos.cost > 0 else 0
-
-                # Only exit if game hasn't started yet (pre-game)
-                if not self._is_pre_game(pos):
-                    continue
-
-                reason = None
-
-                # Auto-hedge: exit if up AUTO_HEDGE_PCT+
-                if unrealized_pct >= config.AUTO_HEDGE_PCT:
-                    reason = f"AUTO_HEDGE: +{unrealized_pct * 100:.0f}%"
-
-                # Stop-loss: exit if down STOP_LOSS_PCT+
-                elif unrealized_pct <= config.STOP_LOSS_PCT:
-                    reason = f"STOP_LOSS: {unrealized_pct * 100:.0f}%"
-
-                if reason is None:
-                    continue
-
-                trade = self.engine.execute_sell(pos, current_price, reason)
-                if trade:
-                    self.tracker.save_position(pos)
-                    self.tracker.log_trade(trade)
-                    self.bankroll.update_bankroll(pos.cost + (pos.pnl or 0))
-                    line_tracker.mark_position_closed(pos.id)
-
-                    logger.info(
-                        "%s: %s | sold @ %.2f¢ | P&L=$%.2f (%+.0f%%)",
-                        "AUTO-HEDGE" if "AUTO_HEDGE" in reason else "STOP-LOSS",
-                        pos.market_question, current_price * 100,
-                        pos.pnl or 0, unrealized_pct * 100,
-                    )
-
-            except Exception as e:
-                logger.error("Early exit check error for %s: %s", pos.id, e)
-
-    def _is_pre_game(self, pos) -> bool:
-        """Check if the game hasn't started yet."""
-        if not pos.game_start_time:
-            return True  # No game time = treat as pre-game (e.g., futures)
-        try:
-            now = utcnow()
-            game_str = pos.game_start_time.replace("Z", "+00:00")
-            game_dt = datetime.fromisoformat(game_str)
-            if game_dt.tzinfo is None:
-                game_dt = game_dt.replace(tzinfo=now.tzinfo)
-            return now < game_dt
-        except (ValueError, TypeError):
-            return True
 
     async def _snapshot_gametime_prices(self) -> None:
         """Record market price at game time for drift tracking.
