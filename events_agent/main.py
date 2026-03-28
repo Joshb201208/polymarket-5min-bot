@@ -49,6 +49,15 @@ class EventsAgent:
         self.executor = EventsExecutor(self.config)
         self.portfolio = PortfolioManager(self.config)
 
+        # Intelligence manager — drives all entry decisions
+        self._intel_manager = None
+        try:
+            from intelligence.manager import IntelligenceManager
+            self._intel_manager = IntelligenceManager(self.config)
+            logger.info("Intelligence manager initialized")
+        except Exception as e:
+            logger.error("Failed to initialize intelligence manager: %s", e)
+
         # Bankroll state — loaded from shared bankroll file
         self._bankroll_path = self.config.DATA_DIR / "bankroll.json"
 
@@ -85,6 +94,28 @@ class EventsAgent:
         """Single cycle: scan, evaluate, trade, check exits."""
         now = utcnow()
 
+        # --- One-time cleanup: purge positions from broken extreme_pricing strategy ---
+        cleanup_flag = self.config.DATA_DIR / ".extreme_pricing_cleanup_done"
+        if not cleanup_flag.exists():
+            try:
+                positions = self.portfolio.load_positions()
+                purge_count = 0
+                for p in positions:
+                    edge_src = getattr(p, "edge_source", "") or ""
+                    if p.status == "open" and edge_src == "extreme_pricing":
+                        p.status = "closed"
+                        p.exit_reason = "emergency_purge_bad_strategy"
+                        p.exit_time = now.isoformat()
+                        purge_count += 1
+                if purge_count > 0:
+                    self.portfolio._write_positions(positions)
+                    logger.warning("EMERGENCY CLEANUP: purged %d extreme_pricing positions", purge_count)
+                else:
+                    logger.info("Extreme pricing cleanup: no positions to purge")
+                cleanup_flag.write_text("done")
+            except Exception as e:
+                logger.error("Extreme pricing cleanup failed: %s", e)
+
         # Write last scan time for system health dashboard
         import json as _json
         status_path = self.config.DATA_DIR / "system_status.json"
@@ -108,12 +139,19 @@ class EventsAgent:
         await self._scan_and_trade()
 
     async def _scan_and_trade(self) -> None:
-        """Scan markets, evaluate edges, and execute trades."""
+        """Scan markets, evaluate edges via intelligence pipeline, and execute trades."""
         # Check bankroll pause state
         from nba_agent.utils import load_json
         bankroll_state = load_json(self._bankroll_path, {})
         if bankroll_state.get("is_paused", False):
             logger.info("Trading paused (stop-loss) — skipping scan")
+            return
+
+        # --- MAX POSITIONS GATE ---
+        open_positions = self.portfolio.get_open_positions()
+        if len(open_positions) >= self.config.MAX_CONCURRENT_POSITIONS:
+            logger.info("Max positions reached (%d/%d) — skipping scan",
+                        len(open_positions), self.config.MAX_CONCURRENT_POSITIONS)
             return
 
         # Scan for events markets
@@ -126,7 +164,23 @@ class EventsAgent:
         )
         logger.info("Evaluating %d events markets (sorted by category priority)", len(markets))
 
-        open_positions = self.portfolio.get_open_positions()
+        # --- RUN INTELLIGENCE PIPELINE ---
+        intel_report = None
+        if self._intel_manager:
+            try:
+                intel_report = await self._intel_manager.run_scan_cycle(
+                    active_markets=markets,
+                    open_positions=open_positions,
+                )
+                logger.info("Intelligence scan complete: %d scored markets",
+                            len(intel_report.scores) if intel_report else 0)
+            except Exception as e:
+                logger.error("Intelligence scan failed: %s", e, exc_info=True)
+
+        if intel_report is None:
+            logger.warning("No intelligence data available — skipping all entries")
+            return
+
         bankroll = self.current_bankroll
 
         for market in markets:
@@ -134,6 +188,12 @@ class EventsAgent:
                 # Skip if we already have a position in this market
                 if self.portfolio.has_existing_position(market.id):
                     continue
+
+                # Re-check max positions (may have added during this loop)
+                if len(open_positions) >= self.config.MAX_CONCURRENT_POSITIONS:
+                    logger.info("Max positions reached (%d) — stopping scan loop",
+                                len(open_positions))
+                    break
 
                 # Check total exposure across ALL agents (shared bankroll)
                 from shared.bankroll import get_total_exposure
@@ -144,11 +204,53 @@ class EventsAgent:
                                 total_exposure, max_total)
                     break
 
-                # Evaluate edge
-                edge_result = await self.analyzer.evaluate(market)
+                # --- INTELLIGENCE-DRIVEN EDGE EVALUATION ---
+                # Get lifecycle and regime for this market
+                lifecycle = None
+                regime = None
+                quality_adjustments = None
+
+                if hasattr(intel_report, 'lifecycle_assessments'):
+                    lifecycle = intel_report.lifecycle_assessments.get(market.id)
+                if hasattr(intel_report, 'regime_assessments'):
+                    regime = intel_report.regime_assessments.get(market.id)
+                if hasattr(intel_report, 'quality_adjustments'):
+                    quality_adjustments = intel_report.quality_adjustments
+
+                edge_result = await self.analyzer.analyze_with_intelligence(
+                    market,
+                    intelligence_report=intel_report,
+                    lifecycle=lifecycle,
+                    regime=regime,
+                    quality_adjustments=quality_adjustments,
+                )
 
                 if edge_result is None or not edge_result.has_edge:
                     continue
+
+                # --- HARD GATE: refuse to trade without intelligence signals ---
+                if edge_result.edge_source not in ("intelligence_blend", "time_decay"):
+                    logger.warning(
+                        "Blocking trade on %s: no intelligence signals (source=%s)",
+                        market.slug, edge_result.edge_source,
+                    )
+                    continue
+
+                # HARD GATE: composite_score must be > 0 for intelligence_blend
+                if edge_result.edge_source == "intelligence_blend":
+                    composite = intel_report.scores.get(market.id)
+                    composite_val = 0.0
+                    if composite is not None:
+                        if hasattr(composite, "composite"):
+                            composite_val = composite.composite
+                        elif isinstance(composite, dict):
+                            composite_val = composite.get("composite", 0)
+                    if composite_val <= 0:
+                        logger.warning(
+                            "Blocking trade on %s: composite_score=%.4f (must be > 0)",
+                            market.slug, composite_val,
+                        )
+                        continue
 
                 # Entry price zone filter: only enter if recommended side's
                 # price is in the backtest-derived profitable zone
@@ -182,11 +284,17 @@ class EventsAgent:
                     logger.debug("Bet size too small for %s", market.question[:40])
                     continue
 
+                # --- MIN BET SIZE GATE ---
+                if bet_size < self.config.MIN_BET_SIZE:
+                    logger.debug("Bet size $%.2f below minimum $%.2f — skipping %s",
+                                 bet_size, self.config.MIN_BET_SIZE, market.question[:40])
+                    continue
+
                 # Check remaining exposure room
                 remaining_room = max_total - total_exposure
                 if bet_size > remaining_room:
                     bet_size = max(0, remaining_room)
-                    if bet_size < 1.0:
+                    if bet_size < self.config.MIN_BET_SIZE:
                         logger.info("Not enough exposure room for %s", market.question[:40])
                         continue
 

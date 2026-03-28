@@ -40,6 +40,10 @@ class EventsConfig:
     # Edge thresholds
     MIN_EDGE: float = float(os.getenv("EVENTS_MIN_EDGE", "0.05"))
 
+    # Position limits
+    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("EVENTS_MAX_POSITIONS", "15"))
+    MIN_BET_SIZE: float = float(os.getenv("EVENTS_MIN_BET_SIZE", "5.0"))
+
     # Liquidity floor
     MIN_LIQUIDITY: float = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
 

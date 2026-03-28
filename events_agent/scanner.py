@@ -35,6 +35,11 @@ _SPORTS_KEYWORDS = {
     "eredivisie", "super-bowl", "superbowl",
     "stanley-cup", "stanleycup", "world-series", "worldseries",
     "march-madness", "marchmadness",
+    # Europa / Turkish / French / misc leagues and teams
+    "europa-league", "europa league", "europa",
+    "fenerbahce", "super-lig", "süper lig", "süper-lig",
+    "french-open", "grand-slam", "roland-garros",
+    "champions", "celta",
     # Generic sports terms in slug context
     "moneyline", "spread-away", "spread-home", "total-over", "total-under",
     "-points-", "-rebounds-", "-assists-", "-touchdowns-",

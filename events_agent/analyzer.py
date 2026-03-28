@@ -26,9 +26,7 @@ class EventsAnalyzer:
     Edge detection strategies:
     1. Spread analysis — look for mispriced binary outcomes (YES+NO != ~1.0)
     2. Time decay — markets near resolution with obvious outcomes
-    3. Liquidity imbalance — detect when order book is heavily skewed
-    4. Extreme pricing — outcomes priced at extremes that may revert
-    5. Volume spike detection — sharp recent moves may overshoot
+    3. Intelligence blend — composite scorer + all intelligence modules (primary)
     """
 
     def __init__(self, config: EventsConfig | None = None) -> None:
@@ -43,10 +41,6 @@ class EventsAnalyzer:
                 return result
 
             result = self._analyze_time_decay(market)
-            if result and result.has_edge:
-                return result
-
-            result = self._analyze_extreme_pricing(market)
             if result and result.has_edge:
                 return result
 
@@ -181,56 +175,6 @@ class EventsAnalyzer:
 
         return None
 
-    def _analyze_extreme_pricing(self, market: EventMarket) -> EdgeResult | None:
-        """Detect edge from extreme pricing that may indicate mispricing.
-
-        Markets with very high volume and extreme prices (3-10% or 90-97%)
-        are often mispriced because retail traders pile in on the obvious
-        outcome, creating a slight edge on the contrarian side when the
-        probability is not actually that extreme.
-        """
-        if len(market.outcome_prices) < 2:
-            return None
-
-        # Only binary markets
-        if len(market.outcomes) != 2:
-            return None
-
-        yes_price = market.outcome_prices[0]
-        no_price = market.outcome_prices[1]
-
-        # Look for markets where one side is extremely cheap (3-12%)
-        # These often represent "tail risk" events that are underpriced
-        for i, (price, label) in enumerate([(yes_price, "YES"), (no_price, "NO")]):
-            if 0.03 <= price <= 0.12:
-                # Cheap outcome — check if it might be underpriced
-                # Volume relative to liquidity tells us if it's actively traded
-                vol_ratio = market.volume_24h / market.liquidity if market.liquidity > 0 else 0
-
-                if vol_ratio > 0.3:
-                    # Actively traded — price is likely efficient
-                    continue
-
-                # Low activity relative to liquidity — might be stale/mispriced
-                # Apply a small contrarian edge estimate
-                # Historical base rate for "unlikely" events is ~2x the market price
-                fair_price = min(price * 1.5, 0.20)
-                edge = fair_price - price
-
-                if edge >= self.config.MIN_EDGE:
-                    return EdgeResult(
-                        market=market,
-                        our_fair_price=fair_price,
-                        market_price=price,
-                        edge=edge,
-                        confidence=Confidence.LOW,  # Always low confidence for tail events
-                        side=label,
-                        side_index=i,
-                        edge_source="extreme_pricing",
-                    )
-
-        return None
-
     async def analyze_with_intelligence(
         self,
         market: EventMarket,
@@ -261,8 +205,11 @@ class EventsAnalyzer:
             composite = scores.get(market.id)
 
             if composite is None:
-                # No intelligence data — fall back to base analysis
-                return base_result
+                # No intelligence data — do NOT fall back to base analysis
+                # Only time_decay is safe to use without intelligence
+                if base_result and base_result.edge_source == "time_decay":
+                    return base_result
+                return None
 
             # Extract composite values (handle both dataclass and dict)
             if hasattr(composite, "composite"):
@@ -358,8 +305,8 @@ class EventsAnalyzer:
             )
 
         except Exception as e:
-            logger.error("Intelligence analysis failed for %s: %s", market.slug, e)
-            return await self.evaluate(market)
+            logger.error("Intelligence analysis failed for %s: %s", market.slug, e, exc_info=True)
+            return None
 
     def _classify_confidence(
         self,
