@@ -96,6 +96,19 @@ class NBAAgent:
         """Single cycle: scan, evaluate, trade, check exits, send summaries."""
         now = utcnow()
 
+        # Write last scan time for system health dashboard
+        import json as _json
+        status_path = self.config.DATA_DIR / "system_status.json"
+        try:
+            status = _json.loads(status_path.read_text()) if status_path.exists() else {}
+        except Exception:
+            status = {}
+        status["nba_last_scan"] = now.isoformat()
+        try:
+            status_path.write_text(_json.dumps(status, default=str))
+        except Exception:
+            pass
+
         # 1. Record line movement snapshots for all open positions
         await self._record_line_snapshots()
 

@@ -903,25 +903,59 @@ def get_combined_status() -> dict:
     current_bankroll = bankroll.get("current_bankroll", 0)
     max_exposure = current_bankroll * 0.50
 
+    # Determine mode per sport from latest trade
+    nba_trades = _read_json("trades.json").get("trades", [])
+    nhl_trades = _read_json("nhl_trades.json").get("trades", [])
+    nba_mode = nba_trades[-1].get("mode", "paper") if nba_trades else "paper"
+    nhl_mode = nhl_trades[-1].get("mode", "paper") if nhl_trades else "paper"
+
+    # Win rates per sport
+    nba_wins = sum(1 for p in nba_closed if (p.get("pnl") or 0) > 0)
+    nhl_wins = sum(1 for p in nhl_closed if (p.get("pnl") or 0) > 0)
+    nba_win_rate = round(nba_wins / len(nba_closed) * 100, 1) if nba_closed else 0
+    nhl_win_rate = round(nhl_wins / len(nhl_closed) * 100, 1) if nhl_closed else 0
+
+    # Today's P&L
+    from datetime import timedelta as td
+    SGT = timezone(td(hours=8))
+    now_sgt = datetime.now(SGT)
+    sgt_midnight = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = sgt_midnight.astimezone(timezone.utc)
+
+    today_pnl = 0.0
+    today_trades = 0
+    for p in nba_closed + nhl_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts and exit_ts >= cutoff:
+            today_pnl += p.get("pnl", 0) or 0
+            today_trades += 1
+
     return {
         "bankroll": current_bankroll,
         "starting_bankroll": bankroll.get("starting_bankroll", 0),
         "peak_bankroll": bankroll.get("peak_bankroll", 0),
         "is_paused": bankroll.get("is_paused", False),
+        "total_exposure": total_exposure,
         "nba": {
             "open_positions": len(nba_open),
             "closed_positions": len(nba_closed),
             "total_pnl": nba_pnl,
             "exposure": nba_exposure,
+            "mode": nba_mode,
+            "win_rate": nba_win_rate,
         },
         "nhl": {
             "open_positions": len(nhl_open),
             "closed_positions": len(nhl_closed),
             "total_pnl": nhl_pnl,
             "exposure": nhl_exposure,
+            "mode": nhl_mode,
+            "win_rate": nhl_win_rate,
         },
         "combined": {
             "total_pnl": round(nba_pnl + nhl_pnl, 2),
+            "today_pnl": round(today_pnl, 2),
+            "today_trades": today_trades,
             "total_open": len(nba_open) + len(nhl_open),
             "total_closed": len(nba_closed) + len(nhl_closed),
             "total_exposure": total_exposure,
@@ -988,7 +1022,52 @@ def get_odds_snapshots() -> dict:
         if not existing or snap.get("time", "") > existing.get("time", ""):
             latest[slug] = snap
 
-    return {"snapshots": list(latest.values())}
+    # Check which games have bets placed
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nhl_positions = _read_json("nhl_positions.json").get("positions", [])
+    bet_slugs = set()
+    for p in nba_positions + nhl_positions:
+        if p.get("status") == "open":
+            bet_slugs.add(p.get("market_slug", ""))
+
+    # Map to frontend-expected format
+    # Snapshot data has: polymarket_home, polymarket_away, vegas_home, vegas_away,
+    # our_fair_home, our_fair_away, edge_home, edge_away, game, sport
+    result = []
+    for snap in latest.values():
+        slug = snap.get("game_slug", "")
+
+        # Use home-side prices as the display price (home is typically the side
+        # we bet on — underdog strategy focuses on home underdogs)
+        market_price = snap.get("polymarket_home")
+        fair_value = snap.get("our_fair_home")
+        vegas_price = snap.get("vegas_home")
+        edge = snap.get("edge_home") or 0
+
+        # If edge_home not pre-computed, calculate it
+        if fair_value and market_price and market_price > 0 and not snap.get("edge_home"):
+            edge = (fair_value - market_price) / market_price
+
+        # Determine status
+        status = "no_edge"
+        if slug in bet_slugs:
+            status = "bet_placed"
+        elif abs(edge) > 0.03:
+            status = "watching"
+
+        result.append({
+            "game": snap.get("game", snap.get("market_question", "")),
+            "game_slug": slug,
+            "sport": snap.get("sport", "nba"),
+            "polymarket_price": market_price,
+            "vegas_price": vegas_price,
+            "fair_value": fair_value,
+            "edge": round(edge, 4) if edge else 0,
+            "status": status,
+            "time": snap.get("time", ""),
+        })
+
+    return {"snapshots": result}
 
 
 @app.get("/api/odds-history/{game_slug}", dependencies=[Depends(_require_auth)])
@@ -1005,27 +1084,33 @@ def get_odds_history(game_slug: str) -> dict:
 @app.get("/api/system-health", dependencies=[Depends(_require_auth)])
 def get_system_health() -> dict:
     """Return last scan times, API status, uptime info."""
-    import time as _time
+    import urllib.request as _urlreq
 
     bankroll = _read_json("bankroll.json")
 
-    # Last scan times from trade timestamps
-    nba_trades = _read_json("trades.json").get("trades", [])
-    nhl_trades = _read_json("nhl_trades.json").get("trades", [])
+    # Primary source: system_status.json written by agents each tick
+    system_status = _read_json("system_status.json")
+    nba_last_scan = system_status.get("nba_last_scan")
+    nhl_last_scan = system_status.get("nhl_last_scan")
 
-    nba_last_scan = None
-    if nba_trades:
-        timestamps = [t.get("timestamp") for t in nba_trades if t.get("timestamp")]
-        if timestamps:
-            nba_last_scan = max(timestamps)
+    # Fallback: derive from trade timestamps if system_status not yet populated
+    if not nba_last_scan:
+        nba_trades = _read_json("trades.json").get("trades", [])
+        if nba_trades:
+            timestamps = [t.get("timestamp") for t in nba_trades if t.get("timestamp")]
+            if timestamps:
+                nba_last_scan = max(timestamps)
 
-    nhl_last_scan = None
-    if nhl_trades:
-        timestamps = [t.get("timestamp") for t in nhl_trades if t.get("timestamp")]
-        if timestamps:
-            nhl_last_scan = max(timestamps)
+    if not nhl_last_scan:
+        nhl_trades = _read_json("nhl_trades.json").get("trades", [])
+        if nhl_trades:
+            timestamps = [t.get("timestamp") for t in nhl_trades if t.get("timestamp")]
+            if timestamps:
+                nhl_last_scan = max(timestamps)
 
     # Uptime from earliest trade
+    nba_trades = _read_json("trades.json").get("trades", [])
+    nhl_trades = _read_json("nhl_trades.json").get("trades", [])
     all_trades = nba_trades + nhl_trades
     uptime_hours = 0.0
     if all_trades:
@@ -1037,29 +1122,51 @@ def get_system_health() -> dict:
                 (datetime.now(timezone.utc) - earliest).total_seconds() / 3600, 1
             )
 
-    # Data file sizes
-    data_files = {}
-    for fname in (
-        "positions.json", "nhl_positions.json", "trades.json",
-        "nhl_trades.json", "bankroll.json", "line_movements.json",
-        "sharp_movements.json", "odds_snapshots.json",
-    ):
-        path = DATA_DIR / fname
-        if path.exists():
-            data_files[fname] = {
-                "exists": True,
-                "size_kb": round(path.stat().st_size / 1024, 1),
-            }
-        else:
-            data_files[fname] = {"exists": False}
+    # Odds API credits remaining
+    odds_api_credits = system_status.get("odds_api_credits")
+    if odds_api_credits is None:
+        odds_key = os.environ.get("ODDS_API_KEY", "")
+        if odds_key:
+            try:
+                req = _urlreq.Request(
+                    f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={odds_key}&regions=us&markets=h2h&oddsFormat=decimal&bookmakers=draftkings",
+                    headers={"Accept": "application/json"},
+                )
+                with _urlreq.urlopen(req, timeout=5) as resp:
+                    odds_api_credits = int(resp.headers.get("x-requests-remaining", 0))
+            except Exception:
+                odds_api_credits = None
+
+    # Quick API health checks
+    apis = {}
+    try:
+        req = _urlreq.Request(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+            headers={"Accept": "application/json"},
+        )
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            apis["espn"] = resp.status == 200
+    except Exception:
+        apis["espn"] = False
+
+    try:
+        req = _urlreq.Request(
+            "https://gamma-api.polymarket.com/markets/1",
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            apis["polymarket"] = resp.status == 200
+    except Exception:
+        apis["polymarket"] = False
 
     return {
         "nba_last_scan": nba_last_scan,
         "nhl_last_scan": nhl_last_scan,
+        "odds_api_credits": odds_api_credits,
         "uptime_hours": uptime_hours,
+        "apis": apis,
         "bankroll": bankroll.get("current_bankroll", 0),
         "is_paused": bankroll.get("is_paused", False),
-        "data_files": data_files,
     }
 
 
@@ -1101,21 +1208,41 @@ def get_combined_equity_curve() -> dict:
             daily_map[day]["trades"] += 1
 
     sorted_days = sorted(daily_map.keys())
-    curve = []
-    running = starting
+
+    # Build arrays in the format the frontend expects
+    dates = []
+    nba_values = []
+    nhl_values = []
+    combined_values = []
+    nba_daily = []
+    nhl_daily = []
+
+    running_combined = starting
+    running_nba = starting
+    running_nhl = starting
+
     for day in sorted_days:
         d = daily_map[day]
-        running += d["total"]
-        curve.append({
-            "date": day,
-            "pnl": round(d["total"], 2),
-            "nba_pnl": round(d["nba"], 2),
-            "nhl_pnl": round(d["nhl"], 2),
-            "bankroll": round(running, 2),
-            "trades": d["trades"],
-        })
+        running_combined += d["total"]
+        running_nba += d["nba"]
+        running_nhl += d["nhl"]
 
-    return {"starting_bankroll": starting, "equity_curve": curve}
+        dates.append(day)
+        combined_values.append(round(running_combined, 2))
+        nba_values.append(round(running_nba, 2))
+        nhl_values.append(round(running_nhl, 2))
+        nba_daily.append(round(d["nba"], 2))
+        nhl_daily.append(round(d["nhl"], 2))
+
+    return {
+        "starting_bankroll": starting,
+        "dates": dates,
+        "nba": nba_values,
+        "nhl": nhl_values,
+        "combined": combined_values,
+        "nba_daily": nba_daily,
+        "nhl_daily": nhl_daily,
+    }
 
 
 @app.get("/api/combined/activity-feed", dependencies=[Depends(_require_auth)])
@@ -1127,27 +1254,30 @@ def get_combined_activity_feed() -> dict:
     for fname, sport in [("trades.json", "nba"), ("nhl_trades.json", "nhl")]:
         trades = _read_json(fname).get("trades", [])
         for t in trades[-50:]:
+            action = t.get("action", "buy")
+            amount = t.get("amount", 0)
+            price = t.get("price", 0)
+            pnl = t.get("pnl")
+            desc = f"{action.upper()} {t.get('market_question', '')} — ${amount:.2f} @ {price*100:.0f}¢"
+            if pnl is not None and action == "sell":
+                desc += f" (P&L: ${pnl:.2f})"
             feed.append({
-                "type": "trade",
+                "type": "bet_placed" if action == "buy" else "market_resolved",
                 "sport": sport,
-                "time": t.get("timestamp", ""),
-                "action": t.get("action", ""),
-                "market": t.get("market_question", ""),
-                "amount": t.get("amount", 0),
-                "price": t.get("price", 0),
-                "pnl": t.get("pnl"),
+                "timestamp": t.get("timestamp", ""),
+                "description": desc,
             })
 
     # Whale alerts (last 20)
     sharp = _read_json("sharp_movements.json").get("movements", [])
     for m in sharp[-20:]:
+        delta = m.get("delta", 0)
+        desc = f"{m.get('market_question', '')} — {delta*100:+.1f}¢ move"
         feed.append({
             "type": "whale_alert",
             "sport": m.get("sport", ""),
-            "time": m.get("time", ""),
-            "market": m.get("market_question", ""),
-            "delta": m.get("delta", 0),
-            "our_position": m.get("our_position", "none"),
+            "timestamp": m.get("time", ""),
+            "description": desc,
         })
 
     # Line movement alerts (positions with alerts triggered)
@@ -1160,21 +1290,19 @@ def get_combined_activity_feed() -> dict:
                 snapshots = record.get("snapshots", [])
                 if snapshots:
                     latest = snapshots[-1]
-                    alert_type = "line_against" if record.get("alerted_against") else "line_favor"
+                    direction = "against" if record.get("alerted_against") else "in favor"
+                    desc = f"{record.get('market_question', '')} — line moved {direction} ({latest.get('delta', 0)*100:+.1f}¢)"
                     feed.append({
-                        "type": alert_type,
+                        "type": "line_movement",
                         "sport": record.get("sport", ""),
-                        "time": latest.get("time", ""),
-                        "market": record.get("market_question", ""),
-                        "entry_price": record.get("entry_price", 0),
-                        "current_price": latest.get("price", 0),
-                        "delta": latest.get("delta", 0),
+                        "timestamp": latest.get("time", ""),
+                        "description": desc,
                     })
 
-    # Sort by time descending
-    feed.sort(key=lambda x: x.get("time", ""), reverse=True)
+    # Sort by timestamp descending
+    feed.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
 
-    return {"feed": feed[:100]}
+    return {"items": feed[:100]}
 
 
 @app.get("/api/combined/calendar-heatmap", dependencies=[Depends(_require_auth)])
