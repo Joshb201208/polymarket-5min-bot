@@ -1,12 +1,12 @@
 [Unit]
-Description=NBA Polymarket Betting Agent
+Description=Polymarket Betting Agent (NBA + NHL)
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
-ExecStart=/root/polymarket-bot/venv/bin/python -m nba_agent.main
+ExecStart=/root/polymarket-bot/venv/bin/python orchestrator.py
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "=== Setting up NBA Polymarket Agent ==="
+echo "=== Setting up Polymarket Agent (NBA + NHL) ==="
 
 # Install system packages
 apt-get update -qq
@@ -43,7 +43,7 @@ chmod +x deploy/auto_update.sh
 (crontab -l 2>/dev/null | grep -v auto_update; echo "*/10 * * * * /root/polymarket-bot/deploy/auto_update.sh >> /var/log/auto_update.log 2>&1") | crontab -
 echo "Set up auto-updater cron."
 
-# Set up systemd service for the agent
+# Set up systemd service for the orchestrator (runs BOTH NBA + NHL)
 cp deploy/agents.service /etc/systemd/system/nba-agent.service
 systemctl daemon-reload
 systemctl enable nba-agent
@@ -67,8 +67,8 @@ systemctl restart nba-dashboard
 echo "Started dashboard API service."
 
 echo ""
-echo "=== Setup complete! Agent + Dashboard running. ==="
+echo "=== Setup complete! Orchestrator (NBA + NHL) + Dashboard running. ==="
 echo "Check agent:     systemctl status nba-agent"
 echo "Check dashboard:  systemctl status nba-dashboard"
 echo "View agent logs:  journalctl -u nba-agent -f"
-echo "Dashboard URL:    http://144.126.192.118/"
+echo "Dashboard URL:    http://139.59.26.34/"

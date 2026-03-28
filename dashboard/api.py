@@ -43,7 +43,7 @@ else:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="NBA Agent Dashboard API", version="1.0.0")
+app = FastAPI(title="Polymarket Agent Dashboard API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -748,6 +748,187 @@ def get_api_health() -> dict:
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "data_dir": str(DATA_DIR), "exists": DATA_DIR.exists()}
+
+
+# ---------------------------------------------------------------------------
+# NHL Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/nhl/status", dependencies=[Depends(_require_auth)])
+def get_nhl_status() -> dict:
+    """NHL agent status — positions, trades, mode."""
+    bankroll = _read_json("bankroll.json")
+    positions = _read_json("nhl_positions.json").get("positions", [])
+    trades = _read_json("nhl_trades.json").get("trades", [])
+
+    mode = "paper"
+    if trades:
+        mode = trades[-1].get("mode", "paper")
+
+    open_positions = [p for p in positions if p.get("status") == "open"]
+
+    last_scan = None
+    if trades:
+        timestamps_str = [t.get("timestamp") for t in trades if t.get("timestamp")]
+        if timestamps_str:
+            last_scan = max(timestamps_str)
+
+    return {
+        "bankroll": bankroll.get("current_bankroll", 0),
+        "mode": mode,
+        "last_scan": last_scan,
+        "open_positions_count": len(open_positions),
+        "total_positions": len(positions),
+        "total_trades": len(trades),
+        "data_sources": ["NHL API", "MoneyPuck", "The Odds API", "ESPN NHL"],
+    }
+
+
+@app.get("/api/nhl/positions", dependencies=[Depends(_require_auth)])
+def get_nhl_positions() -> dict:
+    """NHL open and closed positions."""
+    positions = _read_json("nhl_positions.json").get("positions", [])
+    open_pos = [p for p in positions if p.get("status") == "open"]
+    closed_pos = [p for p in positions if p.get("status") != "open"]
+    return {"open": open_pos, "closed": closed_pos}
+
+
+@app.get("/api/nhl/trades", dependencies=[Depends(_require_auth)])
+def get_nhl_trades() -> dict:
+    """NHL trade history."""
+    trades = _read_json("nhl_trades.json").get("trades", [])
+    return {"trades": trades}
+
+
+@app.get("/api/nhl/edges", dependencies=[Depends(_require_auth)])
+def get_nhl_edges() -> dict:
+    """NHL edge detection summary from recent positions."""
+    positions = _read_json("nhl_positions.json").get("positions", [])
+    edges = []
+    for p in positions:
+        if p.get("edge_at_entry"):
+            edges.append({
+                "market": p.get("market_question", ""),
+                "edge": p.get("edge_at_entry", 0),
+                "fair_price": p.get("our_fair_price", 0),
+                "entry_price": p.get("entry_price", 0),
+                "confidence": p.get("confidence", ""),
+                "status": p.get("status", ""),
+                "pnl": p.get("pnl"),
+                "entry_time": p.get("entry_time", ""),
+            })
+    edges.sort(key=lambda e: e.get("entry_time", ""), reverse=True)
+    return {"edges": edges[:50]}
+
+
+@app.get("/api/nhl/stats", dependencies=[Depends(_require_auth)])
+def get_nhl_stats() -> dict:
+    """NHL performance statistics."""
+    positions = _read_json("nhl_positions.json").get("positions", [])
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+
+    closed = [p for p in positions if p.get("status") != "open"]
+    total_closed = len(closed)
+    wins = [p for p in closed if (p.get("pnl") or 0) > 0]
+    losses = [p for p in closed if (p.get("pnl") or 0) <= 0]
+
+    pnls = [p.get("pnl", 0) or 0 for p in closed]
+    total_pnl = round(sum(pnls), 2)
+
+    win_pnls = [p.get("pnl", 0) or 0 for p in wins]
+    loss_pnls = [p.get("pnl", 0) or 0 for p in losses]
+    gross_profit = sum(p for p in win_pnls if p > 0)
+    gross_loss = abs(sum(p for p in loss_pnls if p < 0))
+
+    return {
+        "total_trades": total_closed,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round((len(wins) / total_closed * 100) if total_closed > 0 else 0, 1),
+        "total_pnl": total_pnl,
+        "roi": round((total_pnl / starting * 100) if starting > 0 else 0, 1),
+        "avg_win": round(sum(win_pnls) / len(win_pnls), 2) if win_pnls else 0,
+        "avg_loss": round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0,
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else None,
+    }
+
+
+@app.get("/api/nhl/calibration", dependencies=[Depends(_require_auth)])
+def get_nhl_calibration() -> dict:
+    """NHL self-learning calibration data."""
+    cal_data = _read_json("nhl_calibration.json")
+    if not cal_data:
+        return {
+            "total_resolved": 0, "active": False, "bets_until_active": 200,
+            "edge_buckets": {}, "confidence_tiers": {},
+            "adjustments": {},
+        }
+    return {
+        "total_resolved": cal_data.get("total_resolved", 0),
+        "active": cal_data.get("active", False),
+        "bets_until_active": max(0, 200 - cal_data.get("total_resolved", 0)),
+        "edge_buckets": cal_data.get("edge_buckets", {}),
+        "confidence_tiers": cal_data.get("confidence_tiers", {}),
+        "home_away": cal_data.get("home_away", {}),
+        "vegas_accuracy": cal_data.get("vegas_accuracy", {}),
+        "adjustments": cal_data.get("adjustments", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Combined (cross-sport) endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/combined/status", dependencies=[Depends(_require_auth)])
+def get_combined_status() -> dict:
+    """Combined view: bankroll, total P&L across both NBA and NHL."""
+    bankroll = _read_json("bankroll.json")
+
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nhl_positions = _read_json("nhl_positions.json").get("positions", [])
+
+    nba_open = [p for p in nba_positions if p.get("status") == "open"]
+    nhl_open = [p for p in nhl_positions if p.get("status") == "open"]
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+    nhl_closed = [p for p in nhl_positions if p.get("status") != "open"]
+
+    nba_pnl = round(sum(p.get("pnl", 0) or 0 for p in nba_closed), 2)
+    nhl_pnl = round(sum(p.get("pnl", 0) or 0 for p in nhl_closed), 2)
+
+    nba_exposure = round(sum(p.get("cost", 0) for p in nba_open), 2)
+    nhl_exposure = round(sum(p.get("cost", 0) for p in nhl_open), 2)
+    total_exposure = nba_exposure + nhl_exposure
+
+    current_bankroll = bankroll.get("current_bankroll", 0)
+    max_exposure = current_bankroll * 0.50
+
+    return {
+        "bankroll": current_bankroll,
+        "starting_bankroll": bankroll.get("starting_bankroll", 0),
+        "peak_bankroll": bankroll.get("peak_bankroll", 0),
+        "is_paused": bankroll.get("is_paused", False),
+        "nba": {
+            "open_positions": len(nba_open),
+            "closed_positions": len(nba_closed),
+            "total_pnl": nba_pnl,
+            "exposure": nba_exposure,
+        },
+        "nhl": {
+            "open_positions": len(nhl_open),
+            "closed_positions": len(nhl_closed),
+            "total_pnl": nhl_pnl,
+            "exposure": nhl_exposure,
+        },
+        "combined": {
+            "total_pnl": round(nba_pnl + nhl_pnl, 2),
+            "total_open": len(nba_open) + len(nhl_open),
+            "total_closed": len(nba_closed) + len(nhl_closed),
+            "total_exposure": total_exposure,
+            "max_exposure": round(max_exposure, 2),
+            "exposure_pct": round(total_exposure / max_exposure * 100, 1) if max_exposure > 0 else 0,
+        },
+    }
 
 
 if __name__ == "__main__":

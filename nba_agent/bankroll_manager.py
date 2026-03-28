@@ -8,6 +8,7 @@ from pathlib import Path
 from nba_agent.config import Config
 from nba_agent.models import Confidence, EdgeResult, Position
 from nba_agent.utils import load_json, atomic_json_write
+from shared.bankroll import check_total_exposure_ok as _cross_sport_exposure_ok
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +110,14 @@ class BankrollManager:
         open_positions: list[Position],
         proposed_bet: float,
     ) -> bool:
-        """Check if adding this bet would exceed total exposure limit."""
-        total_open = sum(p.cost for p in open_positions if p.status == "open")
-        max_total = self.current_bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT
-        return (total_open + proposed_bet) <= max_total
+        """Check if adding this bet would exceed total exposure limit.
+
+        Uses the shared bankroll module to account for BOTH NBA and NHL
+        open positions when checking the 50% cap.
+        """
+        return _cross_sport_exposure_ok(
+            proposed_bet, self.config.MAX_TOTAL_EXPOSURE_PCT
+        )
 
     def update_bankroll(self, pnl: float) -> None:
         """Update bankroll after a trade settles."""
