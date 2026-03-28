@@ -125,18 +125,24 @@ function renderOverview(data) {
     setKpi("kpiCombinedPnl", fmt.usd(combinedPnl), pnlClass(combinedPnl));
     document.getElementById("kpiCombinedPnlSub").textContent = `ROI: ${fmt.pct(roi)}`;
 
-    // Win rate
-    const wins = combined.wins ?? 0;
-    const losses = combined.losses ?? 0;
-    const totalTrades = combined.total_trades ?? (wins + losses);
-    const winRate = totalTrades > 0 ? (wins / totalTrades * 100) : 0;
+    // Win rate — derive from per-agent data
+    const nbaWR = nba.win_rate ?? 0;
+    const evtWR = events.win_rate ?? 0;
+    const nbaTrades = nba.total_trades ?? 0;
+    const evtTrades = events.total_trades ?? 0;
+    const totalTrades = nbaTrades + evtTrades;
+    const nbaWins = Math.round(nbaWR / 100 * nbaTrades);
+    const evtWins = Math.round(evtWR / 100 * evtTrades);
+    const totalWins = nbaWins + evtWins;
+    const totalLosses = totalTrades - totalWins;
+    const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100) : 0;
     setKpi("kpiWinRate", fmt.pct(winRate), "");
-    document.getElementById("kpiWins").textContent = wins;
-    document.getElementById("kpiLosses").textContent = losses;
+    document.getElementById("kpiWins").textContent = totalWins;
+    document.getElementById("kpiLosses").textContent = totalLosses;
     document.getElementById("kpiTrades").textContent = totalTrades;
 
     // Open positions
-    const openPos = combined.open_positions ?? 0;
+    const openPos = combined.total_open_positions ?? combined.open_positions ?? 0;
     const exposure = combined.total_exposure ?? combined.exposure ?? 0;
     setKpi("kpiOpenPositions", openPos, "");
     document.getElementById("kpiOpenSub").textContent = `${fmt.usd(exposure)} exposure`;
@@ -194,13 +200,13 @@ function renderAgentCard(agent, data, combined) {
     const prefix = isNba ? "nba" : "evt";
 
     const todayPnl = data.today_pnl ?? data.daily_pnl ?? 0;
-    const openPos = data.open_positions ?? 0;
+    const openPos = data.open_positions ?? data.open_count ?? 0;
     const wins = data.wins ?? 0;
     const losses = data.losses ?? 0;
     const trades = data.total_trades ?? (wins + losses);
-    const wr = trades > 0 ? (wins / trades * 100) : 0;
+    const wr = data.win_rate ?? (trades > 0 ? (wins / trades * 100) : 0);
     const totalPnl = data.realized_pnl ?? data.total_pnl ?? data.pnl ?? 0;
-    const lastScan = data.last_scan_at ?? data.last_updated ?? null;
+    const lastScan = data.last_scan ?? data.last_scan_at ?? data.last_updated ?? null;
     const mode = data.mode ?? "PAPER";
 
     // Update mode badge on card
@@ -296,9 +302,9 @@ function renderEquityCurve(data) {
 
     // Normalize data — accept { nba: [...], events: [...], combined: [...], labels: [...] }
     const labels = data.labels ?? data.dates ?? [];
-    const nbaSeries = normalizeEquitySeries(data.nba ?? data.nba_series ?? []);
-    const eventsSeries = normalizeEquitySeries(data.events ?? data.events_series ?? []);
-    const combinedSeries = normalizeEquitySeries(data.combined ?? data.combined_series ?? []);
+    const nbaSeries = normalizeEquitySeries(data.nba_cumulative ?? data.nba ?? data.nba_series ?? []);
+    const eventsSeries = normalizeEquitySeries(data.events_cumulative ?? data.events ?? data.events_series ?? []);
+    const combinedSeries = normalizeEquitySeries(data.combined_cumulative ?? data.combined ?? data.combined_series ?? []);
 
     // Fall back to computing combined if not provided
     const finalCombined = combinedSeries.length > 0 ? combinedSeries :
