@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 
 # Data directory
 _project_root = Path(__file__).resolve().parent.parent
-DATA_DIR = Path("/root/polymarket-bot/data") if Path("/root/polymarket-bot/data").exists() else _project_root / "data"
+try:
+    DATA_DIR = Path("/root/polymarket-bot/data") if Path("/root/polymarket-bot/data").exists() else _project_root / "data"
+except (PermissionError, OSError):
+    DATA_DIR = _project_root / "data"
 
 
 class IntelligenceManager:
