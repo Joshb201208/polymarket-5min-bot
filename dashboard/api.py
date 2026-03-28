@@ -1041,6 +1041,400 @@ def get_events_stats() -> dict:
     }
 
 
+# ===========================================================================
+# Intelligence Endpoints
+# ===========================================================================
+
+@app.get("/api/intelligence/signals", dependencies=[Depends(_require_auth)])
+def get_intelligence_signals() -> dict:
+    """All recent signals (last 24h)."""
+    data = _read_json("intelligence_signals.json")
+    signals = data.get("signals", []) if isinstance(data, dict) else []
+    return {"signals": signals}
+
+
+@app.get("/api/intelligence/scores", dependencies=[Depends(_require_auth)])
+def get_intelligence_scores() -> dict:
+    """Current composite scores per market."""
+    data = _read_json("intelligence_scores.json")
+    scores = data.get("scores", {}) if isinstance(data, dict) else {}
+    return {"scores": scores}
+
+
+@app.get("/api/intelligence/health", dependencies=[Depends(_require_auth)])
+def get_intelligence_health() -> dict:
+    """Source health status."""
+    data = _read_json("intelligence_health.json")
+    if not data or not isinstance(data, dict):
+        # Return default health for all known sources
+        sources = [
+            "x_scanner", "orderbook", "metaculus",
+            "google_trends", "congress", "whale_tracker", "cross_market",
+        ]
+        data = {
+            s: {"status": "waiting", "last_update": None, "error": None}
+            for s in sources
+        }
+    return {"sources": data}
+
+
+@app.get("/api/intelligence/market/{market_id}", dependencies=[Depends(_require_auth)])
+def get_intelligence_market(market_id: str) -> dict:
+    """Deep-dive data for a single market — signals, composite, orderbook, prices."""
+    # Signals for this market
+    sig_data = _read_json("intelligence_signals.json")
+    all_signals = sig_data.get("signals", []) if isinstance(sig_data, dict) else []
+    market_signals = [s for s in all_signals if s.get("market_id") == market_id]
+
+    # Composite score
+    score_data = _read_json("intelligence_scores.json")
+    scores = score_data.get("scores", {}) if isinstance(score_data, dict) else {}
+    composite = scores.get(market_id, {})
+
+    # Orderbook depth (from orderbook_depth.json if available)
+    depth_data = _read_json("orderbook_depth.json")
+    orderbook_depth = {}
+    if isinstance(depth_data, dict):
+        orderbook_depth = depth_data.get(market_id, {})
+
+    # Price history (from price_history directory if available)
+    price_history = []
+    price_dir = DATA_DIR / "price_history"
+    if price_dir.exists():
+        price_file = price_dir / f"{market_id}.json"
+        if price_file.exists():
+            try:
+                pdata = json.loads(price_file.read_text())
+                price_history = pdata.get("prices", [])
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    return {
+        "market_id": market_id,
+        "signals": market_signals,
+        "composite": composite,
+        "orderbook_depth": orderbook_depth,
+        "price_history": price_history,
+    }
+
+
+@app.get("/api/intelligence/backtest", dependencies=[Depends(_require_auth)])
+def get_intelligence_backtest(days: int = 30) -> dict:
+    """Run backtest and return results."""
+    try:
+        from intelligence.backtester import Backtester
+        bt = Backtester()
+        report = bt.run(days=days)
+        return report.to_dict()
+    except ImportError:
+        return {
+            "period_days": days,
+            "total_signals": 0,
+            "by_source": {},
+            "by_tier": {},
+            "equity_curve": [],
+            "best_source": "",
+            "worst_source": "",
+            "message": "Backtester not available — collecting data...",
+        }
+    except Exception as e:
+        return {
+            "period_days": days,
+            "total_signals": 0,
+            "by_source": {},
+            "by_tier": {},
+            "equity_curve": [],
+            "best_source": "",
+            "worst_source": "",
+            "error": str(e)[:200],
+        }
+
+
+# ===========================================================================
+# Cross-Agent Analytics Endpoints
+# ===========================================================================
+
+@app.get("/api/analytics/equity_curve", dependencies=[Depends(_require_auth)])
+def get_analytics_equity_curve() -> dict:
+    """Combined equity curve data — NBA, Events, and Combined."""
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+    from datetime import timedelta as _td
+
+    SGT = timezone(_td(hours=8))
+
+    # NBA equity data
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+
+    nba_daily: dict[str, float] = defaultdict(float)
+    for p in nba_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            nba_daily[day] += p.get("pnl", 0) or 0
+
+    # Events equity data
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_closed = [p for p in events_positions if p.get("status") != "open"]
+
+    events_daily: dict[str, float] = defaultdict(float)
+    for p in events_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            events_daily[day] += p.get("pnl", 0) or 0
+
+    # Merge all days
+    all_days = sorted(set(list(nba_daily.keys()) + list(events_daily.keys())))
+
+    nba_curve = []
+    events_curve = []
+    combined_curve = []
+    nba_running = 0
+    events_running = 0
+
+    for day in all_days:
+        nba_running += nba_daily.get(day, 0)
+        events_running += events_daily.get(day, 0)
+        nba_curve.append({"date": day, "value": round(nba_running, 2)})
+        events_curve.append({"date": day, "value": round(events_running, 2)})
+        combined_curve.append({"date": day, "value": round(nba_running + events_running, 2)})
+
+    return {
+        "nba": nba_curve,
+        "events": events_curve,
+        "combined": combined_curve,
+        "starting_bankroll": starting,
+    }
+
+
+@app.get("/api/analytics/correlation", dependencies=[Depends(_require_auth)])
+def get_analytics_correlation() -> dict:
+    """Agent P&L correlation matrix — NBA vs Events daily returns."""
+    from datetime import timedelta as _td
+
+    SGT = timezone(_td(hours=8))
+
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_closed = [p for p in events_positions if p.get("status") != "open"]
+
+    # Build daily P&L maps
+    nba_daily: dict[str, float] = defaultdict(float)
+    events_daily: dict[str, float] = defaultdict(float)
+
+    for p in nba_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            nba_daily[day] += p.get("pnl", 0) or 0
+
+    for p in events_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            events_daily[day] += p.get("pnl", 0) or 0
+
+    # Find shared days for correlation calculation
+    shared_days = sorted(set(nba_daily.keys()) & set(events_daily.keys()))
+
+    nba_values = [nba_daily[d] for d in shared_days]
+    events_values = [events_daily[d] for d in shared_days]
+
+    # Calculate Pearson correlation
+    def pearson(x: list, y: list) -> float:
+        n = len(x)
+        if n < 3:
+            return 0.0
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+        num = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y))
+        den_x = sum((a - mean_x) ** 2 for a in x) ** 0.5
+        den_y = sum((b - mean_y) ** 2 for b in y) ** 0.5
+        if den_x == 0 or den_y == 0:
+            return 0.0
+        return round(num / (den_x * den_y), 3)
+
+    nba_events_corr = pearson(nba_values, events_values)
+
+    # 3x3 matrix (NBA, Events, Intelligence — Intelligence placeholder for now)
+    matrix = {
+        "agents": ["NBA", "Events", "Intelligence"],
+        "values": [
+            [1.0, nba_events_corr, 0.0],
+            [nba_events_corr, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        "shared_days": len(shared_days),
+    }
+
+    return matrix
+
+
+@app.get("/api/analytics/allocation", dependencies=[Depends(_require_auth)])
+def get_analytics_allocation() -> dict:
+    """Current bankroll allocation across agents."""
+    bankroll_data = _read_json("bankroll.json")
+    total_bankroll = bankroll_data.get("current_bankroll", 0)
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+
+    # NBA open positions
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_open = [p for p in nba_positions if p.get("status") == "open"]
+    nba_deployed = sum(p.get("cost", 0) or 0 for p in nba_open)
+
+    # Events open positions
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_open = [p for p in events_positions if p.get("status") == "open"]
+    events_deployed = sum(p.get("cost", 0) or 0 for p in events_open)
+
+    total_deployed = nba_deployed + events_deployed
+    cash = max(0, total_bankroll - total_deployed)
+
+    return {
+        "total_bankroll": round(total_bankroll, 2),
+        "segments": [
+            {"label": "NBA", "value": round(nba_deployed, 2), "color": "#00f0ff"},
+            {"label": "Events", "value": round(events_deployed, 2), "color": "#8B5CF6"},
+            {"label": "Cash", "value": round(cash, 2), "color": "#374151"},
+        ],
+        "total_deployed": round(total_deployed, 2),
+        "deployed_pct": round(total_deployed / total_bankroll * 100, 1) if total_bankroll > 0 else 0,
+    }
+
+
+@app.get("/api/analytics/risk", dependencies=[Depends(_require_auth)])
+def get_analytics_risk() -> dict:
+    """Portfolio risk dashboard — exposure by agent, theme concentration, diversification."""
+    bankroll_data = _read_json("bankroll.json")
+    total_bankroll = bankroll_data.get("current_bankroll", 0) or 1
+    max_exposure_pct = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
+
+    # NBA exposure
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_open = [p for p in nba_positions if p.get("status") == "open"]
+    nba_exposure = sum(p.get("cost", 0) or 0 for p in nba_open)
+
+    # Events exposure
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_open = [p for p in events_positions if p.get("status") == "open"]
+    events_exposure = sum(p.get("cost", 0) or 0 for p in events_open)
+
+    total_exposure = nba_exposure + events_exposure
+
+    # Theme concentration (from events positions)
+    theme_map = {
+        "politics": ["trump", "republican", "democrat", "congress", "senate", "election",
+                      "biden", "president", "vote", "governor"],
+        "crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "defi", "sec",
+                    "stablecoin"],
+        "geopolitical": ["china", "russia", "ukraine", "taiwan", "nato", "sanctions",
+                         "tariff", "war", "missile"],
+        "economics": ["fed", "inflation", "recession", "gdp", "unemployment",
+                       "interest rate", "treasury"],
+    }
+
+    theme_exposure: dict[str, float] = defaultdict(float)
+    for p in events_open:
+        q = (p.get("market_question", "") or "").lower()
+        cost = p.get("cost", 0) or 0
+        matched = False
+        for theme, keywords in theme_map.items():
+            if any(kw in q for kw in keywords):
+                theme_exposure[theme] += cost
+                matched = True
+                break
+        if not matched:
+            theme_exposure["other"] += cost
+
+    # Diversification score (0-100)
+    # More themes = more diversified; single theme = concentrated
+    if total_exposure > 0:
+        theme_pcts = [v / total_exposure for v in theme_exposure.values()]
+        # Herfindahl-Hirschman Index based score
+        hhi = sum(p ** 2 for p in theme_pcts) if theme_pcts else 1.0
+        # HHI of 1.0 = completely concentrated, 1/n = perfectly diversified
+        n = max(len(theme_pcts), 1)
+        min_hhi = 1.0 / n
+        div_score = max(0, min(100, int((1.0 - (hhi - min_hhi) / (1.0 - min_hhi + 0.01)) * 100)))
+    else:
+        div_score = 100  # No positions = no risk
+
+    return {
+        "total_bankroll": round(total_bankroll, 2),
+        "total_deployed": round(total_exposure, 2),
+        "available": round(max(0, total_bankroll - total_exposure), 2),
+        "nba_exposure": round(nba_exposure, 2),
+        "nba_pct": round(nba_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
+        "events_exposure": round(events_exposure, 2),
+        "events_pct": round(events_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
+        "total_pct": round(total_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
+        "max_allowed_pct": round(max_exposure_pct * 100, 1),
+        "theme_concentration": {
+            k: {
+                "amount": round(v, 2),
+                "pct": round(v / total_exposure * 100, 1) if total_exposure > 0 else 0,
+            }
+            for k, v in sorted(theme_exposure.items(), key=lambda x: -x[1])
+        },
+        "diversification_score": div_score,
+    }
+
+
+@app.get("/api/analytics/signal_performance", dependencies=[Depends(_require_auth)])
+def get_analytics_signal_performance() -> dict:
+    """Signal source performance stats from backtest or recent data."""
+    try:
+        from intelligence.backtester import Backtester
+        bt = Backtester()
+        report = bt.run(days=7)
+        return {
+            "by_source": report.by_source,
+            "period_days": 7,
+            "total_signals": report.total_signals,
+        }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: count signals per source from recent data
+    sig_data = _read_json("intelligence_signals.json")
+    signals = sig_data.get("signals", []) if isinstance(sig_data, dict) else []
+
+    source_counts: dict[str, int] = defaultdict(int)
+    for s in signals:
+        source = s.get("source", "unknown")
+        source_counts[source] += 1
+
+    health_data = _read_json("intelligence_health.json")
+
+    by_source = {}
+    for source, count in source_counts.items():
+        status = "active"
+        if isinstance(health_data, dict):
+            h = health_data.get(source, {})
+            status = h.get("status", "unknown")
+        by_source[source] = {
+            "signals": count,
+            "win_rate": 0,
+            "avg_pnl": 0,
+            "total_pnl": 0,
+            "sharpe": 0,
+            "status": status,
+        }
+
+    return {
+        "by_source": by_source,
+        "period_days": 1,
+        "total_signals": len(signals),
+        "message": "Collecting data — backtest available after signal history accumulates",
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)

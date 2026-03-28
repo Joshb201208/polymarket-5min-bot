@@ -15,6 +15,33 @@ def _bool_env(key: str, default: str = "true") -> bool:
     return os.getenv(key, default).lower() == "true"
 
 
+# Master enable/disable for each module (module-level for easy import)
+INTELLIGENCE_MODULES = {
+    "x_scanner": _bool_env("X_SCANNER_ENABLED"),
+    "orderbook": _bool_env("ORDERBOOK_INTEL_ENABLED"),
+    "metaculus": _bool_env("METACULUS_ENABLED"),
+    "google_trends": _bool_env("GOOGLE_TRENDS_ENABLED"),
+    "congress": _bool_env("CONGRESS_TRACKER_ENABLED"),
+    "cross_market": _bool_env("CROSS_MARKET_ENABLED"),
+    "whale_tracker": _bool_env("WHALE_TRACKER_ENABLED"),
+}
+
+# Composite Scoring
+COMPOSITE_MIN_SCORE = float(os.getenv("COMPOSITE_MIN_SCORE", "0.4"))
+COMPOSITE_DIRECTION_BONUS = float(os.getenv("COMPOSITE_DIRECTION_BONUS", "0.2"))
+
+# Signal source weights (must sum to 1.0)
+SOURCE_WEIGHTS = {
+    "metaculus": 0.25,
+    "x_scanner": 0.20,
+    "orderbook": 0.15,
+    "whale_tracker": 0.15,
+    "google_trends": 0.10,
+    "congress": 0.08,
+    "cross_market": 0.07,
+}
+
+
 class IntelligenceConfig:
     """Central configuration for all intelligence modules."""
 

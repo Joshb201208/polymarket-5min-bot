@@ -11,6 +11,14 @@ from events_agent.models import Confidence, EdgeResult, EventCategory, EventMark
 
 logger = logging.getLogger(__name__)
 
+# Intelligence tier -> confidence mapping
+_INTEL_TIER_CONFIDENCE = {
+    "VERY_HIGH": Confidence.HIGH,
+    "HIGH": Confidence.HIGH,
+    "MEDIUM": Confidence.MEDIUM,
+    "LOW": Confidence.LOW,
+}
+
 
 class EventsAnalyzer:
     """Computes fair odds and detects edges for non-sports markets.
@@ -222,6 +230,107 @@ class EventsAnalyzer:
                     )
 
         return None
+
+    async def analyze_with_intelligence(
+        self,
+        market: EventMarket,
+        intelligence_report,
+    ) -> EdgeResult | None:
+        """Enhanced analysis blending base edge with intelligence signals.
+
+        final_edge = 0.4 * base_edge + 0.6 * intelligence_edge
+        Intelligence-weighted, since that's where the real alpha is.
+        """
+        try:
+            # 1. Get base edge from existing strategies
+            base_result = await self.evaluate(market)
+            base_edge = base_result.edge if base_result else 0.0
+            base_side = base_result.side if base_result else "YES"
+
+            # 2. Get composite score from intelligence report
+            scores = intelligence_report.scores if hasattr(intelligence_report, "scores") else {}
+            composite = scores.get(market.id)
+
+            if composite is None:
+                # No intelligence data — fall back to base analysis
+                return base_result
+
+            # Extract composite values (handle both dataclass and dict)
+            if hasattr(composite, "composite"):
+                intel_score = composite.composite
+                intel_direction = composite.direction
+                intel_tier = composite.confidence_tier
+            elif isinstance(composite, dict):
+                intel_score = composite.get("composite", 0)
+                intel_direction = composite.get("direction", "YES")
+                intel_tier = composite.get("confidence_tier", "LOW")
+            else:
+                return base_result
+
+            # 3. Compute intelligence edge
+            # The composite score (0-1) represents how strongly signals indicate direction
+            # Convert to edge: intel_edge = composite * 0.15 (max 15% edge from intel)
+            intel_edge = intel_score * 0.15
+
+            # 4. Blend: final_edge = 0.4 * base_edge + 0.6 * intel_edge
+            if base_edge > 0 and intel_direction == base_side:
+                # Both agree on direction — blend
+                final_edge = 0.4 * base_edge + 0.6 * intel_edge
+            elif intel_edge > base_edge:
+                # Intelligence disagrees but is stronger — follow intel
+                final_edge = intel_edge * 0.6
+                base_side = intel_direction
+            else:
+                # Base is stronger — follow base with minor intel boost
+                final_edge = base_edge * 0.8
+                if intel_direction != base_side:
+                    final_edge *= 0.7  # Penalty for conflicting signals
+
+            # 5. Apply correlation penalty if over-concentrated
+            correlation = intelligence_report.correlation if hasattr(intelligence_report, "correlation") else None
+            if correlation:
+                warnings = []
+                if hasattr(correlation, "concentration_warnings"):
+                    warnings = correlation.concentration_warnings
+                elif isinstance(correlation, dict):
+                    warnings = correlation.get("concentration_warnings", [])
+
+                if warnings:
+                    q_lower = market.question.lower()
+                    for theme in warnings:
+                        if isinstance(theme, str) and theme.lower() in q_lower:
+                            final_edge *= 0.7  # 30% penalty for concentrated themes
+                            logger.info(
+                                "Correlation penalty applied for theme '%s' on %s",
+                                theme, market.slug,
+                            )
+                            break
+
+            if final_edge < self.config.MIN_EDGE:
+                return None
+
+            # 6. Set confidence from intelligence tier
+            confidence = _INTEL_TIER_CONFIDENCE.get(intel_tier, Confidence.LOW)
+
+            # Determine side index
+            side_index = 0 if base_side == "YES" else 1
+            market_price = market.outcome_prices[side_index] if side_index < len(market.outcome_prices) else 0
+
+            return EdgeResult(
+                market=market,
+                our_fair_price=min(0.97, market_price + final_edge),
+                market_price=market_price,
+                edge=final_edge,
+                confidence=confidence,
+                side=base_side,
+                side_index=side_index,
+                edge_source="intelligence_blend",
+            )
+
+        except Exception as e:
+            logger.error("Intelligence analysis failed for %s: %s", market.slug, e)
+            # Fall back to base analysis
+            return await self.evaluate(market)
 
     def _classify_confidence(
         self,

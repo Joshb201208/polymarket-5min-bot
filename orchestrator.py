@@ -1,4 +1,4 @@
-"""Orchestrator — runs NBA + Events agents on their own schedules in one process."""
+"""Orchestrator — runs NBA + Events + Intelligence agents on their own schedules."""
 
 from __future__ import annotations
 
@@ -18,6 +18,16 @@ from nba_agent.utils import utcnow
 logger = logging.getLogger("orchestrator")
 
 
+def _try_init_intelligence():
+    """Try to initialize IntelligenceManager; return None if modules not ready."""
+    try:
+        from intelligence.manager import IntelligenceManager
+        return IntelligenceManager()
+    except Exception as e:
+        logger.warning("Intelligence modules not available yet: %s", e)
+        return None
+
+
 class Orchestrator:
     """Runs all agents concurrently on their own scan intervals."""
 
@@ -25,11 +35,20 @@ class Orchestrator:
         self.nba_agent = NBAAgent()
         self.events_agent = EventsAgent()
         self.digest = CombinedDigest(SharedConfig())
+        self.intelligence = _try_init_intelligence()
         self._shutdown = False
 
     async def run(self) -> None:
         """Start all agents as concurrent tasks."""
         logger.info("Orchestrator starting — NBA + Events agents")
+
+        # Start persistent intelligence connections
+        if self.intelligence:
+            try:
+                await self.intelligence.start_persistent()
+                logger.info("Intelligence persistent connections started")
+            except Exception as e:
+                logger.error("Failed to start intelligence persistent connections: %s", e)
 
         # Run agents concurrently
         tasks = [
@@ -58,7 +77,11 @@ class Orchestrator:
                 await asyncio.sleep(1)
 
     async def _run_events(self) -> None:
-        """Events agent loop — runs on its own interval."""
+        """Events agent loop — runs on its own interval.
+
+        When intelligence modules are available, runs intelligence scan
+        in parallel with the events tick and saves the report for dashboard.
+        """
         logger.info("Events agent task started (interval=%d min)", self.events_agent.config.SCAN_INTERVAL)
 
         # Stagger start: wait 2 minutes so NBA agent gets first scan
@@ -69,7 +92,16 @@ class Orchestrator:
 
         while not self._shutdown:
             try:
+                # Run events tick (intelligence integration happens via
+                # the analyzer when it calls analyze_with_intelligence)
                 await self.events_agent._tick()
+
+                # Run intelligence scan cycle if available
+                if self.intelligence:
+                    try:
+                        await self._run_intelligence_cycle()
+                    except Exception as e:
+                        logger.error("Intelligence cycle error: %s", e)
             except Exception as e:
                 logger.error("Events agent tick error: %s", e, exc_info=True)
 
@@ -77,6 +109,41 @@ class Orchestrator:
                 if self._shutdown:
                     break
                 await asyncio.sleep(1)
+
+    async def _run_intelligence_cycle(self) -> None:
+        """Run intelligence scan and save report for dashboard consumption."""
+        if not self.intelligence:
+            return
+
+        try:
+            # Get active markets from events scanner if available
+            active_markets = []
+            if hasattr(self.events_agent, "scanner") and self.events_agent.scanner:
+                try:
+                    active_markets = await self.events_agent.scanner.scan()
+                except Exception:
+                    pass
+
+            # Get open positions
+            open_positions = []
+            if hasattr(self.events_agent, "portfolio") and self.events_agent.portfolio:
+                try:
+                    open_positions = self.events_agent.portfolio.get_positions()
+                except Exception:
+                    pass
+
+            report = await self.intelligence.run_scan_cycle(
+                active_markets=active_markets,
+                open_positions=open_positions,
+            )
+
+            logger.info(
+                "Intelligence cycle complete: %d signals, %d scores",
+                len(report.signals),
+                len(report.scores),
+            )
+        except Exception as e:
+            logger.error("Intelligence scan cycle failed: %s", e)
 
     async def _run_digest(self) -> None:
         """Combined digest loop — checks every 10 minutes if it's time to send."""

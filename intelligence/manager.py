@@ -7,64 +7,132 @@ collects signals, computes composite scores, and returns a unified IntelligenceR
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
-from intelligence.config import IntelligenceConfig
-from intelligence.models import CompositeScore, IntelligenceReport, Signal
-from intelligence.x_scanner import XScanner
-from intelligence.orderbook import OrderbookIntelligence
-from intelligence.metaculus import MetaculusCompare
-from intelligence.google_trends import GoogleTrendsTracker
-from intelligence.congress_tracker import CongressTracker
-from intelligence.cross_market import CrossMarketArbitrage
-from intelligence.whale_tracker import WhaleTracker
-from intelligence.composite_scorer import CompositeScorer
-from intelligence.correlation import CorrelationMonitor
-from nba_agent.utils import atomic_json_write, load_json, utcnow
+from intelligence.models import (
+    Signal, CompositeScore, CorrelationReport, IntelligenceReport,
+)
+from intelligence import config as intel_config
 
-logger = logging.getLogger("intelligence.manager")
+logger = logging.getLogger(__name__)
+
+# Data directory
+_project_root = Path(__file__).resolve().parent.parent
+DATA_DIR = Path("/root/polymarket-bot/data") if Path("/root/polymarket-bot/data").exists() else _project_root / "data"
 
 
 class IntelligenceManager:
-    """Orchestrates all intelligence modules and produces unified reports."""
+    """Central orchestration class that runs all intelligence modules."""
 
-    def __init__(self, config: IntelligenceConfig | None = None) -> None:
-        self.config = config or IntelligenceConfig()
-        self.config.ensure_data_dir()
-
-        self.x_scanner = XScanner(self.config)
-        self.orderbook = OrderbookIntelligence(self.config)
-        self.metaculus = MetaculusCompare(self.config)
-        self.google_trends = GoogleTrendsTracker(self.config)
-        self.congress = CongressTracker(self.config)
-        self.cross_market = CrossMarketArbitrage(self.config)
-        self.whale_tracker = WhaleTracker(self.config)
-        self.composite_scorer = CompositeScorer()
-        self.correlation = CorrelationMonitor()
-
-        # Rolling buffer of recent signals
+    def __init__(self, config=None):
+        self.config = config
         self.all_signals: list[Signal] = []
-
-        # Persistence paths
-        self._signals_path = self.config.DATA_DIR / "intelligence_signals.json"
-        self._scores_path = self.config.DATA_DIR / "intelligence_scores.json"
-
-        # Volume rotation task handle
+        self._source_health: dict = {}
+        self._modules = {}
         self._volume_rotation_task: asyncio.Task | None = None
+        self._init_modules()
 
-    async def start_persistent(self, token_ids: list[str] | None = None) -> None:
+    def _init_modules(self):
+        """Initialize enabled intelligence modules (lazy imports)."""
+        modules = intel_config.INTELLIGENCE_MODULES
+
+        for name, enabled in modules.items():
+            if enabled:
+                self._source_health[name] = {
+                    "status": "initialized",
+                    "last_update": None,
+                    "error": None,
+                }
+            else:
+                self._source_health[name] = {
+                    "status": "disabled",
+                    "last_update": None,
+                    "error": None,
+                }
+
+        # Try to import and instantiate each module
+        if modules.get("x_scanner"):
+            try:
+                from intelligence.x_scanner import XScanner
+                self._modules["x_scanner"] = XScanner()
+            except ImportError:
+                logger.warning("x_scanner module not available yet")
+
+        if modules.get("orderbook"):
+            try:
+                from intelligence.orderbook import OrderbookIntelligence
+                self._modules["orderbook"] = OrderbookIntelligence()
+            except ImportError:
+                logger.warning("orderbook module not available yet")
+
+        if modules.get("metaculus"):
+            try:
+                from intelligence.metaculus import MetaculusCompare
+                self._modules["metaculus"] = MetaculusCompare()
+            except ImportError:
+                logger.warning("metaculus module not available yet")
+
+        if modules.get("google_trends"):
+            try:
+                from intelligence.google_trends import GoogleTrendsTracker
+                self._modules["google_trends"] = GoogleTrendsTracker()
+            except ImportError:
+                logger.warning("google_trends module not available yet")
+
+        if modules.get("congress"):
+            try:
+                from intelligence.congress_tracker import CongressTracker
+                self._modules["congress"] = CongressTracker()
+            except ImportError:
+                logger.warning("congress_tracker module not available yet")
+
+        if modules.get("cross_market"):
+            try:
+                from intelligence.cross_market import CrossMarketArbitrage
+                self._modules["cross_market"] = CrossMarketArbitrage()
+            except ImportError:
+                logger.warning("cross_market module not available yet")
+
+        if modules.get("whale_tracker"):
+            try:
+                from intelligence.whale_tracker import WhaleTracker
+                self._modules["whale_tracker"] = WhaleTracker()
+            except ImportError:
+                logger.warning("whale_tracker module not available yet")
+
+        try:
+            from intelligence.composite_scorer import CompositeScorer
+            self._composite_scorer = CompositeScorer()
+        except ImportError:
+            logger.warning("composite_scorer module not available yet")
+            self._composite_scorer = None
+
+        try:
+            from intelligence.correlation import CorrelationMonitor
+            self._correlation = CorrelationMonitor()
+        except ImportError:
+            logger.warning("correlation module not available yet")
+            self._correlation = None
+
+    async def start_persistent(self, token_ids: list[str] | None = None):
         """Start long-running tasks (WebSocket, volume rotation, etc.).
 
         Call once at orchestrator startup. Runs in background.
         """
-        if token_ids and self.config.is_enabled("orderbook"):
+        orderbook = self._modules.get("orderbook")
+        if orderbook and hasattr(orderbook, "connect"):
             try:
-                await self.orderbook.connect(token_ids)
-                asyncio.create_task(self.orderbook.run())
-                logger.info("Orderbook WebSocket task started")
+                await orderbook.connect(token_ids or [])
+                asyncio.create_task(orderbook.run())
+                self._source_health["orderbook"]["status"] = "connected"
+                logger.info("Orderbook WebSocket started")
             except Exception as e:
-                logger.error("Failed to start orderbook WS: %s", e)
+                logger.error("Failed to start orderbook WebSocket: %s", e)
+                self._source_health["orderbook"]["status"] = "error"
+                self._source_health["orderbook"]["error"] = str(e)
 
         # Start volume window rotation (every 15 min)
         self._volume_rotation_task = asyncio.create_task(
@@ -74,7 +142,7 @@ class IntelligenceManager:
     async def run_scan_cycle(
         self,
         active_markets: list,
-        open_positions: list,
+        open_positions: list | None = None,
     ) -> IntelligenceReport:
         """Run all scanners in parallel, combine results into IntelligenceReport.
 
@@ -85,121 +153,167 @@ class IntelligenceManager:
         Returns:
             IntelligenceReport with all signals, scores, and correlation data.
         """
-        now = utcnow()
+        open_positions = open_positions or []
+        now = datetime.now(timezone.utc).isoformat()
+
         logger.info("Intelligence scan cycle starting (%d markets)", len(active_markets))
 
-        # Run all scanners concurrently with individual error handling
+        # Build scan tasks for all available modules
         scan_tasks = []
+        scan_names = []
 
-        if self.config.is_enabled("x_scanner"):
-            scan_tasks.append(("x_scanner", self.x_scanner.scan(active_markets)))
-        if self.config.is_enabled("metaculus"):
-            scan_tasks.append(("metaculus", self.metaculus.scan(active_markets)))
-        if self.config.is_enabled("google_trends"):
-            scan_tasks.append(("google_trends", self.google_trends.scan(active_markets)))
-        if self.config.is_enabled("congress"):
-            scan_tasks.append(("congress", self.congress.scan(active_markets)))
-        if self.config.is_enabled("cross_market"):
-            scan_tasks.append(("cross_market", self.cross_market.scan(active_markets)))
-        if self.config.is_enabled("whale_tracker"):
-            scan_tasks.append(("whale_tracker", self.whale_tracker.scan(active_markets)))
+        for name, module in self._modules.items():
+            if hasattr(module, "scan"):
+                scan_tasks.append(
+                    asyncio.wait_for(module.scan(active_markets), timeout=30)
+                )
+                scan_names.append(name)
 
-        # Execute concurrently
-        results = await asyncio.gather(
-            *(task for _, task in scan_tasks),
-            return_exceptions=True,
-        )
+        # Run all scanners concurrently
+        results = await asyncio.gather(*scan_tasks, return_exceptions=True)
 
-        # Collect all signals (skip failed scanners gracefully)
+        # Collect signals, update health
         all_signals: list[Signal] = []
-        for i, result in enumerate(results):
-            name = scan_tasks[i][0] if i < len(scan_tasks) else "unknown"
+        for name, result in zip(scan_names, results):
             if isinstance(result, Exception):
                 logger.error("Scanner %s failed: %s", name, result)
-                continue
-            if isinstance(result, list):
+                self._source_health[name]["status"] = "error"
+                self._source_health[name]["error"] = str(result)[:200]
+            elif isinstance(result, list):
                 all_signals.extend(result)
+                self._source_health[name]["status"] = "active"
+                self._source_health[name]["last_update"] = now
+                self._source_health[name]["error"] = None
                 logger.info("Scanner %s returned %d signals", name, len(result))
+            else:
+                self._source_health[name]["status"] = "no_data"
+                self._source_health[name]["last_update"] = now
 
-        # Add orderbook signals from persistent WebSocket
-        if self.config.is_enabled("orderbook"):
-            orderbook_signals = self.orderbook.get_pending_signals()
-            all_signals.extend(orderbook_signals)
-            if orderbook_signals:
-                logger.info("Orderbook produced %d signals", len(orderbook_signals))
+        # Add orderbook signals if persistent connection is running
+        orderbook = self._modules.get("orderbook")
+        if orderbook and hasattr(orderbook, "get_pending_signals"):
+            try:
+                ob_signals = orderbook.get_pending_signals()
+                all_signals.extend(ob_signals)
+                if ob_signals:
+                    self._source_health["orderbook"]["last_update"] = now
+                    logger.info("Orderbook produced %d signals", len(ob_signals))
+            except Exception as e:
+                logger.error("Orderbook signal fetch failed: %s", e)
 
         # Update rolling buffer
         self.all_signals = all_signals
 
         # Score each market that has signals
         market_scores: dict[str, CompositeScore] = {}
-        for market in active_markets:
-            market_id = getattr(market, "id", "")
-            market_signals = [s for s in all_signals if s.market_id == market_id]
-            if market_signals:
-                market_scores[market_id] = self.composite_scorer.score(
-                    market_id, market_signals,
-                )
+        if self._composite_scorer:
+            for market in active_markets:
+                market_id = getattr(market, "id", str(market))
+                market_signals = [s for s in all_signals if s.market_id == market_id]
+                if market_signals:
+                    market_scores[market_id] = self._composite_scorer.score(
+                        market_id, market_signals
+                    )
 
-        # Correlation analysis on open positions
-        correlation_report = None
-        if open_positions:
+        # Correlation analysis
+        correlation_report = CorrelationReport()
+        if self._correlation and open_positions:
             try:
-                correlation_report = self.correlation.analyze(open_positions)
+                correlation_report = self._correlation.analyze(open_positions)
             except Exception as e:
                 logger.error("Correlation analysis failed: %s", e)
 
         # Persist for dashboard
         self._save_signals(all_signals)
         self._save_scores(market_scores)
-
-        report = IntelligenceReport(
-            signals=all_signals,
-            scores=market_scores,
-            correlation=correlation_report,
-            timestamp=now,
-        )
+        self._save_health()
 
         logger.info(
             "Intelligence scan complete: %d signals, %d scored markets",
             len(all_signals),
             len(market_scores),
         )
-        return report
+
+        return IntelligenceReport(
+            signals=all_signals,
+            scores=market_scores,
+            correlation=correlation_report,
+            timestamp=now,
+            source_health=dict(self._source_health),
+        )
+
+    def get_health(self) -> dict:
+        """Return current source health status."""
+        return dict(self._source_health)
 
     async def _rotate_volume_windows(self) -> None:
         """Rotate orderbook volume windows every 15 minutes."""
         while True:
             try:
                 await asyncio.sleep(900)  # 15 minutes
-                self.orderbook.rotate_volume_window()
+                orderbook = self._modules.get("orderbook")
+                if orderbook and hasattr(orderbook, "rotate_volume_window"):
+                    orderbook.rotate_volume_window()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning("Volume rotation error: %s", e)
 
-    def _save_signals(self, signals: list[Signal]) -> None:
-        """Persist signals for dashboard consumption."""
-        if not signals:
-            return
+    def _save_signals(self, signals: list[Signal]):
+        """Save signals to JSON for dashboard consumption."""
         try:
-            data = [s.to_dict() for s in signals]
-            atomic_json_write(self._signals_path, data)
-        except Exception as e:
-            logger.warning("Failed to save intelligence signals: %s", e)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "intelligence_signals.json"
 
-    def _save_scores(self, scores: dict[str, CompositeScore]) -> None:
-        """Persist composite scores for dashboard consumption."""
-        if not scores:
-            return
-        try:
-            data = {
-                market_id: score.to_dict()
-                for market_id, score in scores.items()
-            }
-            atomic_json_write(self._scores_path, data)
+            # Load existing and append (keep last 24h)
+            existing = []
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text()).get("signals", [])
+                except (json.JSONDecodeError, OSError):
+                    existing = []
+
+            # Add new signals
+            new_signals = [s.to_dict() if hasattr(s, "to_dict") else s for s in signals]
+            all_sigs = existing + new_signals
+
+            # Trim to last 24 hours
+            cutoff = datetime.now(timezone.utc).timestamp() - 86400
+            trimmed = []
+            for sig in all_sigs:
+                try:
+                    ts = sig.get("timestamp", "")
+                    sig_time = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    if sig_time > cutoff:
+                        trimmed.append(sig)
+                except (ValueError, AttributeError):
+                    trimmed.append(sig)  # Keep if we can't parse
+
+            path.write_text(json.dumps({"signals": trimmed}, indent=2, default=str))
         except Exception as e:
-            logger.warning("Failed to save intelligence scores: %s", e)
+            logger.error("Failed to save signals: %s", e)
+
+    def _save_scores(self, scores: dict[str, CompositeScore]):
+        """Save composite scores for dashboard."""
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "intelligence_scores.json"
+            data = {
+                k: v.to_dict() if hasattr(v, "to_dict") else v
+                for k, v in scores.items()
+            }
+            path.write_text(json.dumps({"scores": data}, indent=2, default=str))
+        except Exception as e:
+            logger.error("Failed to save scores: %s", e)
+
+    def _save_health(self):
+        """Save source health for dashboard."""
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "intelligence_health.json"
+            path.write_text(json.dumps(self._source_health, indent=2, default=str))
+        except Exception as e:
+            logger.error("Failed to save health: %s", e)
 
     async def shutdown(self) -> None:
         """Gracefully shut down all persistent tasks."""
@@ -210,4 +324,6 @@ class IntelligenceManager:
                 await self._volume_rotation_task
             except asyncio.CancelledError:
                 pass
-        await self.orderbook.shutdown()
+        orderbook = self._modules.get("orderbook")
+        if orderbook and hasattr(orderbook, "shutdown"):
+            await orderbook.shutdown()
