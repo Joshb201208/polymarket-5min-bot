@@ -547,6 +547,10 @@ function renderMergedPositions() {
                         <span class="pos-detail-value">${p.side}</span>
                     </div>
                     <div class="pos-detail">
+                        <span class="pos-detail-label">Edge</span>
+                        <span class="pos-detail-value pnl-positive">${fmt.edge(p.edge_at_entry)}</span>
+                    </div>
+                    <div class="pos-detail">
                         <span class="pos-detail-label">Entry</span>
                         <span class="pos-detail-value">${fmt.price(p.entry_price)}</span>
                     </div>
