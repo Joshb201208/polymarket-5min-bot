@@ -10,6 +10,250 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="style.css">
+    <style>
+    /* =====================================================================
+       ADVANCED ANALYTICS — inline styles for new sections
+       ===================================================================== */
+
+    /* Section separator */
+    .adv-section { margin-top: 0; }
+
+    /* ---- Win/Loss Streak ---- */
+    .streak-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px;
+        padding: 12px 0 8px;
+        min-height: 48px;
+        align-items: center;
+    }
+    .streak-block {
+        width: 22px;
+        height: 28px;
+        border-radius: 4px;
+        flex-shrink: 0;
+        cursor: default;
+        transition: transform 0.15s ease, opacity 0.15s ease;
+        position: relative;
+    }
+    .streak-block:hover { transform: scaleY(1.18); opacity: 1 !important; }
+    .streak-block.streak-w { background: #22c55e; }
+    .streak-block.streak-l { background: #ef4444; }
+    .streak-block .streak-tip {
+        display: none;
+        position: absolute;
+        bottom: calc(100% + 6px);
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(18,19,26,0.96);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 10px;
+        white-space: nowrap;
+        color: #e4e4e7;
+        font-family: var(--mono);
+        z-index: 10;
+        pointer-events: none;
+    }
+    .streak-block:hover .streak-tip { display: block; }
+    .streak-stats {
+        display: flex;
+        gap: 20px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(255,255,255,0.06);
+        margin-top: 6px;
+        flex-wrap: wrap;
+    }
+    .streak-stat-item {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .streak-stat-label {
+        font-size: 10px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .streak-stat-value {
+        font-family: var(--mono);
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text);
+    }
+    .streak-stat-value.sv-win { color: #22c55e; }
+    .streak-stat-value.sv-loss { color: #ef4444; }
+    .streak-stat-value.sv-cyan { color: #22d3ee; }
+
+    /* ---- Heatmap ---- */
+    .heatmap-wrap {
+        display: grid;
+        grid-template-columns: repeat(24, 1fr);
+        gap: 3px;
+        padding: 14px 0 8px;
+    }
+    .heatmap-cell {
+        height: 48px;
+        border-radius: 4px;
+        cursor: pointer;
+        position: relative;
+        transition: transform 0.15s ease;
+    }
+    .heatmap-cell:hover { transform: scaleY(1.1); z-index: 2; }
+    .heatmap-cell .hm-tip {
+        display: none;
+        position: absolute;
+        bottom: calc(100% + 6px);
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(18,19,26,0.97);
+        border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 10px;
+        white-space: nowrap;
+        color: #e4e4e7;
+        font-family: var(--mono);
+        z-index: 20;
+        pointer-events: none;
+        line-height: 1.6;
+    }
+    .heatmap-cell:hover .hm-tip { display: block; }
+    .heatmap-labels {
+        display: flex;
+        justify-content: space-between;
+        padding: 2px 2px 0;
+        font-size: 10px;
+        color: var(--text-muted);
+        font-family: var(--mono);
+    }
+
+    /* ---- Export CSV button ---- */
+    .export-btn {
+        background: rgba(34,211,238,0.1);
+        border: 1px solid rgba(34,211,238,0.3);
+        color: #22d3ee;
+        font-family: var(--font);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        padding: 5px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background 0.2s ease, border-color 0.2s ease;
+        text-transform: uppercase;
+    }
+    .export-btn:hover {
+        background: rgba(34,211,238,0.18);
+        border-color: rgba(34,211,238,0.55);
+    }
+
+    /* ---- Position Detail Modal ---- */
+    .pos-modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 2000;
+        background: rgba(6,7,16,0.82);
+        backdrop-filter: blur(6px);
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+    }
+    .pos-modal-overlay.open { display: flex; }
+    .pos-modal-panel {
+        background: #111827;
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 16px;
+        padding: 28px;
+        max-width: 620px;
+        width: 100%;
+        position: relative;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+        animation: modalIn 0.22s cubic-bezier(0.22,1,0.36,1);
+    }
+    @keyframes modalIn {
+        from { opacity: 0; transform: scale(0.94) translateY(10px); }
+        to   { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .pos-modal-close {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 8px;
+        color: #71717a;
+        cursor: pointer;
+        padding: 6px;
+        line-height: 0;
+        transition: color 0.2s, background 0.2s;
+    }
+    .pos-modal-close:hover { color: #e4e4e7; background: rgba(255,255,255,0.1); }
+    .pos-modal-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text);
+        line-height: 1.4;
+        margin: 0 32px 6px 0;
+    }
+    .pos-modal-subtitle {
+        font-size: 11px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 20px;
+    }
+    .pos-modal-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+    }
+    .pos-modal-item {
+        background: rgba(255,255,255,0.03);
+        border-radius: 8px;
+        padding: 10px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+    }
+    .pos-modal-item.full { grid-column: 1 / -1; }
+    .pos-modal-label {
+        font-size: 10px;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+    }
+    .pos-modal-value {
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--text);
+        word-break: break-word;
+    }
+    .pos-modal-pnl-banner {
+        margin-top: 16px;
+        padding: 14px 18px;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+    .pos-modal-pnl-banner.banner-win  { background: rgba(34,197,94,0.1);  border: 1px solid rgba(34,197,94,0.25); }
+    .pos-modal-pnl-banner.banner-loss { background: rgba(239,68,68,0.1);   border: 1px solid rgba(239,68,68,0.25); }
+    .pos-modal-pnl-banner.banner-open { background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.2); }
+    .pmb-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .pmb-value { font-family: var(--mono); font-size: 20px; font-weight: 700; }
+    .pmb-value.win  { color: #22c55e; }
+    .pmb-value.loss { color: #ef4444; }
+    .pmb-value.open { color: #22d3ee; }
+
+    /* Make position cards clickable */
+    .position-card { cursor: pointer; }
+    .position-card:hover { border-color: rgba(34,211,238,0.25); }
+    </style>
 </head>
 <body>
 
@@ -102,6 +346,7 @@
             </div>
         </div>
         <div class="header-center">
+            <a href="/overview.html" class="nav-link">Overview</a>
             <a href="/nba.html" class="nav-link active">NBA</a>
             <a href="/events.html" class="nav-link">Events</a>
             <a href="/intelligence.html" class="nav-link">Intelligence</a>
@@ -263,6 +508,7 @@
             <h2 class="card-title">Trade History</h2>
             <div class="card-header-right">
                 <span class="badge" id="tradeCountBadge">0 closed</span>
+                <button class="export-btn" onclick="exportTradesCSV()">Export CSV</button>
             </div>
         </div>
         <div class="table-wrapper" id="tradeTableWrapper">
@@ -371,6 +617,86 @@
             </table>
         </div>
     </section>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         ADVANCED ANALYTICS SECTIONS
+         ═══════════════════════════════════════════════════════════════ -->
+
+    <!-- WIN/LOSS STREAK TRACKER -->
+    <section class="card adv-section">
+        <div class="card-header">
+            <h2 class="card-title">Win / Loss Streak</h2>
+            <div class="card-header-right" id="streakHeaderStats"></div>
+        </div>
+        <div class="streak-container" id="streakTracker"></div>
+        <div class="streak-stats" id="streakStats"></div>
+    </section>
+
+    <!-- P&L DISTRIBUTION HISTOGRAM -->
+    <section class="card adv-section">
+        <div class="card-header">
+            <h2 class="card-title">P&amp;L Distribution</h2>
+            <span class="badge badge-info" id="pnlDistCount">-- trades</span>
+        </div>
+        <div class="chart-container" style="height:220px">
+            <canvas id="pnlHistChart"></canvas>
+        </div>
+    </section>
+
+    <!-- ROI BY DAY OF WEEK + ENTRY HOUR HEATMAP (2-col) -->
+    <section class="charts-grid adv-section">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">ROI by Day of Week</h2>
+            </div>
+            <div class="chart-container" style="height:220px">
+                <canvas id="dowChart"></canvas>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Entry Hour Heatmap <span style="font-size:11px;color:#71717a;font-weight:400">(UTC)</span></h2>
+            </div>
+            <div class="heatmap-wrap" id="hourHeatmap"></div>
+            <div class="heatmap-labels">
+                <span>0</span><span>6</span><span>12</span><span>18</span><span>23</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- OPPONENT STRENGTH + EDGE VS OUTCOME (2-col) -->
+    <section class="charts-grid adv-section">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Opponent Strength</h2>
+                <span class="badge badge-info" style="font-size:10px">bubble size = bet cost</span>
+            </div>
+            <div class="chart-container" style="height:240px">
+                <canvas id="opponentScatterChart"></canvas>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Edge vs Outcome</h2>
+                <span class="badge badge-info" style="font-size:10px">does edge predict P&amp;L?</span>
+            </div>
+            <div class="chart-container" style="height:240px">
+                <canvas id="edgeOutcomeChart"></canvas>
+            </div>
+        </div>
+    </section>
+
+    <!-- POSITION DETAIL MODAL -->
+    <div id="positionModal" class="pos-modal-overlay" onclick="closePosModal(event)">
+        <div class="pos-modal-panel" id="posModalPanel">
+            <button class="pos-modal-close" onclick="closePosModal()" title="Close">
+                <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                    <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+            </button>
+            <div id="posModalContent"></div>
+        </div>
+    </div>
 
     <!-- FOOTER -->
     <footer class="footer">

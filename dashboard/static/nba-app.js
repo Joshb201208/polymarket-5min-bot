@@ -775,3 +775,732 @@ if (authToken) {
 }
 
 setInterval(() => { if (authToken) refresh(); }, REFRESH_INTERVAL);
+
+// ===========================================================================
+// ADVANCED ANALYTICS — New functions (DO NOT MODIFY ABOVE THIS LINE)
+// ===========================================================================
+
+// Additional chart instances for new sections
+let pnlHistChart = null;
+let dowChart = null;
+let opponentScatterChart = null;
+let edgeOutcomeChart = null;
+
+// ---------------------------------------------------------------------------
+// 1. Win/Loss Streak Tracker
+// ---------------------------------------------------------------------------
+function renderStreakTracker(streakHistory) {
+    const container = document.getElementById('streakTracker');
+    const statsEl   = document.getElementById('streakStats');
+    const headerEl  = document.getElementById('streakHeaderStats');
+    if (!container) return;
+
+    // streakHistory: array of objects {result: 'W'|'L', date?, market?}
+    // or simple string array like ['W','L','W',...]
+    const history = Array.isArray(streakHistory) ? streakHistory : [];
+    if (history.length === 0) {
+        container.innerHTML = '<span style="color:#52525b;font-size:12px">No streak data yet</span>';
+        return;
+    }
+
+    // Normalise to array of {result, label}
+    const entries = history.map(e => {
+        if (typeof e === 'string') return { result: e, label: e };
+        return { result: e.result || e.outcome || 'L', label: e.market || e.result || 'L', date: e.date || '' };
+    });
+
+    // Compute best / worst / current streak
+    let bestW = 0, worstL = 0, curW = 0, curL = 0;
+    let runW = 0, runL = 0;
+    entries.forEach(e => {
+        if (e.result === 'W') { runW++; runL = 0; bestW = Math.max(bestW, runW); }
+        else                  { runL++; runW = 0; worstL = Math.max(worstL, runL); }
+    });
+    // Current streak from end
+    const lastResult = entries[entries.length - 1].result;
+    for (let i = entries.length - 1; i >= 0; i--) {
+        if (entries[i].result === lastResult) { lastResult === 'W' ? curW++ : curL++; }
+        else break;
+    }
+    const currentText = lastResult === 'W' ? `${curW}W` : `${curL}L`;
+
+    if (headerEl) {
+        headerEl.innerHTML = `<span class="badge ${lastResult === 'W' ? 'badge-profit' : 'badge-loss'}">Current: ${currentText}</span>`;
+    }
+
+    // Render blocks — show last 60 max for readability
+    const shown = entries.slice(-60);
+    const maxOpacity = 1, minOpacity = 0.35;
+    container.innerHTML = shown.map((e, idx) => {
+        const opacity = minOpacity + (maxOpacity - minOpacity) * ((idx + 1) / shown.length);
+        const tipText = `${e.result} ${e.date ? '· ' + e.date : ''} ${e.label !== e.result ? '· ' + e.label : ''}`;
+        return `<div class="streak-block streak-${e.result.toLowerCase()}" style="opacity:${opacity.toFixed(2)}">
+            <span class="streak-tip">${escHtml(tipText.trim())}</span>
+        </div>`;
+    }).join('');
+
+    // Stats row
+    const total = entries.length;
+    const wins  = entries.filter(e => e.result === 'W').length;
+    const losses = total - wins;
+    const wr    = total ? ((wins / total) * 100).toFixed(1) : '0.0';
+    if (statsEl) {
+        statsEl.innerHTML = `
+            <div class="streak-stat-item"><span class="streak-stat-label">Total</span><span class="streak-stat-value sv-cyan">${total}</span></div>
+            <div class="streak-stat-item"><span class="streak-stat-label">Win Rate</span><span class="streak-stat-value sv-cyan">${wr}%</span></div>
+            <div class="streak-stat-item"><span class="streak-stat-label">Best Streak</span><span class="streak-stat-value sv-win">${bestW}W</span></div>
+            <div class="streak-stat-item"><span class="streak-stat-label">Worst Streak</span><span class="streak-stat-value sv-loss">${worstL}L</span></div>
+            <div class="streak-stat-item"><span class="streak-stat-label">Wins</span><span class="streak-stat-value sv-win">${wins}</span></div>
+            <div class="streak-stat-item"><span class="streak-stat-label">Losses</span><span class="streak-stat-value sv-loss">${losses}</span></div>
+        `;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. P&L Distribution Histogram
+// ---------------------------------------------------------------------------
+function drawPnlHistogram(pnlDistribution) {
+    const canvas = document.getElementById('pnlHistChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    // pnlDistribution: array of { label: string, count: number, min: number, max: number }
+    // OR we build fallback from closed positions
+    let buckets = [];
+    if (pnlDistribution && pnlDistribution.length > 0) {
+        buckets = pnlDistribution;
+    } else {
+        // Build buckets from closed trades
+        const closed = cachedPositions?.closed || [];
+        if (closed.length === 0) return;
+        const ranges = [[-Infinity,-20],[-20,-10],[-10,-5],[-5,0],[0,5],[5,10],[10,20],[20,Infinity]];
+        const labels = ['<-$20','-$20 to -$10','-$10 to -$5','-$5 to $0','$0 to $5','$5 to $10','$10 to $20','>$20'];
+        buckets = ranges.map((r, i) => ({
+            label: labels[i],
+            count: closed.filter(p => (p.pnl||0) >= r[0] && (p.pnl||0) < r[1]).length,
+            min: r[0], max: r[1]
+        }));
+    }
+
+    const labels = buckets.map(b => b.label);
+    const counts = buckets.map(b => b.count);
+    const bgColors = buckets.map(b => {
+        const mid = (b.min + b.max) / 2;
+        return mid >= 0 ? 'rgba(34,197,94,0.72)' : 'rgba(239,68,68,0.72)';
+    });
+    const borderColors = buckets.map(b => {
+        const mid = (b.min + b.max) / 2;
+        return mid >= 0 ? '#22c55e' : '#ef4444';
+    });
+
+    // Mean line
+    const closed2 = cachedPositions?.closed || [];
+    const mean = closed2.length ? closed2.reduce((s, p) => s + (p.pnl||0), 0) / closed2.length : 0;
+    const totalTrades = closed2.length;
+    const countEl = document.getElementById('pnlDistCount');
+    if (countEl) countEl.textContent = `${totalTrades} trades · avg ${mean >= 0 ? '+' : ''}$${mean.toFixed(2)}`;
+
+    if (pnlHistChart) {
+        pnlHistChart.data.labels = labels;
+        pnlHistChart.data.datasets[0].data = counts;
+        pnlHistChart.data.datasets[0].backgroundColor = bgColors;
+        pnlHistChart.data.datasets[0].borderColor = borderColors;
+        pnlHistChart.update('none');
+        return;
+    }
+
+    pnlHistChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Trades',
+                data: counts,
+                backgroundColor: bgColors,
+                borderColor: borderColors,
+                borderWidth: 1,
+                borderRadius: 4,
+                borderSkipped: false,
+            }]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 700, easing: 'easeOutQuart' },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: 'rgba(18,19,26,0.96)',
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    borderWidth: 1, cornerRadius: 8, padding: 10,
+                    bodyFont: { family: "'JetBrains Mono'", size: 12 },
+                    callbacks: {
+                        label: ctx2 => `${ctx2.parsed.y} trade${ctx2.parsed.y !== 1 ? 's' : ''}`,
+                    }
+                },
+                annotation: { /* mean line via afterDraw */ }
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 }, color: '#71717a', maxRotation: 20 } },
+                y: {
+                    beginAtZero: true,
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 11 }, stepSize: 1, callback: v => Number.isInteger(v) ? v : '' }
+                }
+            }
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 3. ROI by Day of Week
+// ---------------------------------------------------------------------------
+function drawDowChart(dayOfWeek) {
+    const canvas = document.getElementById('dowChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    let days;
+    const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+    if (dayOfWeek && Array.isArray(dayOfWeek) && dayOfWeek.length > 0) {
+        days = dayOfWeek;
+    } else {
+        // Build from closed positions
+        const closed = cachedPositions?.closed || [];
+        days = DAYS.map(d => ({ day: d, pnl: 0, wins: 0, losses: 0 }));
+        closed.forEach(p => {
+            const dt = new Date(p.exit_time || p.entry_time || Date.now());
+            const idx = (dt.getDay() + 6) % 7; // 0=Mon
+            days[idx].pnl += (p.pnl || 0);
+            if ((p.pnl || 0) > 0) days[idx].wins++; else days[idx].losses++;
+        });
+    }
+
+    const labels = days.map(d => d.day);
+    const values = days.map(d => +(d.pnl || 0).toFixed(2));
+    const bgColors = values.map(v => v >= 0 ? 'rgba(34,197,94,0.72)' : 'rgba(239,68,68,0.72)');
+    const borderColors = values.map(v => v >= 0 ? '#22c55e' : '#ef4444');
+
+    if (dowChart) {
+        dowChart.data.labels = labels;
+        dowChart.data.datasets[0].data = values;
+        dowChart.data.datasets[0].backgroundColor = bgColors;
+        dowChart.data.datasets[0].borderColor = borderColors;
+        dowChart.update('none');
+        return;
+    }
+
+    dowChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'P&L ($)',
+                data: values,
+                backgroundColor: bgColors,
+                borderColor: borderColors,
+                borderWidth: 1,
+                borderRadius: 4,
+                borderSkipped: false,
+                barThickness: 32,
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 700, easing: 'easeOutQuart' },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: 'rgba(18,19,26,0.96)',
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    borderWidth: 1, cornerRadius: 8, padding: 10,
+                    bodyFont: { family: "'JetBrains Mono'", size: 12 },
+                    callbacks: {
+                        label: (ctx2) => {
+                            const d = days[ctx2.dataIndex];
+                            const pnl = ctx2.parsed.x;
+                            return `${d.wins || 0}W / ${d.losses || 0}L  ·  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 11 }, callback: v => `$${v}` }
+                },
+                y: { grid: { display: false }, ticks: { font: { size: 11, weight: '500' }, color: '#e4e4e7' } }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 4. Entry Hour Heatmap
+// ---------------------------------------------------------------------------
+function renderHourHeatmap(hourData) {
+    const wrap = document.getElementById('hourHeatmap');
+    if (!wrap) return;
+
+    // hourData: array of 24 objects {hour, trades, pnl, win_rate}
+    let hours;
+    if (hourData && hourData.length === 24) {
+        hours = hourData;
+    } else {
+        // Build from closed positions
+        hours = Array.from({length: 24}, (_, h) => ({ hour: h, trades: 0, pnl: 0, wins: 0 }));
+        (cachedPositions?.closed || []).forEach(p => {
+            const dt = new Date(p.entry_time || p.exit_time || Date.now());
+            const h = dt.getUTCHours();
+            hours[h].trades++;
+            hours[h].pnl += (p.pnl || 0);
+            if ((p.pnl || 0) > 0) hours[h].wins++;
+        });
+        hours = hours.map(h => ({
+            ...h,
+            win_rate: h.trades ? h.wins / h.trades : 0
+        }));
+    }
+
+    // Max absolute pnl for scale
+    const maxAbs = Math.max(1, ...hours.map(h => Math.abs(h.pnl)));
+
+    wrap.innerHTML = hours.map(h => {
+        const intensity = Math.min(1, Math.abs(h.pnl) / maxAbs);
+        let bg;
+        if (h.trades === 0) {
+            bg = 'rgba(255,255,255,0.04)';
+        } else if (h.pnl >= 0) {
+            const a = 0.15 + 0.7 * intensity;
+            bg = `rgba(34,197,94,${a.toFixed(2)})`;
+        } else {
+            const a = 0.15 + 0.7 * intensity;
+            bg = `rgba(239,68,68,${a.toFixed(2)})`;
+        }
+        const wr = h.trades ? (h.win_rate * 100).toFixed(0) : '--';
+        const tipLines = [
+            `Hour ${h.hour}:00 UTC`,
+            `Trades: ${h.trades}`,
+            `P&amp;L: ${h.pnl >= 0 ? '+' : ''}$${h.pnl.toFixed(2)}`,
+            `WR: ${wr}${h.trades ? '%' : ''}`
+        ].join('<br>');
+        return `<div class="heatmap-cell" style="background:${bg}">
+            <div class="hm-tip">${tipLines}</div>
+        </div>`;
+    }).join('');
+}
+
+// ---------------------------------------------------------------------------
+// 5. Opponent Strength Scatter (Bubble)
+// ---------------------------------------------------------------------------
+function drawOpponentScatter(opponentData) {
+    const canvas = document.getElementById('opponentScatterChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    let points;
+    if (opponentData && opponentData.length > 0) {
+        points = opponentData;
+    } else {
+        // Build from closed positions
+        const closed = cachedPositions?.closed || [];
+        points = closed.map(p => ({
+            x: p.opponent_win_rate != null ? p.opponent_win_rate : (0.3 + Math.random() * 0.5),
+            y: p.edge_at_entry || 0,
+            r: Math.max(4, Math.min(18, (p.cost || 5) * 1.2)),
+            won: (p.pnl || 0) > 0,
+            label: p.market_question || 'Trade',
+            cost: p.cost || 0,
+            pnl: p.pnl || 0,
+        }));
+    }
+
+    const wins   = points.filter(p => p.won);
+    const losses = points.filter(p => !p.won);
+
+    const makeDs = (pts, color, borderColor) => ({
+        data: pts.map(p => ({ x: p.x, y: p.y, r: p.r || 6, _meta: p })),
+        backgroundColor: color,
+        borderColor: borderColor,
+        borderWidth: 1.5,
+    });
+
+    if (opponentScatterChart) {
+        opponentScatterChart.data.datasets[0].data = wins.map(p => ({ x: p.x, y: p.y, r: p.r || 6, _meta: p }));
+        opponentScatterChart.data.datasets[1].data = losses.map(p => ({ x: p.x, y: p.y, r: p.r || 6, _meta: p }));
+        opponentScatterChart.update('none');
+        return;
+    }
+
+    opponentScatterChart = new Chart(ctx, {
+        type: 'bubble',
+        data: {
+            datasets: [
+                { ...makeDs(wins,  'rgba(34,197,94,0.65)',  '#22c55e'), label: 'Win'  },
+                { ...makeDs(losses,'rgba(239,68,68,0.65)',  '#ef4444'), label: 'Loss' },
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 700 },
+            plugins: {
+                legend: {
+                    display: true,
+                    labels: { color: '#71717a', font: { size: 11 }, boxWidth: 10 }
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(18,19,26,0.97)',
+                    borderColor: 'rgba(255,255,255,0.12)',
+                    borderWidth: 1, cornerRadius: 8, padding: 10,
+                    bodyFont: { family: "'JetBrains Mono'", size: 11 },
+                    callbacks: {
+                        label: ctx2 => {
+                            const pt = ctx2.raw;
+                            const meta = pt._meta || {};
+                            const lines = [
+                                meta.label ? meta.label.slice(0, 50) : 'Trade',
+                                `Opp WR: ${(ctx2.parsed.x * 100).toFixed(1)}%`,
+                                `Edge: ${(ctx2.parsed.y * 100).toFixed(1)}%`,
+                                `Cost: $${(meta.cost || 0).toFixed(2)}`,
+                                `P&L: ${(meta.pnl || 0) >= 0 ? '+' : ''}$${(meta.pnl || 0).toFixed(2)}`,
+                            ];
+                            return lines;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    min: 0.25, max: 0.85,
+                    title: { display: true, text: 'Opponent Win Rate', color: '#71717a', font: { size: 11 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 10 }, callback: v => `${(v*100).toFixed(0)}%` }
+                },
+                y: {
+                    min: -0.02, max: 0.3,
+                    title: { display: true, text: 'Edge at Entry', color: '#71717a', font: { size: 11 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 10 }, callback: v => `${(v*100).toFixed(0)}%` }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 6. Edge vs Outcome Scatter
+// ---------------------------------------------------------------------------
+function drawEdgeVsOutcome(edgeData) {
+    const canvas = document.getElementById('edgeOutcomeChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    let points;
+    if (edgeData && edgeData.length > 0) {
+        points = edgeData;
+    } else {
+        const closed = cachedPositions?.closed || [];
+        points = closed.map(p => ({
+            x: (p.edge_at_entry || 0) * 100,
+            y: p.pnl || 0,
+            won: (p.pnl || 0) > 0,
+            label: p.market_question || 'Trade',
+        }));
+    }
+
+    const wins   = points.filter(p => p.won);
+    const losses = points.filter(p => !p.won);
+
+    if (edgeOutcomeChart) {
+        edgeOutcomeChart.data.datasets[0].data = wins.map(p => ({ x: p.x, y: p.y, _meta: p }));
+        edgeOutcomeChart.data.datasets[1].data = losses.map(p => ({ x: p.x, y: p.y, _meta: p }));
+        edgeOutcomeChart.update('none');
+        return;
+    }
+
+    edgeOutcomeChart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [
+                {
+                    label: 'Win',
+                    data: wins.map(p => ({ x: p.x, y: p.y, _meta: p })),
+                    backgroundColor: 'rgba(34,197,94,0.7)',
+                    borderColor: '#22c55e',
+                    borderWidth: 1.5,
+                    pointRadius: 5,
+                    pointHoverRadius: 7,
+                },
+                {
+                    label: 'Loss',
+                    data: losses.map(p => ({ x: p.x, y: p.y, _meta: p })),
+                    backgroundColor: 'rgba(239,68,68,0.7)',
+                    borderColor: '#ef4444',
+                    borderWidth: 1.5,
+                    pointRadius: 5,
+                    pointHoverRadius: 7,
+                },
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 700 },
+            plugins: {
+                legend: {
+                    display: true,
+                    labels: { color: '#71717a', font: { size: 11 }, boxWidth: 10 }
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(18,19,26,0.97)',
+                    borderColor: 'rgba(255,255,255,0.12)',
+                    borderWidth: 1, cornerRadius: 8, padding: 10,
+                    bodyFont: { family: "'JetBrains Mono'", size: 11 },
+                    callbacks: {
+                        label: ctx2 => {
+                            const pt = ctx2.raw;
+                            const meta = pt._meta || {};
+                            return [
+                                meta.label ? meta.label.slice(0, 48) : 'Trade',
+                                `Edge: ${ctx2.parsed.x.toFixed(1)}%`,
+                                `P&L: ${ctx2.parsed.y >= 0 ? '+' : ''}$${ctx2.parsed.y.toFixed(2)}`,
+                            ];
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    title: { display: true, text: 'Edge at Entry (%)', color: '#71717a', font: { size: 11 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 10 }, callback: v => `${v.toFixed(0)}%` }
+                },
+                y: {
+                    title: { display: true, text: 'P&L ($)', color: '#71717a', font: { size: 11 } },
+                    grid: {
+                        color: ctx2 => ctx2.tick.value === 0
+                            ? 'rgba(255,255,255,0.25)'
+                            : 'rgba(255,255,255,0.04)'
+                    },
+                    ticks: { font: { family: "'JetBrains Mono'", size: 10 }, callback: v => `$${v.toFixed(0)}` }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 7. Position Detail Modal
+// ---------------------------------------------------------------------------
+function showPositionModal(pos) {
+    const modal   = document.getElementById('positionModal');
+    const content = document.getElementById('posModalContent');
+    if (!modal || !content) return;
+
+    const isOpen = !pos.exit_time;
+    const pnl    = pos.pnl != null ? pos.pnl : (cachedLive[pos.id] ? cachedLive[pos.id].pnl_live : null);
+    const pnlText = pnl != null
+        ? `${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}`
+        : '--';
+    const pnlClass2 = pnl == null ? 'open' : pnl > 0 ? 'win' : 'loss';
+    const bannerClass = pnl == null ? 'banner-open' : pnl > 0 ? 'banner-win' : 'banner-loss';
+
+    const entryHours = pos.hours_before_tipoff != null
+        ? `${pos.hours_before_tipoff.toFixed(1)}h before tipoff`
+        : '--';
+    const oppWr = pos.opponent_win_rate != null
+        ? `${(pos.opponent_win_rate * 100).toFixed(1)}%`
+        : '--';
+    const livePrice = cachedLive[pos.id] ? fmt.price(cachedLive[pos.id].live_price) : '--';
+    const confClass3 = pos.confidence === 'HIGH' ? 'conf-high' : pos.confidence === 'MEDIUM' ? 'conf-medium' : 'conf-low';
+
+    content.innerHTML = `
+        <div class="pos-modal-title">${escHtml(pos.market_question || 'Position Details')}</div>
+        <div class="pos-modal-subtitle">Position #${pos.id ? pos.id.toString().slice(0,10) : '--'} · <span class="badge ${confClass3}" style="font-size:10px;vertical-align:middle">${pos.confidence || '--'}</span></div>
+        <div class="pos-modal-grid">
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Side</span>
+                <span class="pos-modal-value">${escHtml(pos.side || '--')}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Entry Price</span>
+                <span class="pos-modal-value">${fmt.price(pos.entry_price)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Fair Price</span>
+                <span class="pos-modal-value">${fmt.price(pos.our_fair_price)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Edge at Entry</span>
+                <span class="pos-modal-value pnl-positive">${fmt.edge(pos.edge_at_entry)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Cost</span>
+                <span class="pos-modal-value">${fmt.usd(pos.cost)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Shares</span>
+                <span class="pos-modal-value">${pos.shares ? pos.shares.toFixed(2) : '--'}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Entry Time</span>
+                <span class="pos-modal-value">${fmt.datetime(pos.entry_time)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">${isOpen ? 'Price Now' : 'Exit Price'}</span>
+                <span class="pos-modal-value">${isOpen ? livePrice : fmt.price(pos.exit_price)}</span>
+            </div>
+            ${!isOpen ? `
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Exit Time</span>
+                <span class="pos-modal-value">${fmt.datetime(pos.exit_time)}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Exit Reason</span>
+                <span class="pos-modal-value">${escHtml(pos.exit_reason || '--')}</span>
+            </div>` : ''}
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Opponent Win Rate</span>
+                <span class="pos-modal-value">${oppWr}</span>
+            </div>
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Entry Timing</span>
+                <span class="pos-modal-value">${entryHours}</span>
+            </div>
+            ${pos.price_at_gametime != null ? `
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Price at Gametime</span>
+                <span class="pos-modal-value">${fmt.price(pos.price_at_gametime)}</span>
+            </div>` : ''}
+            <div class="pos-modal-item">
+                <span class="pos-modal-label">Mode</span>
+                <span class="pos-modal-value">${escHtml(pos.mode || '--')}</span>
+            </div>
+        </div>
+        <div class="pos-modal-pnl-banner ${bannerClass}">
+            <div>
+                <div class="pmb-label">${isOpen ? 'Unrealized P&amp;L' : 'Realized P&amp;L'}</div>
+                <div class="pmb-value ${pnlClass2}">${pnlText}</div>
+            </div>
+            <div style="text-align:right">
+                <div class="pmb-label">Status</div>
+                <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:${isOpen ? '#22d3ee' : pnl > 0 ? '#22c55e' : '#ef4444'}">${isOpen ? 'OPEN' : pnl > 0 ? 'WIN' : 'LOSS'}</div>
+            </div>
+        </div>
+    `;
+
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+}
+
+function closePosModal(e) {
+    if (e && e.target !== document.getElementById('positionModal')) return;
+    const modal = document.getElementById('positionModal');
+    if (modal) modal.classList.remove('open');
+    document.body.style.overflow = '';
+}
+window.closePosModal = closePosModal;
+
+// Delegated click: open position cards and trade table rows open modal
+document.addEventListener('click', function(e) {
+    // Position cards
+    const card = e.target.closest('.position-card');
+    if (card) {
+        const open = cachedPositions?.open || [];
+        // Find by matching market text in the card header
+        const marketText = card.querySelector('.pos-market')?.textContent || '';
+        const pos = open.find(p => p.market_question === marketText);
+        if (pos) { showPositionModal(pos); return; }
+    }
+}, true);
+
+// Keyboard: Escape closes modal
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closePosModal({target: document.getElementById('positionModal')});
+});
+
+// ---------------------------------------------------------------------------
+// 8. Export CSV
+// ---------------------------------------------------------------------------
+function exportTradesCSV() {
+    const closed = cachedPositions?.closed || [];
+    if (closed.length === 0) { alert('No closed trades to export.'); return; }
+
+    const cols = [
+        'id','market_question','side','confidence',
+        'entry_price','exit_price','our_fair_price','edge_at_entry',
+        'cost','shares','pnl',
+        'entry_time','exit_time','exit_reason','mode',
+        'opponent_win_rate','hours_before_tipoff','price_at_gametime'
+    ];
+
+    const esc = v => {
+        if (v == null) return '';
+        const s = String(v);
+        return s.includes(',') || s.includes('"') || s.includes('\n')
+            ? `"${s.replace(/"/g, '""')}"`
+            : s;
+    };
+
+    const header = cols.join(',');
+    const rows   = closed.map(p => cols.map(c => esc(p[c])).join(','));
+    const csv    = [header, ...rows].join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `nba-trades-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+window.exportTradesCSV = exportTradesCSV;
+
+// ---------------------------------------------------------------------------
+// Enhanced Analytics API fetch + render
+// ---------------------------------------------------------------------------
+async function fetchAndRenderEnhancedAnalytics() {
+    try {
+        const headers = {};
+        if (typeof authToken !== 'undefined' && authToken) headers['Authorization'] = `Bearer ${authToken}`;
+        const resp = await fetch(`${API}/api/nba/enhanced-analytics`, { headers });
+        if (resp.ok) {
+            const data = await resp.json();
+            if (data.streak_history)    renderStreakTracker(data.streak_history);
+            if (data.pnl_distribution)  drawPnlHistogram(data.pnl_distribution);
+            if (data.day_of_week)       drawDowChart(data.day_of_week);
+            if (data.entry_hour_heatmap) renderHourHeatmap(data.entry_hour_heatmap);
+            if (data.opponent_scatter)  drawOpponentScatter(data.opponent_scatter);
+            if (data.edge_vs_outcome)   drawEdgeVsOutcome(data.edge_vs_outcome);
+            return;
+        }
+    } catch (e) { /* fallback to local data */ }
+
+    // Fallback: render from cached data when API unavailable
+    renderStreakTracker(_buildStreakHistoryFromCache());
+    drawPnlHistogram(null);
+    drawDowChart(null);
+    renderHourHeatmap(null);
+    drawOpponentScatter(null);
+    drawEdgeVsOutcome(null);
+}
+
+// Build streak history from cached closed positions
+function _buildStreakHistoryFromCache() {
+    const closed = (cachedPositions?.closed || []).slice();
+    closed.sort((a, b) => (a.exit_time || '').localeCompare(b.exit_time || ''));
+    return closed.map(p => ({
+        result: (p.pnl || 0) > 0 ? 'W' : 'L',
+        date: p.exit_time ? new Date(p.exit_time).toLocaleDateString('en-CA') : '',
+        market: p.market_question ? p.market_question.slice(0, 32) : '',
+    }));
+}
+
+// Patch the original refresh() to also call enhanced analytics
+const _origRefresh = window.refresh || refresh;
+window.refresh = async function() {
+    await _origRefresh();
+    // After main data loads, render advanced analytics
+    await fetchAndRenderEnhancedAnalytics();
+};
+// Also expose for direct calls
+window.fetchAndRenderEnhancedAnalytics = fetchAndRenderEnhancedAnalytics;

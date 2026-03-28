@@ -2035,6 +2035,441 @@ def get_analytics_signal_performance() -> dict:
     }
 
 
+# ===========================================================================
+# Dashboard Overhaul — Combined & Enhanced Endpoints
+# ===========================================================================
+
+@app.get("/api/combined/overview", dependencies=[Depends(_require_auth)])
+def get_combined_overview() -> dict:
+    """Combined portfolio overview across NBA and Events agents."""
+    from datetime import timedelta as td
+
+    SGT = timezone(td(hours=8))
+    now_sgt = datetime.now(SGT)
+    today_start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+    bankroll_data = _read_json("bankroll.json")
+    system_status = _read_json("system_status.json")
+
+    # --- NBA agent data ---
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_trades_raw = _read_json("trades.json").get("trades", [])
+    nba_open = [p for p in nba_positions if p.get("status") == "open"]
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+
+    nba_mode = "paper"
+    if nba_trades_raw:
+        nba_mode = nba_trades_raw[-1].get("mode", "paper")
+
+    nba_total_pnl = sum(p.get("pnl", 0) or 0 for p in nba_closed)
+    nba_total_trades = len(nba_closed)
+    nba_wins = sum(1 for p in nba_closed if (p.get("pnl") or 0) > 0)
+    nba_win_rate = round(nba_wins / nba_total_trades * 100, 1) if nba_total_trades > 0 else 0.0
+
+    # NBA today P&L and trades (SGT)
+    nba_today_pnl = 0.0
+    nba_today_trades = 0
+    for p in nba_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts and exit_ts >= today_start:
+            nba_today_pnl += p.get("pnl", 0) or 0
+            nba_today_trades += 1
+
+    nba_last_scan = system_status.get("nba_last_scan")
+    if not nba_last_scan and nba_trades_raw:
+        ts_list = [t.get("timestamp") for t in nba_trades_raw if t.get("timestamp")]
+        if ts_list:
+            nba_last_scan = max(ts_list)
+
+    # --- Events agent data ---
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_trades_raw = _read_json("events_trades.json").get("trades", [])
+    events_open = [p for p in events_positions if p.get("status") == "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open"]
+
+    events_mode = "paper"
+    if events_trades_raw:
+        events_mode = events_trades_raw[-1].get("mode", "paper")
+
+    events_total_pnl = sum(p.get("pnl", 0) or 0 for p in events_closed)
+    events_total_trades = len(events_closed)
+    events_wins = sum(1 for p in events_closed if (p.get("pnl") or 0) > 0)
+    events_win_rate = round(events_wins / events_total_trades * 100, 1) if events_total_trades > 0 else 0.0
+
+    # Events today P&L and trades (SGT)
+    events_today_pnl = 0.0
+    events_today_trades = 0
+    for p in events_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts and exit_ts >= today_start:
+            events_today_pnl += p.get("pnl", 0) or 0
+            events_today_trades += 1
+
+    events_last_scan = system_status.get("events_last_scan")
+
+    # --- Combined totals ---
+    total_open = nba_open + events_open
+    total_exposure = sum(p.get("cost", 0) or 0 for p in total_open)
+
+    return {
+        "total_portfolio": round(bankroll_data.get("current_bankroll", 0), 2),
+        "total_pnl": round(nba_total_pnl + events_total_pnl, 2),
+        "total_open_positions": len(total_open),
+        "total_exposure": round(total_exposure, 2),
+        "today_pnl": round(nba_today_pnl + events_today_pnl, 2),
+        "today_trades": nba_today_trades + events_today_trades,
+        "nba": {
+            "mode": nba_mode,
+            "open_count": len(nba_open),
+            "today_pnl": round(nba_today_pnl, 2),
+            "today_trades": nba_today_trades,
+            "win_rate": nba_win_rate,
+            "total_trades": nba_total_trades,
+            "last_scan": nba_last_scan,
+        },
+        "events": {
+            "mode": events_mode,
+            "open_count": len(events_open),
+            "today_pnl": round(events_today_pnl, 2),
+            "today_trades": events_today_trades,
+            "win_rate": events_win_rate,
+            "total_trades": events_total_trades,
+            "last_scan": events_last_scan,
+        },
+    }
+
+
+@app.get("/api/combined/equity-curve", dependencies=[Depends(_require_auth)])
+def get_combined_equity_curve() -> dict:
+    """Daily cumulative P&L for NBA, Events, and combined — grouped by SGT date."""
+    from datetime import timedelta as td
+
+    SGT = timezone(td(hours=8))
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+
+    # NBA daily P&L
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+    nba_daily: dict[str, float] = defaultdict(float)
+    for p in nba_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            nba_daily[day] += p.get("pnl", 0) or 0
+
+    # Events daily P&L
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_daily: dict[str, float] = defaultdict(float)
+    for p in events_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            events_daily[day] += p.get("pnl", 0) or 0
+
+    all_days = sorted(set(list(nba_daily.keys()) + list(events_daily.keys())))
+
+    dates = []
+    nba_cumulative = []
+    events_cumulative = []
+    combined_cumulative = []
+    nba_running = 0.0
+    events_running = 0.0
+
+    for day in all_days:
+        nba_running += nba_daily.get(day, 0.0)
+        events_running += events_daily.get(day, 0.0)
+        dates.append(day)
+        nba_cumulative.append(round(nba_running, 2))
+        events_cumulative.append(round(events_running, 2))
+        combined_cumulative.append(round(nba_running + events_running, 2))
+
+    return {
+        "dates": dates,
+        "nba_cumulative": nba_cumulative,
+        "events_cumulative": events_cumulative,
+        "combined_cumulative": combined_cumulative,
+        "starting_bankroll": starting,
+    }
+
+
+@app.get("/api/combined/heatmap", dependencies=[Depends(_require_auth)])
+def get_combined_heatmap() -> dict:
+    """90-day calendar heatmap: daily P&L and trade counts across both agents."""
+    from datetime import timedelta as td
+
+    SGT = timezone(td(hours=8))
+    now_sgt = datetime.now(SGT)
+    cutoff = now_sgt - td(days=90)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    # Collect daily stats from NBA
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
+
+    nba_day_pnl: dict[str, float] = defaultdict(float)
+    nba_day_trades: dict[str, int] = defaultdict(int)
+    for p in nba_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            if day >= cutoff_str:
+                nba_day_pnl[day] += p.get("pnl", 0) or 0
+                nba_day_trades[day] += 1
+
+    # Collect daily stats from Events
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    events_closed = [p for p in events_positions if p.get("status") != "open"]
+
+    events_day_pnl: dict[str, float] = defaultdict(float)
+    events_day_trades: dict[str, int] = defaultdict(int)
+    for p in events_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
+            if day >= cutoff_str:
+                events_day_pnl[day] += p.get("pnl", 0) or 0
+                events_day_trades[day] += 1
+
+    all_days = sorted(set(list(nba_day_pnl.keys()) + list(events_day_pnl.keys())))
+
+    days_out = []
+    for day in all_days:
+        nba_pnl = nba_day_pnl.get(day, 0.0)
+        ev_pnl = events_day_pnl.get(day, 0.0)
+        total_trades = nba_day_trades.get(day, 0) + events_day_trades.get(day, 0)
+        days_out.append({
+            "date": day,
+            "pnl": round(nba_pnl + ev_pnl, 2),
+            "trades": total_trades,
+            "nba_pnl": round(nba_pnl, 2),
+            "events_pnl": round(ev_pnl, 2),
+        })
+
+    return {"days": days_out}
+
+
+@app.get("/api/combined/activity-feed", dependencies=[Depends(_require_auth)])
+def get_combined_activity_feed() -> dict:
+    """Last 50 activities (trades placed / resolved) across both agents, newest first."""
+    activities: list[dict] = []
+
+    # --- NBA: derive from positions (closed = resolved, open = placed) ---
+    nba_positions = _read_json("positions.json").get("positions", [])
+    for p in nba_positions:
+        question = p.get("market_question") or ""
+        short_q = question[:60] + ("..." if len(question) > 60 else "")
+        pnl = p.get("pnl") or 0
+
+        if p.get("status") != "open" and p.get("exit_time"):
+            # Resolved trade
+            won = pnl > 0
+            label = f"WIN +${pnl:.2f}" if won else f"LOSS ${pnl:.2f}"
+            activities.append({
+                "time": p["exit_time"],
+                "agent": "nba",
+                "type": "win" if won else "loss",
+                "description": f"{short_q} — {label}",
+                "amount": round(abs(pnl), 2),
+            })
+        elif p.get("status") == "open" and p.get("entry_time"):
+            # Bet placed
+            cost = p.get("cost", 0) or 0
+            side = p.get("side", "YES")
+            entry_price = p.get("entry_price", 0) or 0
+            activities.append({
+                "time": p["entry_time"],
+                "agent": "nba",
+                "type": "bet_placed",
+                "description": f"{short_q} — {side} @ {entry_price:.2f}",
+                "amount": round(cost, 2),
+            })
+
+    # --- Events: derive from positions ---
+    events_positions = _read_json("events_positions.json").get("positions", [])
+    for p in events_positions:
+        question = p.get("market_question") or ""
+        short_q = question[:60] + ("..." if len(question) > 60 else "")
+        pnl = p.get("pnl") or 0
+        side = p.get("side", "YES")
+        entry_price = p.get("entry_price", 0) or 0
+        cost = p.get("cost", 0) or 0
+        # Format price as cents
+        price_cents = f"{entry_price * 100:.1f}¢"
+
+        if p.get("status") != "open" and p.get("exit_time"):
+            won = pnl > 0
+            label = f"WIN +${pnl:.2f}" if won else f"LOSS ${pnl:.2f}"
+            activities.append({
+                "time": p["exit_time"],
+                "agent": "events",
+                "type": "win" if won else "loss",
+                "description": f"{short_q} — {label}",
+                "amount": round(abs(pnl), 2),
+            })
+        elif p.get("status") == "open" and p.get("entry_time"):
+            activities.append({
+                "time": p["entry_time"],
+                "agent": "events",
+                "type": "bet_placed",
+                "description": f"{short_q} — {side} @ {price_cents}",
+                "amount": round(cost, 2),
+            })
+
+    # Sort descending by time, limit 50
+    activities.sort(key=lambda a: a["time"] or "", reverse=True)
+    return {"activities": activities[:50]}
+
+
+@app.get("/api/nba/enhanced-analytics", dependencies=[Depends(_require_auth)])
+def get_nba_enhanced_analytics() -> dict:
+    """Enhanced NBA analytics: P&L histogram, day-of-week, hourly heatmap, streaks, scatter."""
+    from datetime import timedelta as td
+    import math
+
+    SGT = timezone(td(hours=8))
+
+    nba_positions = _read_json("positions.json").get("positions", [])
+    closed = [p for p in nba_positions if p.get("status") != "open"]
+    # Sort chronologically for streak computation
+    closed_sorted = sorted(closed, key=lambda p: p.get("exit_time") or "")
+
+    # --- P&L Distribution Histogram ---
+    pnl_values = [p.get("pnl", 0) or 0 for p in closed]
+    # Fixed bucket boundaries
+    buckets = [
+        (float("-inf"), -30, "< -$30"),
+        (-30, -20, "-$30 to -$20"),
+        (-20, -10, "-$20 to -$10"),
+        (-10, 0,  "-$10 to $0"),
+        (0,   10,  "$0 to $10"),
+        (10,  20,  "$10 to $20"),
+        (20,  30,  "$20 to $30"),
+        (30,  float("inf"), "> $30"),
+    ]
+    bucket_counts: dict[str, int] = {label: 0 for _, _, label in buckets}
+    for pnl in pnl_values:
+        for lo, hi, label in buckets:
+            if lo <= pnl < hi:
+                bucket_counts[label] += 1
+                break
+    pnl_distribution = [{"bucket": label, "count": cnt} for label, cnt in bucket_counts.items()]
+
+    # --- Day-of-Week breakdown (SGT exit date) ---
+    days_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    dow_data: dict[str, dict] = {d: {"trades": 0, "pnl": 0.0, "wins": 0} for d in days_order}
+    for p in closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            day_abbr = exit_ts.astimezone(SGT).strftime("%a")  # Mon, Tue, ...
+            if day_abbr in dow_data:
+                dow_data[day_abbr]["trades"] += 1
+                dow_data[day_abbr]["pnl"] += p.get("pnl", 0) or 0
+                if (p.get("pnl") or 0) > 0:
+                    dow_data[day_abbr]["wins"] += 1
+    day_of_week = []
+    for d in days_order:
+        v = dow_data[d]
+        t = v["trades"]
+        wr = round(v["wins"] / t * 100, 1) if t > 0 else 0.0
+        day_of_week.append({"day": d, "trades": t, "pnl": round(v["pnl"], 2), "win_rate": wr})
+
+    # --- Entry Hour Heatmap (UTC hour of entry_time) ---
+    hour_data: dict[int, dict] = {h: {"trades": 0, "pnl": 0.0, "wins": 0} for h in range(24)}
+    for p in closed:
+        entry_ts = _parse_ts(p.get("entry_time"))
+        if entry_ts:
+            h = entry_ts.astimezone(timezone.utc).hour
+            hour_data[h]["trades"] += 1
+            hour_data[h]["pnl"] += p.get("pnl", 0) or 0
+            if (p.get("pnl") or 0) > 0:
+                hour_data[h]["wins"] += 1
+    entry_hour_heatmap = []
+    for h in range(24):
+        v = hour_data[h]
+        t = v["trades"]
+        wr = round(v["wins"] / t * 100, 1) if t > 0 else 0.0
+        entry_hour_heatmap.append({"hour": h, "trades": t, "pnl": round(v["pnl"], 2), "win_rate": wr})
+
+    # --- Streak History (chronological W/L sequence) ---
+    streak_history = []
+    for p in closed_sorted:
+        streak_history.append("W" if (p.get("pnl") or 0) > 0 else "L")
+
+    # --- Opponent Scatter (opponent win% vs edge at entry) ---
+    opponent_scatter = []
+    for p in closed:
+        opp_wr = p.get("opponent_win_pct")
+        edge = p.get("edge_at_entry")
+        cost = p.get("cost", 0) or 0
+        if opp_wr is not None and edge is not None:
+            opponent_scatter.append({
+                "opponent_wr": round(float(opp_wr), 4),
+                "edge": round(float(edge), 4),
+                "bet_size": round(cost, 2),
+                "won": (p.get("pnl") or 0) > 0,
+                "market": (p.get("market_question") or "")[:60],
+            })
+
+    # --- Edge vs Outcome Scatter ---
+    edge_vs_outcome = []
+    for p in closed:
+        edge = p.get("edge_at_entry")
+        pnl = p.get("pnl") or 0
+        if edge is not None:
+            edge_vs_outcome.append({
+                "edge_at_entry": round(float(edge), 4),
+                "pnl": round(pnl, 2),
+                "won": pnl > 0,
+                "market": (p.get("market_question") or "")[:60],
+            })
+
+    # --- Sizing Funnel ---
+    raw_kelly_values = [p.get("raw_kelly") for p in closed if p.get("raw_kelly") is not None]
+    capped_values   = [p.get("kelly_capped") for p in closed if p.get("kelly_capped") is not None]
+    floored_values  = [p.get("kelly_floored") for p in closed if p.get("kelly_floored") is not None]
+    final_sizes     = [p.get("cost", 0) or 0 for p in closed]
+
+    def _avg(lst: list) -> float:
+        return round(sum(lst) / len(lst), 4) if lst else 0.0
+
+    sizing_funnel = {
+        "raw_kelly_avg": _avg(raw_kelly_values),
+        "after_cap": _avg(capped_values),
+        "after_floor": _avg(floored_values),
+        "final_avg": round(_avg(final_sizes), 2),
+    }
+
+    return {
+        "pnl_distribution": pnl_distribution,
+        "day_of_week": day_of_week,
+        "entry_hour_heatmap": entry_hour_heatmap,
+        "streak_history": streak_history,
+        "opponent_scatter": opponent_scatter,
+        "edge_vs_outcome": edge_vs_outcome,
+        "sizing_funnel": sizing_funnel,
+    }
+
+
+@app.get("/api/combined/odds-snapshot", dependencies=[Depends(_require_auth)])
+def get_combined_odds_snapshot() -> dict:
+    """Current odds being watched across both agents. Reads odds_snapshots.json."""
+    data = _read_json("odds_snapshots.json")
+    if not data:
+        return {"snapshots": [], "last_updated": None}
+
+    # Support both dict-with-snapshots and raw list formats
+    if isinstance(data, list):
+        snapshots = data
+        last_updated = None
+    else:
+        snapshots = data.get("snapshots", [])
+        last_updated = data.get("last_updated") or data.get("timestamp")
+
+    return {"snapshots": snapshots, "last_updated": last_updated}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)

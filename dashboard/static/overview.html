@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Agent — Overview</title>
+    <meta name="description" content="Overview command center for Polymarket NBA + Events betting agents">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="style.css">
+
+    <style>
+        /* ===================================================================
+           Overview Command Center — Supplemental Styles
+           =================================================================== */
+
+        /* Hero KPIs — 5 columns */
+        .overview-hero {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
+            padding: 0 24px 0;
+        }
+        @media (max-width: 1200px) {
+            .overview-hero { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 768px) {
+            .overview-hero { grid-template-columns: repeat(2, 1fr); padding: 0 16px; }
+            .overview-hero .kpi-card:first-child { grid-column: 1 / -1; }
+        }
+        @media (max-width: 480px) {
+            .overview-hero { grid-template-columns: 1fr; }
+            .overview-hero .kpi-card:first-child { grid-column: auto; }
+        }
+
+        /* Two-column agent cards */
+        .agent-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        @media (max-width: 768px) {
+            .agent-columns { grid-template-columns: 1fr; }
+        }
+
+        /* Agent card accents */
+        .agent-card-nba {
+            border-top: 2px solid var(--primary);
+            position: relative;
+        }
+        .agent-card-nba::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 40px;
+            background: linear-gradient(to bottom, rgba(0,240,255,0.04), transparent);
+            border-radius: var(--radius) var(--radius) 0 0;
+            pointer-events: none;
+        }
+        .agent-card-events {
+            border-top: 2px solid var(--secondary);
+            position: relative;
+        }
+        .agent-card-events::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 40px;
+            background: linear-gradient(to bottom, rgba(139,92,246,0.04), transparent);
+            border-radius: var(--radius) var(--radius) 0 0;
+            pointer-events: none;
+        }
+
+        /* Agent card stats grid */
+        .agent-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 16px 0;
+        }
+        .agent-stat {
+            text-align: center;
+            background: rgba(255,255,255,0.02);
+            border-radius: var(--radius-sm);
+            padding: 10px 8px;
+        }
+        .agent-stat-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+        .agent-stat-value {
+            font-family: var(--mono);
+            font-size: 15px;
+            font-weight: 500;
+            color: var(--text);
+        }
+
+        /* Sparkline container */
+        .agent-sparkline {
+            height: 48px;
+            margin-top: 12px;
+        }
+
+        /* Agent card link */
+        .agent-card-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            text-decoration: none;
+            padding: 6px 14px;
+            border-radius: 20px;
+            transition: all var(--transition);
+        }
+        .agent-card-link-nba {
+            color: var(--primary);
+            background: var(--primary-dim);
+            border: 1px solid rgba(0,240,255,0.2);
+        }
+        .agent-card-link-nba:hover {
+            background: rgba(0,240,255,0.2);
+            box-shadow: 0 0 12px rgba(0,240,255,0.15);
+        }
+        .agent-card-link-events {
+            color: var(--secondary);
+            background: var(--secondary-dim);
+            border: 1px solid rgba(139,92,246,0.2);
+        }
+        .agent-card-link-events:hover {
+            background: rgba(139,92,246,0.2);
+            box-shadow: 0 0 12px rgba(139,92,246,0.15);
+        }
+
+        /* Agent header */
+        .agent-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .agent-title {
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+        .agent-title-nba { color: var(--primary); }
+        .agent-title-events { color: var(--secondary); }
+
+        /* ===================================================================
+           Combined Equity Curve
+           =================================================================== */
+        .equity-section-overview {
+            padding: 0 24px 16px;
+        }
+        @media (max-width: 768px) {
+            .equity-section-overview { padding: 0 16px 16px; }
+        }
+        .equity-chart-wrap {
+            height: 260px;
+            position: relative;
+        }
+
+        /* ===================================================================
+           Calendar Heatmap
+           =================================================================== */
+        .heatmap-wrap {
+            overflow-x: auto;
+            padding: 8px 0 4px;
+        }
+        .heatmap-svg {
+            display: block;
+            min-width: 600px;
+        }
+        .heatmap-legend {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            justify-content: flex-end;
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+        .legend-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            display: inline-block;
+        }
+
+        /* Heatmap tooltip */
+        .heatmap-tooltip {
+            position: fixed;
+            background: var(--surface);
+            border: 1px solid var(--border-hover);
+            border-radius: var(--radius-sm);
+            padding: 8px 12px;
+            font-size: 12px;
+            color: var(--text);
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+            white-space: nowrap;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+        .heatmap-tooltip.visible { display: block; }
+        .heatmap-tooltip-date { color: var(--text-muted); font-size: 11px; margin-bottom: 2px; }
+        .heatmap-tooltip-pnl { font-family: var(--mono); font-weight: 600; font-size: 14px; }
+
+        /* ===================================================================
+           Live Activity Feed
+           =================================================================== */
+        .activity-feed {
+            max-height: 360px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.1) transparent;
+        }
+        .activity-feed::-webkit-scrollbar { width: 4px; }
+        .activity-feed::-webkit-scrollbar-track { background: transparent; }
+        .activity-feed::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+
+        .activity-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+            transition: background var(--transition);
+        }
+        .activity-item:last-child { border-bottom: none; }
+        .activity-item:hover { background: rgba(255,255,255,0.02); margin: 0 -16px; padding: 10px 16px; }
+
+        .activity-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            flex-shrink: 0;
+        }
+        .activity-icon-bet {
+            background: rgba(0,240,255,0.1);
+            color: var(--primary);
+            border: 1px solid rgba(0,240,255,0.2);
+        }
+        .activity-icon-win {
+            background: var(--profit-dim);
+            color: var(--profit);
+            border: 1px solid rgba(34,197,94,0.2);
+        }
+        .activity-icon-loss {
+            background: var(--loss-dim);
+            color: var(--loss);
+            border: 1px solid rgba(239,68,68,0.2);
+        }
+
+        .activity-badge {
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            padding: 2px 7px;
+            border-radius: 10px;
+            flex-shrink: 0;
+        }
+        .activity-badge-nba {
+            background: rgba(0,240,255,0.1);
+            color: var(--primary);
+            border: 1px solid rgba(0,240,255,0.2);
+        }
+        .activity-badge-events {
+            background: var(--secondary-dim);
+            color: var(--secondary);
+            border: 1px solid rgba(139,92,246,0.2);
+        }
+
+        .activity-desc {
+            flex: 1;
+            font-size: 13px;
+            color: var(--text);
+            line-height: 1.4;
+        }
+        .activity-time {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-family: var(--mono);
+            flex-shrink: 0;
+        }
+        .activity-amount {
+            font-family: var(--mono);
+            font-size: 13px;
+            font-weight: 600;
+            flex-shrink: 0;
+            min-width: 64px;
+            text-align: right;
+        }
+
+        /* ===================================================================
+           Odds Comparison Table
+           =================================================================== */
+        .overview-odds-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .overview-odds-table th {
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+        .overview-odds-table th:hover { color: var(--primary); }
+        .sort-active { color: var(--primary) !important; }
+
+        .edge-positive { color: var(--profit); }
+        .edge-strong { color: var(--profit); font-weight: 600; }
+        .edge-negative { color: var(--loss); }
+
+        .status-badge {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.07em;
+            text-transform: uppercase;
+            padding: 3px 9px;
+            border-radius: 12px;
+        }
+        .status-no-edge {
+            background: rgba(113,113,122,0.12);
+            color: var(--text-muted);
+            border: 1px solid rgba(113,113,122,0.2);
+        }
+        .status-watching {
+            background: rgba(234,179,8,0.12);
+            color: #eab308;
+            border: 1px solid rgba(234,179,8,0.25);
+        }
+        .status-bet-placed {
+            background: var(--profit-dim);
+            color: var(--profit);
+            border: 1px solid rgba(34,197,94,0.25);
+        }
+
+        /* ===================================================================
+           Overview layout padding
+           =================================================================== */
+        .overview-section {
+            padding: 0 24px 16px;
+        }
+        @media (max-width: 768px) {
+            .overview-section { padding: 0 16px 16px; }
+        }
+
+        /* Mode badge colors */
+        .mode-badge-live {
+            background: rgba(34,197,94,0.1);
+            color: var(--profit);
+            border-color: rgba(34,197,94,0.25);
+        }
+        .mode-badge-live .mode-dot { background: var(--profit); box-shadow: 0 0 6px var(--profit); }
+        .mode-badge-paper {
+            background: rgba(234,179,8,0.1);
+            color: #eab308;
+            border-color: rgba(234,179,8,0.25);
+        }
+        .mode-badge-paper .mode-dot { background: #eab308; box-shadow: 0 0 6px #eab308; }
+
+        /* Two mode badges side by side */
+        .mode-badges-row {
+            display: flex;
+            gap: 6px;
+        }
+
+        /* KPI portfolio glow — overview */
+        .overview-portfolio-glow {
+            background: linear-gradient(135deg, rgba(0,240,255,0.05) 0%, rgba(139,92,246,0.05) 100%);
+        }
+
+        /* Gradient KPI accent for combined */
+        .kpi-combined-accent {
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* Agent card last scan */
+        .agent-last-scan {
+            font-size: 11px;
+            color: var(--text-dim);
+            margin-top: 4px;
+        }
+
+        /* Empty activity state */
+        .activity-empty {
+            padding: 40px 0;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        /* Spinner for loading */
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-spinner {
+            width: 16px; height: 16px;
+            border: 2px solid rgba(255,255,255,0.1);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            display: inline-block;
+        }
+
+        /* Overview logo subtitle */
+        .logo-subtitle-overview {
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* Pulse animation for live dot */
+        @keyframes live-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .live-pulse { animation: live-pulse 2s ease-in-out infinite; }
+    </style>
+</head>
+<body>
+
+    <!-- LOGIN SCREEN -->
+    <div id="loginOverlay" class="login-overlay">
+        <canvas id="loginCanvas"></canvas>
+        <div class="login-orb login-orb-1"></div>
+        <div class="login-orb login-orb-2"></div>
+        <div class="login-orb login-orb-3"></div>
+        <div class="login-grid-bg"></div>
+        <div class="login-scanline"></div>
+        <div class="login-container">
+            <div class="login-ring-wrap">
+                <svg class="login-ring" width="120" height="120" viewBox="0 0 120 120" fill="none">
+                    <circle cx="60" cy="60" r="56" stroke="url(#ringGrad)" stroke-width="1" stroke-dasharray="6 8" opacity="0.4"/>
+                    <circle cx="60" cy="60" r="46" stroke="url(#ringGrad2)" stroke-width="0.75" stroke-dasharray="3 6" opacity="0.3"/>
+                    <defs>
+                        <linearGradient id="ringGrad" x1="0" y1="0" x2="120" y2="120">
+                            <stop offset="0%" stop-color="#00f0ff"/>
+                            <stop offset="100%" stop-color="#8b5cf6"/>
+                        </linearGradient>
+                        <linearGradient id="ringGrad2" x1="120" y1="0" x2="0" y2="120">
+                            <stop offset="0%" stop-color="#8b5cf6"/>
+                            <stop offset="100%" stop-color="#00f0ff"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <div class="login-logo-core">
+                    <!-- Combined NBA+Events crosshair icon -->
+                    <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
+                        <circle cx="16" cy="16" r="12" stroke="url(#loginIconGrad)" stroke-width="1.5" fill="none" opacity="0.5"/>
+                        <circle cx="16" cy="16" r="6" stroke="url(#loginIconGrad)" stroke-width="1.5" fill="none"/>
+                        <circle cx="16" cy="16" r="2.5" fill="url(#loginIconGrad)"/>
+                        <line x1="16" y1="4" x2="16" y2="10" stroke="#00f0ff" stroke-width="1" opacity="0.5"/>
+                        <line x1="16" y1="22" x2="16" y2="28" stroke="#8b5cf6" stroke-width="1" opacity="0.5"/>
+                        <line x1="4" y1="16" x2="10" y2="16" stroke="#8b5cf6" stroke-width="1" opacity="0.5"/>
+                        <line x1="22" y1="16" x2="28" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.5"/>
+                        <defs>
+                            <linearGradient id="loginIconGrad" x1="4" y1="4" x2="28" y2="28">
+                                <stop offset="0%" stop-color="#00f0ff"/>
+                                <stop offset="100%" stop-color="#8b5cf6"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+            </div>
+            <div class="login-text">
+                <div class="login-title">POLYMARKET AGENT</div>
+                <div class="login-subtitle">OVERVIEW</div>
+            </div>
+            <form id="loginForm" class="login-form" autocomplete="off">
+                <div class="login-input-group">
+                    <label class="login-label" for="passkeyInput">PASSKEY</label>
+                    <div class="login-input-wrap">
+                        <input type="password" id="passkeyInput" class="login-input" placeholder="• • • • • •" autofocus autocomplete="off">
+                        <div class="login-input-glow"></div>
+                    </div>
+                </div>
+                <div class="login-error" id="loginError"></div>
+                <button type="submit" class="login-btn" id="loginBtn">
+                    <span class="login-btn-text">UNLOCK</span>
+                    <svg class="login-btn-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div class="login-footer">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style="opacity:0.5">
+                    <rect x="1" y="5" width="10" height="6" rx="1.5" stroke="#71717a" stroke-width="1"/>
+                    <path d="M3 5V3.5a3 3 0 0 1 6 0V5" stroke="#71717a" stroke-width="1" stroke-linecap="round"/>
+                </svg>
+                <span>Secured access only</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- DASHBOARD -->
+    <div id="dashboardContent" class="dashboard-hidden">
+
+    <!-- HEADER -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <!-- Combined gradient logo -->
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="14" stroke="url(#logoGrad)" stroke-width="1.5" fill="none" opacity="0.4"/>
+                    <circle cx="16" cy="16" r="8" stroke="url(#logoGrad)" stroke-width="1.5" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="url(#logoGrad)"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#00f0ff" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#8b5cf6" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#8b5cf6" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.6"/>
+                    <defs>
+                        <linearGradient id="logoGrad" x1="2" y1="2" x2="30" y2="30">
+                            <stop offset="0%" stop-color="#00f0ff"/>
+                            <stop offset="100%" stop-color="#8b5cf6"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <div class="logo-text">
+                    <span class="logo-title">POLYMARKET</span>
+                    <span class="logo-subtitle logo-subtitle-overview">OVERVIEW</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-center">
+            <a href="/overview.html" class="nav-link active">Overview</a>
+            <a href="/nba.html" class="nav-link">NBA</a>
+            <a href="/events.html" class="nav-link">Events</a>
+            <a href="/intelligence.html" class="nav-link">Intelligence</a>
+            <a href="/analytics.html" class="nav-link">Analytics</a>
+        </div>
+        <div class="header-right">
+            <div class="api-health" id="apiHealth" title="API Status">
+                <span class="api-dot" id="dotEspn" title="ESPN"></span>
+                <span class="api-dot" id="dotOdds" title="Odds API"></span>
+                <span class="api-dot" id="dotBdl" title="BallDontLie"></span>
+                <span class="api-dot" id="dotPoly" title="Polymarket"></span>
+            </div>
+            <div class="mode-badges-row">
+                <div class="mode-badge mode-badge-paper" id="modeBadgeNba">
+                    <span class="mode-dot"></span>
+                    <span class="mode-text">NBA</span>
+                </div>
+                <div class="mode-badge mode-badge-paper" id="modeBadgeEvents">
+                    <span class="mode-dot"></span>
+                    <span class="mode-text">EVT</span>
+                </div>
+            </div>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot connected"></span>
+                <span class="status-text">Live</span>
+            </div>
+            <div class="last-update" id="lastUpdate">--</div>
+        </div>
+    </header>
+
+    <!-- 1. HERO KPIs ROW -->
+    <section class="overview-hero" style="padding-top:24px;">
+        <!-- Total Portfolio -->
+        <div class="kpi-card overview-portfolio-glow">
+            <div class="kpi-label">Total Portfolio</div>
+            <div class="kpi-value kpi-combined-accent" id="kpiTotalPortfolio">$0.00</div>
+            <div class="kpi-sub" id="kpiPortfolioSub">Cash: $0 · Bets: $0</div>
+        </div>
+        <!-- Combined P&L -->
+        <div class="kpi-card">
+            <div class="kpi-label">Combined P&L</div>
+            <div class="kpi-value" id="kpiCombinedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiCombinedPnlSub">ROI: 0%</div>
+        </div>
+        <!-- Combined Win Rate -->
+        <div class="kpi-card">
+            <div class="kpi-label">Combined Win Rate</div>
+            <div class="kpi-value" id="kpiWinRate">0%</div>
+            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L · <span id="kpiTrades">0</span> trades</div>
+        </div>
+        <!-- Open Positions -->
+        <div class="kpi-card">
+            <div class="kpi-label">Open Positions</div>
+            <div class="kpi-value" id="kpiOpenPositions">0</div>
+            <div class="kpi-sub" id="kpiOpenSub">$0 exposure</div>
+        </div>
+        <!-- Today's P&L -->
+        <div class="kpi-card">
+            <div class="kpi-label">Today's P&L</div>
+            <div class="kpi-value" id="kpiTodayPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiTodaySub">0 trades today</div>
+        </div>
+    </section>
+
+    <!-- 2. COMBINED EQUITY CURVE -->
+    <section class="overview-section" style="margin-top:16px;">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Combined Equity Curve</h2>
+                <div class="card-header-right">
+                    <span class="badge badge-info" id="drawdownBadge">Max DD: --</span>
+                    <span class="badge badge-info" id="profitFactorBadge">PF: --</span>
+                    <!-- Legend -->
+                    <span style="display:flex;align-items:center;gap:4px;font-size:11px;color:#a1a1aa;">
+                        <span style="width:12px;height:2px;background:#00f0ff;border-radius:2px;display:inline-block;"></span>NBA
+                        <span style="width:12px;height:2px;background:#8b5cf6;border-radius:2px;display:inline-block;margin-left:6px;"></span>Events
+                        <span style="width:12px;height:2px;background:#ffffff;border-radius:2px;display:inline-block;margin-left:6px;"></span>Combined
+                    </span>
+                </div>
+            </div>
+            <div class="chart-container equity-chart">
+                <canvas id="equityChart"></canvas>
+            </div>
+        </div>
+    </section>
+
+    <!-- 3. AGENT CARDS (two-column) -->
+    <section class="overview-section">
+        <div class="agent-columns">
+            <!-- NBA Agent Card -->
+            <div class="card agent-card-nba">
+                <div class="agent-header">
+                    <span class="agent-title agent-title-nba">NBA Agent</span>
+                    <div class="mode-badge mode-badge-paper" id="nbaModeCard">
+                        <span class="mode-dot"></span>
+                        <span class="mode-text">PAPER</span>
+                    </div>
+                </div>
+                <div class="agent-stats-grid">
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Today P&L</div>
+                        <div class="agent-stat-value" id="nbaTodayPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Open Pos.</div>
+                        <div class="agent-stat-value" id="nbaOpenPos">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Win Rate</div>
+                        <div class="agent-stat-value" id="nbaWinRate">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total Trades</div>
+                        <div class="agent-stat-value" id="nbaTrades">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total P&L</div>
+                        <div class="agent-stat-value" id="nbaTotalPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Last Scan</div>
+                        <div class="agent-stat-value" id="nbaLastScan" style="font-size:11px;">--</div>
+                    </div>
+                </div>
+                <div class="agent-sparkline">
+                    <canvas id="nbaSparkline"></canvas>
+                </div>
+                <a href="/nba.html" class="agent-card-link agent-card-link-nba">
+                    View NBA Dashboard
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6h7M6 2.5l3.5 3.5L6 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </a>
+            </div>
+
+            <!-- Events Agent Card -->
+            <div class="card agent-card-events">
+                <div class="agent-header">
+                    <span class="agent-title agent-title-events">Events Agent</span>
+                    <div class="mode-badge mode-badge-paper" id="eventsModeCard">
+                        <span class="mode-dot"></span>
+                        <span class="mode-text">PAPER</span>
+                    </div>
+                </div>
+                <div class="agent-stats-grid">
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Today P&L</div>
+                        <div class="agent-stat-value" id="evtTodayPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Open Pos.</div>
+                        <div class="agent-stat-value" id="evtOpenPos">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Win Rate</div>
+                        <div class="agent-stat-value" id="evtWinRate">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total Trades</div>
+                        <div class="agent-stat-value" id="evtTrades">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total P&L</div>
+                        <div class="agent-stat-value" id="evtTotalPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Last Scan</div>
+                        <div class="agent-stat-value" id="evtLastScan" style="font-size:11px;">--</div>
+                    </div>
+                </div>
+                <div class="agent-sparkline">
+                    <canvas id="eventsSparkline"></canvas>
+                </div>
+                <a href="/events.html" class="agent-card-link agent-card-link-events">
+                    View Events Dashboard
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6h7M6 2.5l3.5 3.5L6 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- 4. CALENDAR HEATMAP -->
+    <section class="overview-section">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">90-Day P&amp;L Heatmap</h2>
+                <div class="card-header-right">
+                    <span class="badge badge-profit" id="heatmapProfitDays">0 profit days</span>
+                    <span class="badge badge-loss" id="heatmapLossDays">0 loss days</span>
+                </div>
+            </div>
+            <div class="heatmap-wrap">
+                <svg id="heatmapSvg" class="heatmap-svg" height="120"></svg>
+            </div>
+            <div class="heatmap-legend">
+                <span>Loss</span>
+                <span class="legend-swatch" style="background:#6b0000;"></span>
+                <span class="legend-swatch" style="background:#991b1b;"></span>
+                <span class="legend-swatch" style="background:#3d3d3d;"></span>
+                <span class="legend-swatch" style="background:#14532d;"></span>
+                <span class="legend-swatch" style="background:#15803d;"></span>
+                <span class="legend-swatch" style="background:#22c55e;"></span>
+                <span>Profit</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Heatmap tooltip (global, outside card) -->
+    <div class="heatmap-tooltip" id="heatmapTooltip">
+        <div class="heatmap-tooltip-date" id="htDate">--</div>
+        <div class="heatmap-tooltip-pnl" id="htPnl">--</div>
+        <div style="font-size:11px;color:#71717a;margin-top:2px;" id="htTrades">--</div>
+    </div>
+
+    <!-- 5. LIVE ACTIVITY FEED + 6. ODDS TABLE (two columns on large screens) -->
+    <section class="overview-section">
+        <div class="agent-columns">
+            <!-- Live Activity Feed -->
+            <div class="card" style="min-height:300px;">
+                <div class="card-header">
+                    <h2 class="card-title">Live Activity</h2>
+                    <div class="card-header-right">
+                        <span class="badge badge-cyan live-pulse" id="activityCount">0 events</span>
+                    </div>
+                </div>
+                <div class="activity-feed" id="activityFeed">
+                    <div class="activity-empty">
+                        <div class="loading-spinner"></div>
+                        <div style="margin-top:12px;">Loading activity...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Odds Snapshot -->
+            <div class="card" style="min-height:300px;">
+                <div class="card-header">
+                    <h2 class="card-title">Odds Snapshot</h2>
+                    <div class="card-header-right">
+                        <span class="badge badge-info" id="oddsCount">0 markets</span>
+                    </div>
+                </div>
+                <div class="table-wrapper" style="max-height:360px;overflow-y:auto;">
+                    <table class="odds-table overview-odds-table">
+                        <thead>
+                            <tr>
+                                <th class="sortable" data-col="market">Market <span class="sort-arrow">↕</span></th>
+                                <th class="sortable" data-col="poly_price">Poly <span class="sort-arrow">↕</span></th>
+                                <th class="sortable" data-col="fair_value">Fair Val <span class="sort-arrow">↕</span></th>
+                                <th class="sortable sort-active" data-col="edge">Edge <span class="sort-arrow">↓</span></th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="oddsTableBody">
+                            <tr><td colspan="5" class="empty-table-cell">Loading odds...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <span class="footer-text">Polymarket Agent — Overview — Auto-refreshes every 30s</span>
+    </footer>
+
+    </div><!-- /dashboardContent -->
+
+    <script src="common.js"></script>
+    <script src="overview-app.js"></script>
+</body>
+</html>
