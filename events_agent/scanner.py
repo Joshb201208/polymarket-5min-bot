@@ -283,10 +283,10 @@ class EventsScanner:
                          market.slug, market.liquidity, self.config.MIN_LIQUIDITY)
             return False
 
-        # Price bounds: each outcome price between 0.03 and 0.97
+        # Price bounds: each outcome price between 0.05 and 0.85
         for price in market.outcome_prices:
-            if price < 0.03 or price > 0.97:
-                logger.debug("Rejected %s: price %.2f out of bounds", market.slug, price)
+            if price < 0.05 or price > 0.85:
+                logger.debug("Rejected %s: price %.2f out of bounds [0.05, 0.85]", market.slug, price)
                 return False
 
         # End date must be in the future

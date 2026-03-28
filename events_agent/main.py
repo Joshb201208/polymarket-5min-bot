@@ -17,6 +17,25 @@ from nba_agent.utils import utcnow
 
 logger = logging.getLogger("events_agent")
 
+# Category priority weights — multiply composite scores when ranking markets
+CATEGORY_PRIORITY: dict[str, float] = {
+    "geopolitics": 1.0,
+    "crypto": 1.0,
+    "government_policy": 1.0,
+    "politics": 0.85,
+    "commodities": 0.80,
+    "tech_industry": 0.80,
+    "economics": 0.65,
+    "macro_economics": 0.65,
+    "entertainment": 0.60,
+    "world_elections": 0.60,
+    "other": 0.50,
+    "science": 0.50,
+    "climate": 0.50,
+    "forex": 0.50,
+    "futures": 0.50,
+}
+
 
 class EventsAgent:
     """Main events agent orchestrator — runs scan cycles, exit checks, and summaries."""
@@ -99,7 +118,13 @@ class EventsAgent:
 
         # Scan for events markets
         markets = await self.scanner.scan()
-        logger.info("Evaluating %d events markets", len(markets))
+
+        # Sort markets by category priority (highest first) for better capital allocation
+        markets.sort(
+            key=lambda m: CATEGORY_PRIORITY.get(m.category.value.lower(), 0.50),
+            reverse=True,
+        )
+        logger.info("Evaluating %d events markets (sorted by category priority)", len(markets))
 
         open_positions = self.portfolio.get_open_positions()
         bankroll = self.current_bankroll
@@ -125,14 +150,30 @@ class EventsAgent:
                 if edge_result is None or not edge_result.has_edge:
                     continue
 
+                # Entry price zone filter: only enter if recommended side's
+                # price is in the backtest-derived profitable zone
+                yes_price = edge_result.market_price
+                recommended_price = yes_price if edge_result.side == "YES" else (1.0 - yes_price)
+                if recommended_price < self.config.MIN_ENTRY_PRICE or recommended_price > self.config.MAX_ENTRY_PRICE:
+                    logger.info(
+                        "Skipping %s: entry price %.2f outside profitable zone [%.2f, %.2f]",
+                        market.slug, recommended_price,
+                        self.config.MIN_ENTRY_PRICE, self.config.MAX_ENTRY_PRICE,
+                    )
+                    continue
+
+                # Apply category priority weight to effective score for ranking
+                cat_weight = CATEGORY_PRIORITY.get(market.category.value.lower(), 0.50)
+
                 logger.info(
-                    "EDGE FOUND: %s | edge=%.1f%% conf=%s fair=%.2f market=%.2f src=%s",
+                    "EDGE FOUND: %s | edge=%.1f%% conf=%s fair=%.2f market=%.2f src=%s cat_wt=%.2f",
                     market.question[:60],
                     edge_result.edge * 100,
                     edge_result.confidence.value,
                     edge_result.our_fair_price,
                     edge_result.market_price,
                     edge_result.edge_source,
+                    cat_weight,
                 )
 
                 # Calculate bet size — Half Kelly capped at MAX_BET_PCT

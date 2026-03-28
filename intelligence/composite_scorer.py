@@ -16,6 +16,10 @@ from nba_agent.utils import utcnow
 
 logger = logging.getLogger("intelligence.composite_scorer")
 
+# Base rate adjustment: 76% of markets resolve NO historically.
+# Nudges ambiguous signals toward NO.
+NO_BIAS_FACTOR: float = float(os.getenv("EVENTS_NO_BIAS_FACTOR", "0.06"))
+
 # Env var names for each source's ENABLED flag
 _SOURCE_ENABLED_VARS: dict[str, str] = {
     "metaculus": "METACULUS_ENABLED",
@@ -181,6 +185,12 @@ class CompositeScorer:
                 composite = min(composite * 1.20, 1.0)
             elif consensus_count >= 3:
                 composite = min(composite * 1.10, 1.0)
+
+        # 4b. NO bias: nudge ambiguous signals toward NO (76% base rate)
+        if consensus_direction == "YES":
+            composite = max(composite - NO_BIAS_FACTOR, 0.0)
+        elif consensus_direction == "NO":
+            composite = min(composite + NO_BIAS_FACTOR, 1.0)
 
         # 5. Map to confidence tier
         confidence_tier = "LOW"

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from events_agent.config import EventsConfig
 from events_agent.models import Position
-from nba_agent.utils import utcnow
+from nba_agent.utils import parse_utc, utcnow
 
 logger = logging.getLogger("events_agent.smart_exit")
 
@@ -95,13 +95,64 @@ class SmartExitEngine:
             "peak_pnl_pct": round(peak_pnl_pct, 4),
         }
 
-        # --- Priority 1: EDGE REVERSAL ---
+        # Determine market duration bucket for exit strategy
+        duration_days = self._estimate_market_duration(position)
+
+        # --- Priority 1: EDGE REVERSAL (always checked) ---
         decision = self._check_edge_reversal(
             position, composite_direction, unrealized_pnl_pct, base
         )
         if decision:
             return decision
 
+        # SHORT markets (<14d): only exit on edge reversal or hard stop
+        # Hold to resolution is 5x better EV than smart exit
+        if duration_days is not None and duration_days < 14:
+            decision = self._check_smart_sl(
+                unrealized_pnl_pct, remaining_edge, composite_score, lifecycle_stage, base,
+                hard_stop_only=True,
+            )
+            if decision:
+                return decision
+            logger.debug("Short market (%.0fd) — holding to resolution", duration_days)
+            return self._no_exit(position, current_price)
+
+        # LONG markets (>60d): use tighter exit thresholds
+        if duration_days is not None and duration_days > 60:
+            decision = self._check_smart_tp(
+                unrealized_pnl_pct, remaining_edge, lifecycle_stage, regime, base,
+                long_market=True,
+            )
+            if decision:
+                return decision
+
+            decision = self._check_trailing_stop(
+                unrealized_pnl_pct, peak_pnl_pct, base,
+                drawdown_override=0.30,
+            )
+            if decision:
+                return decision
+
+            decision = self._check_smart_sl(
+                unrealized_pnl_pct, remaining_edge, composite_score, lifecycle_stage, base
+            )
+            if decision:
+                return decision
+
+            decision = self._check_liquidity_exit(bid_depth, base)
+            if decision:
+                return decision
+
+            decision = self._check_time_exit(
+                hold_days, unrealized_pnl_pct, entry, current_price, base,
+                max_days_override=20,
+            )
+            if decision:
+                return decision
+
+            return self._no_exit(position, current_price)
+
+        # MEDIUM markets (14-60d): standard rules
         # --- Priority 2: SMART TAKE PROFIT ---
         decision = self._check_smart_tp(
             unrealized_pnl_pct, remaining_edge, lifecycle_stage, regime, base
@@ -174,8 +225,14 @@ class SmartExitEngine:
         lifecycle_stage: str | None,
         regime: str | None,
         base: dict,
+        long_market: bool = False,
     ) -> ExitDecision | None:
-        """Dynamic take-profit with multiple tiers."""
+        """Dynamic take-profit with multiple tiers.
+
+        For long markets (>60d), thresholds are tighter:
+        - Tier 4 at +10% instead of +15%
+        - Tier 2 at +20% instead of +25%
+        """
         # Tier 1: >40% → always take profit
         if pnl_pct > 0.40:
             reason = f"Smart TP: unrealized P&L {pnl_pct * 100:.1f}% > 40% hard cap"
@@ -185,10 +242,11 @@ class SmartExitEngine:
                 method="twap", trigger_type="smart_tp", **base,
             )
 
-        # Tier 2: >25% AND late/terminal lifecycle
-        if pnl_pct > 0.25 and lifecycle_stage in ("LATE", "TERMINAL"):
+        # Tier 2: >25% AND late/terminal lifecycle (>20% for long markets)
+        tp2_threshold = 0.20 if long_market else 0.25
+        if pnl_pct > tp2_threshold and lifecycle_stage in ("LATE", "TERMINAL"):
             reason = (
-                f"Smart TP: P&L {pnl_pct * 100:.1f}% > 25% in {lifecycle_stage} stage"
+                f"Smart TP: P&L {pnl_pct * 100:.1f}% > {tp2_threshold * 100:.0f}% in {lifecycle_stage} stage"
             )
             logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
             return ExitDecision(
@@ -205,8 +263,9 @@ class SmartExitEngine:
                 method="limit", trigger_type="smart_tp", **base,
             )
 
-        # Tier 4: >15% AND remaining edge < 3%
-        if pnl_pct > 0.15 and remaining_edge is not None and remaining_edge < 0.03:
+        # Tier 4: >15% AND remaining edge < 3% (>10% for long markets)
+        tp4_threshold = 0.10 if long_market else 0.15
+        if pnl_pct > tp4_threshold and remaining_edge is not None and remaining_edge < 0.03:
             reason = (
                 f"Smart TP: P&L {pnl_pct * 100:.1f}% > 15% with "
                 f"remaining edge {remaining_edge * 100:.1f}% < 3%"
@@ -221,12 +280,13 @@ class SmartExitEngine:
 
     def _check_trailing_stop(
         self, pnl_pct: float, peak_pnl_pct: float, base: dict,
+        drawdown_override: float | None = None,
     ) -> ExitDecision | None:
-        """Exit if unrealized P&L drops >40% from peak."""
+        """Exit if unrealized P&L drops too far from peak (default 40%, 30% for long markets)."""
         if peak_pnl_pct <= 0:
             return None
 
-        drawdown = self.config.TRAILING_STOP_DRAWDOWN
+        drawdown = drawdown_override if drawdown_override is not None else self.config.TRAILING_STOP_DRAWDOWN
         drawdown_from_peak = (peak_pnl_pct - pnl_pct) / peak_pnl_pct if peak_pnl_pct > 0 else 0
 
         if drawdown_from_peak > drawdown:
@@ -249,8 +309,13 @@ class SmartExitEngine:
         composite_score: float | None,
         lifecycle_stage: str | None,
         base: dict,
+        hard_stop_only: bool = False,
     ) -> ExitDecision | None:
-        """Dynamic stop loss with multiple tiers."""
+        """Dynamic stop loss with multiple tiers.
+
+        For short markets, hard_stop_only=True skips the softer tiers
+        and only checks the -30% hard stop.
+        """
         hard_stop = self.config.HARD_STOP_LOSS
 
         # Hard stop: loss > -30% (configurable)
@@ -261,6 +326,9 @@ class SmartExitEngine:
                 should_exit=True, reason=reason, urgency="immediate",
                 method="market", trigger_type="smart_sl", **base,
             )
+
+        if hard_stop_only:
+            return None
 
         # Early lifecycle losers: cut faster at -10%
         if lifecycle_stage == "EARLY" and pnl_pct <= -0.10:
@@ -321,9 +389,10 @@ class SmartExitEngine:
         entry_price: float,
         current_price: float,
         base: dict,
+        max_days_override: int | None = None,
     ) -> ExitDecision | None:
         """Exit if held too long with minimal price movement."""
-        max_days = self.config.TIME_EXIT_DAYS
+        max_days = max_days_override if max_days_override is not None else self.config.TIME_EXIT_DAYS
         if hold_days <= 0 or hold_days < max_days:
             return None
 
@@ -343,6 +412,36 @@ class SmartExitEngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _estimate_market_duration(self, position: Position) -> float | None:
+        """Estimate total market duration in days.
+
+        Uses start_date→end_date if both available, otherwise entry_time→end_date.
+        Returns None if end_date is missing.
+        """
+        end_date_str = getattr(position, "market_end_date", None)
+        if not end_date_str:
+            return None
+
+        try:
+            end_dt = parse_utc(end_date_str)
+
+            start_date_str = getattr(position, "market_start_date", None)
+            if start_date_str:
+                start_dt = parse_utc(start_date_str)
+                return (end_dt - start_dt).total_seconds() / 86400
+
+            # Fallback: entry_time to end_date
+            entry_str = position.entry_time
+            if entry_str:
+                entry_dt = datetime.fromisoformat(entry_str.replace("Z", "+00:00"))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                return (end_dt - entry_dt).total_seconds() / 86400
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        return None
 
     def _hold_days(self, position: Position) -> float:
         """Calculate how many days a position has been held."""

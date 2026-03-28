@@ -47,6 +47,13 @@ class EventsConfig:
     TAKE_PROFIT: float = float(os.getenv("EVENTS_TAKE_PROFIT", "0.30"))
     STOP_LOSS: float = float(os.getenv("EVENTS_STOP_LOSS", "0.25"))
 
+    # Entry price filter (backtest-derived profitable zone)
+    MIN_ENTRY_PRICE: float = float(os.getenv("EVENTS_MIN_ENTRY_PRICE", "0.15"))
+    MAX_ENTRY_PRICE: float = float(os.getenv("EVENTS_MAX_ENTRY_PRICE", "0.65"))
+
+    # NO bias factor (76% of markets historically resolve NO)
+    NO_BIAS_FACTOR: float = float(os.getenv("EVENTS_NO_BIAS_FACTOR", "0.06"))
+
     # Smart exit engine parameters
     TRAILING_STOP_DRAWDOWN: float = float(os.getenv("EVENTS_TRAILING_STOP_DRAWDOWN", "0.40"))
     HARD_STOP_LOSS: float = float(os.getenv("EVENTS_HARD_STOP_LOSS", "0.30"))

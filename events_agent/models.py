@@ -123,6 +123,8 @@ class Position:
     status: str = "open"
     category: str = "other"
     market_end_date: Optional[str] = None
+    market_start_date: Optional[str] = None
+    estimated_duration_days: Optional[float] = None
     exit_price: Optional[float] = None
     exit_time: Optional[str] = None
     pnl: Optional[float] = None
