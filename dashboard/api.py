@@ -931,6 +931,289 @@ def get_combined_status() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# New Feature Endpoints — Line Movements, Whale Alerts, Odds, System Health
+# ---------------------------------------------------------------------------
+
+@app.get("/api/line-movements", dependencies=[Depends(_require_auth)])
+def get_line_movements() -> dict:
+    """Return line tracking data for all open positions."""
+    data = _read_json("line_movements.json")
+    if not data:
+        return {"movements": []}
+    # Return non-closed positions
+    movements = [
+        record for record in data.values()
+        if isinstance(record, dict) and not record.get("closed_time")
+    ]
+    return {"movements": movements}
+
+
+@app.get("/api/line-movements/{position_id}", dependencies=[Depends(_require_auth)])
+def get_line_movement_detail(position_id: str) -> dict:
+    """Return line movement history for a specific position."""
+    data = _read_json("line_movements.json")
+    record = data.get(position_id)
+    if not record or not isinstance(record, dict):
+        raise HTTPException(status_code=404, detail="Position not found in line tracker")
+    return record
+
+
+@app.get("/api/whale-alerts", dependencies=[Depends(_require_auth)])
+def get_whale_alerts() -> dict:
+    """Return recent sharp movements (last 7 days)."""
+    from datetime import timedelta as td
+    data = _read_json("sharp_movements.json")
+    movements = data.get("movements", [])
+    cutoff = datetime.now(timezone.utc) - td(days=7)
+    recent = []
+    for m in movements:
+        ts = _parse_ts(m.get("time"))
+        if ts and ts >= cutoff:
+            recent.append(m)
+    return {"movements": recent, "total": len(recent)}
+
+
+@app.get("/api/odds-snapshots", dependencies=[Depends(_require_auth)])
+def get_odds_snapshots() -> dict:
+    """Return latest odds comparison for each active game."""
+    data = _read_json("odds_snapshots.json")
+    snapshots = data.get("snapshots", [])
+
+    # Group by game_slug, take the latest
+    latest: dict[str, dict] = {}
+    for snap in snapshots:
+        slug = snap.get("game_slug", "")
+        existing = latest.get(slug)
+        if not existing or snap.get("time", "") > existing.get("time", ""):
+            latest[slug] = snap
+
+    return {"snapshots": list(latest.values())}
+
+
+@app.get("/api/odds-history/{game_slug}", dependencies=[Depends(_require_auth)])
+def get_odds_history(game_slug: str) -> dict:
+    """Return price history for a specific game."""
+    data = _read_json("odds_snapshots.json")
+    history = [
+        s for s in data.get("snapshots", [])
+        if s.get("game_slug") == game_slug
+    ]
+    return {"game_slug": game_slug, "snapshots": history}
+
+
+@app.get("/api/system-health", dependencies=[Depends(_require_auth)])
+def get_system_health() -> dict:
+    """Return last scan times, API status, uptime info."""
+    import time as _time
+
+    bankroll = _read_json("bankroll.json")
+
+    # Last scan times from trade timestamps
+    nba_trades = _read_json("trades.json").get("trades", [])
+    nhl_trades = _read_json("nhl_trades.json").get("trades", [])
+
+    nba_last_scan = None
+    if nba_trades:
+        timestamps = [t.get("timestamp") for t in nba_trades if t.get("timestamp")]
+        if timestamps:
+            nba_last_scan = max(timestamps)
+
+    nhl_last_scan = None
+    if nhl_trades:
+        timestamps = [t.get("timestamp") for t in nhl_trades if t.get("timestamp")]
+        if timestamps:
+            nhl_last_scan = max(timestamps)
+
+    # Uptime from earliest trade
+    all_trades = nba_trades + nhl_trades
+    uptime_hours = 0.0
+    if all_trades:
+        timestamps = [_parse_ts(t.get("timestamp")) for t in all_trades]
+        timestamps = [t for t in timestamps if t is not None]
+        if timestamps:
+            earliest = min(timestamps)
+            uptime_hours = round(
+                (datetime.now(timezone.utc) - earliest).total_seconds() / 3600, 1
+            )
+
+    # Data file sizes
+    data_files = {}
+    for fname in (
+        "positions.json", "nhl_positions.json", "trades.json",
+        "nhl_trades.json", "bankroll.json", "line_movements.json",
+        "sharp_movements.json", "odds_snapshots.json",
+    ):
+        path = DATA_DIR / fname
+        if path.exists():
+            data_files[fname] = {
+                "exists": True,
+                "size_kb": round(path.stat().st_size / 1024, 1),
+            }
+        else:
+            data_files[fname] = {"exists": False}
+
+    return {
+        "nba_last_scan": nba_last_scan,
+        "nhl_last_scan": nhl_last_scan,
+        "uptime_hours": uptime_hours,
+        "bankroll": bankroll.get("current_bankroll", 0),
+        "is_paused": bankroll.get("is_paused", False),
+        "data_files": data_files,
+    }
+
+
+@app.get("/api/combined/equity-curve", dependencies=[Depends(_require_auth)])
+def get_combined_equity_curve() -> dict:
+    """Merged equity data from both sports for charting."""
+    from datetime import timedelta as td
+
+    bankroll_data = _read_json("bankroll.json")
+    starting = bankroll_data.get("starting_bankroll", 440.58)
+
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nhl_positions = _read_json("nhl_positions.json").get("positions", [])
+
+    all_closed = []
+    for p in nba_positions:
+        if p.get("status") != "open":
+            p["_sport"] = "nba"
+            all_closed.append(p)
+    for p in nhl_positions:
+        if p.get("status") != "open":
+            p["_sport"] = "nhl"
+            all_closed.append(p)
+
+    # Build daily P&L grouped by day (SGT)
+    SGT = timezone(td(hours=8))
+    daily_map: dict[str, dict] = {}  # day -> {total, nba, nhl, count}
+
+    for p in all_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            exit_sgt = exit_ts.astimezone(SGT)
+            day = exit_sgt.strftime("%Y-%m-%d")
+            if day not in daily_map:
+                daily_map[day] = {"total": 0, "nba": 0, "nhl": 0, "trades": 0}
+            pnl = p.get("pnl", 0) or 0
+            daily_map[day]["total"] += pnl
+            daily_map[day][p["_sport"]] += pnl
+            daily_map[day]["trades"] += 1
+
+    sorted_days = sorted(daily_map.keys())
+    curve = []
+    running = starting
+    for day in sorted_days:
+        d = daily_map[day]
+        running += d["total"]
+        curve.append({
+            "date": day,
+            "pnl": round(d["total"], 2),
+            "nba_pnl": round(d["nba"], 2),
+            "nhl_pnl": round(d["nhl"], 2),
+            "bankroll": round(running, 2),
+            "trades": d["trades"],
+        })
+
+    return {"starting_bankroll": starting, "equity_curve": curve}
+
+
+@app.get("/api/combined/activity-feed", dependencies=[Depends(_require_auth)])
+def get_combined_activity_feed() -> dict:
+    """Merged recent activity: trades + whale alerts + line movements."""
+    feed = []
+
+    # Recent trades (last 50)
+    for fname, sport in [("trades.json", "nba"), ("nhl_trades.json", "nhl")]:
+        trades = _read_json(fname).get("trades", [])
+        for t in trades[-50:]:
+            feed.append({
+                "type": "trade",
+                "sport": sport,
+                "time": t.get("timestamp", ""),
+                "action": t.get("action", ""),
+                "market": t.get("market_question", ""),
+                "amount": t.get("amount", 0),
+                "price": t.get("price", 0),
+                "pnl": t.get("pnl"),
+            })
+
+    # Whale alerts (last 20)
+    sharp = _read_json("sharp_movements.json").get("movements", [])
+    for m in sharp[-20:]:
+        feed.append({
+            "type": "whale_alert",
+            "sport": m.get("sport", ""),
+            "time": m.get("time", ""),
+            "market": m.get("market_question", ""),
+            "delta": m.get("delta", 0),
+            "our_position": m.get("our_position", "none"),
+        })
+
+    # Line movement alerts (positions with alerts triggered)
+    line_data = _read_json("line_movements.json")
+    if isinstance(line_data, dict):
+        for record in line_data.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("alerted_against") or record.get("alerted_favor"):
+                snapshots = record.get("snapshots", [])
+                if snapshots:
+                    latest = snapshots[-1]
+                    alert_type = "line_against" if record.get("alerted_against") else "line_favor"
+                    feed.append({
+                        "type": alert_type,
+                        "sport": record.get("sport", ""),
+                        "time": latest.get("time", ""),
+                        "market": record.get("market_question", ""),
+                        "entry_price": record.get("entry_price", 0),
+                        "current_price": latest.get("price", 0),
+                        "delta": latest.get("delta", 0),
+                    })
+
+    # Sort by time descending
+    feed.sort(key=lambda x: x.get("time", ""), reverse=True)
+
+    return {"feed": feed[:100]}
+
+
+@app.get("/api/combined/calendar-heatmap", dependencies=[Depends(_require_auth)])
+def get_calendar_heatmap() -> dict:
+    """Daily P&L for last 90 days, suitable for a calendar heatmap chart."""
+    from datetime import timedelta as td
+
+    nba_positions = _read_json("positions.json").get("positions", [])
+    nhl_positions = _read_json("nhl_positions.json").get("positions", [])
+
+    all_closed = [p for p in nba_positions if p.get("status") != "open"]
+    all_closed += [p for p in nhl_positions if p.get("status") != "open"]
+
+    SGT = timezone(td(hours=8))
+    cutoff = datetime.now(SGT) - td(days=90)
+
+    daily_pnl: dict[str, float] = defaultdict(float)
+    daily_count: dict[str, int] = defaultdict(int)
+
+    for p in all_closed:
+        exit_ts = _parse_ts(p.get("exit_time"))
+        if exit_ts:
+            exit_sgt = exit_ts.astimezone(SGT)
+            if exit_sgt >= cutoff:
+                day = exit_sgt.strftime("%Y-%m-%d")
+                daily_pnl[day] += p.get("pnl", 0) or 0
+                daily_count[day] += 1
+
+    days = []
+    for day in sorted(daily_pnl.keys()):
+        days.append({
+            "date": day,
+            "pnl": round(daily_pnl[day], 2),
+            "trades": daily_count[day],
+        })
+
+    return {"days": days}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)

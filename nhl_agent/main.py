@@ -17,6 +17,8 @@ from nhl_agent.performance_tracker import NHLPerformanceTracker
 from nhl_agent.polymarket_scanner import NHLPolymarketScanner
 from nhl_agent.trading_engine import NHLTradingEngine, NHLBankrollManager
 from nba_agent.utils import utcnow
+from shared.config import SharedConfig
+from shared import line_tracker, whale_detector, odds_snapshots
 
 logger = logging.getLogger("nhl_agent")
 
@@ -75,20 +77,34 @@ class NHLAgent:
         """Single cycle: scan, evaluate, trade, check resolutions."""
         now = utcnow()
 
-        # 1. Snapshot game-time prices
+        # 1. Record line movement snapshots for all open positions
+        await self._record_line_snapshots()
+
+        # 2. Check whale / sharp money movements
+        await self._check_whale_movements()
+
+        # 3. Snapshot game-time prices
         await self._snapshot_gametime_prices()
 
-        # 2. Check for resolved positions
+        # 4. Auto-hedge / stop-loss early exits
+        await self._check_early_exits()
+
+        # 5. Check for resolved positions
         await self._check_resolutions()
 
-        # 3. Scan for new opportunities
+        # 6. Scan for new opportunities (also records odds snapshots)
         await self._scan_and_trade()
 
-        # 4. Daily summary at 4pm UTC
+        # 7. Prune old tracking data
+        line_tracker.prune_old_data()
+        whale_detector.prune_old_data()
+        odds_snapshots.prune_old_data()
+
+        # 8. Daily summary at 4pm UTC
         if now.hour == 16 and (self._last_daily is None or (now - self._last_daily) > timedelta(hours=12)):
             self._last_daily = now
 
-        # 5. Weekly summary on Monday
+        # 9. Weekly summary on Monday
         if now.weekday() == 0 and now.hour == 16 and (self._last_weekly is None or (now - self._last_weekly) > timedelta(days=5)):
             self._last_weekly = now
 
@@ -111,6 +127,22 @@ class NHLAgent:
                     continue
 
                 edge_result = await self.edge_calc.evaluate(market)
+
+                # Record odds snapshot for every evaluated market
+                if edge_result is not None:
+                    try:
+                        odds_snapshots.record_from_evaluation(
+                            sport="nhl",
+                            market_question=market.question,
+                            market_slug=market.slug,
+                            game_date=market.end_date[:10] if market.end_date else "",
+                            outcome_prices=market.outcome_prices,
+                            our_fair_price=edge_result.our_fair_price,
+                            side_index=edge_result.side_index,
+                        )
+                    except Exception as e:
+                        logger.debug("Odds snapshot error: %s", e)
+
                 if edge_result is None or not edge_result.has_edge:
                     continue
 
@@ -148,6 +180,122 @@ class NHLAgent:
 
             except Exception as e:
                 logger.error("NHL error processing %s: %s", market.id, e, exc_info=True)
+
+    async def _record_line_snapshots(self) -> None:
+        """Record current market price for all open positions (line tracking)."""
+        open_positions = self.tracker.get_open_positions()
+        config = SharedConfig()
+
+        for pos in open_positions:
+            try:
+                current_price = await self.scanner.get_market_price(pos.token_id)
+                if current_price is None:
+                    continue
+
+                alert = line_tracker.record_snapshot(
+                    position_id=pos.id,
+                    token_id=pos.token_id,
+                    entry_price=pos.entry_price,
+                    current_price=current_price,
+                    entry_time=pos.entry_time,
+                    game_start_time=pos.game_start_time,
+                    sport="nhl",
+                    market_question=pos.market_question,
+                )
+
+                if alert:
+                    await line_tracker.send_line_alert(alert, config)
+            except Exception as e:
+                logger.debug("Line snapshot error for %s: %s", pos.id, e)
+
+    async def _check_whale_movements(self) -> None:
+        """Check all scanned markets for sharp price movements."""
+        try:
+            markets = await self.scanner.scan()
+            open_positions = self.tracker.get_open_positions()
+            position_token_ids = {pos.token_id for pos in open_positions}
+
+            market_dicts = []
+            for m in markets:
+                market_dicts.append({
+                    "id": m.id,
+                    "question": m.question,
+                    "outcome_prices": m.outcome_prices,
+                    "clob_token_ids": m.clob_token_ids,
+                })
+
+            movements = whale_detector.check_movements(
+                markets=market_dicts,
+                open_position_token_ids=position_token_ids,
+                sport="nhl",
+            )
+
+            config = SharedConfig()
+            for movement in movements:
+                await whale_detector.send_whale_alert(movement, config)
+        except Exception as e:
+            logger.debug("NHL whale detector error: %s", e)
+
+    async def _check_early_exits(self) -> None:
+        """Check open positions for auto-hedge (+30%) and stop-loss (-50%) exits."""
+        open_positions = self.tracker.get_open_positions()
+        config = SharedConfig()
+
+        for pos in open_positions:
+            try:
+                current_price = await self.scanner.get_market_price(pos.token_id)
+                if current_price is None:
+                    continue
+
+                # Calculate unrealized P&L
+                current_value = pos.shares * current_price
+                unrealized_pnl = current_value - pos.cost
+                unrealized_pct = unrealized_pnl / pos.cost if pos.cost > 0 else 0
+
+                # Only exit if game hasn't started yet
+                if not self._is_pre_game(pos):
+                    continue
+
+                reason = None
+
+                if unrealized_pct >= config.AUTO_HEDGE_PCT:
+                    reason = f"AUTO_HEDGE: +{unrealized_pct * 100:.0f}%"
+                elif unrealized_pct <= config.STOP_LOSS_PCT:
+                    reason = f"STOP_LOSS: {unrealized_pct * 100:.0f}%"
+
+                if reason is None:
+                    continue
+
+                trade = self.engine.execute_sell(pos, current_price, reason)
+                if trade:
+                    self.tracker.save_position(pos)
+                    self.tracker.log_trade(trade)
+                    self.bankroll.update_bankroll(pos.cost + (pos.pnl or 0))
+                    line_tracker.mark_position_closed(pos.id)
+
+                    logger.info(
+                        "NHL %s: %s | sold @ %.2f¢ | P&L=$%.2f (%+.0f%%)",
+                        "AUTO-HEDGE" if "AUTO_HEDGE" in reason else "STOP-LOSS",
+                        pos.market_question, current_price * 100,
+                        pos.pnl or 0, unrealized_pct * 100,
+                    )
+
+            except Exception as e:
+                logger.error("NHL early exit check error for %s: %s", pos.id, e)
+
+    def _is_pre_game(self, pos) -> bool:
+        """Check if the game hasn't started yet."""
+        if not pos.game_start_time:
+            return True
+        try:
+            now = utcnow()
+            game_str = pos.game_start_time.replace("Z", "+00:00")
+            game_dt = datetime.fromisoformat(game_str)
+            if game_dt.tzinfo is None:
+                game_dt = game_dt.replace(tzinfo=now.tzinfo)
+            return now < game_dt
+        except (ValueError, TypeError):
+            return True
 
     async def _snapshot_gametime_prices(self) -> None:
         """Record market price at game time for drift tracking."""

@@ -53,11 +53,54 @@ async def _combined_reports(nba_agent: NBAAgent, nhl_agent: NHLAgent) -> None:
                 bankroll = get_current_bankroll()
                 mode = nba_agent.config.TRADING_MODE
 
+                # Count auto-hedge/stop-loss actions from today's trades
+                auto_hedge_count = 0
+                stop_loss_count = 0
+                for tracker in (nba_agent.tracker, nhl_agent.tracker):
+                    try:
+                        trades = tracker.get_todays_trades() if hasattr(tracker, 'get_todays_trades') else []
+                        for t in trades:
+                            reason = ""
+                            # Check if there's a matching position with exit_reason
+                            if hasattr(t, 'pnl') and t.action == "SELL":
+                                # Look for reason in trade or position
+                                pass
+                    except Exception:
+                        pass
+                # Simpler approach: count from trade logs on disk
+                try:
+                    import json
+                    from pathlib import Path
+                    data_dir = Path(__file__).resolve().parent / "data"
+                    for fname in ("trades.json", "nhl_trades.json"):
+                        path = data_dir / fname
+                        if path.exists():
+                            trades = json.loads(path.read_text()).get("trades", [])
+                            today_str = now.strftime("%Y-%m-%d")
+                            for t in trades:
+                                ts = t.get("timestamp", "")
+                                if today_str in ts and t.get("action") == "SELL":
+                                    # Check corresponding position for exit_reason
+                                    pos_file = "positions.json" if fname == "trades.json" else "nhl_positions.json"
+                                    positions = json.loads((data_dir / pos_file).read_text()).get("positions", [])
+                                    for p in positions:
+                                        if p.get("id") == t.get("position_id"):
+                                            reason = p.get("exit_reason", "")
+                                            if "AUTO_HEDGE" in reason:
+                                                auto_hedge_count += 1
+                                            elif "STOP_LOSS" in reason:
+                                                stop_loss_count += 1
+                                            break
+                except Exception:
+                    pass
+
                 await reporter.send_combined_daily_summary(
                     bankroll=bankroll,
                     nba_stats=nba_stats,
                     nhl_stats=nhl_stats,
                     mode=mode,
+                    auto_hedge_count=auto_hedge_count,
+                    stop_loss_count=stop_loss_count,
                 )
                 last_daily = now
                 logger.info("Sent combined daily summary")

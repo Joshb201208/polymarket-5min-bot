@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import httpx
 
 from shared.config import SharedConfig
+from shared import line_tracker, whale_detector
 from nba_agent.utils import format_dollars, format_pct
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class CombinedTelegramReporter:
         nba_stats: dict,
         nhl_stats: dict,
         mode: str,
+        auto_hedge_count: int = 0,
+        stop_loss_count: int = 0,
     ) -> bool:
         """Send combined daily P&L summary for both sports."""
         nba_pnl = nba_stats.get("daily_pnl", 0)
@@ -91,6 +94,21 @@ class CombinedTelegramReporter:
                 f"P&L: {nhl_sign}{format_dollars(nhl_pnl)} | "
                 f"Trades: {nhl_trades} | Open: {nhl_open}\n\n"
             )
+
+        # Line movement summary
+        line_summary = line_tracker.get_summary()
+        whale_count = whale_detector.get_movement_count(days=1)
+
+        text += "<b>SIGNALS</b>\n"
+        text += (
+            f"Line Movements: {line_summary['moving_toward_us']} toward / "
+            f"{line_summary['moving_against_us']} against\n"
+        )
+        if auto_hedge_count > 0 or stop_loss_count > 0:
+            text += f"Auto-Exits: {auto_hedge_count} hedge / {stop_loss_count} stop-loss\n"
+        if whale_count > 0:
+            text += f"Whale Alerts: {whale_count}\n"
+        text += "\n"
 
         text += f"Mode: {mode.upper()}"
 

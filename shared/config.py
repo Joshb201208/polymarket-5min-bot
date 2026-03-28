@@ -40,6 +40,10 @@ class SharedConfig:
     # Edge thresholds
     MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.04"))
 
+    # Auto-hedge / early exit thresholds
+    AUTO_HEDGE_PCT: float = float(os.getenv("AUTO_HEDGE_PCT", "0.30"))   # Exit at +30% unrealized
+    STOP_LOSS_PCT: float = float(os.getenv("STOP_LOSS_PCT", "-0.50"))    # Exit at -50% unrealized
+
     # External APIs
     ODDS_API_KEY: str = os.getenv("ODDS_API_KEY", "")
     PROXY_HOST: str = os.getenv("PROXY_HOST", "")
