@@ -257,11 +257,26 @@ class EventsAgent:
                 # NOTE: edge_result.market_price is ALREADY the price of our
                 # recommended side (YES price if side=YES, NO price if side=NO)
                 recommended_price = edge_result.market_price
-                if recommended_price < self.config.MIN_ENTRY_PRICE or recommended_price > self.config.MAX_ENTRY_PRICE:
+
+                # Duration-aware entry price cap:
+                # Short markets (<14d): allow up to 0.85 (high-prob NO bets
+                # on things like "Oil hits $110 by Friday" are valid)
+                # Default: 0.65 max
+                max_entry = self.config.MAX_ENTRY_PRICE  # default 0.65
+                if market.end_date:
+                    try:
+                        from nba_agent.utils import parse_utc
+                        remaining = (parse_utc(market.end_date) - utcnow()).total_seconds() / 86400
+                        if remaining <= 14:
+                            max_entry = 0.85  # short-duration: wider entry zone
+                    except Exception:
+                        pass
+
+                if recommended_price < self.config.MIN_ENTRY_PRICE or recommended_price > max_entry:
                     logger.info(
                         "Skipping %s: entry price %.2f outside profitable zone [%.2f, %.2f]",
                         market.slug, recommended_price,
-                        self.config.MIN_ENTRY_PRICE, self.config.MAX_ENTRY_PRICE,
+                        self.config.MIN_ENTRY_PRICE, max_entry,
                     )
                     continue
 
