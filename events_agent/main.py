@@ -152,6 +152,9 @@ class EventsAgent:
                 # Execute trade
                 position, trade = self.executor.execute_buy(edge_result, bet_size)
                 if position and trade:
+                    # Record signal attribution at entry time
+                    self._record_signal_attribution(position, market)
+
                     self.portfolio.save_position(position)
                     self.portfolio.log_trade(trade)
 
@@ -196,8 +199,27 @@ class EventsAgent:
         return round(bet_size, 2)
 
     async def _check_exits(self) -> None:
-        """Check all open positions for early exit conditions."""
+        """Check all open positions using the SmartExitEngine.
+
+        Gathers intelligence context (composite score, direction, lifecycle,
+        regime, order-book depth) for each position and passes it to the
+        smart exit evaluation.
+        """
         open_positions = self.portfolio.get_open_positions()
+
+        # Load intelligence context from disk for exit decisions
+        from nba_agent.utils import load_json as _load_json
+        intel_data = _load_json(self.config.DATA_DIR / "intelligence_report.json", {})
+        scores_list = intel_data.get("scores", [])
+        lifecycle_data = intel_data.get("lifecycle_assessments", {})
+        regime_data = intel_data.get("regime_assessments", {})
+
+        # Index scores by market_id for O(1) lookup
+        scores_by_market: dict[str, dict] = {}
+        for s in scores_list:
+            mid = s.get("market_id", "")
+            if mid:
+                scores_by_market[mid] = s
 
         for position in open_positions:
             try:
@@ -205,26 +227,57 @@ class EventsAgent:
                 if current_price is None:
                     continue
 
-                # Check take-profit / stop-loss
-                should_exit, reason = self.portfolio.should_exit_early(position, current_price)
+                # Gather intelligence context for this position's market
+                composite_score = None
+                composite_direction = None
+                remaining_edge = None
+                lifecycle_stage = None
+                regime = None
+                bid_depth = None
 
-                # Also check liquidity (if we can get order book)
-                if not should_exit:
-                    # Check if market liquidity has dropped below safety threshold
-                    try:
-                        book = await self.scanner.get_order_book(position.token_id)
-                        if book:
-                            bid_depth = sum(float(b[1]) for b in book.get("bids", []))
-                            if bid_depth < 5000:
-                                should_exit = True
-                                reason = f"Low liquidity exit (bid depth ${bid_depth:.0f})"
-                    except Exception:
-                        pass
+                score_entry = scores_by_market.get(position.market_id)
+                if score_entry:
+                    composite_score = score_entry.get("composite")
+                    composite_direction = score_entry.get("direction")
+                    if composite_score is not None and current_price > 0:
+                        remaining_edge = max(0, composite_score - current_price)
+
+                # Lifecycle stage
+                if isinstance(lifecycle_data, dict):
+                    lc = lifecycle_data.get(position.market_id)
+                    if isinstance(lc, dict):
+                        lifecycle_stage = lc.get("stage")
+
+                # Regime
+                if isinstance(regime_data, dict):
+                    ra = regime_data.get(position.market_id)
+                    if isinstance(ra, dict):
+                        regime = ra.get("regime")
+
+                # Get order book depth
+                try:
+                    book = await self.scanner.get_order_book(position.token_id)
+                    if book:
+                        bid_depth = sum(float(b[1]) for b in book.get("bids", []))
+                except Exception:
+                    pass
+
+                # Run smart exit evaluation
+                should_exit, reason = self.portfolio.should_exit_early(
+                    position=position,
+                    current_price=current_price,
+                    composite_score=composite_score,
+                    composite_direction=composite_direction,
+                    remaining_edge=remaining_edge,
+                    lifecycle_stage=lifecycle_stage,
+                    regime=regime,
+                    bid_depth=bid_depth,
+                )
 
                 if not should_exit:
                     continue
 
-                logger.info("EARLY EXIT: %s | reason=%s", position.market_question[:50], reason)
+                logger.info("SMART EXIT: %s | reason=%s", position.market_question[:50], reason)
 
                 trade = self.executor.execute_sell(position, current_price, reason)
                 if trade:
@@ -270,6 +323,78 @@ class EventsAgent:
 
             except Exception as e:
                 logger.error("Error resolving events position %s: %s", pos.id, e)
+
+    def _record_signal_attribution(self, position, market) -> None:
+        """Record which intelligence signals drove a trade entry.
+
+        Captures the composite score, contributing signals, regime, and
+        lifecycle at the time of entry. This data is saved with the position
+        and never reconstructed later.
+        """
+        try:
+            from intelligence.manager import IntelligenceManager
+            from nba_agent.utils import load_json
+
+            # Try to read the latest intelligence report from disk
+            report_path = self.config.DATA_DIR / "intelligence_report.json"
+            report_data = load_json(report_path, {})
+
+            # Find composite score for this market
+            scores = report_data.get("scores", [])
+            for score_entry in scores:
+                mid = score_entry.get("market_id", "")
+                if mid == market.id:
+                    position.entry_composite = score_entry.get("composite", 0.0)
+                    position.last_composite = position.entry_composite
+
+                    # Build entry_signals from signal breakdown
+                    breakdown = score_entry.get("signal_breakdown", {})
+                    entry_signals = []
+                    for source, info in breakdown.items():
+                        entry_signals.append({
+                            "source": source,
+                            "strength": info.get("strength", 0),
+                            "direction": info.get("direction", "NEUTRAL"),
+                        })
+                    position.entry_signals = entry_signals
+                    break
+
+            # Lifecycle at entry
+            lifecycles = report_data.get("lifecycle_assessments", {})
+            if isinstance(lifecycles, dict):
+                lc = lifecycles.get(market.id, {})
+                if isinstance(lc, dict):
+                    position.lifecycle_at_entry = lc.get("stage", "")
+                elif hasattr(lc, "stage"):
+                    position.lifecycle_at_entry = lc.stage
+
+            # Regime at entry
+            regimes = report_data.get("regime_assessments", {})
+            if isinstance(regimes, dict):
+                ra = regimes.get(market.id, {})
+                if isinstance(ra, dict):
+                    position.regime_at_entry = ra.get("regime", "")
+                elif hasattr(ra, "regime"):
+                    position.regime_at_entry = ra.regime
+
+            # Initialize peak tracking
+            position.peak_pnl_pct = 0.0
+            position.peak_price = position.entry_price
+
+            logger.info(
+                "Signal attribution: composite=%.3f signals=%d regime=%s lifecycle=%s",
+                position.entry_composite,
+                len(position.entry_signals or []),
+                position.regime_at_entry,
+                position.lifecycle_at_entry,
+            )
+
+        except Exception as e:
+            logger.warning("Could not record signal attribution: %s", e)
+            position.entry_signals = []
+            position.entry_composite = 0.0
+            position.peak_pnl_pct = 0.0
+            position.peak_price = position.entry_price
 
     def shutdown(self) -> None:
         """Signal graceful shutdown."""

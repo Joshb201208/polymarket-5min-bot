@@ -18,6 +18,12 @@ class EventCategory(str, Enum):
     SCIENCE = "science"
     ENTERTAINMENT = "entertainment"
     TECHNOLOGY = "technology"
+    COMMODITIES = "commodities"
+    MACRO_ECONOMICS = "macro_economics"
+    FOREX = "forex"
+    CLIMATE = "climate"
+    TECH_INDUSTRY = "tech_industry"
+    FUTURES = "futures"
     OTHER = "other"
 
 
@@ -124,6 +130,17 @@ class Position:
     market_slug: str = ""
     fees_paid: float = 0.0
     edge_source: str = ""
+    # Peak tracking (smart exit engine)
+    peak_pnl_pct: float = 0.0
+    peak_price: float = 0.0
+    # Signal attribution (recorded at entry)
+    entry_signals: Optional[list] = None
+    entry_composite: float = 0.0
+    last_composite: float = 0.0
+    hold_days: float = 0.0
+    exit_checks: int = 0
+    regime_at_entry: str = ""
+    lifecycle_at_entry: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -20,7 +20,7 @@ class EventsConfig:
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Trading mode
-    TRADING_MODE: str = os.getenv("EVENTS_TRADING_MODE", "paper")
+    TRADING_MODE: str = os.getenv("EVENTS_TRADING_MODE", "live")
 
     # Polymarket credentials (live mode only — shared with NBA)
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
@@ -43,9 +43,15 @@ class EventsConfig:
     # Liquidity floor
     MIN_LIQUIDITY: float = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
 
-    # Early exit thresholds
+    # Early exit thresholds (legacy, used as fallback)
     TAKE_PROFIT: float = float(os.getenv("EVENTS_TAKE_PROFIT", "0.30"))
     STOP_LOSS: float = float(os.getenv("EVENTS_STOP_LOSS", "0.25"))
+
+    # Smart exit engine parameters
+    TRAILING_STOP_DRAWDOWN: float = float(os.getenv("EVENTS_TRAILING_STOP_DRAWDOWN", "0.40"))
+    HARD_STOP_LOSS: float = float(os.getenv("EVENTS_HARD_STOP_LOSS", "0.30"))
+    TIME_EXIT_DAYS: int = int(os.getenv("EVENTS_TIME_EXIT_DAYS", "30"))
+    MIN_EXIT_LIQUIDITY: float = float(os.getenv("EVENTS_MIN_EXIT_LIQUIDITY", "3000"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

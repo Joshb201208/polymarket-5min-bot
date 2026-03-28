@@ -7,6 +7,7 @@ per market. Used by the events agent to determine bet sizing and confidence.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime
 
@@ -15,20 +16,77 @@ from nba_agent.utils import utcnow
 
 logger = logging.getLogger("intelligence.composite_scorer")
 
+# Env var names for each source's ENABLED flag
+_SOURCE_ENABLED_VARS: dict[str, str] = {
+    "metaculus": "METACULUS_ENABLED",
+    "x_scanner": "X_SCANNER_ENABLED",
+    "orderbook": "ORDERBOOK_INTEL_ENABLED",
+    "whale_tracker": "WHALE_TRACKER_ENABLED",
+    "google_trends": "GOOGLE_TRENDS_ENABLED",
+    "congress": "CONGRESS_TRACKER_ENABLED",
+    "cross_market": "CROSS_MARKET_ENABLED",
+}
+
+
+def _is_source_enabled(source: str) -> bool:
+    """Check if a source is enabled via its env var (default true)."""
+    env_var = _SOURCE_ENABLED_VARS.get(source)
+    if env_var is None:
+        return True
+    return os.getenv(env_var, "true").lower() == "true"
+
+
+def _get_active_weights(base_weights: dict[str, float]) -> dict[str, float]:
+    """Redistribute weights from disabled sources proportionally to active ones.
+
+    When any source has ENABLED=false, its weight is redistributed proportionally
+    to the remaining active sources so they still sum to 1.0.
+    """
+    active = {s: w for s, w in base_weights.items() if _is_source_enabled(s)}
+    disabled = {s: w for s, w in base_weights.items() if not _is_source_enabled(s)}
+
+    if not disabled:
+        return dict(base_weights)
+
+    if not active:
+        return dict(base_weights)
+
+    disabled_weight = sum(disabled.values())
+    active_total = sum(active.values())
+
+    redistributed = {}
+    for source, weight in active.items():
+        proportion = weight / active_total if active_total > 0 else 0
+        redistributed[source] = weight + (disabled_weight * proportion)
+
+    for source in disabled:
+        redistributed[source] = 0.0
+
+    logger.info(
+        "Weight redistribution: disabled=%s, redistributed %.2f weight to %d active sources",
+        list(disabled.keys()), disabled_weight, len(active),
+    )
+    return redistributed
+
 
 class CompositeScorer:
     """Combines all signal sources into weighted composite confidence scores."""
 
-    # Signal source weights (sum to 1.0)
-    WEIGHTS: dict[str, float] = {
-        "metaculus": 0.25,
-        "x_scanner": 0.20,
-        "orderbook": 0.15,
-        "whale_tracker": 0.15,
-        "google_trends": 0.10,
-        "congress": 0.08,
-        "cross_market": 0.07,
+    # Default signal source weights (sum to 1.0)
+    # X scanner set to 0.0 — weight redistributed to other sources
+    DEFAULT_WEIGHTS: dict[str, float] = {
+        "metaculus": 0.30,
+        "x_scanner": 0.00,
+        "orderbook": 0.20,
+        "whale_tracker": 0.20,
+        "google_trends": 0.12,
+        "congress": 0.10,
+        "cross_market": 0.08,
     }
+
+    def __init__(self) -> None:
+        # Compute runtime weights accounting for disabled sources
+        self.WEIGHTS = _get_active_weights(self.DEFAULT_WEIGHTS)
 
     # Confidence tier thresholds and max bet percentages
     TIERS: list[tuple[float, str, float]] = [

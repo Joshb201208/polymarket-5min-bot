@@ -30,15 +30,15 @@ INTELLIGENCE_MODULES = {
 COMPOSITE_MIN_SCORE = float(os.getenv("COMPOSITE_MIN_SCORE", "0.4"))
 COMPOSITE_DIRECTION_BONUS = float(os.getenv("COMPOSITE_DIRECTION_BONUS", "0.2"))
 
-# Signal source weights (must sum to 1.0)
+# Signal source weights (sum to 1.0; x_scanner zeroed, weight redistributed)
 SOURCE_WEIGHTS = {
-    "metaculus": 0.25,
-    "x_scanner": 0.20,
-    "orderbook": 0.15,
-    "whale_tracker": 0.15,
-    "google_trends": 0.10,
-    "congress": 0.08,
-    "cross_market": 0.07,
+    "metaculus": 0.30,
+    "x_scanner": 0.00,
+    "orderbook": 0.20,
+    "whale_tracker": 0.20,
+    "google_trends": 0.12,
+    "congress": 0.10,
+    "cross_market": 0.08,
 }
 
 

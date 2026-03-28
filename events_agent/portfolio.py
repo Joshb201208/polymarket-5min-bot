@@ -83,7 +83,7 @@ class PortfolioManager:
         atomic_json_write(self._trades_path, data)
 
     # ------------------------------------------------------------------
-    # Early exit logic
+    # Smart exit logic (delegates to SmartExitEngine)
     # ------------------------------------------------------------------
 
     def should_exit_early(
@@ -91,22 +91,56 @@ class PortfolioManager:
         position: Position,
         current_price: float,
         lifecycle=None,
+        composite_score: float | None = None,
+        composite_direction: str | None = None,
+        remaining_edge: float | None = None,
+        lifecycle_stage: str | None = None,
+        regime: str | None = None,
+        bid_depth: float | None = None,
     ) -> tuple[bool, str]:
-        """Check if an events position should be exited early.
+        """Check if an events position should be exited using the SmartExitEngine.
 
-        Events markets CAN be sold early (unlike game-day sports bets).
-        Exit triggers:
-        - Take profit (lifecycle-adjusted or default +30%)
-        - Stop loss (lifecycle-adjusted or default -25%)
-        - Liquidity concern (handled externally via scanner)
+        Delegates to SmartExitEngine for intelligent, multi-trigger exit decisions.
+        Falls back to basic TP/SL if SmartExitEngine import fails.
         """
+        try:
+            from events_agent.smart_exit import SmartExitEngine
+
+            engine = SmartExitEngine(self.config)
+            decision = engine.should_exit(
+                position=position,
+                current_price=current_price,
+                composite_score=composite_score,
+                composite_direction=composite_direction,
+                remaining_edge=remaining_edge,
+                lifecycle_stage=lifecycle_stage,
+                regime=regime,
+                bid_depth=bid_depth,
+            )
+
+            # Persist updated peak tracking fields
+            if decision.should_exit or position.exit_checks % 5 == 0:
+                self.save_position(position)
+
+            return decision.should_exit, decision.reason
+
+        except Exception as e:
+            logger.warning("SmartExitEngine failed, falling back to basic TP/SL: %s", e)
+            return self._basic_exit_check(position, current_price, lifecycle)
+
+    def _basic_exit_check(
+        self,
+        position: Position,
+        current_price: float,
+        lifecycle=None,
+    ) -> tuple[bool, str]:
+        """Fallback: basic fixed TP/SL check."""
         entry = position.entry_price
         if entry <= 0:
             return False, ""
 
         pnl_pct = (current_price - entry) / entry
 
-        # Use lifecycle-adjusted TP/SL if available
         tp = self.config.TAKE_PROFIT
         sl = self.config.STOP_LOSS
         if lifecycle:
@@ -119,7 +153,6 @@ class PortfolioManager:
             elif isinstance(lifecycle, dict):
                 sl = lifecycle.get("stop_loss", sl)
 
-            # Hold-to-resolution strategy: don't exit early
             hold_strategy = ""
             if hasattr(lifecycle, "hold_strategy"):
                 hold_strategy = lifecycle.hold_strategy
@@ -128,11 +161,9 @@ class PortfolioManager:
             if hold_strategy == "hold_to_resolution":
                 return False, ""
 
-        # Take profit
         if pnl_pct >= tp:
             return True, f"Take profit (+{pnl_pct * 100:.1f}%)"
 
-        # Stop loss
         if pnl_pct <= -sl:
             return True, f"Stop loss ({pnl_pct * 100:.1f}%)"
 

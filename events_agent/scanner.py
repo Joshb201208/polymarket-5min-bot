@@ -90,7 +90,38 @@ _CATEGORY_KEYWORDS: dict[EventCategory, list[str]] = {
         "controversy", "scandal", "lawsuit", "supreme-court",
         "roe-v-wade", "gun-control", "immigration",
     ],
+    EventCategory.COMMODITIES: [
+        "oil", "crude", "wti", "brent", "gold", "silver", "copper",
+        "natural gas", "commodity", "opec", "barrel", "precious metal",
+    ],
+    EventCategory.MACRO_ECONOMICS: [
+        "gdp", "cpi", "inflation", "unemployment", "interest rate", "fed rate",
+        "federal reserve", "pce", "ppi", "jobs report", "nonfarm", "payroll",
+        "recession", "treasury", "yield", "bond", "debt ceiling",
+    ],
+    EventCategory.FOREX: [
+        "usd", "eur", "gbp", "jpy", "dollar", "euro", "pound", "yen",
+        "exchange rate", "currency",
+    ],
+    EventCategory.CLIMATE: [
+        "climate change", "carbon", "emissions", "renewable", "solar",
+        "wind energy", "drought", "flooding", "wildfire", "sea level",
+        "temperature record", "paris agreement", "cop2",
+    ],
+    EventCategory.TECH_INDUSTRY: [
+        "ai", "agi", "gpt", "artificial intelligence", "tech regulation",
+        "antitrust", "earnings", "revenue", "market cap", "ipo",
+    ],
+    EventCategory.FUTURES: [
+        "futures", "contract", "expiry", "settlement", "forward",
+        "derivative", "margin", "open interest",
+    ],
 }
+
+# Secondary scan keywords — commodity/macro markets often phrase questions this way
+_SECONDARY_SCAN_KEYWORDS = [
+    "price", "rate", "above", "below", "over", "under",
+]
 
 
 class EventsScanner:
@@ -134,12 +165,19 @@ class EventsScanner:
         return markets
 
     async def _fetch_events(self) -> list[dict]:
-        """Fetch active events from Gamma API sorted by liquidity."""
+        """Fetch active events from Gamma API sorted by liquidity.
+
+        Runs a primary liquidity-sorted fetch, then a secondary keyword-based
+        fetch for commodity/macro markets that use "price", "rate", "above",
+        "below", "over", "under" in the question.
+        """
         all_events: list[dict] = []
+        seen_ids: set[str] = set()
         offset = 0
         limit = 100
 
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # Primary fetch: liquidity-sorted
             while True:
                 try:
                     resp = await client.get(
@@ -157,7 +195,11 @@ class EventsScanner:
                     events = resp.json()
                     if not events:
                         break
-                    all_events.extend(events)
+                    for ev in events:
+                        eid = ev.get("id", "")
+                        if eid and eid not in seen_ids:
+                            seen_ids.add(eid)
+                            all_events.append(ev)
                     if len(events) < limit:
                         break
                     offset += limit
@@ -168,7 +210,30 @@ class EventsScanner:
                     logger.error("Gamma API request failed (offset=%d): %s", offset, e)
                     break
 
-        logger.info("Fetched %d events from Gamma API", len(all_events))
+            # Secondary fetch: keyword-based for commodity/macro markets
+            for keyword in _SECONDARY_SCAN_KEYWORDS:
+                try:
+                    resp = await client.get(
+                        f"{self.base_url}/events",
+                        params={
+                            "active": "true",
+                            "closed": "false",
+                            "limit": 50,
+                            "offset": 0,
+                            "title": keyword,
+                        },
+                    )
+                    resp.raise_for_status()
+                    events = resp.json()
+                    for ev in events:
+                        eid = ev.get("id", "")
+                        if eid and eid not in seen_ids:
+                            seen_ids.add(eid)
+                            all_events.append(ev)
+                except httpx.HTTPError as e:
+                    logger.debug("Secondary scan for '%s' failed: %s", keyword, e)
+
+        logger.info("Fetched %d events from Gamma API (primary + secondary scan)", len(all_events))
         return all_events
 
     def _is_sports_event(self, slug: str, title: str) -> bool:
