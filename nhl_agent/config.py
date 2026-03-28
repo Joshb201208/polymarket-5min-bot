@@ -28,9 +28,9 @@ class NHLConfig(SharedConfig):
 
     # Bet sizing
     MAX_BET_PCT: float = 0.08  # 8% max per bet (half-Kelly capped)
-    MAX_FUTURES_BET_PCT: float = 0.04  # 4% max per futures bet (capital locked longer)
+    MAX_FUTURES_BET_PCT: float = 0.06  # 6% max per futures bet (can sell early)
     MAX_GAME_EXPOSURE_PCT: float = 0.12  # 12% max per game
-    MAX_FUTURES_EXPOSURE_PCT: float = 0.15  # 15% max total futures exposure
+    MAX_FUTURES_EXPOSURE_PCT: float = 0.25  # 25% max total futures exposure (sellable anytime)
     MAX_TOTAL_EXPOSURE_PCT: float = 0.50  # 50% total (NBA + NHL)
 
     # NHL data

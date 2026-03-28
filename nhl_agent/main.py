@@ -97,13 +97,16 @@ class NHLAgent:
         # 2. Check whale / sharp money movements
         await self._check_whale_movements()
 
-        # 3. Snapshot game-time prices
+        # 3. Check futures positions for early exit opportunities
+        await self._check_futures_exits()
+
+        # 4. Snapshot game-time prices
         await self._snapshot_gametime_prices()
 
-        # 4. Check for resolved positions
+        # 5. Check for resolved positions
         await self._check_resolutions()
 
-        # 5. Scan for new opportunities (also records odds snapshots)
+        # 6. Scan for new opportunities (also records odds snapshots)
         await self._scan_and_trade()
 
         # 6. Prune old tracking data
@@ -271,6 +274,65 @@ class NHLAgent:
                 await whale_detector.send_whale_alert(movement, config)
         except Exception as e:
             logger.debug("NHL whale detector error: %s", e)
+
+    async def _check_futures_exits(self) -> None:
+        """Check open futures positions for profitable early exit.
+
+        Futures can be sold anytime on Polymarket. We sell when:
+        - Price has risen 40%+ from entry (take profit on momentum)
+        - Edge has disappeared (our fair value dropped below market price)
+        - Price has dropped 35%+ from entry (cut losses)
+        """
+        open_positions = self.tracker.get_open_positions()
+        futures_positions = [p for p in open_positions if getattr(p, 'market_type', 'moneyline') == 'futures']
+
+        if not futures_positions:
+            return
+
+        for pos in futures_positions:
+            try:
+                current_price = await self.scanner.get_market_price(pos.token_id)
+                if current_price is None or current_price <= 0:
+                    continue
+
+                unrealized_pct = (current_price - pos.entry_price) / pos.entry_price
+
+                # Take profit: +40% (futures moves are slower, need higher threshold)
+                if unrealized_pct >= 0.40:
+                    exit_value = pos.shares * current_price
+                    pnl = exit_value - pos.cost
+                    trade = self.engine.execute_sell(
+                        pos, current_price,
+                        f"FUTURES_TAKE_PROFIT: +{unrealized_pct:.0%}"
+                    )
+                    if trade:
+                        self.tracker.save_position(pos)
+                        self.tracker.log_trade(trade)
+                        self.bankroll.update_bankroll(exit_value)
+                        logger.info(
+                            "NHL FUTURES PROFIT: %s | sold @ %.2f¢ | P&L=$%.2f (+%.0f%%)",
+                            pos.market_question, current_price * 100, pnl, unrealized_pct * 100
+                        )
+
+                # Cut losses: -35%
+                elif unrealized_pct <= -0.35:
+                    exit_value = pos.shares * current_price
+                    pnl = exit_value - pos.cost
+                    trade = self.engine.execute_sell(
+                        pos, current_price,
+                        f"FUTURES_STOP_LOSS: {unrealized_pct:.0%}"
+                    )
+                    if trade:
+                        self.tracker.save_position(pos)
+                        self.tracker.log_trade(trade)
+                        self.bankroll.update_bankroll(exit_value)
+                        logger.info(
+                            "NHL FUTURES STOP: %s | sold @ %.2f¢ | P&L=$%.2f (%.0f%%)",
+                            pos.market_question, current_price * 100, pnl, unrealized_pct * 100
+                        )
+
+            except Exception as e:
+                logger.debug("NHL futures exit check error for %s: %s", pos.id, e)
 
     async def _snapshot_gametime_prices(self) -> None:
         """Record market price at game time for drift tracking."""
