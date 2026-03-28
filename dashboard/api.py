@@ -765,19 +765,26 @@ def deploy() -> dict:
     project_dir = Path("/root/polymarket-bot")
     results = {}
 
-    # Git pull
+    # Git fetch + reset (more robust than pull — avoids ref conflicts)
     try:
-        pull = subprocess.run(
-            ["git", "pull", "origin", "master"],
+        fetch = subprocess.run(
+            ["git", "fetch", "--all"],
             cwd=project_dir,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        reset = subprocess.run(
+            ["git", "reset", "--hard", "origin/master"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
         results["git_pull"] = {
-            "ok": pull.returncode == 0,
-            "stdout": pull.stdout.strip()[-500:],
-            "stderr": pull.stderr.strip()[-200:] if pull.returncode != 0 else "",
+            "ok": fetch.returncode == 0 and reset.returncode == 0,
+            "stdout": reset.stdout.strip()[-500:],
+            "stderr": (fetch.stderr.strip() + reset.stderr.strip())[-200:] if (fetch.returncode != 0 or reset.returncode != 0) else "",
         }
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
