@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Agent — NBA</title>
+    <meta name="description" content="NBA Polymarket betting agent dashboard">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- LOGIN SCREEN -->
+    <div id="loginOverlay" class="login-overlay">
+        <canvas id="loginCanvas"></canvas>
+        <div class="login-orb login-orb-1"></div>
+        <div class="login-orb login-orb-2"></div>
+        <div class="login-orb login-orb-3"></div>
+        <div class="login-grid-bg"></div>
+        <div class="login-scanline"></div>
+        <div class="login-container">
+            <div class="login-ring-wrap">
+                <svg class="login-ring" width="120" height="120" viewBox="0 0 120 120" fill="none">
+                    <circle cx="60" cy="60" r="56" stroke="url(#ringGrad)" stroke-width="1" stroke-dasharray="6 8" opacity="0.4"/>
+                    <circle cx="60" cy="60" r="46" stroke="url(#ringGrad2)" stroke-width="0.75" stroke-dasharray="3 6" opacity="0.3"/>
+                    <defs>
+                        <linearGradient id="ringGrad" x1="0" y1="0" x2="120" y2="120">
+                            <stop offset="0%" stop-color="#00f0ff"/>
+                            <stop offset="100%" stop-color="#8b5cf6"/>
+                        </linearGradient>
+                        <linearGradient id="ringGrad2" x1="120" y1="0" x2="0" y2="120">
+                            <stop offset="0%" stop-color="#8b5cf6"/>
+                            <stop offset="100%" stop-color="#00f0ff"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <div class="login-logo-core">
+                    <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
+                        <circle cx="16" cy="16" r="12" stroke="#00f0ff" stroke-width="1.5" fill="none" opacity="0.5"/>
+                        <circle cx="16" cy="16" r="6" stroke="#00f0ff" stroke-width="1.5" fill="none"/>
+                        <circle cx="16" cy="16" r="2.5" fill="#00f0ff"/>
+                        <line x1="16" y1="4" x2="16" y2="10" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="16" y1="22" x2="16" y2="28" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="4" y1="16" x2="10" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <line x1="22" y1="16" x2="28" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                    </svg>
+                </div>
+            </div>
+            <div class="login-text">
+                <div class="login-title">POLYMARKET AGENT</div>
+                <div class="login-subtitle">NBA + NHL DASHBOARD</div>
+            </div>
+            <form id="loginForm" class="login-form" autocomplete="off">
+                <div class="login-input-group">
+                    <label class="login-label" for="passkeyInput">PASSKEY</label>
+                    <div class="login-input-wrap">
+                        <input type="password" id="passkeyInput" class="login-input" placeholder="• • • • • •" autofocus autocomplete="off">
+                        <div class="login-input-glow"></div>
+                    </div>
+                </div>
+                <div class="login-error" id="loginError"></div>
+                <button type="submit" class="login-btn" id="loginBtn">
+                    <span class="login-btn-text">UNLOCK</span>
+                    <svg class="login-btn-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div class="login-footer">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style="opacity:0.5">
+                    <rect x="1" y="5" width="10" height="6" rx="1.5" stroke="#71717a" stroke-width="1"/>
+                    <path d="M3 5V3.5a3 3 0 0 1 6 0V5" stroke="#71717a" stroke-width="1" stroke-linecap="round"/>
+                </svg>
+                <span>Secured access only</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- DASHBOARD -->
+    <div id="dashboardContent" class="dashboard-hidden">
+
+    <!-- HEADER -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="14" stroke="#00f0ff" stroke-width="2" fill="none" opacity="0.3"/>
+                    <circle cx="16" cy="16" r="8" stroke="#00f0ff" stroke-width="2" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="#00f0ff"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                </svg>
+                <div class="logo-text">
+                    <span class="logo-title">POLYMARKET</span>
+                    <span class="logo-subtitle">NBA</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-center">
+            <a href="/" class="nav-link">Overview</a>
+            <a href="/nba.html" class="nav-link active">NBA</a>
+            <a href="/nhl.html" class="nav-link">NHL</a>
+            <a href="/analytics.html" class="nav-link">Analytics</a>
+        </div>
+        <div class="header-right">
+            <div class="api-health" id="apiHealth" title="API Status">
+                <span class="api-dot" id="dotEspn" title="ESPN"></span>
+                <span class="api-dot" id="dotOdds" title="Odds API"></span>
+                <span class="api-dot" id="dotBdl" title="BallDontLie"></span>
+                <span class="api-dot" id="dotPoly" title="Polymarket"></span>
+            </div>
+            <div class="mode-badge" id="modeBadge">
+                <span class="mode-dot"></span>
+                <span class="mode-text">PAPER</span>
+            </div>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot connected"></span>
+                <span class="status-text">Live</span>
+            </div>
+            <div class="last-update" id="lastUpdate">--</div>
+        </div>
+    </header>
+
+    <!-- HERO KPIs -->
+    <section class="hero-stats">
+        <div class="kpi-card kpi-balance">
+            <div class="kpi-label">Portfolio Value</div>
+            <div class="kpi-value balance-glow" id="kpiPortfolio">$0.00</div>
+            <div class="kpi-sub" id="kpiPortfolioSub">Cash: $0 · Bets: $0</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Total P&L</div>
+            <div class="kpi-value" id="kpiRealizedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiRealizedSub">ROI: 0%</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Unrealized P&L</div>
+            <div class="kpi-value" id="kpiUnrealizedPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiUnrealizedSub">0 open positions</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Today's P&L</div>
+            <div class="kpi-value" id="kpiDailyPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiDailyPnlSub">0 trades today</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Win Rate</div>
+            <div class="kpi-value" id="kpiWinRate">0%</div>
+            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L · <span id="kpiTotalTrades">0</span> trades</div>
+        </div>
+    </section>
+
+    <!-- EQUITY CURVE -->
+    <section class="card equity-section">
+        <div class="card-header">
+            <h2 class="card-title">Equity Curve</h2>
+            <div class="card-header-right">
+                <span class="badge badge-info" id="drawdownBadge">Max DD: --</span>
+                <span class="badge badge-info" id="profitFactorBadge">PF: --</span>
+            </div>
+        </div>
+        <div class="chart-container equity-chart">
+            <canvas id="equityChart"></canvas>
+        </div>
+    </section>
+
+    <!-- LIVE POSITIONS -->
+    <section class="card">
+        <div class="card-header">
+            <h2 class="card-title">Live Positions</h2>
+            <div class="card-header-right">
+                <span class="badge badge-cyan" id="openCount">0 open</span>
+            </div>
+        </div>
+        <div class="positions-grid" id="positionsGrid">
+            <div class="empty-state" id="emptyPositions">
+                <div class="empty-icon">
+                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                        <circle cx="24" cy="24" r="20" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
+                        <path d="M18 24h12M24 18v12" stroke="#71717a" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="empty-text">No open positions</div>
+                <div class="empty-sub">Waiting for next edge opportunity</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- PERFORMANCE CHARTS -->
+    <section class="charts-grid">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Daily P&L</h2>
+            </div>
+            <div class="chart-container">
+                <canvas id="dailyPnlChart"></canvas>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Win Rate by Type</h2>
+            </div>
+            <div class="chart-container">
+                <canvas id="winRateTypeChart"></canvas>
+            </div>
+        </div>
+    </section>
+
+    <!-- STREAK + STATS -->
+    <section class="stats-row">
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Current Streak</div>
+            <div class="stat-mini-value" id="currentStreak">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Best Streak</div>
+            <div class="stat-mini-value streak-win" id="bestStreak">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Worst Streak</div>
+            <div class="stat-mini-value streak-loss" id="worstStreak">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Avg Win</div>
+            <div class="stat-mini-value streak-win" id="avgWin">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Avg Loss</div>
+            <div class="stat-mini-value streak-loss" id="avgLoss">--</div>
+        </div>
+        <div class="card stat-mini">
+            <div class="stat-mini-label">Avg Edge</div>
+            <div class="stat-mini-value" id="avgEdge">--</div>
+        </div>
+    </section>
+
+    <!-- REDEEM CHECKLIST -->
+    <section class="card">
+        <div class="card-header">
+            <h2 class="card-title">Redeem Checklist</h2>
+            <div class="card-header-right">
+                <span class="badge badge-profit" id="redeemWinCount">0 to collect</span>
+                <span class="badge badge-loss" id="redeemLossCount">0 to clear</span>
+                <button class="redeem-clear-btn" id="redeemClearBtn" onclick="clearAllRedeemed()" title="Mark all as done">Clear All</button>
+            </div>
+        </div>
+        <div id="redeemList" class="redeem-list">
+            <div class="empty-state">
+                <div class="empty-text">No positions to redeem</div>
+                <div class="empty-sub">Resolved positions will appear here</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- TRADE HISTORY -->
+    <section class="card">
+        <div class="card-header">
+            <h2 class="card-title">Trade History</h2>
+            <div class="card-header-right">
+                <span class="badge" id="tradeCountBadge">0 closed</span>
+            </div>
+        </div>
+        <div class="table-wrapper" id="tradeTableWrapper">
+            <table class="trade-table">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort="date">Date <span class="sort-arrow">↕</span></th>
+                        <th class="sortable" data-sort="market">Market <span class="sort-arrow">↕</span></th>
+                        <th>Side</th>
+                        <th class="sortable" data-sort="entry">Entry <span class="sort-arrow">↕</span></th>
+                        <th class="sortable" data-sort="exit">Exit <span class="sort-arrow">↕</span></th>
+                        <th class="sortable" data-sort="pnl">P&L <span class="sort-arrow">↕</span></th>
+                        <th>Edge</th>
+                        <th>Confidence</th>
+                    </tr>
+                </thead>
+                <tbody id="tradeTableBody"></tbody>
+            </table>
+        </div>
+        <div class="trade-cards-mobile" id="tradeCardsMobile"></div>
+    </section>
+
+    <!-- RESEARCH FEED -->
+    <section class="card">
+        <div class="card-header">
+            <h2 class="card-title">Research Feed</h2>
+            <span class="badge badge-purple" id="researchCount">0 analyzed</span>
+        </div>
+        <div class="research-grid" id="researchGrid">
+            <div class="empty-state">
+                <div class="empty-text">No research data yet</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- PERFORMANCE SUMMARY -->
+    <section class="card">
+        <div class="card-header">
+            <h2 class="card-title">Performance Summary</h2>
+            <div class="period-tabs">
+                <button class="period-tab active" data-period="today">Today</button>
+                <button class="period-tab" data-period="week">This Week</button>
+                <button class="period-tab" data-period="month">This Month</button>
+                <button class="period-tab" data-period="all">All Time</button>
+            </div>
+        </div>
+        <div class="summary-grid" id="perfGrid">
+            <div class="summary-item">
+                <div class="summary-label">Bets</div>
+                <div class="summary-value" id="perfBets">0</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Wins / Losses</div>
+                <div class="summary-value" id="perfWL">0 / 0</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Win Rate</div>
+                <div class="summary-value" id="perfWinRate">0%</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">P&L</div>
+                <div class="summary-value" id="perfPnl">$0.00</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">ROI</div>
+                <div class="summary-value" id="perfRoi">0%</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Avg Win</div>
+                <div class="summary-value" id="perfAvgWin">$0.00</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Avg Loss</div>
+                <div class="summary-value" id="perfAvgLoss">$0.00</div>
+            </div>
+            <div class="summary-item">
+                <div class="summary-label">Profit Factor</div>
+                <div class="summary-value" id="perfPF">--</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <span class="footer-text">Polymarket Agent — NBA Dashboard — Auto-refreshes every 30s</span>
+    </footer>
+
+    </div>
+
+    <script src="common.js"></script>
+    <script src="nba-app.js"></script>
+</body>
+</html>

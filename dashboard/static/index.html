@@ -1,61 +1,26 @@
-<!--
-   ______                            __
-  / ____/___  ____ ___  ____  __  __/ /____  _____
- / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
-/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
-\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
-                    /_/
-        Created with Perplexity Computer
-        https://www.perplexity.ai/computer
--->
-
-<!-- Perplexity Computer Attribution — SEO Meta Tags -->
-<meta name="generator" content="Perplexity Computer">
-<meta name="author" content="Perplexity Computer">
-<meta property="og:see_also" content="https://www.perplexity.ai/computer">
-<link rel="author" href="https://www.perplexity.ai/computer">
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Polymarket Agent — Live Dashboard</title>
-    <meta name="description" content="Real-time monitoring dashboard for NBA + NHL Polymarket betting agents">
-
-    <!-- Fonts -->
+    <title>Polymarket Agent — Overview</title>
+    <meta name="description" content="Combined overview dashboard for NBA + NHL Polymarket betting agents">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-    <!-- Styles -->
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-    <!-- ============================================= -->
-    <!-- LOGIN SCREEN                                  -->
-    <!-- ============================================= -->
+    <!-- LOGIN SCREEN -->
     <div id="loginOverlay" class="login-overlay">
-        <!-- Interactive particle canvas -->
         <canvas id="loginCanvas"></canvas>
-
-        <!-- Floating aurora orbs -->
         <div class="login-orb login-orb-1"></div>
         <div class="login-orb login-orb-2"></div>
         <div class="login-orb login-orb-3"></div>
-
-        <!-- Subtle grid overlay -->
         <div class="login-grid-bg"></div>
-
-        <!-- Horizontal scan line -->
         <div class="login-scanline"></div>
-
-        <!-- Card -->
         <div class="login-container">
-            <!-- Rotating ring behind logo -->
             <div class="login-ring-wrap">
                 <svg class="login-ring" width="120" height="120" viewBox="0 0 120 120" fill="none">
                     <circle cx="60" cy="60" r="56" stroke="url(#ringGrad)" stroke-width="1" stroke-dasharray="6 8" opacity="0.4"/>
@@ -71,7 +36,6 @@
                         </linearGradient>
                     </defs>
                 </svg>
-                <!-- Core logo -->
                 <div class="login-logo-core">
                     <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
                         <circle cx="16" cy="16" r="12" stroke="#00f0ff" stroke-width="1.5" fill="none" opacity="0.5"/>
@@ -84,15 +48,13 @@
                     </svg>
                 </div>
             </div>
-
             <div class="login-text">
                 <div class="login-title">POLYMARKET AGENT</div>
                 <div class="login-subtitle">NBA + NHL DASHBOARD</div>
             </div>
-
             <form id="loginForm" class="login-form" autocomplete="off">
                 <div class="login-input-group">
-                    <label class="login-label" for="passkey">PASSKEY</label>
+                    <label class="login-label" for="passkeyInput">PASSKEY</label>
                     <div class="login-input-wrap">
                         <input type="password" id="passkeyInput" class="login-input" placeholder="• • • • • •" autofocus autocomplete="off">
                         <div class="login-input-glow"></div>
@@ -116,18 +78,14 @@
         </div>
     </div>
 
-    <!-- ============================================= -->
-    <!-- DASHBOARD (hidden until auth)                 -->
-    <!-- ============================================= -->
+    <!-- DASHBOARD -->
     <div id="dashboardContent" class="dashboard-hidden">
 
-    <!-- ============================================= -->
-    <!-- HEADER                                        -->
-    <!-- ============================================= -->
+    <!-- HEADER -->
     <header class="header">
         <div class="header-left">
             <div class="logo">
-                <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="NBA Agent Logo">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
                     <circle cx="16" cy="16" r="14" stroke="#00f0ff" stroke-width="2" fill="none" opacity="0.3"/>
                     <circle cx="16" cy="16" r="8" stroke="#00f0ff" stroke-width="2" fill="none"/>
                     <circle cx="16" cy="16" r="3" fill="#00f0ff"/>
@@ -138,24 +96,17 @@
                 </svg>
                 <div class="logo-text">
                     <span class="logo-title">POLYMARKET</span>
-                    <span class="logo-subtitle">NBA + NHL</span>
+                    <span class="logo-subtitle">AGENT</span>
                 </div>
             </div>
         </div>
         <div class="header-center">
             <a href="/" class="nav-link active">Overview</a>
+            <a href="/nba.html" class="nav-link">NBA</a>
+            <a href="/nhl.html" class="nav-link">NHL</a>
             <a href="/analytics.html" class="nav-link">Analytics</a>
         </div>
         <div class="header-right">
-            <div class="api-health" id="apiHealth" title="API Status">
-                <span class="api-dot" id="dotEspn" title="ESPN"></span>
-                <span class="api-dot" id="dotOdds" title="Odds API"></span>
-                <span class="api-dot" id="dotBdl" title="BallDontLie"></span>
-                <span class="api-dot" id="dotPoly" title="Polymarket"></span>
-                <span class="api-health-sep"></span>
-                <span class="api-dot" id="dotNhlApi" title="NHL API"></span>
-                <span class="api-dot" id="dotMoneyPuck" title="MoneyPuck"></span>
-            </div>
             <div class="mode-badge" id="modeBadge">
                 <span class="mode-dot"></span>
                 <span class="mode-text">PAPER</span>
@@ -168,10 +119,8 @@
         </div>
     </header>
 
-    <!-- ============================================= -->
-    <!-- HERO KPIs                                     -->
-    <!-- ============================================= -->
-    <section class="hero-stats">
+    <!-- HERO KPIs -->
+    <section class="hero-stats hero-stats-overview">
         <div class="kpi-card kpi-balance">
             <div class="kpi-label">Portfolio Value</div>
             <div class="kpi-value balance-glow" id="kpiPortfolio">$0.00</div>
@@ -179,31 +128,24 @@
         </div>
         <div class="kpi-card">
             <div class="kpi-label">Total P&L</div>
-            <div class="kpi-value" id="kpiRealizedPnl">$0.00</div>
-            <div class="kpi-sub" id="kpiRealizedSub">ROI: 0%</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Unrealized P&L</div>
-            <div class="kpi-value" id="kpiUnrealizedPnl">$0.00</div>
-            <div class="kpi-sub" id="kpiUnrealizedSub">0 open positions</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Today's P&L</div>
-            <div class="kpi-value" id="kpiDailyPnl">$0.00</div>
-            <div class="kpi-sub" id="kpiDailyPnlSub">0 trades today</div>
+            <div class="kpi-value" id="kpiTotalPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiTotalPnlSub">Combined NBA + NHL</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-label">Win Rate</div>
             <div class="kpi-value" id="kpiWinRate">0%</div>
-            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L · <span id="kpiTotalTrades">0</span> trades</div>
+            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Total Trades</div>
+            <div class="kpi-value" id="kpiTotalTrades">0</div>
+            <div class="kpi-sub" id="kpiTotalTradesSub">All time</div>
         </div>
     </section>
 
-    <!-- ============================================= -->
-    <!-- SPORT BREAKDOWN ROW                           -->
-    <!-- ============================================= -->
+    <!-- SPORT BREAKDOWN -->
     <section class="sport-breakdown">
-        <div class="sport-breakdown-card">
+        <a href="/nba.html" class="sport-breakdown-card sport-link-card">
             <span class="sport-badge badge-nba">NBA</span>
             <div class="sport-breakdown-stats">
                 <div class="sport-stat">
@@ -219,8 +161,9 @@
                     <span class="sport-stat-value" id="nbaExposure">$0.00</span>
                 </div>
             </div>
-        </div>
-        <div class="sport-breakdown-card">
+            <span class="sport-link-arrow">&rarr;</span>
+        </a>
+        <a href="/nhl.html" class="sport-breakdown-card sport-link-card">
             <span class="sport-badge badge-nhl">NHL</span>
             <div class="sport-breakdown-stats">
                 <div class="sport-stat">
@@ -236,241 +179,103 @@
                     <span class="sport-stat-value" id="nhlExposure">$0.00</span>
                 </div>
             </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- EQUITY CURVE                                  -->
-    <!-- ============================================= -->
-    <section class="card equity-section">
-        <div class="card-header">
-            <h2 class="card-title">Equity Curve</h2>
-            <div class="card-header-right">
-                <span class="badge badge-info" id="drawdownBadge">Max DD: --</span>
-                <span class="badge badge-info" id="profitFactorBadge">PF: --</span>
-            </div>
-        </div>
-        <div class="chart-container equity-chart">
-            <canvas id="equityChart"></canvas>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- LIVE POSITIONS                                -->
-    <!-- ============================================= -->
-    <section class="card">
-        <div class="card-header">
-            <h2 class="card-title">Live Positions</h2>
-            <div class="card-header-right">
-                <div class="sport-filters" id="positionFilters">
-                    <button class="filter-btn active" data-sport="all" onclick="setSportFilter('positions','all')">All</button>
-                    <button class="filter-btn" data-sport="nba" onclick="setSportFilter('positions','nba')">NBA</button>
-                    <button class="filter-btn" data-sport="nhl" onclick="setSportFilter('positions','nhl')">NHL</button>
-                </div>
-                <span class="badge badge-cyan" id="openCount">0 open</span>
-            </div>
-        </div>
-        <div class="positions-grid" id="positionsGrid">
-            <div class="empty-state" id="emptyPositions">
-                <div class="empty-icon">
-                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-                        <circle cx="24" cy="24" r="20" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
-                        <path d="M18 24h12M24 18v12" stroke="#71717a" stroke-width="1.5" stroke-linecap="round"/>
-                    </svg>
-                </div>
-                <div class="empty-text">No open positions</div>
-                <div class="empty-sub">Waiting for next edge opportunity</div>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- PERFORMANCE CHARTS                            -->
-    <!-- ============================================= -->
-    <section class="charts-grid">
-        <div class="card">
-            <div class="card-header">
-                <h2 class="card-title">Daily P&L</h2>
-            </div>
-            <div class="chart-container">
-                <canvas id="dailyPnlChart"></canvas>
-            </div>
-        </div>
-        <div class="card">
-            <div class="card-header">
-                <h2 class="card-title">Win Rate by Type</h2>
-            </div>
-            <div class="chart-container">
-                <canvas id="winRateTypeChart"></canvas>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- STREAK + STATS CARDS                          -->
-    <!-- ============================================= -->
-    <section class="stats-row">
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Current Streak</div>
-            <div class="stat-mini-value" id="currentStreak">--</div>
-        </div>
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Best Streak</div>
-            <div class="stat-mini-value streak-win" id="bestStreak">--</div>
-        </div>
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Worst Streak</div>
-            <div class="stat-mini-value streak-loss" id="worstStreak">--</div>
-        </div>
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Avg Win</div>
-            <div class="stat-mini-value streak-win" id="avgWin">--</div>
-        </div>
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Avg Loss</div>
-            <div class="stat-mini-value streak-loss" id="avgLoss">--</div>
-        </div>
-        <div class="card stat-mini">
-            <div class="stat-mini-label">Avg Edge</div>
-            <div class="stat-mini-value" id="avgEdge">--</div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- REDEEM CHECKLIST                               -->
-    <!-- ============================================= -->
-    <section class="card">
-        <div class="card-header">
-            <h2 class="card-title">Redeem Checklist</h2>
-            <div class="card-header-right">
-                <span class="badge badge-profit" id="redeemWinCount">0 to collect</span>
-                <span class="badge badge-loss" id="redeemLossCount">0 to clear</span>
-                <button class="redeem-clear-btn" id="redeemClearBtn" onclick="clearAllRedeemed()" title="Mark all as done">Clear All</button>
-            </div>
-        </div>
-        <div id="redeemList" class="redeem-list">
-            <div class="empty-state">
-                <div class="empty-text">No positions to redeem</div>
-                <div class="empty-sub">Resolved positions will appear here</div>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- TRADE HISTORY                                 -->
-    <!-- ============================================= -->
-    <section class="card">
-        <div class="card-header">
-            <h2 class="card-title">Trade History</h2>
-            <div class="card-header-right">
-                <div class="sport-filters" id="tradeFilters">
-                    <button class="filter-btn active" data-sport="all" onclick="setSportFilter('trades','all')">All</button>
-                    <button class="filter-btn" data-sport="nba" onclick="setSportFilter('trades','nba')">NBA</button>
-                    <button class="filter-btn" data-sport="nhl" onclick="setSportFilter('trades','nhl')">NHL</button>
-                </div>
-                <span class="badge" id="tradeCountBadge">0 closed</span>
-            </div>
-        </div>
-        <div class="table-wrapper" id="tradeTableWrapper">
-            <table class="trade-table">
-                <thead>
-                    <tr>
-                        <th class="sortable" data-sort="date">Date <span class="sort-arrow">↕</span></th>
-                        <th>Sport</th>
-                        <th class="sortable" data-sort="market">Market <span class="sort-arrow">↕</span></th>
-                        <th>Side</th>
-                        <th class="sortable" data-sort="entry">Entry <span class="sort-arrow">↕</span></th>
-                        <th class="sortable" data-sort="exit">Exit <span class="sort-arrow">↕</span></th>
-                        <th class="sortable" data-sort="pnl">P&L <span class="sort-arrow">↕</span></th>
-                        <th>Edge</th>
-                        <th>Confidence</th>
-                    </tr>
-                </thead>
-                <tbody id="tradeTableBody">
-                </tbody>
-            </table>
-        </div>
-        <!-- Mobile card view -->
-        <div class="trade-cards-mobile" id="tradeCardsMobile"></div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- RESEARCH FEED                                 -->
-    <!-- ============================================= -->
-    <section class="card">
-        <div class="card-header">
-            <h2 class="card-title">Research Feed</h2>
-            <span class="badge badge-purple" id="researchCount">0 analyzed</span>
-        </div>
-        <div class="research-grid" id="researchGrid">
-            <div class="empty-state">
-                <div class="empty-text">No research data yet</div>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- PERFORMANCE SUMMARY                            -->
-    <!-- ============================================= -->
-    <section class="card">
-        <div class="card-header">
-            <h2 class="card-title">Performance Summary</h2>
-            <div class="period-tabs">
-                <button class="period-tab active" data-period="today">Today</button>
-                <button class="period-tab" data-period="week">This Week</button>
-                <button class="period-tab" data-period="month">This Month</button>
-                <button class="period-tab" data-period="all">All Time</button>
-            </div>
-        </div>
-        <div class="summary-grid" id="perfGrid">
-            <div class="summary-item">
-                <div class="summary-label">Bets</div>
-                <div class="summary-value" id="perfBets">0</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">Wins / Losses</div>
-                <div class="summary-value" id="perfWL">0 / 0</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">Win Rate</div>
-                <div class="summary-value" id="perfWinRate">0%</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">P&L</div>
-                <div class="summary-value" id="perfPnl">$0.00</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">ROI</div>
-                <div class="summary-value" id="perfRoi">0%</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">Avg Win</div>
-                <div class="summary-value" id="perfAvgWin">$0.00</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">Avg Loss</div>
-                <div class="summary-value" id="perfAvgLoss">$0.00</div>
-            </div>
-            <div class="summary-item">
-                <div class="summary-label">Profit Factor</div>
-                <div class="summary-value" id="perfPF">--</div>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============================================= -->
-    <!-- FOOTER                                        -->
-    <!-- ============================================= -->
-    <footer class="footer">
-        <span class="footer-text">Polymarket Agent Dashboard v2.0 (NBA + NHL) — Auto-refreshes every 30s</span>
-        <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener noreferrer" class="footer-link">
-            Created with Perplexity Computer
+            <span class="sport-link-arrow">&rarr;</span>
         </a>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <span class="footer-text">Polymarket Agent Dashboard v3.0 — Auto-refreshes every 30s</span>
     </footer>
 
-    </div> <!-- end #dashboardContent -->
+    </div>
 
-    <!-- App JS -->
-    <script src="app.js"></script>
+    <script src="common.js"></script>
+    <script>
+    /* =================================================================
+       Overview Page JS
+       ================================================================= */
+
+    async function refresh() {
+        const [status, combinedStatus, stats] = await Promise.all([
+            fetchJSON("/api/status"),
+            fetchJSON("/api/combined/status"),
+            fetchJSON("/api/stats"),
+        ]);
+
+        const anySuccess = status || combinedStatus || stats;
+        setConnected(anySuccess);
+
+        // Mode badge
+        if (status) {
+            const badge = document.getElementById("modeBadge");
+            const modeText = badge.querySelector(".mode-text");
+            if (status.mode === "live") {
+                badge.classList.add("live");
+                modeText.textContent = "LIVE";
+            } else {
+                badge.classList.remove("live");
+                modeText.textContent = "PAPER";
+            }
+            document.getElementById("lastUpdate").textContent = status.last_scan
+                ? fmt.relative(status.last_scan) : "--";
+        }
+
+        // Combined status
+        if (combinedStatus) {
+            const cash = combinedStatus.bankroll || 0;
+            const combined = combinedStatus.combined || {};
+            const totalExposure = combinedStatus.total_exposure || 0;
+            const portfolioValue = cash + totalExposure;
+
+            document.getElementById("kpiPortfolio").textContent = fmt.usd(portfolioValue);
+            document.getElementById("kpiPortfolioSub").textContent =
+                `Cash: ${fmt.usd(cash)} \u00b7 Bets: ${fmt.usd(totalExposure)}`;
+
+            const totalPnl = combined.total_pnl || 0;
+            const pnlEl = document.getElementById("kpiTotalPnl");
+            pnlEl.textContent = (totalPnl >= 0 ? "+" : "") + fmt.usd(totalPnl);
+            pnlEl.className = `kpi-value ${pnlClass(totalPnl)}`;
+
+            // Sport breakdown
+            const nba = combinedStatus.nba || {};
+            const nhl = combinedStatus.nhl || {};
+
+            const nbaPnlEl = document.getElementById("nbaPnl");
+            const nbaPnlVal = nba.total_pnl || 0;
+            nbaPnlEl.textContent = (nbaPnlVal >= 0 ? "+" : "") + fmt.usd(nbaPnlVal);
+            nbaPnlEl.className = `sport-stat-value ${pnlClass(nbaPnlVal)}`;
+            document.getElementById("nbaOpen").textContent = nba.open_positions || 0;
+            document.getElementById("nbaExposure").textContent = fmt.usd(nba.exposure || 0);
+
+            const nhlPnlEl = document.getElementById("nhlPnl");
+            const nhlPnlVal = nhl.total_pnl || 0;
+            nhlPnlEl.textContent = (nhlPnlVal >= 0 ? "+" : "") + fmt.usd(nhlPnlVal);
+            nhlPnlEl.className = `sport-stat-value ${pnlClass(nhlPnlVal)}`;
+            document.getElementById("nhlOpen").textContent = nhl.open_positions || 0;
+            document.getElementById("nhlExposure").textContent = fmt.usd(nhl.exposure || 0);
+        }
+
+        // Stats — win rate, total trades
+        if (stats) {
+            document.getElementById("kpiWinRate").textContent = fmt.pct(stats.win_rate);
+            document.getElementById("kpiWins").textContent = stats.wins || 0;
+            document.getElementById("kpiLosses").textContent = stats.losses || 0;
+            document.getElementById("kpiTotalTrades").textContent = stats.total_trades || 0;
+        }
+    }
+
+    // Init
+    if (authToken) {
+        fetchJSON("/api/status").then((data) => {
+            if (data) { showDashboard(); refresh(); }
+            else { showLogin(); }
+        });
+    } else {
+        showLogin();
+    }
+
+    setInterval(() => { if (authToken) refresh(); }, REFRESH_INTERVAL);
+    </script>
 </body>
 </html>

@@ -1,0 +1,573 @@
+/* ===================================================================
+   NHL Dashboard — nhl-app.js
+   Full NHL-only dashboard: positions, charts, trades, edges.
+   Fetches from /api/nhl/* endpoints.
+   =================================================================== */
+
+// State
+let equityChart = null;
+let dailyPnlChart = null;
+let winRateTypeChart = null;
+let sortColumn = "date";
+let sortDirection = "desc";
+let expandedTradeId = null;
+let cachedPositions = null;
+let cachedStats = null;
+let cachedStatus = null;
+
+// ---------------------------------------------------------------------------
+// Update Functions
+// ---------------------------------------------------------------------------
+function updateStatus(data) {
+    if (!data) return;
+    cachedStatus = data;
+
+    const badge = document.getElementById("modeBadge");
+    const modeText = badge.querySelector(".mode-text");
+    if (data.mode === "live") {
+        badge.classList.add("live");
+        modeText.textContent = "LIVE";
+    } else {
+        badge.classList.remove("live");
+        modeText.textContent = "PAPER";
+    }
+
+    document.getElementById("lastUpdate").textContent = data.last_scan
+        ? fmt.relative(data.last_scan) : "--";
+
+    // NHL API health from data_sources
+    const sources = data.data_sources || [];
+    const nhlApiEl = document.getElementById("dotNhlApi");
+    const moneyPuckEl = document.getElementById("dotMoneyPuck");
+    const polyEl = document.getElementById("dotPoly");
+
+    if (nhlApiEl) {
+        nhlApiEl.className = `api-dot ${sources.includes("NHL API") ? "ok" : "error"}`;
+        nhlApiEl.title = "NHL API: " + (sources.includes("NHL API") ? "ok" : "unknown");
+    }
+    if (moneyPuckEl) {
+        moneyPuckEl.className = `api-dot ${sources.includes("MoneyPuck") ? "ok" : "error"}`;
+        moneyPuckEl.title = "MoneyPuck: " + (sources.includes("MoneyPuck") ? "ok" : "unknown");
+    }
+    if (polyEl) {
+        polyEl.className = `api-dot ${sources.includes("Polymarket") ? "ok" : "error"}`;
+        polyEl.title = "Polymarket: " + (sources.includes("Polymarket") ? "ok" : "unknown");
+    }
+}
+
+function updateStats(data) {
+    if (!data) return;
+    cachedStats = data;
+
+    // Exposure
+    const openPositions = cachedPositions?.open || [];
+    const exposure = openPositions.reduce((sum, p) => sum + (p.cost || 0), 0);
+    document.getElementById("kpiExposure").textContent = fmt.usd(exposure);
+    document.getElementById("kpiExposureSub").textContent =
+        `${openPositions.length} open position${openPositions.length !== 1 ? "s" : ""}`;
+
+    // Today's P&L
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+    const todayEntry = (data.daily_pnl || []).find((d) => d.date === today);
+    const dailyPnl = todayEntry ? todayEntry.pnl : 0;
+    const dailyEl = document.getElementById("kpiDailyPnl");
+    dailyEl.textContent = (dailyPnl >= 0 ? "+" : "") + fmt.usd(dailyPnl);
+    dailyEl.className = `kpi-value ${pnlClass(dailyPnl)}`;
+    const todayTrades = todayEntry ? (todayEntry.trades || 1) : 0;
+    document.getElementById("kpiDailyPnlSub").textContent =
+        `${todayTrades} trade${todayTrades !== 1 ? "s" : ""} today`;
+
+    // Realized P&L
+    const realizedEl = document.getElementById("kpiRealizedPnl");
+    const realizedPnl = data.total_pnl || 0;
+    realizedEl.textContent = (realizedPnl >= 0 ? "+" : "") + fmt.usd(realizedPnl);
+    realizedEl.className = `kpi-value ${pnlClass(realizedPnl)}`;
+    document.getElementById("kpiRealizedSub").textContent =
+        `ROI: ${(data.roi >= 0 ? "+" : "")}${fmt.pct(data.roi)}`;
+
+    // Win rate
+    document.getElementById("kpiWinRate").textContent = fmt.pct(data.win_rate);
+    document.getElementById("kpiTotalTrades").textContent = data.total_trades || 0;
+    document.getElementById("kpiWins").textContent = data.wins || 0;
+    document.getElementById("kpiLosses").textContent = data.losses || 0;
+
+    // Badges
+    document.getElementById("drawdownBadge").textContent = `Max DD: ${fmt.pct(data.max_drawdown)}`;
+    document.getElementById("profitFactorBadge").textContent =
+        `PF: ${data.profit_factor === Infinity ? "\u221e" : data.profit_factor}`;
+
+    // Streaks
+    const streak = data.streak || {};
+    const csEl = document.getElementById("currentStreak");
+    csEl.textContent = `${streak.current || 0}${streak.type || ""}`;
+    csEl.className = `stat-mini-value ${streak.type === "W" ? "streak-win" : "streak-loss"}`;
+    document.getElementById("bestStreak").textContent = `${streak.best || 0}W`;
+    document.getElementById("worstStreak").textContent = `${streak.worst || 0}L`;
+    document.getElementById("avgWin").textContent = fmt.usd(data.avg_win);
+    document.getElementById("avgLoss").textContent = fmt.usd(data.avg_loss);
+    document.getElementById("avgEdge").textContent = `${data.avg_edge || 0}%`;
+
+    // Performance summary
+    document.getElementById("perfBets").textContent = data.total_trades || 0;
+    document.getElementById("perfWL").textContent = `${data.wins || 0} / ${data.losses || 0}`;
+    document.getElementById("perfWinRate").textContent = fmt.pct(data.win_rate);
+    const pnlEl = document.getElementById("perfPnl");
+    pnlEl.textContent = (realizedPnl >= 0 ? "+" : "") + fmt.usd(realizedPnl);
+    pnlEl.className = `summary-value ${pnlClass(realizedPnl)}`;
+    const roiEl = document.getElementById("perfRoi");
+    const roi = data.roi || 0;
+    roiEl.textContent = (roi >= 0 ? "+" : "") + fmt.pct(roi);
+    roiEl.className = `summary-value ${pnlClass(roi)}`;
+    document.getElementById("perfAvgWin").textContent = fmt.usd(data.avg_win);
+    document.getElementById("perfAvgWin").className = "summary-value pnl-positive";
+    document.getElementById("perfAvgLoss").textContent = fmt.usd(data.avg_loss);
+    document.getElementById("perfAvgLoss").className = "summary-value pnl-negative";
+    document.getElementById("perfPF").textContent = data.profit_factor != null
+        ? (data.profit_factor === Infinity ? "\u221e" : data.profit_factor.toFixed(2) + "x") : "--";
+
+    // Charts
+    drawEquityChart(data.daily_pnl || []);
+    drawDailyPnlChart(data.daily_pnl || []);
+    drawWinRateTypeChart(data.win_rate_by_type || {});
+}
+
+function renderPositions() {
+    const open = cachedPositions?.open || [];
+    const grid = document.getElementById("positionsGrid");
+    document.getElementById("openCount").textContent = `${open.length} open`;
+
+    if (open.length === 0) {
+        grid.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">
+                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                        <circle cx="24" cy="24" r="20" stroke="#71717a" stroke-width="1.5" stroke-dasharray="4 4"/>
+                        <path d="M18 24h12M24 18v12" stroke="#71717a" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="empty-text">No open positions</div>
+                <div class="empty-sub">Waiting for next edge opportunity</div>
+            </div>`;
+        return;
+    }
+
+    grid.innerHTML = open.map((p) => {
+        const confClass = p.confidence === "HIGH" ? "conf-high" :
+            p.confidence === "MEDIUM" ? "conf-medium" : "conf-low";
+
+        let gameDate = "--";
+        if (p.game_start_time) {
+            gameDate = new Date(p.game_start_time).toLocaleDateString("en-US",
+                { weekday: "short", month: "short", day: "numeric", timeZone: TZ });
+        }
+
+        return `
+        <div class="position-card pos-neutral">
+            <div class="pos-header">
+                <div class="pos-market">${escHtml(p.market_question)}</div>
+                <div class="pos-header-right">
+                    <span class="pos-game-date">${gameDate}</span>
+                    <span class="pos-conf badge ${confClass}">${p.confidence || 'N/A'}</span>
+                </div>
+            </div>
+            <div class="pos-details">
+                <div class="pos-detail"><span class="pos-detail-label">Side</span><span class="pos-detail-value">${p.side}</span></div>
+                <div class="pos-detail"><span class="pos-detail-label">Entry</span><span class="pos-detail-value">${fmt.price(p.entry_price)}</span></div>
+                <div class="pos-detail"><span class="pos-detail-label">Cost</span><span class="pos-detail-value">${fmt.usd(p.cost)}</span></div>
+                <div class="pos-detail"><span class="pos-detail-label">Edge</span><span class="pos-detail-value">${fmt.edge(p.edge_at_entry)}</span></div>
+            </div>
+        </div>`;
+    }).join("");
+}
+
+function renderTrades() {
+    const closed = (cachedPositions?.closed || []).slice();
+
+    closed.sort((a, b) => {
+        let va, vb;
+        switch (sortColumn) {
+            case "date": va = a.exit_time || a.entry_time || ""; vb = b.exit_time || b.entry_time || ""; break;
+            case "market": va = a.market_question || ""; vb = b.market_question || ""; break;
+            case "entry": va = a.entry_price || 0; vb = b.entry_price || 0; break;
+            case "exit": va = a.exit_price || 0; vb = b.exit_price || 0; break;
+            case "pnl": va = a.pnl || 0; vb = b.pnl || 0; break;
+            default: va = a.exit_time || ""; vb = b.exit_time || "";
+        }
+        if (typeof va === "string") {
+            const cmp = va.localeCompare(vb);
+            return sortDirection === "asc" ? cmp : -cmp;
+        }
+        return sortDirection === "asc" ? va - vb : vb - va;
+    });
+
+    document.getElementById("tradeCountBadge").textContent = `${closed.length} closed`;
+
+    const tbody = document.getElementById("tradeTableBody");
+    tbody.innerHTML = closed.map((p) => {
+        const pnl = p.pnl || 0;
+        const pnlCls = pnlClass(pnl);
+        const confClass = p.confidence === "HIGH" ? "conf-high" :
+            p.confidence === "MEDIUM" ? "conf-medium" : "conf-low";
+        const isExpanded = expandedTradeId === p.id;
+
+        return `
+        <tr onclick="toggleTradeDetail('${p.id}')">
+            <td>${fmt.date(p.exit_time || p.entry_time)}</td>
+            <td class="td-market" title="${escHtml(p.market_question)}">${escHtml(p.market_question)}</td>
+            <td>${p.side}</td>
+            <td>${fmt.price(p.entry_price)}</td>
+            <td>${fmt.price(p.exit_price)}</td>
+            <td class="${pnlCls}">${(pnl >= 0 ? "+" : "") + fmt.usd(pnl)}</td>
+            <td>${fmt.edge(p.edge_at_entry)}</td>
+            <td><span class="badge ${confClass}" style="font-size:10px">${p.confidence || 'N/A'}</span></td>
+        </tr>
+        <tr class="trade-detail-row ${isExpanded ? "expanded" : ""}" id="detail-${p.id}">
+            <td colspan="8" class="trade-detail-cell">
+                <div class="trade-detail-grid">
+                    <div class="trade-detail-item"><span class="trade-detail-label">Position ID</span><span class="trade-detail-value">${p.id}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Game Date</span><span class="trade-detail-value">${p.game_start_time ? new Date(p.game_start_time).toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",timeZone:TZ}) : "--"}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Entry Time</span><span class="trade-detail-value">${fmt.datetime(p.entry_time)}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Exit Time</span><span class="trade-detail-value">${fmt.datetime(p.exit_time)}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Cost</span><span class="trade-detail-value">${fmt.usd(p.cost)}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Shares</span><span class="trade-detail-value">${p.shares?.toFixed(2) || "--"}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Fair Price</span><span class="trade-detail-value">${fmt.price(p.our_fair_price)}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Exit Reason</span><span class="trade-detail-value">${p.exit_reason || "--"}</span></div>
+                    <div class="trade-detail-item"><span class="trade-detail-label">Mode</span><span class="trade-detail-value">${p.mode || "--"}</span></div>
+                </div>
+            </td>
+        </tr>`;
+    }).join("");
+
+    // Mobile cards
+    document.getElementById("tradeCardsMobile").innerHTML = closed.map((p) => {
+        const pnl = p.pnl || 0;
+        const pnlCls = pnlClass(pnl);
+        const confClass = p.confidence === "HIGH" ? "conf-high" :
+            p.confidence === "MEDIUM" ? "conf-medium" : "conf-low";
+        return `
+        <div class="trade-card-m">
+            <div class="trade-card-m-header">
+                <div class="trade-card-m-market">${escHtml(p.market_question)}</div>
+                <div class="trade-card-m-pnl ${pnlCls}">${(pnl >= 0 ? "+" : "") + fmt.usd(pnl)}</div>
+            </div>
+            <div class="trade-card-m-details">
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Side</span><span class="trade-card-m-value">${p.side}</span></div>
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Entry</span><span class="trade-card-m-value">${fmt.price(p.entry_price)}</span></div>
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Exit</span><span class="trade-card-m-value">${fmt.price(p.exit_price)}</span></div>
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Edge</span><span class="trade-card-m-value">${fmt.edge(p.edge_at_entry)}</span></div>
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Date</span><span class="trade-card-m-value">${fmt.date(p.exit_time)}</span></div>
+                <div class="trade-card-m-detail"><span class="trade-card-m-label">Conf</span><span class="trade-card-m-value"><span class="badge ${confClass}" style="font-size:9px;padding:2px 6px">${p.confidence || 'N/A'}</span></span></div>
+            </div>
+        </div>`;
+    }).join("");
+}
+
+function updateEdges(data) {
+    if (!data) return;
+    const edges = data.edges || [];
+    const grid = document.getElementById("researchGrid");
+    document.getElementById("researchCount").textContent = `${edges.length} edges`;
+
+    if (edges.length === 0) {
+        grid.innerHTML = `<div class="empty-state"><div class="empty-text">No edges detected yet</div></div>`;
+        return;
+    }
+
+    grid.innerHTML = edges.map((r) => {
+        const hasEdge = (r.edge || 0) >= 0.04;
+        const edgeClass = hasEdge ? "has-edge" : "no-edge";
+        return `
+        <div class="research-card ${edgeClass}">
+            <div class="research-header">
+                <span class="research-game">${escHtml(r.game || r.matchup || '')}</span>
+                <span class="research-time">${fmt.datetime(r.game_time || r.detected_at)}</span>
+            </div>
+            <div class="research-odds">
+                <div class="research-odds-item"><div class="research-odds-label">Fair Price</div><div class="research-odds-value">${fmt.price(r.our_fair_price || r.fair_price)}</div></div>
+                <div class="research-odds-item"><div class="research-odds-label">Market</div><div class="research-odds-value">${fmt.price(r.market_price)}</div></div>
+                <div class="research-odds-item"><div class="research-odds-label">Edge</div><div class="research-odds-value ${hasEdge ? "pnl-positive" : "pnl-neutral"}">${fmt.edge(r.edge)}</div></div>
+            </div>
+            ${r.analysis ? `<div class="research-analysis">${escHtml(r.analysis)}</div>` : ''}
+            <div class="research-footer">
+                <span class="badge ${r.confidence === "HIGH" ? "conf-high" : r.confidence === "MEDIUM" ? "conf-medium" : "conf-low"}" style="font-size:10px">${r.confidence || 'N/A'}</span>
+                <span class="research-bet-status ${r.bet_placed ? "research-bet-placed" : "research-bet-passed"}">${r.bet_placed ? "\u2713 BET PLACED" : "\u2014 PASSED"}</span>
+            </div>
+        </div>`;
+    }).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Redeem Checklist (NHL-specific key)
+// ---------------------------------------------------------------------------
+function getRedeemedSet() {
+    try { return new Set(JSON.parse(localStorage.getItem('nhl_agent_redeemed') || '[]')); }
+    catch { return new Set(); }
+}
+function saveRedeemedSet(set) {
+    try { localStorage.setItem('nhl_agent_redeemed', JSON.stringify([...set])); } catch {}
+}
+function toggleRedeemed(posId) {
+    const set = getRedeemedSet();
+    if (set.has(posId)) set.delete(posId); else set.add(posId);
+    saveRedeemedSet(set);
+    if (cachedPositions) updateRedeemChecklist(cachedPositions);
+}
+function updateRedeemChecklist(positions) {
+    const closed = positions.closed || [];
+    const container = document.getElementById('redeemList');
+    const redeemed = getRedeemedSet();
+
+    if (closed.length === 0) {
+        container.innerHTML = `<div class="empty-state"><div class="empty-text">No positions to redeem</div><div class="empty-sub">Resolved positions will appear here</div></div>`;
+        document.getElementById('redeemWinCount').textContent = '0 to collect';
+        document.getElementById('redeemLossCount').textContent = '0 to clear';
+        return;
+    }
+
+    const sorted = closed.slice().sort((a, b) => {
+        const aChecked = redeemed.has(a.id) ? 1 : 0;
+        const bChecked = redeemed.has(b.id) ? 1 : 0;
+        if (aChecked !== bChecked) return aChecked - bChecked;
+        return (b.exit_time || '').localeCompare(a.exit_time || '');
+    });
+
+    const wins = sorted.filter(p => (p.pnl || 0) > 0);
+    const losses = sorted.filter(p => (p.pnl || 0) <= 0);
+    document.getElementById('redeemWinCount').textContent = `${wins.filter(p => !redeemed.has(p.id)).length} to collect`;
+    document.getElementById('redeemLossCount').textContent = `${losses.filter(p => !redeemed.has(p.id)).length} to clear`;
+
+    container.innerHTML = sorted.map(p => {
+        const pnl = p.pnl || 0;
+        const isWin = pnl > 0;
+        const isChecked = redeemed.has(p.id);
+        const typeClass = isWin ? 'win' : 'loss';
+        return `
+        <div class="redeem-item ${typeClass} ${isChecked ? 'checked' : ''}" onclick="toggleRedeemed('${p.id}')">
+            <div class="redeem-check">
+                <svg class="redeem-check-icon" viewBox="0 0 12 12" fill="none">
+                    <path d="M2 6l3 3 5-6" stroke="${isWin ? '#0a0b0f' : '#fff'}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </div>
+            <div class="redeem-info">
+                <span class="redeem-market">${escHtml(p.market_question)}</span>
+                <div class="redeem-meta">
+                    <span class="redeem-date">${fmt.date(p.exit_time)}</span>
+                    <span class="redeem-side">${p.side}</span>
+                    <span class="redeem-amount ${typeClass}">${isWin ? '+' : ''}${fmt.usd(pnl)}</span>
+                    <span class="redeem-type ${isWin ? 'collect' : 'clear'}">${isWin ? 'COLLECT' : 'CLEAR'}</span>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+function clearAllRedeemed() {
+    if (!cachedPositions) return;
+    const set = getRedeemedSet();
+    (cachedPositions.closed || []).forEach(p => set.add(p.id));
+    saveRedeemedSet(set);
+    updateRedeemChecklist(cachedPositions);
+}
+window.toggleRedeemed = toggleRedeemed;
+window.clearAllRedeemed = clearAllRedeemed;
+
+// ---------------------------------------------------------------------------
+// Charts (NHL uses orange accent: #f59e0b)
+// ---------------------------------------------------------------------------
+function drawEquityChart(dailyPnl) {
+    const ctx = document.getElementById("equityChart").getContext("2d");
+    const labels = dailyPnl.map((d) => d.date);
+    const values = dailyPnl.map((d) => d.bankroll);
+
+    if (equityChart) {
+        equityChart.data.labels = labels;
+        equityChart.data.datasets[0].data = values;
+        equityChart.update("none");
+        return;
+    }
+
+    const gradient = ctx.createLinearGradient(0, 0, 0, 340);
+    gradient.addColorStop(0, "rgba(245, 158, 11, 0.25)");
+    gradient.addColorStop(0.5, "rgba(245, 158, 11, 0.08)");
+    gradient.addColorStop(1, "rgba(245, 158, 11, 0)");
+
+    equityChart = new Chart(ctx, {
+        type: "line",
+        data: {
+            labels,
+            datasets: [{
+                label: "Bankroll", data: values,
+                borderColor: "#f59e0b", borderWidth: 2.5,
+                backgroundColor: gradient, fill: true, tension: 0.4,
+                pointRadius: 3, pointBackgroundColor: "#f59e0b",
+                pointBorderColor: "#0a0b0f", pointBorderWidth: 2,
+                pointHoverRadius: 6, pointHoverBackgroundColor: "#f59e0b",
+                pointHoverBorderColor: "#fff",
+            }],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 1000, easing: "easeOutQuart" },
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: "rgba(18,19,26,0.95)", borderColor: "rgba(245,158,11,0.3)",
+                    borderWidth: 1, cornerRadius: 8, padding: 12,
+                    titleFont: { family: "'Inter'", size: 12, weight: "600" },
+                    bodyFont: { family: "'JetBrains Mono'", size: 13 },
+                    titleColor: "#71717a", bodyColor: "#e4e4e7",
+                    callbacks: { label: (ctx) => `$${ctx.parsed.y.toFixed(2)}` },
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 0, maxTicksLimit: 10 } },
+                y: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { font: { family: "'JetBrains Mono'", size: 11 }, callback: (v) => `$${v}` } },
+            },
+        },
+    });
+}
+
+function drawDailyPnlChart(dailyPnl) {
+    const ctx = document.getElementById("dailyPnlChart").getContext("2d");
+    const labels = dailyPnl.map((d) => d.date);
+    const values = dailyPnl.map((d) => d.pnl);
+    const colors = values.map((v) => (v >= 0 ? "#00ff88" : "#ff3366"));
+    const bgColors = values.map((v) => v >= 0 ? "rgba(0,255,136,0.7)" : "rgba(255,51,102,0.7)");
+
+    if (dailyPnlChart) {
+        dailyPnlChart.data.labels = labels;
+        dailyPnlChart.data.datasets[0].data = values;
+        dailyPnlChart.data.datasets[0].backgroundColor = bgColors;
+        dailyPnlChart.data.datasets[0].borderColor = colors;
+        dailyPnlChart.update("none");
+        return;
+    }
+
+    dailyPnlChart = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "P&L", data: values, backgroundColor: bgColors, borderColor: colors, borderWidth: 1, borderRadius: 4, borderSkipped: false }] },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 800, easing: "easeOutQuart" },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: "rgba(18,19,26,0.95)", borderColor: "rgba(255,255,255,0.1)",
+                    borderWidth: 1, cornerRadius: 8, padding: 12,
+                    bodyFont: { family: "'JetBrains Mono'", size: 13 },
+                    callbacks: { label: (ctx) => `${ctx.parsed.y >= 0 ? "+" : ""}$${ctx.parsed.y.toFixed(2)}` },
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 0, maxTicksLimit: 8 } },
+                y: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { font: { family: "'JetBrains Mono'", size: 11 }, callback: (v) => `$${v}` } },
+            },
+        },
+    });
+}
+
+function drawWinRateTypeChart(winRateByType) {
+    const ctx = document.getElementById("winRateTypeChart").getContext("2d");
+    const types = Object.keys(winRateByType);
+    const values = Object.values(winRateByType);
+    const bgColors = types.map(() => "rgba(245,158,11,0.7)");
+    const borderColors = types.map(() => "#f59e0b");
+
+    if (winRateTypeChart) {
+        winRateTypeChart.data.labels = types.map((t) => t.charAt(0).toUpperCase() + t.slice(1));
+        winRateTypeChart.data.datasets[0].data = values;
+        winRateTypeChart.data.datasets[0].backgroundColor = bgColors;
+        winRateTypeChart.data.datasets[0].borderColor = borderColors;
+        winRateTypeChart.update("none");
+        return;
+    }
+
+    winRateTypeChart = new Chart(ctx, {
+        type: "bar",
+        data: {
+            labels: types.map((t) => t.charAt(0).toUpperCase() + t.slice(1)),
+            datasets: [{ label: "Win Rate %", data: values, backgroundColor: bgColors, borderColor: borderColors, borderWidth: 1, borderRadius: 6, borderSkipped: false, barThickness: 40 }],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 800, easing: "easeOutQuart" },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: "rgba(18,19,26,0.95)", borderColor: "rgba(255,255,255,0.1)",
+                    borderWidth: 1, cornerRadius: 8, padding: 12,
+                    bodyFont: { family: "'JetBrains Mono'", size: 13 },
+                    callbacks: { label: (ctx) => `${ctx.parsed.y.toFixed(1)}%` },
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 11, weight: "500" }, color: "#e4e4e7" } },
+                y: { min: 0, max: 100, grid: { color: "rgba(255,255,255,0.04)" }, ticks: { font: { family: "'JetBrains Mono'", size: 11 }, callback: (v) => `${v}%` } },
+            },
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Sort + Expand handlers
+// ---------------------------------------------------------------------------
+window.toggleTradeDetail = function (id) {
+    expandedTradeId = expandedTradeId === id ? null : id;
+    renderTrades();
+};
+
+document.addEventListener("click", (e) => {
+    const th = e.target.closest("th.sortable");
+    if (!th) return;
+    const col = th.dataset.sort;
+    if (sortColumn === col) sortDirection = sortDirection === "asc" ? "desc" : "asc";
+    else { sortColumn = col; sortDirection = "desc"; }
+    document.querySelectorAll("th.sortable").forEach((el) => {
+        el.classList.remove("sort-active");
+        el.querySelector(".sort-arrow").textContent = "↕";
+    });
+    th.classList.add("sort-active");
+    th.querySelector(".sort-arrow").textContent = sortDirection === "asc" ? "↑" : "↓";
+    renderTrades();
+});
+
+// ---------------------------------------------------------------------------
+// Main refresh loop — NHL endpoints
+// ---------------------------------------------------------------------------
+async function refresh() {
+    const [status, positions, stats, edges] = await Promise.all([
+        fetchJSON("/api/nhl/status"),
+        fetchJSON("/api/nhl/positions"),
+        fetchJSON("/api/nhl/stats"),
+        fetchJSON("/api/nhl/edges"),
+    ]);
+
+    const anySuccess = status || positions || stats;
+    setConnected(anySuccess);
+
+    if (status) updateStatus(status);
+
+    if (positions) {
+        cachedPositions = positions;
+        renderPositions();
+        renderTrades();
+        updateRedeemChecklist(positions);
+    }
+
+    if (stats) updateStats(stats);
+    if (edges) updateEdges(edges);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+if (authToken) {
+    fetchJSON("/api/nhl/status").then((data) => {
+        if (data) { showDashboard(); refresh(); }
+        else { showLogin(); }
+    });
+} else {
+    showLogin();
+}
+
+setInterval(() => { if (authToken) refresh(); }, REFRESH_INTERVAL);

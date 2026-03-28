@@ -1929,3 +1929,117 @@ body::after {
     background: var(--border);
     margin: 0 2px;
 }
+
+/* ===================================================================
+   NHL THEME — Orange accent override
+   =================================================================== */
+.nhl-theme {
+    --primary: #f59e0b;
+    --primary-dim: rgba(245, 158, 11, 0.15);
+    --primary-glow: rgba(245, 158, 11, 0.1);
+}
+
+.nhl-theme .balance-glow {
+    color: #f59e0b;
+    text-shadow: 0 0 20px rgba(245, 158, 11, 0.4), 0 0 40px rgba(245, 158, 11, 0.2);
+    animation: nhl-balance-pulse 3s ease-in-out infinite;
+}
+
+@keyframes nhl-balance-pulse {
+    0%, 100% { text-shadow: 0 0 20px rgba(245, 158, 11, 0.4), 0 0 40px rgba(245, 158, 11, 0.2); }
+    50% { text-shadow: 0 0 30px rgba(245, 158, 11, 0.6), 0 0 60px rgba(245, 158, 11, 0.3); }
+}
+
+.nhl-theme .nav-link.active {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.15);
+}
+
+.nhl-theme .period-tab.active {
+    background: #f59e0b;
+    box-shadow: 0 0 12px rgba(245, 158, 11, 0.3);
+}
+
+.nhl-theme .badge-cyan {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border-color: rgba(245, 158, 11, 0.2);
+}
+
+.nhl-theme .filter-btn.active {
+    color: #f59e0b;
+    border-color: rgba(245, 158, 11, 0.4);
+    background: rgba(245, 158, 11, 0.15);
+}
+
+.nhl-theme .trade-table th.sortable:hover,
+.nhl-theme .trade-table th.sort-active {
+    color: #f59e0b;
+}
+
+.nhl-theme .trade-table tbody tr:hover {
+    background: rgba(245, 158, 11, 0.04);
+}
+
+.nhl-theme .login-logo-core {
+    filter: drop-shadow(0 0 16px rgba(245, 158, 11, 0.5));
+}
+
+.nhl-theme body::before {
+    background:
+        linear-gradient(rgba(245, 158, 11, 0.015) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(245, 158, 11, 0.015) 1px, transparent 1px);
+    background-size: 60px 60px;
+}
+
+.nhl-theme body::after {
+    background: radial-gradient(ellipse, rgba(245, 158, 11, 0.04) 0%, transparent 70%);
+}
+
+/* ===================================================================
+   OVERVIEW PAGE — 4-column KPI row, sport link cards
+   =================================================================== */
+.hero-stats-overview {
+    grid-template-columns: repeat(4, 1fr);
+}
+
+@media (max-width: 1200px) {
+    .hero-stats-overview {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 480px) {
+    .hero-stats-overview {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Sport link cards (clickable) */
+.sport-link-card {
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+    transition: all var(--transition);
+    position: relative;
+}
+
+.sport-link-card:hover {
+    border-color: var(--border-hover);
+    background: var(--surface-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.sport-link-arrow {
+    font-size: 18px;
+    color: var(--text-dim);
+    transition: all var(--transition);
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.sport-link-card:hover .sport-link-arrow {
+    color: var(--primary);
+    transform: translateX(4px);
+}

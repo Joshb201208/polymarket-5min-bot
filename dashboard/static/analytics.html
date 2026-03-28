@@ -498,6 +498,8 @@
         </div>
         <div class="header-center">
             <a href="/" class="nav-link">Overview</a>
+            <a href="/nba.html" class="nav-link">NBA</a>
+            <a href="/nhl.html" class="nav-link">NHL</a>
             <a href="/analytics.html" class="nav-link active">Analytics</a>
         </div>
         <div class="header-right">
@@ -768,7 +770,15 @@
         // -------------------------------------------------------
         // Auth State
         // -------------------------------------------------------
-        let authToken = sessionStorage.getItem('nba_agent_token') || null;
+        // Migrate from sessionStorage if present
+        (function() {
+            const old = sessionStorage.getItem('nba_agent_token');
+            if (old && !localStorage.getItem('nba_agent_token')) {
+                localStorage.setItem('nba_agent_token', old);
+                localStorage.removeItem('nba_agent_token');
+            }
+        })();
+        let authToken = localStorage.getItem('nba_agent_token') || null;
 
         // -------------------------------------------------------
         // Chart.js Defaults
@@ -972,7 +982,7 @@
 
                 const data = await res.json();
                 authToken = data.token;
-                sessionStorage.setItem('nba_agent_token', authToken);
+                localStorage.setItem('nba_agent_token', authToken);
 
                 showDashboard();
                 refresh();
@@ -1004,7 +1014,7 @@
                 const res = await fetch(`${API}${endpoint}`, { headers });
                 if (res.status === 401) {
                     authToken = null;
-                    sessionStorage.removeItem('nba_agent_token');
+                    localStorage.removeItem('nba_agent_token');
                     showLogin();
                     return null;
                 }
