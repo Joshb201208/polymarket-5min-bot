@@ -1,5 +1,5 @@
 /* ===================================================================
-   NBA Agent Dashboard — app.js
+   NBA + NHL Agent Dashboard — app.js
    Fetches all API endpoints every 30s, updates DOM, draws charts.
    =================================================================== */
 
@@ -23,10 +23,16 @@ let winRateTypeChart = null;
 let sortColumn = "date";
 let sortDirection = "desc";
 let expandedTradeId = null;
-let cachedPositions = null;
+let cachedPositions = null;    // NBA positions { open, closed }
+let cachedNhlPositions = null; // NHL positions { open, closed }
+let cachedCombined = null;     // /api/combined/status data
 let cachedStats = null;
 let cachedStatus = null;
 let cachedLive = {};  // { posId: { live_price, current_value, pnl_live, score } }
+
+// Sport filter state: 'all' | 'nba' | 'nhl'
+let sportFilterPositions = 'all';
+let sportFilterTrades = 'all';
 
 // ---------------------------------------------------------------------------
 // Chart.js Defaults
@@ -334,15 +340,14 @@ function setConnected(ok) {
 // Portfolio Value (computed from status + positions)
 // ---------------------------------------------------------------------------
 function updatePortfolioValue() {
-    if (!cachedStatus) return;
-    const cash = cachedStatus.bankroll || 0;
-    const starting = cachedStatus.starting_bankroll || 0;
+    if (!cachedStatus && !cachedCombined) return;
 
-    // Sum up cost of open positions to get deployed capital
-    let deployed = 0;
-    if (cachedPositions && cachedPositions.open) {
-        deployed = cachedPositions.open.reduce((sum, p) => sum + (p.cost || 0), 0);
-    }
+    // Prefer combined status for bankroll (shared across sports)
+    const cash = cachedCombined ? (cachedCombined.bankroll || 0) : (cachedStatus ? cachedStatus.bankroll || 0 : 0);
+
+    // Sum up cost of open positions across both sports
+    const merged = getMergedPositions();
+    const deployed = merged.open.reduce((sum, p) => sum + (p.cost || 0), 0);
 
     const portfolioValue = cash + deployed;
 
@@ -357,7 +362,8 @@ function updatePortfolioValue() {
 }
 
 function updateUnrealizedPnl() {
-    const openPositions = (cachedPositions && cachedPositions.open) ? cachedPositions.open : [];
+    const merged = getMergedPositions();
+    const openPositions = merged.open;
     let unrealized = 0;
     let hasLiveData = false;
 
@@ -459,8 +465,6 @@ function updateStats(data) {
     alEl.textContent = fmt.usd(data.avg_loss);
     document.getElementById("avgEdge").textContent = `${data.avg_edge || 0}%`;
 
-    document.getElementById("tradeCountBadge").textContent = `${data.total_trades || 0} closed`;
-
     // Draw charts
     drawEquityChart(data.daily_pnl || []);
     drawDailyPnlChart(data.daily_pnl || []);
@@ -471,12 +475,25 @@ function updatePositions(data) {
     if (!data) return;
     cachedPositions = data;
     updatePortfolioValue();  // Recalculate with fresh position data
+    renderMergedPositions();
+}
 
-    const open = data.open || [];
+function updateNhlPositions(data) {
+    if (!data) return;
+    cachedNhlPositions = data;
+    updatePortfolioValue();
+    renderMergedPositions();
+}
+
+function renderMergedPositions() {
+    const merged = getMergedPositions();
+    const allOpen = merged.open;
+    const filtered = filterBySport(allOpen, sportFilterPositions);
+
     const grid = document.getElementById("positionsGrid");
-    document.getElementById("openCount").textContent = `${open.length} open`;
+    document.getElementById("openCount").textContent = `${allOpen.length} open`;
 
-    if (open.length === 0) {
+    if (filtered.length === 0) {
         grid.innerHTML = `
             <div class="empty-state">
                 <div class="empty-icon">
@@ -491,8 +508,9 @@ function updatePositions(data) {
         return;
     }
 
-    grid.innerHTML = open
+    grid.innerHTML = filtered
         .map((p) => {
+            const sport = getSport(p);
             const holdTime = fmt.relative(p.entry_time);
             const confClass =
                 p.confidence === "HIGH" ? "conf-high" :
@@ -501,7 +519,7 @@ function updatePositions(data) {
             const cardClass = live && live.pnl_live > 0 ? "pos-profit" :
                               live && live.pnl_live < 0 ? "pos-loss" : "pos-neutral";
 
-            // Extract game date from slug (nba-away-home-YYYY-MM-DD) or game_start_time
+            // Extract game date from slug or game_start_time
             let gameDate = "--";
             if (p.game_start_time) {
                 const d = new Date(p.game_start_time);
@@ -517,7 +535,7 @@ function updatePositions(data) {
             return `
             <div class="position-card ${cardClass}">
                 <div class="pos-header">
-                    <div class="pos-market">${escHtml(p.market_question)}</div>
+                    <div class="pos-market">${sportBadgeHtml(sport)} ${escHtml(p.market_question)}</div>
                     <div class="pos-header-right">
                         <span class="pos-game-date">${gameDate}</span>
                         <span class="pos-conf badge ${confClass}">${p.confidence}</span>
@@ -561,8 +579,13 @@ function updatePositions(data) {
 
 function updateTrades(positions) {
     if (!positions) return;
+    // This is called with NBA positions data — just re-render merged
+    renderMergedTrades();
+}
 
-    const closed = (positions.closed || []).slice();
+function renderMergedTrades() {
+    const merged = getMergedPositions();
+    const closed = filterBySport(merged.closed, sportFilterTrades).slice();
 
     // Sort
     closed.sort((a, b) => {
@@ -599,10 +622,13 @@ function updateTrades(positions) {
         return sortDirection === "asc" ? va - vb : vb - va;
     });
 
+    document.getElementById("tradeCountBadge").textContent = `${merged.closed.length} closed`;
+
     // Desktop table
     const tbody = document.getElementById("tradeTableBody");
     tbody.innerHTML = closed
         .map((p) => {
+            const sport = getSport(p);
             const pnl = p.pnl || 0;
             const pnlClass = pnl > 0 ? "pnl-positive" : pnl < 0 ? "pnl-negative" : "pnl-neutral";
             const confClass =
@@ -613,6 +639,7 @@ function updateTrades(positions) {
             return `
             <tr onclick="toggleTradeDetail('${p.id}')">
                 <td>${fmt.date(p.exit_time || p.entry_time)}</td>
+                <td>${sportBadgeHtml(sport)}</td>
                 <td class="td-market" title="${escHtml(p.market_question)}">${escHtml(p.market_question)}</td>
                 <td>${p.side}</td>
                 <td>${fmt.price(p.entry_price)}</td>
@@ -622,7 +649,7 @@ function updateTrades(positions) {
                 <td><span class="badge ${confClass}" style="font-size:10px">${p.confidence}</span></td>
             </tr>
             <tr class="trade-detail-row ${isExpanded ? "expanded" : ""}" id="detail-${p.id}">
-                <td colspan="8" class="trade-detail-cell">
+                <td colspan="9" class="trade-detail-cell">
                     <div class="trade-detail-grid">
                         <div class="trade-detail-item">
                             <span class="trade-detail-label">Position ID</span>
@@ -670,6 +697,7 @@ function updateTrades(positions) {
     const mobileContainer = document.getElementById("tradeCardsMobile");
     mobileContainer.innerHTML = closed
         .map((p) => {
+            const sport = getSport(p);
             const pnl = p.pnl || 0;
             const pnlClass = pnl > 0 ? "pnl-positive" : pnl < 0 ? "pnl-negative" : "pnl-neutral";
             const confClass =
@@ -678,7 +706,7 @@ function updateTrades(positions) {
             return `
             <div class="trade-card-m">
                 <div class="trade-card-m-header">
-                    <div class="trade-card-m-market">${escHtml(p.market_question)}</div>
+                    <div class="trade-card-m-market">${sportBadgeHtml(sport)} ${escHtml(p.market_question)}</div>
                     <div class="trade-card-m-pnl ${pnlClass}">${(pnl >= 0 ? "+" : "") + fmt.usd(pnl)}</div>
                 </div>
                 <div class="trade-card-m-details">
@@ -860,6 +888,37 @@ function clearAllRedeemed() {
 // Expose for onclick
 window.toggleRedeemed = toggleRedeemed;
 window.clearAllRedeemed = clearAllRedeemed;
+
+// ---------------------------------------------------------------------------
+// Combined Status + Sport Breakdown
+// ---------------------------------------------------------------------------
+function updateCombinedStatus(data) {
+    if (!data) return;
+    cachedCombined = data;
+    updatePortfolioValue();
+
+    // Update KPI cards with combined data
+    const combined = data.combined || {};
+    const totalPnl = combined.total_pnl || 0;
+
+    // Sport breakdown row
+    const nba = data.nba || {};
+    const nhl = data.nhl || {};
+
+    const nbaPnlEl = document.getElementById("nbaPnl");
+    const nbaPnlVal = nba.total_pnl || 0;
+    nbaPnlEl.textContent = (nbaPnlVal >= 0 ? "+" : "") + fmt.usd(nbaPnlVal);
+    nbaPnlEl.className = `sport-stat-value ${nbaPnlVal >= 0 ? "pnl-positive" : "pnl-negative"}`;
+    document.getElementById("nbaOpen").textContent = nba.open_positions || 0;
+    document.getElementById("nbaExposure").textContent = fmt.usd(nba.exposure || 0);
+
+    const nhlPnlEl = document.getElementById("nhlPnl");
+    const nhlPnlVal = nhl.total_pnl || 0;
+    nhlPnlEl.textContent = (nhlPnlVal >= 0 ? "+" : "") + fmt.usd(nhlPnlVal);
+    nhlPnlEl.className = `sport-stat-value ${nhlPnlVal >= 0 ? "pnl-positive" : "pnl-negative"}`;
+    document.getElementById("nhlOpen").textContent = nhl.open_positions || 0;
+    document.getElementById("nhlExposure").textContent = fmt.usd(nhl.exposure || 0);
+}
 
 // Performance summary with period tabs
 let currentPeriod = "today";
@@ -1185,7 +1244,7 @@ window.toggleTradeDetail = function (id) {
     } else {
         expandedTradeId = id;
     }
-    if (cachedPositions) updateTrades(cachedPositions);
+    renderMergedTrades();
 };
 
 document.addEventListener("click", (e) => {
@@ -1208,7 +1267,7 @@ document.addEventListener("click", (e) => {
     th.classList.add("sort-active");
     th.querySelector(".sort-arrow").textContent = sortDirection === "asc" ? "↑" : "↓";
 
-    if (cachedPositions) updateTrades(cachedPositions);
+    renderMergedTrades();
 });
 
 // ---------------------------------------------------------------------------
@@ -1224,22 +1283,79 @@ function escHtml(str) {
 }
 
 // ---------------------------------------------------------------------------
+// Sport helpers
+// ---------------------------------------------------------------------------
+function getSport(position) {
+    return position._sport || 'nba';
+}
+
+function sportBadgeHtml(sport) {
+    const cls = sport === 'nhl' ? 'badge-nhl' : 'badge-nba';
+    const label = sport.toUpperCase();
+    return `<span class="sport-badge ${cls}">${label}</span>`;
+}
+
+function tagPositions(positions, sport) {
+    if (!positions) return { open: [], closed: [] };
+    return {
+        open: (positions.open || []).map(p => ({ ...p, _sport: sport })),
+        closed: (positions.closed || []).map(p => ({ ...p, _sport: sport })),
+    };
+}
+
+function getMergedPositions() {
+    const nba = tagPositions(cachedPositions, 'nba');
+    const nhl = tagPositions(cachedNhlPositions, 'nhl');
+    return {
+        open: [...nba.open, ...nhl.open],
+        closed: [...nba.closed, ...nhl.closed],
+    };
+}
+
+function filterBySport(arr, sport) {
+    if (sport === 'all') return arr;
+    return arr.filter(p => getSport(p) === sport);
+}
+
+// Sport filter button handler
+window.setSportFilter = function(section, sport) {
+    if (section === 'positions') {
+        sportFilterPositions = sport;
+        // Update active button
+        document.querySelectorAll('#positionFilters .filter-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.sport === sport);
+        });
+        renderMergedPositions();
+    } else if (section === 'trades') {
+        sportFilterTrades = sport;
+        document.querySelectorAll('#tradeFilters .filter-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.sport === sport);
+        });
+        renderMergedTrades();
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Main refresh loop
 // ---------------------------------------------------------------------------
 async function refresh() {
-    const [status, positions, stats, research, liveData] = await Promise.all([
+    const [status, positions, stats, research, liveData, nhlPositions, combinedStatus] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/positions"),
         fetchJSON("/api/stats"),
         fetchJSON("/api/research"),
         fetchJSON("/api/live"),
+        fetchJSON("/api/nhl/positions"),
+        fetchJSON("/api/combined/status"),
     ]);
 
-    const anySuccess = status || positions || stats || research;
+    const anySuccess = status || positions || stats || research || nhlPositions || combinedStatus;
     setConnected(anySuccess);
 
     if (status) updateStatus(status);
     if (stats) updateStats(stats);
+    if (combinedStatus) updateCombinedStatus(combinedStatus);
+
     // Update live data cache before rendering positions
     if (liveData && liveData.positions) {
         cachedLive = {};
@@ -1249,24 +1365,55 @@ async function refresh() {
         updateUnrealizedPnl();
     }
 
+    // Update NBA positions
     if (positions) {
         updatePositions(positions);
-        updateTrades(positions);
-        updateRedeemChecklist(positions);
     }
+    // Update NHL positions
+    if (nhlPositions) {
+        updateNhlPositions(nhlPositions);
+    }
+
+    // Render merged trades and redeem checklist from both sports
+    renderMergedTrades();
+    const merged = getMergedPositions();
+    updateRedeemChecklist({ open: merged.open, closed: merged.closed });
+
     if (research) updateResearch(research);
     updateDailySummary(stats, research);
 
     // API health check (runs less frequently — piggybacks on refresh)
     fetchJSON("/api/api-health").then((h) => {
         if (!h || !h.sources) return;
-        const map = { dotEspn: "espn", dotOdds: "odds_api", dotBdl: "balldontlie", dotPoly: "polymarket" };
+        const map = {
+            dotEspn: "espn",
+            dotOdds: "odds_api",
+            dotBdl: "balldontlie",
+            dotPoly: "polymarket",
+        };
         for (const [elId, key] of Object.entries(map)) {
             const el = document.getElementById(elId);
             if (!el) continue;
             const src = h.sources[key];
             el.className = `api-dot ${src && src.status === "ok" ? "ok" : "error"}`;
             el.title = `${key}: ${src ? src.status : "unknown"}`;
+        }
+    });
+
+    // NHL-specific API health
+    fetchJSON("/api/nhl/status").then((nhlStatus) => {
+        if (!nhlStatus) return;
+        const sources = nhlStatus.data_sources || [];
+        const nhlApiEl = document.getElementById("dotNhlApi");
+        const moneyPuckEl = document.getElementById("dotMoneyPuck");
+        // If we got a response, the NHL API is working
+        if (nhlApiEl) {
+            nhlApiEl.className = `api-dot ${sources.includes("NHL API") ? "ok" : "error"}`;
+            nhlApiEl.title = "NHL API: " + (sources.includes("NHL API") ? "ok" : "unknown");
+        }
+        if (moneyPuckEl) {
+            moneyPuckEl.className = `api-dot ${sources.includes("MoneyPuck") ? "ok" : "error"}`;
+            moneyPuckEl.title = "MoneyPuck: " + (sources.includes("MoneyPuck") ? "ok" : "unknown");
         }
     });
 }

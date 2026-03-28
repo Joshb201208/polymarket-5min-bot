@@ -1796,4 +1796,136 @@ body::after {
     .mode-badge .mode-text {
         display: none;
     }
+
+    .sport-breakdown {
+        flex-direction: column;
+    }
+
+    .sport-filters {
+        order: -1;
+    }
+}
+
+/* ===================================================================
+   SPORT BADGES — NBA (cyan) / NHL (orange)
+   =================================================================== */
+.sport-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    vertical-align: middle;
+    line-height: 1.2;
+}
+
+.badge-nba {
+    background: rgba(0, 240, 255, 0.15);
+    color: #00f0ff;
+    border: 1px solid rgba(0, 240, 255, 0.3);
+}
+
+.badge-nhl {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+/* ===================================================================
+   SPORT FILTER BUTTONS
+   =================================================================== */
+.sport-filters {
+    display: flex;
+    gap: 4px;
+    margin-right: 8px;
+}
+
+.filter-btn {
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font);
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.filter-btn:hover {
+    color: var(--text);
+    border-color: var(--border-hover);
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.filter-btn.active {
+    color: var(--primary);
+    border-color: rgba(0, 240, 255, 0.4);
+    background: var(--primary-dim);
+}
+
+/* ===================================================================
+   SPORT BREAKDOWN ROW
+   =================================================================== */
+.sport-breakdown {
+    display: flex;
+    gap: 16px;
+    padding: 0 24px;
+    margin-bottom: 24px;
+}
+
+.sport-breakdown-card {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    background: var(--surface-alpha);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(12px);
+}
+
+.sport-breakdown-card .sport-badge {
+    font-size: 11px;
+    padding: 4px 10px;
+}
+
+.sport-breakdown-stats {
+    display: flex;
+    gap: 24px;
+    flex: 1;
+}
+
+.sport-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sport-stat-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.sport-stat-value {
+    font-size: 14px;
+    font-weight: 600;
+    font-family: var(--mono);
+    color: var(--text);
+}
+
+/* ===================================================================
+   API HEALTH SEPARATOR
+   =================================================================== */
+.api-health-sep {
+    width: 1px;
+    height: 10px;
+    background: var(--border);
+    margin: 0 2px;
 }

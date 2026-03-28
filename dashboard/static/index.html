@@ -152,6 +152,9 @@
                 <span class="api-dot" id="dotOdds" title="Odds API"></span>
                 <span class="api-dot" id="dotBdl" title="BallDontLie"></span>
                 <span class="api-dot" id="dotPoly" title="Polymarket"></span>
+                <span class="api-health-sep"></span>
+                <span class="api-dot" id="dotNhlApi" title="NHL API"></span>
+                <span class="api-dot" id="dotMoneyPuck" title="MoneyPuck"></span>
             </div>
             <div class="mode-badge" id="modeBadge">
                 <span class="mode-dot"></span>
@@ -197,6 +200,46 @@
     </section>
 
     <!-- ============================================= -->
+    <!-- SPORT BREAKDOWN ROW                           -->
+    <!-- ============================================= -->
+    <section class="sport-breakdown">
+        <div class="sport-breakdown-card">
+            <span class="sport-badge badge-nba">NBA</span>
+            <div class="sport-breakdown-stats">
+                <div class="sport-stat">
+                    <span class="sport-stat-label">P&L</span>
+                    <span class="sport-stat-value" id="nbaPnl">$0.00</span>
+                </div>
+                <div class="sport-stat">
+                    <span class="sport-stat-label">Open</span>
+                    <span class="sport-stat-value" id="nbaOpen">0</span>
+                </div>
+                <div class="sport-stat">
+                    <span class="sport-stat-label">Exposure</span>
+                    <span class="sport-stat-value" id="nbaExposure">$0.00</span>
+                </div>
+            </div>
+        </div>
+        <div class="sport-breakdown-card">
+            <span class="sport-badge badge-nhl">NHL</span>
+            <div class="sport-breakdown-stats">
+                <div class="sport-stat">
+                    <span class="sport-stat-label">P&L</span>
+                    <span class="sport-stat-value" id="nhlPnl">$0.00</span>
+                </div>
+                <div class="sport-stat">
+                    <span class="sport-stat-label">Open</span>
+                    <span class="sport-stat-value" id="nhlOpen">0</span>
+                </div>
+                <div class="sport-stat">
+                    <span class="sport-stat-label">Exposure</span>
+                    <span class="sport-stat-value" id="nhlExposure">$0.00</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
     <!-- EQUITY CURVE                                  -->
     <!-- ============================================= -->
     <section class="card equity-section">
@@ -218,7 +261,14 @@
     <section class="card">
         <div class="card-header">
             <h2 class="card-title">Live Positions</h2>
-            <span class="badge badge-cyan" id="openCount">0 open</span>
+            <div class="card-header-right">
+                <div class="sport-filters" id="positionFilters">
+                    <button class="filter-btn active" data-sport="all" onclick="setSportFilter('positions','all')">All</button>
+                    <button class="filter-btn" data-sport="nba" onclick="setSportFilter('positions','nba')">NBA</button>
+                    <button class="filter-btn" data-sport="nhl" onclick="setSportFilter('positions','nhl')">NHL</button>
+                </div>
+                <span class="badge badge-cyan" id="openCount">0 open</span>
+            </div>
         </div>
         <div class="positions-grid" id="positionsGrid">
             <div class="empty-state" id="emptyPositions">
@@ -313,6 +363,11 @@
         <div class="card-header">
             <h2 class="card-title">Trade History</h2>
             <div class="card-header-right">
+                <div class="sport-filters" id="tradeFilters">
+                    <button class="filter-btn active" data-sport="all" onclick="setSportFilter('trades','all')">All</button>
+                    <button class="filter-btn" data-sport="nba" onclick="setSportFilter('trades','nba')">NBA</button>
+                    <button class="filter-btn" data-sport="nhl" onclick="setSportFilter('trades','nhl')">NHL</button>
+                </div>
                 <span class="badge" id="tradeCountBadge">0 closed</span>
             </div>
         </div>
@@ -321,6 +376,7 @@
                 <thead>
                     <tr>
                         <th class="sortable" data-sort="date">Date <span class="sort-arrow">↕</span></th>
+                        <th>Sport</th>
                         <th class="sortable" data-sort="market">Market <span class="sort-arrow">↕</span></th>
                         <th>Side</th>
                         <th class="sortable" data-sort="entry">Entry <span class="sort-arrow">↕</span></th>
