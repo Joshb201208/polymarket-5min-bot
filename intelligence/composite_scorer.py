@@ -38,17 +38,35 @@ class CompositeScorer:
         (0.0, "LOW", 0.0),
     ]
 
-    def score(self, market_id: str, signals: list[Signal]) -> CompositeScore:
+    def score(
+        self,
+        market_id: str,
+        signals: list[Signal],
+        lifecycle_overrides: dict[str, float] | None = None,
+        quality_multipliers: dict[str, float] | None = None,
+    ) -> CompositeScore:
         """Combine signals into a composite score for a market.
+
+        Args:
+            market_id: Market identifier.
+            signals: List of Signal objects for this market.
+            lifecycle_overrides: {source: multiplier} from lifecycle stage.
+                Applied on top of base weights.
+            quality_multipliers: {source: multiplier} from live quality scorer.
+                Applied on top of base weights.
+
+        Weight stacking: final_weight = base_weight * lifecycle_override * quality_multiplier
 
         Steps:
         1. Group signals by source
         2. Take strongest signal per source (highest strength * confidence)
-        3. Weighted average using WEIGHTS
+        3. Weighted average using stacked WEIGHTS
         4. Apply direction consensus bonus (5+ sources agree → 20% boost)
         5. Map to confidence tier and max bet pct
         """
         now = utcnow()
+        lifecycle_overrides = lifecycle_overrides or {}
+        quality_multipliers = quality_multipliers or {}
 
         # 1. Group signals by source, filter expired
         by_source: dict[str, list[Signal]] = defaultdict(list)
@@ -78,13 +96,16 @@ class CompositeScorer:
             if best.direction in ("YES", "NO"):
                 direction_votes[best.direction] += 1
 
-        # 3. Weighted average
+        # 3. Weighted average with stacked overrides
         weighted_sum = 0.0
         weight_total = 0.0
         for source, info in source_scores.items():
-            weight = self.WEIGHTS.get(source, 0.05)
-            weighted_sum += info["score"] * weight
-            weight_total += weight
+            base_weight = self.WEIGHTS.get(source, 0.05)
+            lc_mult = lifecycle_overrides.get(source, 1.0)
+            qa_mult = quality_multipliers.get(source, 1.0)
+            final_weight = base_weight * lc_mult * qa_mult
+            weighted_sum += info["score"] * final_weight
+            weight_total += final_weight
 
         composite = weighted_sum / weight_total if weight_total > 0 else 0.0
 

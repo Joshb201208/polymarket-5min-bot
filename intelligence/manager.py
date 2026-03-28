@@ -1,7 +1,8 @@
 """IntelligenceManager — orchestrates all intelligence modules in parallel.
 
 Central entry point for the intelligence system. Runs all scanners concurrently,
-collects signals, computes composite scores, and returns a unified IntelligenceReport.
+collects signals, deduplicates, applies decay, computes composite scores with
+lifecycle/quality overrides, and returns a unified IntelligenceReport.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ class IntelligenceManager:
         self._modules = {}
         self._volume_rotation_task: asyncio.Task | None = None
         self._init_modules()
+        self._init_advanced_modules()
 
     def _init_modules(self):
         """Initialize enabled intelligence modules (lazy imports)."""
@@ -120,6 +122,49 @@ class IntelligenceManager:
             logger.warning("correlation module not available yet")
             self._correlation = None
 
+    def _init_advanced_modules(self):
+        """Initialize advanced intelligence modules (dedup, lifecycle, etc.)."""
+        self._dedup = None
+        self._lifecycle = None
+        self._regime = None
+        self._live_quality = None
+        self._calibrator = None
+
+        try:
+            from intelligence.dedup import SignalDeduplicator
+            self._dedup = SignalDeduplicator()
+            logger.info("Signal deduplicator initialized")
+        except Exception as e:
+            logger.warning("Dedup module not available: %s", e)
+
+        try:
+            from intelligence.lifecycle import EventLifecycle
+            self._lifecycle = EventLifecycle()
+            logger.info("Event lifecycle manager initialized")
+        except Exception as e:
+            logger.warning("Lifecycle module not available: %s", e)
+
+        try:
+            from intelligence.regime import RegimeDetector
+            self._regime = RegimeDetector()
+            logger.info("Regime detector initialized")
+        except Exception as e:
+            logger.warning("Regime module not available: %s", e)
+
+        try:
+            from intelligence.live_quality import LiveQualityScorer
+            self._live_quality = LiveQualityScorer()
+            logger.info("Live quality scorer initialized")
+        except Exception as e:
+            logger.warning("Live quality module not available: %s", e)
+
+        try:
+            from intelligence.calibrator import SignalCalibrator
+            self._calibrator = SignalCalibrator()
+            logger.info("Signal calibrator initialized")
+        except Exception as e:
+            logger.warning("Calibrator module not available: %s", e)
+
     async def start_persistent(self, token_ids: list[str] | None = None):
         """Start long-running tasks (WebSocket, volume rotation, etc.).
 
@@ -149,6 +194,18 @@ class IntelligenceManager:
     ) -> IntelligenceReport:
         """Run all scanners in parallel, combine results into IntelligenceReport.
 
+        Pipeline:
+        1. Run all scanners in parallel → raw signals
+        2. Deduplicate signals (cluster related signals)
+        3. Apply time-based decay
+        4. Classify market lifecycle stages
+        5. Detect market regimes
+        6. Get live quality adjustments
+        7. Run calibrator if due
+        8. Score markets with lifecycle/quality overrides
+        9. Correlation analysis
+        10. Return enriched IntelligenceReport
+
         Args:
             active_markets: List of EventMarket objects to scan.
             open_positions: List of Position objects for correlation analysis.
@@ -161,7 +218,7 @@ class IntelligenceManager:
 
         logger.info("Intelligence scan cycle starting (%d markets)", len(active_markets))
 
-        # Build scan tasks for all available modules
+        # ── Step 1: Run all scanners concurrently ──
         scan_tasks = []
         scan_names = []
 
@@ -172,10 +229,8 @@ class IntelligenceManager:
                 )
                 scan_names.append(name)
 
-        # Run all scanners concurrently
         results = await asyncio.gather(*scan_tasks, return_exceptions=True)
 
-        # Collect signals, update health
         all_signals: list[Signal] = []
         for name, result in zip(scan_names, results):
             if isinstance(result, Exception):
@@ -204,21 +259,101 @@ class IntelligenceManager:
             except Exception as e:
                 logger.error("Orderbook signal fetch failed: %s", e)
 
-        # Update rolling buffer
+        raw_signal_count = len(all_signals)
+
+        # ── Step 2: Deduplicate signals ──
+        dedup_clusters = []
+        if self._dedup and all_signals:
+            try:
+                all_signals = self._dedup.deduplicate(all_signals)
+                dedup_clusters_raw = self._dedup.get_cluster_stats()
+                dedup_clusters = dedup_clusters_raw
+                logger.info("Dedup: %d → %d signals", raw_signal_count, len(all_signals))
+            except Exception as e:
+                logger.error("Dedup failed: %s", e)
+
+        # ── Step 3: Apply time-based decay ──
+        if self._dedup and all_signals:
+            try:
+                pre_decay = len(all_signals)
+                all_signals = self._dedup.apply_decay(all_signals)
+                logger.info("Decay: %d → %d signals", pre_decay, len(all_signals))
+            except Exception as e:
+                logger.error("Decay failed: %s", e)
+
         self.all_signals = all_signals
 
-        # Score each market that has signals
+        # ── Step 4: Classify market lifecycle stages ──
+        lifecycle_assessments = {}
+        if self._lifecycle:
+            for market in active_markets:
+                try:
+                    market_id = getattr(market, "id", str(market))
+                    assessment = self._lifecycle.classify(market)
+                    lifecycle_assessments[market_id] = assessment
+                except Exception as e:
+                    logger.warning("Lifecycle failed for market: %s", e)
+
+        # ── Step 5: Detect market regimes ──
+        regime_assessments = {}
+        if self._regime:
+            for market in active_markets:
+                try:
+                    market_id = getattr(market, "id", str(market))
+                    price_history = self._get_price_history(market_id)
+                    volume_history = self._get_volume_history(market_id)
+                    current_price = self._get_current_price(market)
+                    assessment = self._regime.detect(
+                        market_id,
+                        price_history=price_history,
+                        volume_history=volume_history,
+                        current_price=current_price,
+                    )
+                    regime_assessments[market_id] = assessment
+                except Exception as e:
+                    logger.warning("Regime detection failed for market: %s", e)
+
+        # ── Step 6: Get live quality adjustments ──
+        quality_adjustments = {}
+        if self._live_quality:
+            try:
+                quality_adjustments = self._live_quality.get_weight_adjustments()
+                if quality_adjustments:
+                    logger.info("Quality adjustments: %s", {k: round(v, 2) for k, v in quality_adjustments.items()})
+            except Exception as e:
+                logger.error("Live quality adjustments failed: %s", e)
+
+        # ── Step 7: Run calibrator if due ──
+        if self._calibrator:
+            try:
+                if self._calibrator.should_calibrate():
+                    result = self._calibrator.calibrate()
+                    logger.info(
+                        "Calibration ran: %d trades, weights updated",
+                        result.resolved_trades,
+                    )
+            except Exception as e:
+                logger.error("Calibrator failed: %s", e)
+
+        # ── Step 8: Score each market with overrides ──
         market_scores: dict[str, CompositeScore] = {}
         if self._composite_scorer:
             for market in active_markets:
                 market_id = getattr(market, "id", str(market))
                 market_signals = [s for s in all_signals if s.market_id == market_id]
                 if market_signals:
+                    # Get lifecycle overrides for this market
+                    lc = lifecycle_assessments.get(market_id)
+                    lc_overrides = lc.signal_weight_overrides if lc else {}
+
                     market_scores[market_id] = self._composite_scorer.score(
-                        market_id, market_signals
+                        market_id,
+                        market_signals,
+                        lifecycle_overrides=lc_overrides,
+                        quality_multipliers=quality_adjustments,
                     )
 
-        # Correlation analysis
+        # ── Step 9: Correlation analysis ──
         correlation_report = CorrelationReport()
         if self._correlation and open_positions:
             try:
@@ -226,15 +361,17 @@ class IntelligenceManager:
             except Exception as e:
                 logger.error("Correlation analysis failed: %s", e)
 
-        # Persist for dashboard
+        # ── Persist for dashboard ──
         self._save_signals(all_signals)
         self._save_scores(market_scores)
         self._save_health()
 
         logger.info(
-            "Intelligence scan complete: %d signals, %d scored markets",
+            "Intelligence scan complete: %d signals, %d scored markets, %d lifecycle, %d regime",
             len(all_signals),
             len(market_scores),
+            len(lifecycle_assessments),
+            len(regime_assessments),
         )
 
         return IntelligenceReport(
@@ -243,11 +380,69 @@ class IntelligenceManager:
             correlation=correlation_report,
             timestamp=now,
             source_health=dict(self._source_health),
+            lifecycle_assessments=lifecycle_assessments,
+            regime_assessments=regime_assessments,
+            quality_adjustments=quality_adjustments,
+            dedup_clusters=dedup_clusters,
         )
 
     def get_health(self) -> dict:
         """Return current source health status."""
         return dict(self._source_health)
+
+    def get_lifecycle(self):
+        """Return the lifecycle manager instance."""
+        return self._lifecycle
+
+    def get_regime(self):
+        """Return the regime detector instance."""
+        return self._regime
+
+    def get_calibrator(self):
+        """Return the calibrator instance."""
+        return self._calibrator
+
+    def get_live_quality(self):
+        """Return the live quality scorer instance."""
+        return self._live_quality
+
+    def get_dedup(self):
+        """Return the deduplicator instance."""
+        return self._dedup
+
+    def _get_price_history(self, market_id: str) -> list[float]:
+        """Load price history for a market from data/price_history/."""
+        try:
+            path = DATA_DIR / "price_history" / f"{market_id}.json"
+            if not path.exists():
+                return []
+            data = json.loads(path.read_text())
+            prices = data.get("prices", [])
+            return [p.get("price", p) if isinstance(p, dict) else float(p) for p in prices[-168:]]  # ~7 days
+        except Exception:
+            return []
+
+    def _get_volume_history(self, market_id: str) -> list[float]:
+        """Load volume history for a market."""
+        try:
+            path = DATA_DIR / "price_history" / f"{market_id}.json"
+            if not path.exists():
+                return []
+            data = json.loads(path.read_text())
+            volumes = data.get("volumes", [])
+            return [float(v) for v in volumes[-168:]]
+        except Exception:
+            return []
+
+    def _get_current_price(self, market) -> float | None:
+        """Get the current price from a market object."""
+        prices = getattr(market, "outcome_prices", None)
+        if prices and len(prices) > 0:
+            try:
+                return float(prices[0])
+            except (ValueError, TypeError):
+                pass
+        return None
 
     async def _rotate_volume_windows(self) -> None:
         """Rotate orderbook volume windows every 15 minutes."""

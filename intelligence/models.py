@@ -94,6 +94,10 @@ class IntelligenceReport:
     correlation: CorrelationReport = field(default_factory=CorrelationReport)
     timestamp: str = ""
     source_health: dict = field(default_factory=dict)     # {source: {status, last_update, error}}
+    lifecycle_assessments: dict = field(default_factory=dict)  # {market_id: LifecycleAssessment}
+    regime_assessments: dict = field(default_factory=dict)     # {market_id: RegimeAssessment}
+    quality_adjustments: dict = field(default_factory=dict)    # {source: multiplier}
+    dedup_clusters: list = field(default_factory=list)         # list[SignalCluster]
 
     def __post_init__(self):
         if not self.timestamp:
@@ -109,8 +113,109 @@ class IntelligenceReport:
             "correlation": self.correlation.to_dict() if hasattr(self.correlation, "to_dict") else self.correlation,
             "timestamp": self.timestamp,
             "source_health": self.source_health,
+            "lifecycle_assessments": {
+                k: v.to_dict() if hasattr(v, "to_dict") else v
+                for k, v in self.lifecycle_assessments.items()
+            },
+            "regime_assessments": {
+                k: v.to_dict() if hasattr(v, "to_dict") else v
+                for k, v in self.regime_assessments.items()
+            },
+            "quality_adjustments": self.quality_adjustments,
+            "dedup_clusters": [
+                c.to_dict() if hasattr(c, "to_dict") else c
+                for c in self.dedup_clusters
+            ],
         }
         return d
+
+
+@dataclass
+class LifecycleAssessment:
+    """Lifecycle stage and adjusted parameters for a market."""
+    stage: str = "unknown"                          # "early", "developing", "mature", "late", "terminal", "unknown"
+    days_remaining: float = -1.0
+    min_edge: float = 0.05
+    max_bet_pct: float = 0.015
+    signal_weight_overrides: dict = field(default_factory=dict)  # {source_name: weight_multiplier}
+    hold_strategy: str = "hold"                     # "accumulate", "hold", "active", "hold_to_resolution"
+    take_profit: float = 0.30
+    stop_loss: float = 0.25
+    timestamp: str = ""
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> LifecycleAssessment:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class RegimeAssessment:
+    """Market regime classification and trading adjustments."""
+    regime: str = "unknown"                # "trending", "volatile", "stale", "converging", "unknown"
+    volatility: float = 0.0
+    trend_strength: float = 0.0            # -1 (strong NO) to +1 (strong YES)
+    volume_ratio: float = 1.0              # recent_volume / avg_volume
+    edge_multiplier: float = 1.0           # Applied to min_edge threshold
+    size_multiplier: float = 1.0           # Applied to position size
+    recommendation: str = "trade"          # "trade", "reduce_size", "avoid", "hold_to_resolution"
+    timestamp: str = ""
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> RegimeAssessment:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SignalCluster:
+    """A cluster of related signals about the same event."""
+    primary_signal: dict = field(default_factory=dict)    # Signal.to_dict()
+    supporting_signals: list = field(default_factory=list)  # [Signal.to_dict(), ...]
+    source_count: int = 0
+    confidence_boost: float = 1.0
+    cluster_id: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SignalCluster:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class CalibrationResult:
+    """Result of a calibrator run with per-source metrics."""
+    calibrated_weights: dict = field(default_factory=dict)    # {source: new_weight}
+    default_weights: dict = field(default_factory=dict)       # {source: default_weight}
+    source_metrics: dict = field(default_factory=dict)        # {source: {accuracy, profitability, lift, brier, sample_size, status}}
+    resolved_trades: int = 0
+    smoothing_factor: float = 0.7
+    timestamp: str = ""
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CalibrationResult:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
