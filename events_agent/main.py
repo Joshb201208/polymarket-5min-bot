@@ -198,11 +198,28 @@ class EventsAgent:
                 # Check total exposure across ALL agents (shared bankroll)
                 from shared.bankroll import get_total_exposure
                 total_exposure = get_total_exposure(self.config.DATA_DIR)
-                max_total = bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT
+
+                # NBA cash reserve: always keep $90 available for NBA agent
+                available_for_events = bankroll - self.config.NBA_CASH_RESERVE
+                max_total = min(
+                    bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT,
+                    available_for_events,
+                )
                 if total_exposure >= max_total:
-                    logger.info("Total cross-agent exposure limit reached ($%.2f >= $%.2f)",
-                                total_exposure, max_total)
+                    logger.info("Exposure limit reached ($%.2f >= $%.2f, NBA reserve=$%.0f)",
+                                total_exposure, max_total, self.config.NBA_CASH_RESERVE)
                     break
+
+                # Per-category concentration limit
+                cat_key = market.category.value.lower() if hasattr(market.category, 'value') else str(market.category).lower()
+                cat_count = sum(
+                    1 for p in open_positions
+                    if getattr(p, 'category', '') == cat_key
+                )
+                if cat_count >= self.config.MAX_PER_CATEGORY:
+                    logger.debug("Category %s at limit (%d positions) — skipping %s",
+                                 cat_key, cat_count, market.slug)
+                    continue
 
                 # --- INTELLIGENCE-DRIVEN EDGE EVALUATION ---
                 # Get lifecycle and regime for this market

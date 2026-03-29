@@ -41,8 +41,14 @@ class EventsConfig:
     MIN_EDGE: float = float(os.getenv("EVENTS_MIN_EDGE", "0.05"))
 
     # Position limits
-    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("EVENTS_MAX_POSITIONS", "30"))
+    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("EVENTS_MAX_POSITIONS", "999"))  # No hard cap
     MIN_BET_SIZE: float = float(os.getenv("EVENTS_MIN_BET_SIZE", "5.0"))
+
+    # NBA cash reserve — always keep this much available for NBA agent
+    NBA_CASH_RESERVE: float = float(os.getenv("EVENTS_NBA_CASH_RESERVE", "90.0"))
+
+    # Per-category concentration limit — max positions in a single category
+    MAX_PER_CATEGORY: int = int(os.getenv("EVENTS_MAX_PER_CATEGORY", "10"))
 
     # Liquidity floor
     MIN_LIQUIDITY: float = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
