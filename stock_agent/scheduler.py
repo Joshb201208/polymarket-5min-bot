@@ -18,6 +18,7 @@ from stock_agent.models import (
 from stock_agent.portfolio import Portfolio
 from stock_agent.risk_manager import RiskManager
 from stock_agent.screener import Screener
+from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class StockAgentScheduler:
         self.risk_manager = RiskManager(self.config)
         self.executor = Executor(self.config)
         self.telegram = TelegramReporter(self.config)
+        self.discord = DiscordReporter(self.config)
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
@@ -66,8 +68,12 @@ class StockAgentScheduler:
         """Main entry point — runs forever."""
         logger.info("Stock Agent starting in %s mode", self.config.MODE)
         try:
-            await self.telegram.send_message(
-                f"\U0001f680 <b>Stock Agent started</b> in <code>{self.config.MODE}</code> mode"
+            await asyncio.gather(
+                self.telegram.send_message(
+                    f"\U0001f680 <b>Stock Agent started</b> in <code>{self.config.MODE}</code> mode"
+                ),
+                self.discord.send_startup(self.config.MODE, self.portfolio.state.cash),
+                return_exceptions=True,
             )
         except Exception as e:
             logger.error("Failed to send startup message: %s", e)
@@ -80,7 +86,11 @@ class StockAgentScheduler:
                 except Exception as e:
                     logger.exception("Error in main tick: %s", e)
                     try:
-                        await self.telegram.send_error_alert(str(e))
+                        await asyncio.gather(
+                            self.telegram.send_error_alert(str(e)),
+                            self.discord.send_error(str(e), context="Main tick"),
+                            return_exceptions=True,
+                        )
                     except Exception:
                         pass
 
@@ -152,12 +162,20 @@ class StockAgentScheduler:
     async def _run_weekly_analysis(self):
         """Full weekly research cycle."""
         try:
-            await self.telegram.send_message("\U0001f50d <b>Weekly Analysis Starting</b>")
+            await asyncio.gather(
+                self.telegram.send_message("\U0001f50d <b>Weekly Analysis Starting</b>"),
+                self.discord.send_system_log("INFO", "Weekly analysis cycle starting"),
+                return_exceptions=True,
+            )
 
             # 1. Screen universe
             symbols = await self.data_feed.screen_universe()
             if not symbols:
-                await self.telegram.send_message("\u26a0\ufe0f Universe screening returned no symbols")
+                await asyncio.gather(
+                    self.telegram.send_message("\u26a0\ufe0f Universe screening returned no symbols"),
+                    self.discord.send_system_log("WARNING", "Universe screening returned no symbols"),
+                    return_exceptions=True,
+                )
                 return
 
             self.portfolio.set_universe(symbols)
@@ -174,7 +192,11 @@ class StockAgentScheduler:
                     logger.warning("Failed to fetch fundamentals for %s: %s", sym, e)
 
             if not companies:
-                await self.telegram.send_message("\u26a0\ufe0f No fundamental data retrieved")
+                await asyncio.gather(
+                    self.telegram.send_message("\u26a0\ufe0f No fundamental data retrieved"),
+                    self.discord.send_system_log("WARNING", "No fundamental data retrieved"),
+                    return_exceptions=True,
+                )
                 return
 
             logger.info("Fetched fundamentals for %d companies", len(companies))
@@ -183,6 +205,12 @@ class StockAgentScheduler:
             ranked = await self.screener.screen_candidates(companies)
             top_symbols = [r["symbol"] for r in ranked[: self.config.DEEP_ANALYSIS_SIZE]]
             logger.info("Top %d for deep analysis: %s", len(top_symbols), top_symbols)
+
+            # Send screener results to Discord
+            try:
+                await self.discord.send_screener_results(ranked[:25])
+            except Exception as e:
+                logger.error("Failed to send screener results to Discord: %s", e)
 
             # 4. Deep analysis with Perplexity Sonar Pro
             signals: list[Signal] = []
@@ -197,6 +225,19 @@ class StockAgentScheduler:
                         continue
 
                     self.portfolio.update_thesis(sym, thesis)
+
+                    # Send thesis and analysis to Discord
+                    try:
+                        await asyncio.gather(
+                            self.discord.send_thesis(thesis),
+                            self.discord.send_analysis_report(
+                                sym, thesis.summary + "\n\n**Bull Case:** " + thesis.bull_case + "\n\n**Bear Case:** " + thesis.bear_case,
+                                thesis.sources,
+                            ),
+                            return_exceptions=True,
+                        )
+                    except Exception:
+                        pass
 
                     if thesis.direction == "BUY" and thesis.conviction >= self.config.MIN_CONVICTION:
                         pv = self.portfolio.get_portfolio_value()
@@ -223,12 +264,23 @@ class StockAgentScheduler:
 
             # 7. Report
             stats = self.portfolio.calculate_stats()
-            await self.telegram.send_weekly_report(
-                portfolio_value=self.portfolio.get_portfolio_value(),
-                cash=self.portfolio.state.cash,
-                positions=self.portfolio.state.positions,
-                signals=executed_signals,
-                stats=stats,
+            await asyncio.gather(
+                self.telegram.send_weekly_report(
+                    portfolio_value=self.portfolio.get_portfolio_value(),
+                    cash=self.portfolio.state.cash,
+                    positions=self.portfolio.state.positions,
+                    signals=executed_signals,
+                    stats=stats,
+                ),
+                self.discord.send_weekly_report(
+                    portfolio_value=self.portfolio.get_portfolio_value(),
+                    cash=self.portfolio.state.cash,
+                    positions=self.portfolio.state.positions,
+                    signals=executed_signals,
+                    stats=stats,
+                ),
+                self.discord.send_eli5_weekly(self.portfolio.state, executed_signals),
+                return_exceptions=True,
             )
 
             self.portfolio.set_last_weekly_analysis(_now_utc())
@@ -236,7 +288,11 @@ class StockAgentScheduler:
 
         except Exception as e:
             logger.exception("Weekly analysis failed: %s", e)
-            await self.telegram.send_error_alert(f"Weekly analysis failed: {e}")
+            await asyncio.gather(
+                self.telegram.send_error_alert(f"Weekly analysis failed: {e}"),
+                self.discord.send_error(str(e), context="Weekly analysis"),
+                return_exceptions=True,
+            )
 
     async def _re_analyze_existing_positions(self, companies: list[CompanyData]):
         """Re-analyze all existing positions with fresh data."""
@@ -306,6 +362,14 @@ class StockAgentScheduler:
                                 "Material event for %s: %s (severity=%d, impact=%s)",
                                 pos.symbol, event_desc, severity, impact,
                             )
+
+                            # Send to Discord market-monitor
+                            try:
+                                await self.discord.send_material_event(
+                                    pos.symbol, event_desc, impact, severity,
+                                )
+                            except Exception:
+                                pass
 
                             # Severe negative event → full re-analysis
                             if severity >= 7 and impact == "negative":
@@ -382,12 +446,21 @@ class StockAgentScheduler:
             )
 
             self.portfolio.add_daily_summary(summary)
-            await self.telegram.send_daily_summary(summary)
+            await asyncio.gather(
+                self.telegram.send_daily_summary(summary),
+                self.discord.send_daily_summary(summary),
+                self.discord.send_eli5_daily(summary),
+                return_exceptions=True,
+            )
             logger.info("Daily summary sent — PV=$%,.0f, Day P&L=$%+,.0f", pv, day_pnl)
 
         except Exception as e:
             logger.exception("Daily summary failed: %s", e)
-            await self.telegram.send_error_alert(f"Daily summary failed: {e}")
+            await asyncio.gather(
+                self.telegram.send_error_alert(f"Daily summary failed: {e}"),
+                self.discord.send_error(str(e), context="Daily summary"),
+                return_exceptions=True,
+            )
 
     # ── Trade execution ──────────────────────────────────────────────
 
@@ -398,7 +471,11 @@ class StockAgentScheduler:
         # Check PDT compliance first
         if not self.risk_manager.check_pdt_compliance(self.portfolio.state.trade_history):
             logger.warning("PDT limit reached — skipping new buys")
-            await self.telegram.send_message("\u26a0\ufe0f PDT limit reached — no new trades today")
+            await asyncio.gather(
+                self.telegram.send_message("\u26a0\ufe0f PDT limit reached — no new trades today"),
+                self.discord.send_risk_alert("PDT_WARNING", "PDT day-trade limit reached — no new trades today"),
+                return_exceptions=True,
+            )
             return executed
 
         for signal in signals:
@@ -474,7 +551,12 @@ class StockAgentScheduler:
             )
             self.portfolio.log_trade(trade)
 
-            await self.telegram.send_trade_alert(trade, signal.thesis)
+            await asyncio.gather(
+                self.telegram.send_trade_alert(trade, signal.thesis),
+                self.discord.send_trade_alert(trade, signal.thesis),
+                self.discord.send_eli5_trade(trade, signal.thesis, is_buy=True),
+                return_exceptions=True,
+            )
             executed.append(signal)
             logger.info("Executed BUY: %s x%d @ $%.2f", sym, qty, price)
 
@@ -512,7 +594,12 @@ class StockAgentScheduler:
             self.portfolio.remove_position(position.symbol)
             self.portfolio.log_trade(trade)
 
-            await self.telegram.send_trade_alert(trade)
+            await asyncio.gather(
+                self.telegram.send_trade_alert(trade),
+                self.discord.send_trade_alert(trade),
+                self.discord.send_eli5_trade(trade, position.thesis, is_buy=False),
+                return_exceptions=True,
+            )
             logger.info(
                 "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%+.1%%)",
                 position.symbol, position.shares, sell_price, pnl, pnl_pct * 100,
@@ -520,7 +607,11 @@ class StockAgentScheduler:
 
         except Exception as e:
             logger.exception("Sell execution failed for %s: %s", position.symbol, e)
-            await self.telegram.send_error_alert(f"Sell failed for {position.symbol}: {e}")
+            await asyncio.gather(
+                self.telegram.send_error_alert(f"Sell failed for {position.symbol}: {e}"),
+                self.discord.send_error(str(e), context=f"Sell execution for {position.symbol}"),
+                return_exceptions=True,
+            )
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
@@ -528,11 +619,15 @@ class StockAgentScheduler:
         """Graceful cleanup of all resources."""
         logger.info("Cleaning up resources...")
         try:
-            await self.telegram.send_message("\U0001f6d1 <b>Stock Agent shutting down</b>")
+            await asyncio.gather(
+                self.telegram.send_message("\U0001f6d1 <b>Stock Agent shutting down</b>"),
+                self.discord.send_shutdown("Graceful shutdown"),
+                return_exceptions=True,
+            )
         except Exception:
             pass
 
-        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram]:
+        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram, self.discord]:
             try:
                 await resource.close()
             except Exception:

@@ -17,6 +17,28 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+    # Discord
+    DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+    DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "1488044677889396758")
+    DISCORD_CHANNELS = {
+        "announcements": os.environ.get("DISCORD_CH_ANNOUNCEMENTS", "1488045682710413312"),
+        "portfolio": os.environ.get("DISCORD_CH_PORTFOLIO", "1488045688171266138"),
+        "research": os.environ.get("DISCORD_CH_RESEARCH", "1488045698686652427"),
+        "thesis": os.environ.get("DISCORD_CH_THESIS", "1488045703929401505"),
+        "trades": os.environ.get("DISCORD_CH_TRADES", "1488045709113426080"),
+        "daily_pnl": os.environ.get("DISCORD_CH_DAILY_PNL", "1488045714905759895"),
+        "risk": os.environ.get("DISCORD_CH_RISK", "1488045720241049661"),
+        "market_monitor": os.environ.get("DISCORD_CH_MARKET", "1488045725949366435"),
+        "screener": os.environ.get("DISCORD_CH_SCREENER", "1488045736938442784"),
+        "analyst": os.environ.get("DISCORD_CH_ANALYST", "1488045742458404886"),
+        "macro": os.environ.get("DISCORD_CH_MACRO", "1488045747965395075"),
+        "system_logs": os.environ.get("DISCORD_CH_LOGS", "1488045758627315782"),
+        "trade_history": os.environ.get("DISCORD_CH_HISTORY", "1488045763995893760"),
+        "what_bot_did": os.environ.get("DISCORD_CH_WHAT_BOT_DID", "1488046586272419860"),
+        "investing_101": os.environ.get("DISCORD_CH_INVESTING_101", "1488046598641680465"),
+        "weekly_eli5": os.environ.get("DISCORD_CH_WEEKLY_ELI5", "1488046604798787605"),
+    }
+
     # Trading mode
     MODE = os.environ.get("STOCK_AGENT_MODE", "PAPER")
 
