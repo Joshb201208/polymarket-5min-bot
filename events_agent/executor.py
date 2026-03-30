@@ -338,3 +338,43 @@ class EventsExecutor:
         except Exception as e:
             logger.error("Live SELL failed: %s", e)
             return ""
+
+    def _execute_limit_sell(self, token_id: str, shares: float, price: float) -> str:
+        """Execute a GTC limit sell at a specific price.
+
+        Used for cleanup sells where FOK fails due to low liquidity.
+        Price should be slightly below midpoint for faster fills.
+        """
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import SELL
+
+            client = self._get_live_client()
+            if not client:
+                return ""
+
+            rounded_price = round(price, 2)
+            if rounded_price <= 0.01:
+                return ""
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=rounded_price,
+                size=shares,
+                side=SELL,
+            )
+
+            neg_risk = False
+            try:
+                neg_risk = client.get_neg_risk(token_id)
+            except Exception:
+                pass
+
+            signed = client.create_order(order_args, {"neg_risk": neg_risk})
+            resp = client.post_order(signed, OrderType.GTC)
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
+            logger.info("LIMIT SELL: order=%s shares=%.2f @ %.3f", order_id, shares, rounded_price)
+            return order_id
+        except Exception as e:
+            logger.error("LIMIT SELL failed: %s", e)
+            return ""

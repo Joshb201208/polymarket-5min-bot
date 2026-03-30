@@ -154,10 +154,12 @@ class EventsAgent:
                         if mid <= 0.005:
                             p.exit_reason = "extreme_pricing_worthless"
                             continue
-                        # Sell via executor
+                        # Sell via limit order (FOK fails on low-liquidity markets)
+                        # Price at 90% of midpoint for fast fill
+                        sell_price = round(mid * 0.90, 2)
                         try:
-                            order_id = self.executor._execute_live_sell(
-                                token_id, shares, getattr(p, "market_id", "")
+                            order_id = self.executor._execute_limit_sell(
+                                token_id, shares, sell_price,
                             )
                             if order_id:
                                 sold_count += 1
