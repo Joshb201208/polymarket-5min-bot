@@ -1,4 +1,9 @@
-"""Kelly criterion, position sizing, exposure limits."""
+"""Flat-percentage position sizing with exposure limits.
+
+Replaces the Half-Kelly model which amplified edge calculation errors.
+Now uses a simple flat 2% of bankroll per bet — predictable, consistent,
+and doesn't compound model mistakes into sizing mistakes.
+"""
 
 from __future__ import annotations
 
@@ -39,55 +44,42 @@ class BankrollManager:
         })
 
     def calculate_bet_size(self, edge_result: EdgeResult) -> float:
-        """Calculate optimal bet size using Quarter-Kelly criterion."""
+        """Calculate bet size — flat percentage of bankroll.
+
+        Simple and predictable:
+        - LOW confidence:    1.5% of bankroll
+        - MEDIUM confidence: 2.0% of bankroll
+        - HIGH confidence:   2.5% of bankroll
+
+        No Kelly, no model-dependent sizing. Every bet is roughly the same
+        size, so one bad edge calculation doesn't blow up a position.
+        """
         if self.is_paused:
             logger.warning("Bankroll manager is paused — no bets allowed")
             return 0.0
 
-        edge = edge_result.edge
-        market_price = edge_result.market_price
-
-        # Kelly fraction: edge / odds_against
-        # odds_against = (1 - prob) / prob, but we use simplified Kelly
-        if market_price <= 0 or market_price >= 1:
-            return 0.0
-
-        odds_against = (1.0 - market_price) / market_price
-        if odds_against <= 0:
-            return 0.0
-
-        kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly
-        bet_size = self.current_bankroll * kelly_fraction
-
-        # HIGH confidence BLOCKED: 0W/9L in live trading (-$59.60).
-        # The edge calculator fundamentally overvalues these — they represent
-        # heavy underdogs with large calculated edges that never materialize.
+        # Flat sizing by confidence tier
         if edge_result.confidence == Confidence.HIGH:
-            logger.info("BLOCKED: HIGH confidence bet on %s (0/9 in live data)",
-                        edge_result.market.question)
-            return 0.0
+            pct = 0.025  # 2.5%
+        elif edge_result.confidence == Confidence.MEDIUM:
+            pct = 0.020  # 2.0%
+        else:
+            pct = 0.015  # 1.5%
 
-        # Vegas agreement boost: if Vegas and our model agree, size up
-        if edge_result.has_vegas_line and edge_result.vegas_agrees:
-            bet_size *= 1.4  # 40% larger when Vegas confirms our edge
-            logger.debug("Vegas agrees — boosting bet size by 40%%")
-        elif edge_result.has_vegas_line and not edge_result.vegas_agrees:
-            bet_size *= 0.7  # 30% smaller when we're going against Vegas
-            logger.debug("Vegas disagrees — reducing bet size by 30%%")
+        bet_size = self.current_bankroll * pct
 
-        # Apply maximum per-bet limit
-        max_bet = self.current_bankroll * self.config.MAX_BET_PCT
-        bet_size = min(bet_size, max_bet)
-
-        # If in reduced mode, halve bet sizes
+        # If in reduced mode (drawdown protection), halve bet sizes
         if self.is_reduced:
             bet_size *= 0.5
 
-        # Floor at $1
-        if bet_size < 1.0:
+        # Floor at $2 — below this, fees and slippage eat the edge
+        if bet_size < 2.0:
             return 0.0
 
-        # Round to 2 decimal places
+        # Cap at MAX_BET_PCT of bankroll (safety net)
+        max_bet = self.current_bankroll * self.config.MAX_BET_PCT
+        bet_size = min(bet_size, max_bet)
+
         return round(bet_size, 2)
 
     def check_game_exposure(
@@ -125,11 +117,11 @@ class BankrollManager:
 
     def _check_stop_loss(self) -> None:
         """Check stop-loss conditions."""
-        # If below 60% of peak — pause trading
-        if self.current_bankroll < self.peak_bankroll * 0.60:
+        # If below 50% of peak — pause trading
+        if self.current_bankroll < self.peak_bankroll * 0.50:
             if not self.is_paused:
                 logger.critical(
-                    "STOP LOSS: Bankroll $%.2f is below 60%% of peak $%.2f — PAUSING",
+                    "STOP LOSS: Bankroll $%.2f is below 50%% of peak $%.2f — PAUSING",
                     self.current_bankroll,
                     self.peak_bankroll,
                 )
@@ -137,7 +129,7 @@ class BankrollManager:
                 self.is_reduced = False
             return
 
-        # If below 75-80% of starting — reduce bet sizes
+        # If below 80% of starting — reduce bet sizes
         if self.current_bankroll < self.starting_bankroll * 0.80:
             if not self.is_reduced:
                 logger.warning(
@@ -149,9 +141,9 @@ class BankrollManager:
         else:
             self.is_reduced = False
 
-        # Reset pause if bankroll recovers above 60% of peak
-        if self.is_paused and self.current_bankroll >= self.peak_bankroll * 0.60:
-            logger.info("Bankroll recovered above 60%% of peak — resuming trading")
+        # Reset pause if bankroll recovers above 50% of peak
+        if self.is_paused and self.current_bankroll >= self.peak_bankroll * 0.50:
+            logger.info("Bankroll recovered above 50%% of peak — resuming trading")
             self.is_paused = False
 
     def should_exit_early(
@@ -161,45 +153,9 @@ class BankrollManager:
     ) -> tuple[bool, str]:
         """Check if a position should be exited early.
 
-        Game-day bets: NEVER sell early — hold to resolution. The asymmetric
-        payoff (underdogs at 10-50c pay 2-10x) means one win covers many
-        losses. Selling early caps upside for no reason.
-
-        Futures bets (championship, MVP, conference): Use take-profit and
-        stop-loss since these resolve weeks/months away and conditions change.
+        Game-day moneyline bets: NEVER sell early. Hold to resolution.
+        The new strategy bets favorites at 45-80¢ — these resolve to $1
+        on win. Selling early caps the upside.
         """
-        entry = position.entry_price
-        if entry <= 0:
-            return False, ""
-
-        # Determine if this is a futures/long-term position
-        is_futures = False
-        slug = (position.market_slug or "").lower()
-        if any(kw in slug for kw in ("championship", "mvp", "conference", "finals", "award", "leader", "ppg", "rpg")):
-            is_futures = True
-
-        # Game-day bets: hold to resolution, never sell early
-        if not is_futures:
-            return False, ""
-
-        # Futures bets: apply take-profit / stop-loss
-        pnl_pct = (current_price - entry) / entry
-        conf = position.confidence.upper()
-
-        if conf == Confidence.HIGH.value:
-            if pnl_pct >= 0.50:
-                return True, "Futures take-profit (HIGH, +50%)"
-            if pnl_pct <= -0.30:
-                return True, "Futures stop-loss (HIGH, -30%)"
-        elif conf == Confidence.MEDIUM.value:
-            if pnl_pct >= 0.35:
-                return True, "Futures take-profit (MEDIUM, +35%)"
-            if pnl_pct <= -0.25:
-                return True, "Futures stop-loss (MEDIUM, -25%)"
-        else:  # LOW
-            if pnl_pct >= 0.25:
-                return True, "Futures take-profit (LOW, +25%)"
-            if pnl_pct <= -0.20:
-                return True, "Futures stop-loss (LOW, -20%)"
-
+        # Game-day bets always hold to resolution
         return False, ""

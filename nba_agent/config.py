@@ -31,9 +31,9 @@ class Config:
 
     # Bankroll
     STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "500"))
-    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.03"))  # Capped from 8% to 3% — prevents outsized single losses
-    MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.12"))
-    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
+    MAX_BET_PCT: float = float(os.getenv("MAX_BET_PCT", "0.025"))  # 2.5% hard cap per bet
+    MAX_GAME_EXPOSURE_PCT: float = float(os.getenv("MAX_GAME_EXPOSURE_PCT", "0.05"))  # 5% per game
+    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.25"))  # 25% total (shared with events)
 
     # Scan intervals (minutes)
     SCAN_INTERVAL: int = int(os.getenv("SCAN_INTERVAL", "10"))
@@ -41,8 +41,8 @@ class Config:
     PRE_TIPOFF_MINUTES: int = int(os.getenv("PRE_TIPOFF_MINUTES", "30"))
 
     # Edge thresholds
-    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.04"))
-    MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.07"))
+    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.03"))  # 3% min edge (Vegas disagreement)
+    MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.07"))  # Not used — futures disabled
 
     # External data APIs
     ODDS_API_KEY: str = os.getenv("ODDS_API_KEY", "")
