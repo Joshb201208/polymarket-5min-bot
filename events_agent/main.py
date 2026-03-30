@@ -116,6 +116,67 @@ class EventsAgent:
             except Exception as e:
                 logger.error("Extreme pricing cleanup failed: %s", e)
 
+        # --- One-time SELL cleanup: sell all live extreme_pricing positions on Polymarket ---
+        sell_flag = self.config.DATA_DIR / ".extreme_pricing_sell_done"
+        if not sell_flag.exists() and self.config.is_live:
+            try:
+                import httpx as _httpx
+                CLOB_API = "https://clob.polymarket.com"
+                positions = self.portfolio.load_positions()
+                sold_count = 0
+                sold_value = 0.0
+                for p in positions:
+                    edge_src = getattr(p, "edge_source", "") or ""
+                    mode = getattr(p, "mode", "")
+                    status = getattr(p, "status", "")
+                    # Only sell purged live positions
+                    if (status == "closed"
+                            and edge_src == "extreme_pricing"
+                            and mode == "live"
+                            and getattr(p, "exit_reason", "") == "emergency_purge_bad_strategy"):
+                        token_id = getattr(p, "token_id", "")
+                        shares = getattr(p, "shares", 0)
+                        if not token_id or shares <= 0:
+                            continue
+                        # Get current price
+                        try:
+                            with _httpx.Client(timeout=5) as hc:
+                                resp = hc.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
+                                mid = float(resp.json().get("mid", 0)) if resp.status_code == 200 else 0
+                        except Exception:
+                            mid = 0
+                        if mid <= 0.01:  # Skip if no price or nearly worthless
+                            continue
+                        # Sell via executor
+                        try:
+                            order_id = self.executor._execute_live_sell(
+                                token_id, shares, getattr(p, "market_id", "")
+                            )
+                            if order_id:
+                                sold_count += 1
+                                sold_value += shares * mid
+                                p.exit_reason = "sold_extreme_pricing_cleanup"
+                                p.exit_price = mid
+                                p.pnl = round(shares * mid - (getattr(p, "cost", 0) or 0), 2)
+                                logger.info(
+                                    "SOLD purged position: %s @ %.3f | ~$%.2f | %s",
+                                    getattr(p, "side", ""), mid, shares * mid,
+                                    getattr(p, "market_question", "")[:50],
+                                )
+                                import time as _time
+                                _time.sleep(0.5)  # Rate limit
+                        except Exception as sell_err:
+                            logger.warning("Failed to sell %s: %s",
+                                           getattr(p, "market_question", "")[:40], sell_err)
+                self.portfolio._write_positions(positions)
+                logger.warning(
+                    "SELL CLEANUP COMPLETE: sold %d positions, recovered ~$%.2f",
+                    sold_count, sold_value,
+                )
+                sell_flag.write_text(f"sold={sold_count} value={sold_value:.2f}")
+            except Exception as e:
+                logger.error("Sell cleanup failed: %s", e, exc_info=True)
+
         # Write last scan time for system health dashboard
         import json as _json
         status_path = self.config.DATA_DIR / "system_status.json"
