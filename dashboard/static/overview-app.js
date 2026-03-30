@@ -12,6 +12,7 @@
 let equityChart = null;
 let nbaSparklineChart = null;
 let eventsSparklineChart = null;
+let stocksSparklineChart = null;
 let oddsData = [];
 let oddsSortCol = "edge";
 let oddsSortAsc = false;
@@ -65,7 +66,7 @@ async function refresh() {
     updateLastUpdate();
 
     // Fire all API calls in parallel
-    const [overview, equity, heatmap, activity, odds, sysHealth, apiHealth] = await Promise.all([
+    const [overview, equity, heatmap, activity, odds, sysHealth, apiHealth, stocksSummary] = await Promise.all([
         fetchJSON("/api/combined/overview"),
         fetchJSON("/api/combined/equity-curve"),
         fetchJSON("/api/combined/heatmap"),
@@ -73,6 +74,7 @@ async function refresh() {
         fetchJSON("/api/combined/odds-snapshot"),
         fetchJSON("/api/system-health"),
         fetchJSON("/api/api-health"),
+        fetchJSON("/api/stocks/summary"),
     ]);
 
     if (!overview && !equity && !heatmap && !activity && !odds) {
@@ -90,6 +92,7 @@ async function refresh() {
     }
     if (apiHealth) renderApiHealth(apiHealth);
     if (sysHealth) renderSysHealth(sysHealth);
+    if (stocksSummary) renderStocksCard(stocksSummary);
 
     updateLastUpdate();
 }
@@ -255,7 +258,8 @@ function renderSparkline(canvasId, data, color) {
     // Extract values
     const values = data.map(d => (typeof d === "object" ? (d.cumulative_pnl ?? d.value ?? d.y ?? d) : d));
 
-    const existingRef = canvasId === "nbaSparkline" ? nbaSparklineChart : eventsSparklineChart;
+    const existingRef = canvasId === "nbaSparkline" ? nbaSparklineChart :
+                        canvasId === "stocksSparkline" ? stocksSparklineChart : eventsSparklineChart;
     if (existingRef) existingRef.destroy();
 
     const chart = new Chart(canvas, {
@@ -290,6 +294,7 @@ function renderSparkline(canvasId, data, color) {
     });
 
     if (canvasId === "nbaSparkline") nbaSparklineChart = chart;
+    else if (canvasId === "stocksSparkline") stocksSparklineChart = chart;
     else eventsSparklineChart = chart;
 }
 
@@ -789,6 +794,47 @@ function renderSysHealth(data) {
     if (eventsModeRaw) {
         renderModeBadge("modeBadgeEvents", eventsModeRaw);
         renderModeBadge("eventsModeCard", eventsModeRaw);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stock Agent Card
+// ---------------------------------------------------------------------------
+function renderStocksCard(data) {
+    const todayPnl = data.today_pnl ?? data.daily_pnl ?? 0;
+    const openPos = data.open_positions ?? data.open_count ?? 0;
+    const wins = data.wins ?? 0;
+    const losses = data.losses ?? 0;
+    const trades = data.total_trades ?? (wins + losses);
+    const wr = data.win_rate ?? (trades > 0 ? (wins / trades * 100) : 0);
+    const totalPnl = data.total_pnl ?? data.realized_pnl ?? data.pnl ?? 0;
+    const lastScan = data.last_scan ?? data.last_updated ?? null;
+    const mode = data.mode ?? "PAPER";
+
+    // Update mode badge
+    const cardModeBadge = document.getElementById("stocksModeCard");
+    if (cardModeBadge) {
+        const isLive = (mode || "").toUpperCase() === "LIVE";
+        cardModeBadge.className = `mode-badge ${isLive ? "mode-badge-live" : "mode-badge-paper"}`;
+        const dot = cardModeBadge.querySelector(".mode-dot");
+        const txt = cardModeBadge.querySelector(".mode-text");
+        if (txt) txt.textContent = mode.toUpperCase();
+        if (dot && !isLive) { dot.style.background = "#eab308"; dot.style.boxShadow = "0 0 6px #eab308"; }
+    }
+
+    // Stats
+    setStatValue("stocksTodayPnl", fmt.usd(todayPnl), pnlClass(todayPnl));
+    setStatValue("stocksOpenPos", openPos, "");
+    setStatValue("stocksWinRate", fmt.pct(wr), wr >= 55 ? "pnl-positive" : wr < 45 ? "pnl-negative" : "");
+    setStatValue("stocksTrades", trades, "");
+    setStatValue("stocksTotalPnl", fmt.usd(totalPnl), pnlClass(totalPnl));
+    const scanEl = document.getElementById("stocksLastScan");
+    if (scanEl) scanEl.textContent = lastScan ? fmt.relative(lastScan) : "--";
+
+    // Sparkline
+    const sparkData = data.equity_curve ?? data.sparkline ?? [];
+    if (sparkData.length > 0) {
+        renderSparkline("stocksSparkline", sparkData, "#10b981");
     }
 }
 

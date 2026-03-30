@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Agent — Stocks</title>
+    <meta name="description" content="Stock trading agent dashboard — positions, theses, signals">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="style.css">
+
+    <style>
+        /* ===================================================================
+           Stocks Dashboard — Supplemental Styles
+           =================================================================== */
+
+        /* Stock accent color */
+        :root {
+            --stock-accent: #10b981;
+            --stock-accent-dim: rgba(16, 185, 129, 0.08);
+        }
+
+        /* Hero KPIs — 5 columns */
+        .stocks-hero {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
+            padding: 0 24px 0;
+        }
+        @media (max-width: 1200px) {
+            .stocks-hero { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 768px) {
+            .stocks-hero { grid-template-columns: repeat(2, 1fr); padding: 0 16px; }
+            .stocks-hero .kpi-card:first-child { grid-column: 1 / -1; }
+        }
+        @media (max-width: 480px) {
+            .stocks-hero { grid-template-columns: 1fr; }
+            .stocks-hero .kpi-card:first-child { grid-column: auto; }
+        }
+
+        /* Stocks section padding */
+        .stocks-section {
+            padding: 0 24px 16px;
+        }
+        @media (max-width: 768px) {
+            .stocks-section { padding: 0 16px 16px; }
+        }
+
+        /* Logo subtitle stock color */
+        .logo-subtitle-stocks {
+            color: var(--stock-accent);
+        }
+
+        /* KPI portfolio glow — stocks */
+        .stocks-portfolio-glow {
+            background: linear-gradient(135deg, rgba(16,185,129,0.05) 0%, rgba(16,185,129,0.02) 100%);
+        }
+
+        /* Stock accent KPI text */
+        .kpi-stock-accent {
+            color: var(--stock-accent);
+        }
+
+        /* Equity chart wrap */
+        .stocks-equity-chart-wrap {
+            height: 260px;
+            position: relative;
+        }
+
+        /* Two-column layout */
+        .stocks-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        @media (max-width: 768px) {
+            .stocks-columns { grid-template-columns: 1fr; }
+        }
+
+        /* ===================================================================
+           Positions Table
+           =================================================================== */
+        .stocks-positions-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .stocks-positions-table th {
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+        .stocks-positions-table th:hover { color: var(--stock-accent); }
+
+        /* Conviction badges */
+        .conviction-badge {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            padding: 2px 8px;
+            border-radius: 10px;
+            display: inline-block;
+        }
+        .conviction-7 {
+            background: rgba(234,179,8,0.12);
+            color: #eab308;
+            border: 1px solid rgba(234,179,8,0.25);
+        }
+        .conviction-8 {
+            background: rgba(34,197,94,0.12);
+            color: #22c55e;
+            border: 1px solid rgba(34,197,94,0.25);
+        }
+        .conviction-9 {
+            background: rgba(16,185,129,0.15);
+            color: #10b981;
+            border: 1px solid rgba(16,185,129,0.3);
+        }
+        .conviction-10 {
+            background: rgba(234,179,8,0.18);
+            color: #fbbf24;
+            border: 1px solid rgba(234,179,8,0.35);
+            text-shadow: 0 0 6px rgba(251,191,36,0.3);
+        }
+
+        /* Sector badge */
+        .sector-badge {
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 2px 7px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.04);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+
+        /* Thesis truncated */
+        .thesis-truncated {
+            max-width: 200px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 12px;
+            color: var(--text-muted);
+            cursor: help;
+        }
+
+        /* ===================================================================
+           Signals & Trades Panels
+           =================================================================== */
+        .signal-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .signal-item:last-child { border-bottom: none; }
+
+        .signal-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            flex-shrink: 0;
+        }
+        .signal-icon-buy {
+            background: rgba(16,185,129,0.1);
+            color: var(--stock-accent);
+            border: 1px solid rgba(16,185,129,0.2);
+        }
+        .signal-icon-sell {
+            background: var(--loss-dim);
+            color: var(--loss);
+            border: 1px solid rgba(239,68,68,0.2);
+        }
+        .signal-icon-hold {
+            background: rgba(234,179,8,0.1);
+            color: #eab308;
+            border: 1px solid rgba(234,179,8,0.2);
+        }
+
+        .signal-desc {
+            flex: 1;
+            font-size: 13px;
+            color: var(--text);
+            line-height: 1.4;
+        }
+        .signal-conviction {
+            font-family: var(--mono);
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+        .signal-time {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-family: var(--mono);
+            flex-shrink: 0;
+        }
+
+        .signal-feed {
+            max-height: 360px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.1) transparent;
+        }
+        .signal-feed::-webkit-scrollbar { width: 4px; }
+        .signal-feed::-webkit-scrollbar-track { background: transparent; }
+        .signal-feed::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+
+        /* ===================================================================
+           Thesis Board
+           =================================================================== */
+        .thesis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 16px;
+        }
+        @media (max-width: 768px) {
+            .thesis-grid { grid-template-columns: 1fr; }
+        }
+
+        .thesis-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            transition: all var(--transition);
+            border-top: 2px solid var(--stock-accent);
+            position: relative;
+        }
+        .thesis-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 40px;
+            background: linear-gradient(to bottom, rgba(16,185,129,0.04), transparent);
+            border-radius: var(--radius) var(--radius) 0 0;
+            pointer-events: none;
+        }
+        .thesis-card:hover {
+            border-color: rgba(16,185,129,0.3);
+            box-shadow: 0 4px 24px rgba(16,185,129,0.06);
+        }
+
+        .thesis-symbol {
+            font-family: var(--mono);
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--stock-accent);
+        }
+        .thesis-name {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+        .thesis-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+        .thesis-text {
+            font-size: 13px;
+            line-height: 1.6;
+            color: var(--text);
+            margin-bottom: 12px;
+        }
+        .thesis-section {
+            margin-bottom: 10px;
+        }
+        .thesis-section-title {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+        .thesis-section-body {
+            font-size: 12px;
+            color: var(--text);
+            line-height: 1.5;
+        }
+        .thesis-citations {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-style: italic;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+        }
+
+        /* Mode badge colors for paper */
+        .mode-badge-paper-stock {
+            background: rgba(234,179,8,0.1);
+            color: #eab308;
+            border-color: rgba(234,179,8,0.25);
+        }
+        .mode-badge-paper-stock .mode-dot { background: #eab308; box-shadow: 0 0 6px #eab308; }
+
+        /* Spinner */
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-spinner {
+            width: 16px; height: 16px;
+            border: 2px solid rgba(255,255,255,0.1);
+            border-top-color: var(--stock-accent);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            display: inline-block;
+        }
+
+        /* Empty state */
+        .empty-state {
+            padding: 40px 0;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        /* Position detail modal */
+        .pos-modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(4px);
+            z-index: 2000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        .pos-modal-overlay.open { display: flex; }
+        .pos-modal-panel {
+            background: var(--surface);
+            border: 1px solid var(--border-hover);
+            border-radius: var(--radius);
+            padding: 28px;
+            max-width: 600px;
+            width: 90vw;
+            max-height: 80vh;
+            overflow-y: auto;
+            position: relative;
+        }
+        .pos-modal-close {
+            position: absolute;
+            top: 12px; right: 16px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 18px;
+            cursor: pointer;
+        }
+        .pos-modal-close:hover { color: var(--text); }
+        .pos-modal-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .pos-modal-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .pos-modal-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .pos-modal-value {
+            font-family: var(--mono);
+            font-size: 14px;
+            color: var(--text);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- LOGIN SCREEN -->
+    <div id="loginOverlay" class="login-overlay">
+        <canvas id="loginCanvas"></canvas>
+        <div class="login-orb login-orb-1"></div>
+        <div class="login-orb login-orb-2"></div>
+        <div class="login-orb login-orb-3"></div>
+        <div class="login-grid-bg"></div>
+        <div class="login-scanline"></div>
+        <div class="login-container">
+            <div class="login-ring-wrap">
+                <svg class="login-ring" width="120" height="120" viewBox="0 0 120 120" fill="none">
+                    <circle cx="60" cy="60" r="56" stroke="url(#ringGrad)" stroke-width="1" stroke-dasharray="6 8" opacity="0.4"/>
+                    <circle cx="60" cy="60" r="46" stroke="url(#ringGrad2)" stroke-width="0.75" stroke-dasharray="3 6" opacity="0.3"/>
+                    <defs>
+                        <linearGradient id="ringGrad" x1="0" y1="0" x2="120" y2="120">
+                            <stop offset="0%" stop-color="#10b981"/>
+                            <stop offset="100%" stop-color="#10b981"/>
+                        </linearGradient>
+                        <linearGradient id="ringGrad2" x1="120" y1="0" x2="0" y2="120">
+                            <stop offset="0%" stop-color="#10b981"/>
+                            <stop offset="100%" stop-color="#10b981"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+                <div class="login-logo-core">
+                    <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
+                        <circle cx="16" cy="16" r="12" stroke="#10b981" stroke-width="1.5" fill="none" opacity="0.5"/>
+                        <circle cx="16" cy="16" r="6" stroke="#10b981" stroke-width="1.5" fill="none"/>
+                        <circle cx="16" cy="16" r="2.5" fill="#10b981"/>
+                        <line x1="16" y1="4" x2="16" y2="10" stroke="#10b981" stroke-width="1" opacity="0.5"/>
+                        <line x1="16" y1="22" x2="16" y2="28" stroke="#10b981" stroke-width="1" opacity="0.5"/>
+                        <line x1="4" y1="16" x2="10" y2="16" stroke="#10b981" stroke-width="1" opacity="0.5"/>
+                        <line x1="22" y1="16" x2="28" y2="16" stroke="#10b981" stroke-width="1" opacity="0.5"/>
+                    </svg>
+                </div>
+            </div>
+            <div class="login-text">
+                <div class="login-title">POLYMARKET AGENT</div>
+                <div class="login-subtitle" style="color:#10b981;">STOCKS</div>
+            </div>
+            <form id="loginForm" class="login-form" autocomplete="off">
+                <div class="login-input-group">
+                    <label class="login-label" for="passkeyInput">PASSKEY</label>
+                    <div class="login-input-wrap">
+                        <input type="password" id="passkeyInput" class="login-input" placeholder="&#x2022; &#x2022; &#x2022; &#x2022; &#x2022; &#x2022;" autofocus autocomplete="off">
+                        <div class="login-input-glow"></div>
+                    </div>
+                </div>
+                <div class="login-error" id="loginError"></div>
+                <button type="submit" class="login-btn" id="loginBtn">
+                    <span class="login-btn-text">UNLOCK</span>
+                    <svg class="login-btn-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div class="login-footer">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style="opacity:0.5">
+                    <rect x="1" y="5" width="10" height="6" rx="1.5" stroke="#71717a" stroke-width="1"/>
+                    <path d="M3 5V3.5a3 3 0 0 1 6 0V5" stroke="#71717a" stroke-width="1" stroke-linecap="round"/>
+                </svg>
+                <span>Secured access only</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- DASHBOARD -->
+    <div id="dashboardContent" class="dashboard-hidden">
+
+    <!-- HEADER -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <!-- Stock-themed logo — green/emerald -->
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="14" stroke="#10b981" stroke-width="1.5" fill="none" opacity="0.4"/>
+                    <circle cx="16" cy="16" r="8" stroke="#10b981" stroke-width="1.5" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="#10b981"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#10b981" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#10b981" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#10b981" stroke-width="1.5" opacity="0.6"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#10b981" stroke-width="1.5" opacity="0.6"/>
+                </svg>
+                <div class="logo-text">
+                    <span class="logo-title">POLYMARKET</span>
+                    <span class="logo-subtitle logo-subtitle-stocks">STOCKS</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-center">
+            <a href="/overview.html" class="nav-link">Overview</a>
+            <a href="/nba.html" class="nav-link">NBA</a>
+            <a href="/events.html" class="nav-link">Events</a>
+            <a href="/intelligence.html" class="nav-link">Intelligence</a>
+            <a href="/analytics.html" class="nav-link">Analytics</a>
+            <a href="/stocks.html" class="nav-link active" style="color:#10b981;background:rgba(16,185,129,0.15);">Stocks</a>
+        </div>
+        <div class="header-right">
+            <div class="mode-badge mode-badge-paper" id="modeBadge">
+                <span class="mode-dot"></span>
+                <span class="mode-text">PAPER</span>
+            </div>
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot connected"></span>
+                <span class="status-text">Live</span>
+            </div>
+            <div class="last-update" id="lastUpdate">--</div>
+        </div>
+    </header>
+
+    <!-- 1. HERO KPIs ROW -->
+    <section class="stocks-hero" style="padding-top:24px;">
+        <!-- Portfolio Value -->
+        <div class="kpi-card stocks-portfolio-glow">
+            <div class="kpi-label">Portfolio Value</div>
+            <div class="kpi-value kpi-stock-accent" id="kpiPortfolioValue">$0.00</div>
+            <div class="kpi-sub" id="kpiPortfolioSub">Cash: $0 · Invested: $0</div>
+        </div>
+        <!-- Total P&L -->
+        <div class="kpi-card">
+            <div class="kpi-label">Total P&L</div>
+            <div class="kpi-value" id="kpiTotalPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiTotalPnlSub">ROI: 0%</div>
+        </div>
+        <!-- Win Rate -->
+        <div class="kpi-card">
+            <div class="kpi-label">Win Rate</div>
+            <div class="kpi-value" id="kpiWinRate">0%</div>
+            <div class="kpi-sub"><span id="kpiWins">0</span>W / <span id="kpiLosses">0</span>L · <span id="kpiTotalTrades">0</span> trades</div>
+        </div>
+        <!-- Open Positions -->
+        <div class="kpi-card">
+            <div class="kpi-label">Open Positions</div>
+            <div class="kpi-value" id="kpiOpenPositions">0</div>
+            <div class="kpi-sub" id="kpiExposureSub">0% exposure</div>
+        </div>
+        <!-- Today's P&L -->
+        <div class="kpi-card">
+            <div class="kpi-label">Today's P&L</div>
+            <div class="kpi-value" id="kpiTodayPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiTodaySub">0 trades today</div>
+        </div>
+    </section>
+
+    <!-- 2. EQUITY CURVE -->
+    <section class="stocks-section" style="margin-top:16px;">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Equity Curve</h2>
+                <div class="card-header-right">
+                    <span class="badge badge-info" id="drawdownBadge">Max DD: --</span>
+                    <span class="badge badge-info" id="sharpeBadge">Sharpe: --</span>
+                    <span style="display:flex;align-items:center;gap:4px;font-size:11px;color:#a1a1aa;">
+                        <span style="width:12px;height:2px;background:#10b981;border-radius:2px;display:inline-block;"></span>Portfolio
+                        <span style="width:12px;height:2px;background:rgba(255,255,255,0.3);border-radius:2px;display:inline-block;margin-left:6px;"></span>Benchmark
+                    </span>
+                </div>
+            </div>
+            <div class="chart-container stocks-equity-chart-wrap">
+                <canvas id="equityChart"></canvas>
+            </div>
+        </div>
+    </section>
+
+    <!-- 3. ACTIVE POSITIONS TABLE -->
+    <section class="stocks-section">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Active Positions</h2>
+                <div class="card-header-right">
+                    <span class="badge badge-info" id="positionsCount">0 positions</span>
+                </div>
+            </div>
+            <div class="table-wrapper" style="overflow-x:auto;">
+                <table class="odds-table stocks-positions-table">
+                    <thead>
+                        <tr>
+                            <th class="sortable" data-col="symbol">Symbol <span class="sort-arrow">↕</span></th>
+                            <th class="sortable" data-col="name">Name <span class="sort-arrow">↕</span></th>
+                            <th class="sortable" data-col="entry_price">Entry <span class="sort-arrow">↕</span></th>
+                            <th class="sortable" data-col="current_price">Current <span class="sort-arrow">↕</span></th>
+                            <th class="sortable sort-active" data-col="pnl_pct">P&L % <span class="sort-arrow">↓</span></th>
+                            <th class="sortable" data-col="pnl">P&L $ <span class="sort-arrow">↕</span></th>
+                            <th class="sortable" data-col="conviction">Conv. <span class="sort-arrow">↕</span></th>
+                            <th>Sector</th>
+                            <th>Thesis</th>
+                            <th class="sortable" data-col="days_held">Days <span class="sort-arrow">↕</span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="positionsTableBody">
+                        <tr><td colspan="10" class="empty-table-cell">Loading positions...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- 4. RECENT SIGNALS + RECENT TRADES (two columns) -->
+    <section class="stocks-section">
+        <div class="stocks-columns">
+            <!-- Recent Signals -->
+            <div class="card" style="min-height:300px;">
+                <div class="card-header">
+                    <h2 class="card-title">Recent Signals</h2>
+                    <div class="card-header-right">
+                        <span class="badge badge-info" id="signalsCount">0 signals</span>
+                    </div>
+                </div>
+                <div class="signal-feed" id="signalsFeed">
+                    <div class="empty-state">
+                        <div class="loading-spinner"></div>
+                        <div style="margin-top:12px;">Loading signals...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Trades -->
+            <div class="card" style="min-height:300px;">
+                <div class="card-header">
+                    <h2 class="card-title">Recent Trades</h2>
+                    <div class="card-header-right">
+                        <span class="badge badge-info" id="tradesCount">0 trades</span>
+                    </div>
+                </div>
+                <div class="signal-feed" id="tradesFeed">
+                    <div class="empty-state">
+                        <div class="loading-spinner"></div>
+                        <div style="margin-top:12px;">Loading trades...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 5. THESIS BOARD -->
+    <section class="stocks-section">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Thesis Board</h2>
+                <div class="card-header-right">
+                    <span class="badge badge-info" id="thesesCount">0 theses</span>
+                </div>
+            </div>
+            <div class="thesis-grid" id="thesisGrid">
+                <div class="empty-state">
+                    <div class="loading-spinner"></div>
+                    <div style="margin-top:12px;">Loading theses...</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- POSITION DETAIL MODAL -->
+    <div id="positionModal" class="pos-modal-overlay" onclick="closePositionModal(event)">
+        <div class="pos-modal-panel" id="posModalPanel">
+            <button class="pos-modal-close" onclick="closePositionModal()">&times;</button>
+            <div id="posModalContent"></div>
+        </div>
+    </div>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <span class="footer-text">Polymarket Agent — Stocks — Auto-refreshes every 30s</span>
+    </footer>
+
+    </div><!-- /dashboardContent -->
+
+    <script src="common.js"></script>
+    <script src="stocks-app.js"></script>
+</body>
+</html>

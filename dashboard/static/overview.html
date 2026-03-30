@@ -35,11 +35,14 @@
             .overview-hero .kpi-card:first-child { grid-column: auto; }
         }
 
-        /* Two-column agent cards */
+        /* Agent cards grid — 3 columns when stocks present */
         .agent-columns {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 16px;
+        }
+        @media (max-width: 1200px) {
+            .agent-columns { grid-template-columns: 1fr 1fr; }
         }
         @media (max-width: 768px) {
             .agent-columns { grid-template-columns: 1fr; }
@@ -69,6 +72,19 @@
             top: 0; left: 0; right: 0;
             height: 40px;
             background: linear-gradient(to bottom, rgba(139,92,246,0.04), transparent);
+            border-radius: var(--radius) var(--radius) 0 0;
+            pointer-events: none;
+        }
+        .agent-card-stocks {
+            border-top: 2px solid #10b981;
+            position: relative;
+        }
+        .agent-card-stocks::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 40px;
+            background: linear-gradient(to bottom, rgba(16,185,129,0.04), transparent);
             border-radius: var(--radius) var(--radius) 0 0;
             pointer-events: none;
         }
@@ -140,6 +156,15 @@
             background: rgba(139,92,246,0.2);
             box-shadow: 0 0 12px rgba(139,92,246,0.15);
         }
+        .agent-card-link-stocks {
+            color: #10b981;
+            background: rgba(16,185,129,0.08);
+            border: 1px solid rgba(16,185,129,0.2);
+        }
+        .agent-card-link-stocks:hover {
+            background: rgba(16,185,129,0.2);
+            box-shadow: 0 0 12px rgba(16,185,129,0.15);
+        }
 
         /* Agent header */
         .agent-header {
@@ -156,6 +181,7 @@
         }
         .agent-title-nba { color: var(--primary); }
         .agent-title-events { color: var(--secondary); }
+        .agent-title-stocks { color: #10b981; }
 
         /* ===================================================================
            Combined Equity Curve
@@ -546,6 +572,7 @@
             <a href="/events.html" class="nav-link">Events</a>
             <a href="/intelligence.html" class="nav-link">Intelligence</a>
             <a href="/analytics.html" class="nav-link">Analytics</a>
+            <a href="/stocks.html" class="nav-link">Stocks</a>
         </div>
         <div class="header-right">
             <div class="api-health" id="apiHealth" title="API Status">
@@ -715,6 +742,50 @@
                 </div>
                 <a href="/events.html" class="agent-card-link agent-card-link-events">
                     View Events Dashboard
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6h7M6 2.5l3.5 3.5L6 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </a>
+            </div>
+
+            <!-- Stock Agent Card -->
+            <div class="card agent-card-stocks">
+                <div class="agent-header">
+                    <span class="agent-title agent-title-stocks">Stock Agent</span>
+                    <div class="mode-badge mode-badge-paper" id="stocksModeCard">
+                        <span class="mode-dot"></span>
+                        <span class="mode-text">PAPER</span>
+                    </div>
+                </div>
+                <div class="agent-stats-grid">
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Today P&L</div>
+                        <div class="agent-stat-value" id="stocksTodayPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Open Pos.</div>
+                        <div class="agent-stat-value" id="stocksOpenPos">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Win Rate</div>
+                        <div class="agent-stat-value" id="stocksWinRate">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total Trades</div>
+                        <div class="agent-stat-value" id="stocksTrades">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Total P&L</div>
+                        <div class="agent-stat-value" id="stocksTotalPnl">--</div>
+                    </div>
+                    <div class="agent-stat">
+                        <div class="agent-stat-label">Last Scan</div>
+                        <div class="agent-stat-value" id="stocksLastScan" style="font-size:11px;">--</div>
+                    </div>
+                </div>
+                <div class="agent-sparkline">
+                    <canvas id="stocksSparkline"></canvas>
+                </div>
+                <a href="/stocks.html" class="agent-card-link agent-card-link-stocks">
+                    View Stocks Dashboard
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6h7M6 2.5l3.5 3.5L6 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </a>
             </div>

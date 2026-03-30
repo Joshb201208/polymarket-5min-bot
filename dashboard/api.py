@@ -2470,6 +2470,176 @@ def get_combined_odds_snapshot() -> dict:
     return {"snapshots": snapshots, "last_updated": last_updated}
 
 
+# ---------------------------------------------------------------------------
+# Stock Agent endpoints
+# ---------------------------------------------------------------------------
+_STOCK_DATA_SUBDIR = "stock_agent"
+
+
+def _read_stock_json(filename: str) -> Any:
+    """Read a JSON file from the stock agent's data directory."""
+    # Try primary data dir first, then VPS path
+    for base in [DATA_DIR, Path("/root/polymarket-bot/data")]:
+        path = base / _STOCK_DATA_SUBDIR / filename
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+    return {}
+
+
+@app.get("/api/stocks/summary", dependencies=[Depends(_require_auth)])
+def stocks_summary() -> dict:
+    """Return stock portfolio summary KPIs."""
+    portfolio = _read_stock_json("portfolio.json")
+    if not portfolio:
+        return {
+            "portfolio_value": 0, "cash": 0, "invested": 0,
+            "total_pnl": 0, "roi": 0, "wins": 0, "losses": 0,
+            "total_trades": 0, "win_rate": 0, "open_positions": 0,
+            "exposure_pct": 0, "today_pnl": 0, "today_trades": 0,
+            "mode": "PAPER", "max_drawdown": 0, "sharpe_ratio": 0,
+        }
+
+    # Support both flat and nested formats
+    summary = portfolio.get("summary", portfolio)
+    positions = portfolio.get("positions", [])
+    trades = portfolio.get("trades", [])
+
+    cash = summary.get("cash", summary.get("cash_balance", 0))
+    invested = summary.get("invested", summary.get("positions_value", 0))
+    portfolio_value = summary.get("portfolio_value", summary.get("total_value", cash + invested))
+
+    wins = summary.get("wins", 0)
+    losses = summary.get("losses", 0)
+    total_trades = summary.get("total_trades", wins + losses)
+    win_rate = summary.get("win_rate", (wins / total_trades * 100) if total_trades > 0 else 0)
+
+    open_positions = len([p for p in positions if p.get("status", "open") == "open"]) if positions else summary.get("open_positions", summary.get("open_count", 0))
+
+    return {
+        "portfolio_value": portfolio_value,
+        "cash": cash,
+        "invested": invested,
+        "total_pnl": summary.get("total_pnl", summary.get("realized_pnl", 0)),
+        "roi": summary.get("roi", 0),
+        "wins": wins,
+        "losses": losses,
+        "total_trades": total_trades,
+        "win_rate": round(win_rate, 1),
+        "open_positions": open_positions,
+        "exposure_pct": summary.get("exposure_pct", 0),
+        "today_pnl": summary.get("today_pnl", summary.get("daily_pnl", 0)),
+        "today_trades": summary.get("today_trades", 0),
+        "mode": summary.get("mode", "PAPER"),
+        "max_drawdown": summary.get("max_drawdown", 0),
+        "sharpe_ratio": summary.get("sharpe_ratio", 0),
+        "last_scan": summary.get("last_scan", summary.get("last_updated", None)),
+        "equity_curve": summary.get("equity_curve", summary.get("sparkline", [])),
+    }
+
+
+@app.get("/api/stocks/positions", dependencies=[Depends(_require_auth)])
+def stocks_positions() -> list:
+    """Return current stock positions with theses."""
+    portfolio = _read_stock_json("portfolio.json")
+    positions = portfolio.get("positions", [])
+    if not positions:
+        # Try standalone positions file
+        positions_data = _read_stock_json("positions.json")
+        if isinstance(positions_data, list):
+            positions = positions_data
+        elif isinstance(positions_data, dict):
+            positions = positions_data.get("positions", [])
+
+    # Filter to open only
+    return [p for p in positions if p.get("status", "open") == "open"]
+
+
+@app.get("/api/stocks/trades", dependencies=[Depends(_require_auth)])
+def stocks_trades() -> list:
+    """Return stock trade history."""
+    portfolio = _read_stock_json("portfolio.json")
+    trades = portfolio.get("trades", [])
+    if not trades:
+        trades_data = _read_stock_json("trades.json")
+        if isinstance(trades_data, list):
+            trades = trades_data
+        elif isinstance(trades_data, dict):
+            trades = trades_data.get("trades", [])
+
+    # Sort newest first
+    trades.sort(
+        key=lambda t: t.get("timestamp", t.get("exit_time", t.get("closed_at", ""))),
+        reverse=True,
+    )
+    return trades[:50]
+
+
+@app.get("/api/stocks/signals", dependencies=[Depends(_require_auth)])
+def stocks_signals() -> list:
+    """Return recent stock signals."""
+    signals_data = _read_stock_json("signals.json")
+    if isinstance(signals_data, list):
+        signals = signals_data
+    elif isinstance(signals_data, dict):
+        signals = signals_data.get("signals", signals_data.get("items", []))
+    else:
+        signals = []
+
+    signals.sort(
+        key=lambda s: s.get("timestamp", s.get("created_at", s.get("time", ""))),
+        reverse=True,
+    )
+    return signals[:30]
+
+
+@app.get("/api/stocks/equity-curve", dependencies=[Depends(_require_auth)])
+def stocks_equity_curve() -> dict:
+    """Return equity curve data for charting."""
+    equity_data = _read_stock_json("equity_curve.json")
+    if not equity_data:
+        # Fall back to portfolio.json
+        portfolio = _read_stock_json("portfolio.json")
+        curve = portfolio.get("equity_curve", portfolio.get("history", []))
+        if isinstance(curve, list) and len(curve) > 0:
+            if isinstance(curve[0], dict):
+                labels = [d.get("date", d.get("day", "")) for d in curve]
+                values = [d.get("value", d.get("portfolio_value", d.get("cumulative_pnl", 0))) for d in curve]
+            else:
+                labels = []
+                values = curve
+            return {"labels": labels, "portfolio": values, "benchmark": []}
+        return {"labels": [], "portfolio": [], "benchmark": []}
+
+    if isinstance(equity_data, list):
+        if len(equity_data) > 0 and isinstance(equity_data[0], dict):
+            labels = [d.get("date", d.get("day", "")) for d in equity_data]
+            values = [d.get("value", d.get("portfolio_value", d.get("cumulative_pnl", 0))) for d in equity_data]
+        else:
+            labels = []
+            values = equity_data
+        return {"labels": labels, "portfolio": values, "benchmark": []}
+
+    return {
+        "labels": equity_data.get("labels", equity_data.get("dates", [])),
+        "portfolio": equity_data.get("portfolio", equity_data.get("equity", equity_data.get("values", []))),
+        "benchmark": equity_data.get("benchmark", []),
+    }
+
+
+@app.get("/api/stocks/theses", dependencies=[Depends(_require_auth)])
+def stocks_theses() -> list:
+    """Return active theses."""
+    theses_data = _read_stock_json("theses.json")
+    if isinstance(theses_data, list):
+        return theses_data
+    if isinstance(theses_data, dict):
+        return theses_data.get("theses", theses_data.get("items", []))
+    return []
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
