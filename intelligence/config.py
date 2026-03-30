@@ -24,6 +24,7 @@ INTELLIGENCE_MODULES = {
     "congress": _bool_env("CONGRESS_TRACKER_ENABLED"),
     "cross_market": _bool_env("CROSS_MARKET_ENABLED"),
     "whale_tracker": _bool_env("WHALE_TRACKER_ENABLED"),
+    "reference_price": _bool_env("REFERENCE_PRICE_ENABLED"),
 }
 
 # Composite Scoring
@@ -32,12 +33,13 @@ COMPOSITE_DIRECTION_BONUS = float(os.getenv("COMPOSITE_DIRECTION_BONUS", "0.2"))
 
 # Signal source weights (sum to 1.0; x_scanner zeroed, weight redistributed)
 SOURCE_WEIGHTS = {
-    "metaculus": 0.30,
+    "reference_price": 0.25,
+    "metaculus": 0.20,
     "x_scanner": 0.00,
-    "orderbook": 0.20,
-    "whale_tracker": 0.20,
-    "google_trends": 0.12,
-    "congress": 0.10,
+    "orderbook": 0.15,
+    "whale_tracker": 0.15,
+    "google_trends": 0.10,
+    "congress": 0.07,
     "cross_market": 0.08,
 }
 
@@ -54,6 +56,7 @@ class IntelligenceConfig:
         "congress": _bool_env("CONGRESS_TRACKER_ENABLED"),
         "cross_market": _bool_env("CROSS_MARKET_ENABLED"),
         "whale_tracker": _bool_env("WHALE_TRACKER_ENABLED"),
+        "reference_price": _bool_env("REFERENCE_PRICE_ENABLED"),
     }
 
     # X/Twitter Scanner

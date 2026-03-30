@@ -108,6 +108,13 @@ class IntelligenceManager:
             except ImportError:
                 logger.warning("whale_tracker module not available yet")
 
+        if modules.get("reference_price"):
+            try:
+                from intelligence.reference_price import ReferencePriceScanner
+                self._modules["reference_price"] = ReferencePriceScanner()
+            except ImportError:
+                logger.warning("reference_price module not available yet")
+
         try:
             from intelligence.composite_scorer import CompositeScorer
             self._composite_scorer = CompositeScorer()
