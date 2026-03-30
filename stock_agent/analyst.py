@@ -91,14 +91,21 @@ class Analyst:
         ]
         return "\n".join(line for line in lines if line)
 
-    async def analyze_stock(self, symbol: str, company_data: CompanyData) -> Thesis | None:
+    async def analyze_stock(
+        self, symbol: str, company_data: CompanyData, tipranks_context: str = ""
+    ) -> Thesis | None:
         """Deep analysis using Perplexity Sonar Pro."""
         financial_str = self._format_financial_data(company_data)
+
+        supplementary = ""
+        if tipranks_context:
+            supplementary = f"\n{tipranks_context}\n"
 
         prompt = f"""You are a senior equity analyst at a top hedge fund. Analyze {symbol} ({company_data.name}) for a potential investment.
 
 FINANCIAL DATA:
 {financial_str}
+{supplementary}
 
 TASK: Form a comprehensive investment thesis. Research the following:
 1. Recent earnings performance vs estimates — any surprises?

@@ -3,6 +3,24 @@ from datetime import datetime
 from typing import Optional
 
 
+class TipRanksStock(BaseModel):
+    """TipRanks screener data for a single stock."""
+    symbol: str
+    name: str
+    smart_score: int
+    analyst_consensus: str  # Strong Buy, Moderate Buy, Hold, etc.
+    analyst_target_upside: float  # percentage
+    hedge_fund_signal: str  # Positive, Negative, Neutral
+    insider_signal: str  # Positive, Negative, Neutral
+    news_sentiment: str  # Very Bullish, Bullish, Neutral, Bearish
+    blogger_consensus: str
+    ai_rating: Optional[str] = None
+    ai_target_upside: Optional[float] = None
+    sector: str
+    market_cap: Optional[str] = None
+    pe_ratio: Optional[float] = None
+
+
 class CompanyData(BaseModel):
     """Raw financial data for a company."""
     symbol: str

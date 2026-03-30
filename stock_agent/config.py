@@ -71,4 +71,9 @@ class Config:
         except (PermissionError, OSError):
             DATA_DIR = _local
 
+    # TipRanks
+    TIPRANKS_EMAIL = os.environ.get("TIPRANKS_EMAIL", "")
+    TIPRANKS_PASSWORD = os.environ.get("TIPRANKS_PASSWORD", "")
+    TIPRANKS_ENABLED = os.environ.get("TIPRANKS_ENABLED", "true").lower() == "true"
+
     LOG_LEVEL = os.environ.get("STOCK_LOG_LEVEL", "INFO")

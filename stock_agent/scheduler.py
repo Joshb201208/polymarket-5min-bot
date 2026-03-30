@@ -168,6 +168,41 @@ class StockAgentScheduler:
                 return_exceptions=True,
             )
 
+            # 0. Run TipRanks scraper and load data (supplementary — never blocks)
+            tipranks_stocks = None
+            if getattr(self.config, "TIPRANKS_ENABLED", False):
+                try:
+                    from stock_agent.tipranks_scraper import scrape_tipranks
+
+                    await scrape_tipranks(self.config)
+
+                    from stock_agent.tipranks_data import TipRanksData
+
+                    tr = TipRanksData(self.config)
+                    tipranks_stocks = tr.load_latest()
+                    if tipranks_stocks:
+                        logger.info("Loaded %d stocks from TipRanks", len(tipranks_stocks))
+                        await self.discord.send_system_log(
+                            "INFO", f"TipRanks data loaded: {len(tipranks_stocks)} stocks"
+                        )
+                        # Report aligned signals
+                        aligned = [
+                            s
+                            for s in tipranks_stocks
+                            if s.smart_score >= 9
+                            and s.analyst_consensus == "Strong Buy"
+                            and s.hedge_fund_signal.lower() == "positive"
+                        ]
+                        if aligned:
+                            symbols_str = ", ".join(s.symbol for s in aligned[:15])
+                            await self.discord.send_system_log(
+                                "INFO",
+                                f"TipRanks aligned signals: {len(aligned)} stocks "
+                                f"with SS9+, Strong Buy, HF Positive: {symbols_str}",
+                            )
+                except Exception as e:
+                    logger.warning("TipRanks scrape failed (non-critical): %s", e)
+
             # 1. Screen universe
             symbols = await self.data_feed.screen_universe()
             if not symbols:
@@ -220,7 +255,27 @@ class StockAgentScheduler:
                     continue
 
                 try:
-                    thesis = await self.analyst.analyze_stock(sym, company)
+                    # Build TipRanks context for this symbol if available
+                    tipranks_context = ""
+                    if tipranks_stocks:
+                        tr_stock = next(
+                            (s for s in tipranks_stocks if s.symbol.upper() == sym.upper()),
+                            None,
+                        )
+                        if tr_stock:
+                            tipranks_context = (
+                                f"TIPRANKS DATA:\n"
+                                f"- Smart Score: {tr_stock.smart_score}/10\n"
+                                f"- Analyst Consensus: {tr_stock.analyst_consensus}\n"
+                                f"- Analyst Price Target Upside: {tr_stock.analyst_target_upside:+.1f}%\n"
+                                f"- Hedge Fund Signal: {tr_stock.hedge_fund_signal}\n"
+                                f"- Insider Signal: {tr_stock.insider_signal}\n"
+                                f"- News Sentiment: {tr_stock.news_sentiment}\n"
+                            )
+
+                    thesis = await self.analyst.analyze_stock(
+                        sym, company, tipranks_context=tipranks_context
+                    )
                     if not thesis:
                         continue
 
