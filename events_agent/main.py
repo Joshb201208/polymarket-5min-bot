@@ -142,44 +142,59 @@ class EventsAgent:
                         if not token_id or shares <= 0:
                             p.exit_reason = "extreme_pricing_no_shares"
                             continue
-                        # Get current price
-                        mid = 0
+                        # Get current price (CLOB midpoint returns YES price)
+                        yes_mid = 0
                         try:
                             with _httpx.Client(timeout=8) as hc:
                                 resp = hc.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
                                 if resp.status_code == 200:
-                                    mid = float(resp.json().get("mid", 0))
+                                    yes_mid = float(resp.json().get("mid", 0))
                         except Exception:
                             pass
+                        # Adjust for NO positions
+                        side_str = (getattr(p, "side", "") or "").upper()
+                        mid = (1.0 - yes_mid) if "NO" in side_str else yes_mid
                         if mid <= 0.005:
                             p.exit_reason = "extreme_pricing_worthless"
                             continue
-                        # Sell via limit order (FOK fails on low-liquidity markets)
-                        # Price at 90% of midpoint for fast fill
-                        sell_price = round(mid * 0.90, 2)
+                        # Try selling 99% of shares to avoid precision issues
+                        adjusted_shares = round(shares * 0.99, 2)
+                        if adjusted_shares <= 0:
+                            adjusted_shares = shares
+                        order_id = None
                         try:
-                            order_id = self.executor._execute_limit_sell(
-                                token_id, shares, sell_price,
+                            # Try FOK sell with reduced shares first
+                            order_id = self.executor._execute_live_sell(
+                                token_id, adjusted_shares, getattr(p, "market_id", ""),
                             )
-                            if order_id:
-                                sold_count += 1
-                                sold_value += shares * mid
-                                p.exit_reason = "sold_extreme_pricing_cleanup"
-                                p.exit_price = mid
-                                p.pnl = round(shares * mid - (getattr(p, "cost", 0) or 0), 2)
-                                logger.info(
-                                    "SOLD #%d: %s @ %.3f | ~$%.2f | %s",
-                                    sold_count, getattr(p, "side", ""), mid, shares * mid,
-                                    getattr(p, "market_question", "")[:50],
-                                )
-                            else:
-                                failed_count += 1
-                                logger.warning("Sell returned no order_id: %s",
-                                               getattr(p, "market_question", "")[:40])
                         except Exception as sell_err:
-                            failed_count += 1
-                            logger.warning("Failed to sell %s: %s",
+                            logger.warning("FOK sell failed for %s: %s",
                                            getattr(p, "market_question", "")[:40], sell_err)
+                        # Fallback: limit sell at 90% of midpoint
+                        if not order_id:
+                            sell_price = round(mid * 0.90, 2)
+                            try:
+                                order_id = self.executor._execute_limit_sell(
+                                    token_id, adjusted_shares, sell_price,
+                                )
+                            except Exception as sell_err2:
+                                logger.warning("Limit sell also failed for %s: %s",
+                                               getattr(p, "market_question", "")[:40], sell_err2)
+                        if order_id:
+                            sold_count += 1
+                            sold_value += shares * mid
+                            p.exit_reason = "sold_extreme_pricing_cleanup"
+                            p.exit_price = mid
+                            p.pnl = round(shares * mid - (getattr(p, "cost", 0) or 0), 2)
+                            logger.info(
+                                "SOLD #%d: %s @ %.3f | ~$%.2f | %s",
+                                sold_count, getattr(p, "side", ""), mid, shares * mid,
+                                getattr(p, "market_question", "")[:50],
+                            )
+                        else:
+                            failed_count += 1
+                            logger.warning("All sell methods failed: %s",
+                                           getattr(p, "market_question", "")[:40])
                         _time.sleep(1.0)  # Rate limit between sells
                     self.portfolio._write_positions(positions)
                     logger.warning(
@@ -480,9 +495,16 @@ class EventsAgent:
 
         for position in open_positions:
             try:
-                current_price = await self.scanner.get_market_price(position.token_id)
-                if current_price is None:
+                yes_price = await self.scanner.get_market_price(position.token_id)
+                if yes_price is None:
                     continue
+
+                # CLOB midpoint returns YES token price; for NO positions
+                # our token value is (1 - yes_price)
+                if "NO" in (getattr(position, "side", "") or "").upper():
+                    current_price = 1.0 - yes_price
+                else:
+                    current_price = yes_price
 
                 # Gather intelligence context for this position's market
                 composite_score = None
@@ -548,38 +570,93 @@ class EventsAgent:
                 logger.error("Error checking exit for %s: %s", position.id, e)
 
     async def _check_resolutions(self) -> None:
-        """Check for markets that have ended and auto-resolve positions."""
-        resolved = self.portfolio.check_resolved_positions()
-        for pos in resolved:
-            try:
-                current_price = await self.scanner.get_market_price(pos.token_id)
-                if current_price is None:
-                    logger.info("Cannot get price for resolved events position %s — will retry", pos.id)
+        """Check Gamma API for resolved markets and close positions."""
+        import httpx
+        import json as _json
+
+        open_positions = self.portfolio.get_open_positions()
+        if not open_positions:
+            return
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            for pos in open_positions:
+                market_id = getattr(pos, "market_id", "")
+                if not market_id:
                     continue
 
-                if current_price >= 0.99:
-                    payout = pos.shares * 1.0
-                    pnl = payout - pos.cost
-                    result = "WIN"
-                elif current_price <= 0.01:
-                    payout = 0.0
-                    pnl = -pos.cost
-                    result = "LOSS"
-                else:
-                    continue
+                try:
+                    resp = await client.get(
+                        f"https://gamma-api.polymarket.com/markets/{market_id}"
+                    )
+                    if resp.status_code != 200:
+                        continue
 
-                pos.status = "closed"
-                pos.exit_price = current_price
-                pos.exit_time = utcnow().isoformat()
-                pos.pnl = round(pnl, 2)
-                pos.exit_reason = f"Market resolved: {result}"
-                self.portfolio.save_position(pos)
+                    market_data = resp.json()
+                    if not market_data.get("closed", False):
+                        continue
 
-                logger.info("RESOLVED: %s | %s | P&L=$%.2f",
-                            pos.market_question[:50], result, pnl)
+                    # Market is closed — check outcome
+                    outcome_prices = market_data.get("outcomePrices", [])
+                    if isinstance(outcome_prices, str):
+                        outcome_prices = _json.loads(outcome_prices)
 
-            except Exception as e:
-                logger.error("Error resolving events position %s: %s", pos.id, e)
+                    if not outcome_prices or len(outcome_prices) < 2:
+                        continue
+
+                    yes_price = float(outcome_prices[0])
+
+                    # Determine if YES or NO won
+                    if yes_price >= 0.99:
+                        winning_side = "YES"
+                    elif yes_price <= 0.01:
+                        winning_side = "NO"
+                    else:
+                        continue  # Not fully resolved yet
+
+                    # Calculate P&L based on our position side
+                    our_side = "YES" if "YES" in (pos.side or "").upper() else "NO"
+
+                    if our_side == winning_side:
+                        # We won — payout is $1 per share
+                        payout = pos.shares * 1.0
+                        pnl = payout - pos.cost
+                        result = "WIN"
+                    else:
+                        # We lost — payout is $0
+                        pnl = -pos.cost
+                        result = "LOSS"
+
+                    pos.status = "closed"
+                    pos.exit_price = 1.0 if our_side == winning_side else 0.0
+                    pos.exit_time = utcnow().isoformat()
+                    pos.pnl = round(pnl, 2)
+                    pos.exit_reason = f"Market resolved: {result} ({winning_side} won)"
+                    self.portfolio.save_position(pos)
+
+                    # Update bankroll on wins
+                    if result == "WIN":
+                        self._update_bankroll(payout)
+
+                    logger.info(
+                        "RESOLVED: %s | %s | P&L=$%.2f | Our side=%s, Winner=%s",
+                        pos.market_question[:50], result, pnl, our_side, winning_side,
+                    )
+
+                except Exception as e:
+                    logger.debug("Resolution check failed for %s: %s", market_id, e)
+
+    def _update_bankroll(self, payout: float) -> None:
+        """Add resolved payout back to bankroll."""
+        try:
+            from nba_agent.utils import load_json
+            state = load_json(self._bankroll_path, {})
+            current = float(state.get("current_bankroll", self.config.STARTING_BANKROLL))
+            state["current_bankroll"] = round(current + payout, 2)
+            import json as _json
+            self._bankroll_path.write_text(_json.dumps(state, default=str))
+            logger.info("Bankroll updated: +$%.2f → $%.2f", payout, state["current_bankroll"])
+        except Exception as e:
+            logger.error("Failed to update bankroll: %s", e)
 
     def _record_signal_attribution(self, position, market) -> None:
         """Record which intelligence signals drove a trade entry.

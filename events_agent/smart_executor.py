@@ -273,16 +273,17 @@ class SmartExecutor:
 
         # Check adverse price movement
         if scanner and conditions.get("entry_price"):
-            current_price = await scanner.get_market_price(tranche.token_id)
-            if current_price is not None:
+            yes_price = await scanner.get_market_price(tranche.token_id)
+            if yes_price is not None:
+                # CLOB midpoint returns YES price; adjust for NO
+                if tranche.direction == "NO":
+                    current_price = 1.0 - yes_price
+                else:
+                    current_price = yes_price
                 entry_price = conditions["entry_price"]
                 max_adverse = conditions.get("max_adverse_move", 0.02)
-                # Buying YES: price going up is adverse (we pay more)
-                # Buying NO: price going down is adverse
-                if tranche.direction == "YES":
-                    adverse_move = current_price - entry_price
-                else:
-                    adverse_move = entry_price - current_price
+                # Price going up from our entry is adverse (we pay more)
+                adverse_move = current_price - entry_price
 
                 if adverse_move > max_adverse:
                     logger.info(
@@ -328,7 +329,13 @@ class SmartExecutor:
         """Execute a TWAP exit tranche."""
         current_price = None
         if scanner:
-            current_price = await scanner.get_market_price(tranche.token_id)
+            yes_price = await scanner.get_market_price(tranche.token_id)
+            if yes_price is not None:
+                # CLOB midpoint returns YES price; adjust for NO
+                if "NO" in (tranche.side or "").upper():
+                    current_price = 1.0 - yes_price
+                else:
+                    current_price = yes_price
 
         if current_price is None:
             current_price = 0.50  # fallback

@@ -407,9 +407,13 @@ class EventsTelegramCommands:
                 current_price = 0.50
                 if self.scanner:
                     try:
-                        price = await self.scanner.get_market_price(pos.token_id)
-                        if price is not None:
-                            current_price = price
+                        yes_price = await self.scanner.get_market_price(pos.token_id)
+                        if yes_price is not None:
+                            # CLOB midpoint returns YES price; adjust for NO
+                            if "NO" in (pos.side or "").upper():
+                                current_price = 1.0 - yes_price
+                            else:
+                                current_price = yes_price
                     except Exception:
                         pass
 
