@@ -157,28 +157,33 @@ class EventsAgent:
                         if mid <= 0.005:
                             p.exit_reason = "extreme_pricing_worthless"
                             continue
-                        # Try selling 99% of shares to avoid precision issues
+                        # Round shares to 2 decimals (Polymarket precision limit for FOK)
                         adjusted_shares = round(shares * 0.99, 2)
                         if adjusted_shares <= 0:
-                            adjusted_shares = shares
+                            adjusted_shares = round(shares, 2)
+                        # Minimum acceptable price (slippage protection)
+                        min_price = round(mid * 0.50, 2)
+                        if min_price < 0.01:
+                            min_price = 0.01
                         order_id = None
                         try:
-                            # Try FOK sell with reduced shares first
-                            order_id = self.executor._execute_live_sell(
-                                token_id, adjusted_shares, getattr(p, "market_id", ""),
-                            )
-                        except Exception as sell_err:
-                            logger.warning("FOK sell failed for %s: %s",
-                                           getattr(p, "market_question", "")[:40], sell_err)
-                        # Fallback: limit sell at 90% of midpoint
-                        if not order_id:
-                            sell_price = round(mid * 0.90, 2)
-                            try:
+                            # GTC limit sell at 85% of midpoint — sits on book and fills
+                            sell_price = round(mid * 0.85, 2)
+                            if sell_price >= 0.01:
                                 order_id = self.executor._execute_limit_sell(
                                     token_id, adjusted_shares, sell_price,
                                 )
+                        except Exception as sell_err:
+                            logger.warning("Limit sell failed for %s: %s",
+                                           getattr(p, "market_question", "")[:40], sell_err)
+                        # Fallback: FOK at minimum price
+                        if not order_id:
+                            try:
+                                order_id = self.executor._execute_live_sell(
+                                    token_id, adjusted_shares, getattr(p, "market_id", ""),
+                                )
                             except Exception as sell_err2:
-                                logger.warning("Limit sell also failed for %s: %s",
+                                logger.warning("FOK sell also failed for %s: %s",
                                                getattr(p, "market_question", "")[:40], sell_err2)
                         if order_id:
                             sold_count += 1
