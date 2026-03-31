@@ -40,7 +40,7 @@ MIN_ENTRY_PRICE = 0.45
 MAX_ENTRY_PRICE = 0.80
 
 # Minimum edge (Vegas fair - Polymarket price) to trigger a bet
-MIN_EDGE = 0.03  # 3%
+MIN_EDGE = 0.02  # 2% — lowered from 3% (Polymarket tracks Vegas within 3% on most NBA games)
 
 # We REQUIRE a Vegas line. No Vegas = no bet.
 REQUIRE_VEGAS = True

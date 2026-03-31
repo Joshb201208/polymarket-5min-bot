@@ -41,7 +41,7 @@ class Config:
     PRE_TIPOFF_MINUTES: int = int(os.getenv("PRE_TIPOFF_MINUTES", "30"))
 
     # Edge thresholds
-    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.03"))  # 3% min edge (Vegas disagreement)
+    MIN_GAME_EDGE: float = float(os.getenv("MIN_GAME_EDGE", "0.02"))  # 2% min edge (Vegas disagreement)
     MIN_FUTURES_EDGE: float = float(os.getenv("MIN_FUTURES_EDGE", "0.07"))  # Not used — futures disabled
 
     # External data APIs
