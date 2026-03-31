@@ -37,17 +37,30 @@ class Config:
         "what_bot_did": os.environ.get("DISCORD_CH_WHAT_BOT_DID", "1488046586272419860"),
         "investing_101": os.environ.get("DISCORD_CH_INVESTING_101", "1488046598641680465"),
         "weekly_eli5": os.environ.get("DISCORD_CH_WEEKLY_ELI5", "1488046604798787605"),
+        "live_positions": os.environ.get("DISCORD_CH_LIVE_POSITIONS", "1488115077805510656"),
     }
 
     # Trading mode
     MODE = os.environ.get("STOCK_AGENT_MODE", "PAPER")
 
-    # Risk limits
-    MAX_POSITION_PCT = 0.05      # 5% max per position
-    MAX_TOTAL_EXPOSURE = 0.25    # 25% max total exposure
-    MAX_POSITIONS = 15           # Max concurrent positions
-    STOP_LOSS_PCT = 0.05         # 5% hard stop loss
+    # Risk limits — conviction-tiered sizing
+    MAX_POSITION_PCT = 0.06      # Absolute cap per position (conviction 10 = 6%)
+    MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "0.50"))  # 50%
+    MAX_POSITIONS = 10           # Max concurrent positions
     MAX_SECTOR_PCT = 0.30        # 30% max in any sector
+
+    # Conviction-tiered position sizing: conviction score → % of portfolio
+    CONVICTION_SIZE_MAP = {
+        7: 0.03,   # 3%
+        8: 0.04,   # 4%
+        9: 0.05,   # 5%
+        10: 0.06,  # 6%
+    }
+
+    # Stop-loss: volatility-adjusted, clamped to range
+    STOP_LOSS_PCT_MIN = 0.05     # 5% minimum stop-loss
+    STOP_LOSS_PCT_MAX = 0.10     # 10% maximum stop-loss
+    STOP_LOSS_PCT = 0.05         # Legacy fallback (used if beta unavailable)
 
     # Strategy params
     MIN_CONVICTION = 7           # Only trade conviction >= 7
@@ -57,9 +70,14 @@ class Config:
 
     # Schedule
     WEEKLY_ANALYSIS_DAY = 6      # Sunday (0=Mon, 6=Sun)
-    DAILY_MONITORING_HOUR = 9    # 9 AM ET
+    MIDWEEK_ANALYSIS_DAY = 2     # Wednesday
+    DAILY_PRESCAN_HOUR = 8       # 8 AM ET — pre-market scan
     MARKET_CLOSE_HOUR = 16       # 4 PM ET
     SCAN_INTERVAL_MINUTES = 30   # Check positions every 30 min during market hours
+
+    # Earnings-reactive scanning
+    EARNINGS_CHECK_ENABLED = True
+    EARNINGS_LOOKBACK_DAYS = 2   # Check for earnings in last 2 days
 
     # Data directory
     _local = Path(__file__).parent.parent / "data" / "stock_agent"

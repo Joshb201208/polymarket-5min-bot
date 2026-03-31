@@ -59,6 +59,11 @@ class StockAgentScheduler:
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
+        self._daily_prescan_done_today: str | None = None
+        self._midweek_analysis_done_this_week: str | None = None
+        self._earnings_check_done_today: str | None = None
+        self._first_run_done = False
+        self._pending_signals: list[Signal] = []
 
     def shutdown(self):
         logger.info("Shutdown requested")
@@ -100,18 +105,47 @@ class StockAgentScheduler:
 
     async def _tick(self, now_et: datetime):
         """Single tick of the main loop."""
-        # Weekly analysis: Sunday, between 6-8 PM ET (good time before Asia Monday morning)
+        # ── First run: execute any pending signals from pre-market scan ──
+        if not self._first_run_done:
+            self._first_run_done = True
+            if self._pending_signals:
+                logger.info("Executing %d pending signals from pre-market scan", len(self._pending_signals))
+                await self._execute_signals(self._pending_signals)
+                self._pending_signals.clear()
+
+        # ── Weekly analysis: Sunday, between 6-8 PM ET ──
         if self._should_run_weekly(now_et):
             logger.info("Starting weekly analysis cycle")
             await self._run_weekly_analysis()
 
-        # Market monitoring during open hours
+        # ── Mid-week analysis: Wednesday, between 6-8 PM ET ──
+        if self._should_run_midweek(now_et):
+            logger.info("Starting mid-week analysis cycle")
+            await self._run_midweek_analysis()
+
+        # ── Daily pre-market scan: Mon-Fri, 8-9 AM ET ──
+        if self._should_run_daily_prescan(now_et):
+            logger.info("Starting daily pre-market scan")
+            await self._run_daily_prescan()
+
+        # ── Earnings-reactive scan: Mon-Fri, check for recent earnings ──
+        if self._should_run_earnings_check(now_et):
+            logger.info("Starting earnings-reactive scan")
+            await self._run_earnings_reactive()
+
+        # ── Market monitoring during open hours ──
         if self._is_market_open(now_et):
+            # Execute any pending signals once market opens
+            if self._pending_signals:
+                logger.info("Market open — executing %d pending signals", len(self._pending_signals))
+                executed = await self._execute_signals(self._pending_signals)
+                self._pending_signals.clear()
+
             if self._should_monitor(now_et):
                 logger.info("Running market monitoring")
                 await self._run_market_monitoring()
 
-        # Daily summary at market close
+        # ── Daily summary at market close ──
         if self._should_send_daily_summary(now_et):
             logger.info("Sending daily summary")
             await self._send_daily_summary()
@@ -131,6 +165,41 @@ class StockAgentScheduler:
             if (now_et - last_et).days < 5:
                 return False
         return True
+
+    def _should_run_midweek(self, now_et: datetime) -> bool:
+        """Run mid-week analysis on Wednesday between 6-8 PM ET."""
+        if now_et.weekday() != self.config.MIDWEEK_ANALYSIS_DAY:
+            return False
+        if not (18 <= now_et.hour <= 20):
+            return False
+        # Only once per week
+        week_key = now_et.strftime("%Y-W%W")
+        if self._midweek_analysis_done_this_week == week_key:
+            return False
+        return True
+
+    def _should_run_daily_prescan(self, now_et: datetime) -> bool:
+        """Run daily pre-market scan Mon-Fri, 8-9 AM ET."""
+        if now_et.weekday() >= 5:  # Weekend
+            return False
+        today_str = now_et.strftime("%Y-%m-%d")
+        if self._daily_prescan_done_today == today_str:
+            return False
+        # Between 8:00 AM and 9:00 AM ET
+        current_time = now_et.time()
+        return time(8, 0) <= current_time <= time(9, 0)
+
+    def _should_run_earnings_check(self, now_et: datetime) -> bool:
+        """Check for earnings-reactive opportunities Mon-Fri, 7-8 AM ET."""
+        if now_et.weekday() >= 5:
+            return False
+        if not getattr(self.config, "EARNINGS_CHECK_ENABLED", True):
+            return False
+        today_str = now_et.strftime("%Y-%m-%d")
+        if self._earnings_check_done_today == today_str:
+            return False
+        current_time = now_et.time()
+        return time(7, 0) <= current_time <= time(8, 0)
 
     def _is_market_open(self, now_et: datetime) -> bool:
         """Check if US stock market is currently open."""
@@ -169,39 +238,7 @@ class StockAgentScheduler:
             )
 
             # 0. Run TipRanks scraper and load data (supplementary — never blocks)
-            tipranks_stocks = None
-            if getattr(self.config, "TIPRANKS_ENABLED", False):
-                try:
-                    from stock_agent.tipranks_scraper import scrape_tipranks
-
-                    await scrape_tipranks(self.config)
-
-                    from stock_agent.tipranks_data import TipRanksData
-
-                    tr = TipRanksData(self.config)
-                    tipranks_stocks = tr.load_latest()
-                    if tipranks_stocks:
-                        logger.info("Loaded %d stocks from TipRanks", len(tipranks_stocks))
-                        await self.discord.send_system_log(
-                            "INFO", f"TipRanks data loaded: {len(tipranks_stocks)} stocks"
-                        )
-                        # Report aligned signals
-                        aligned = [
-                            s
-                            for s in tipranks_stocks
-                            if s.smart_score >= 9
-                            and s.analyst_consensus == "Strong Buy"
-                            and s.hedge_fund_signal.lower() == "positive"
-                        ]
-                        if aligned:
-                            symbols_str = ", ".join(s.symbol for s in aligned[:15])
-                            await self.discord.send_system_log(
-                                "INFO",
-                                f"TipRanks aligned signals: {len(aligned)} stocks "
-                                f"with SS9+, Strong Buy, HF Positive: {symbols_str}",
-                            )
-                except Exception as e:
-                    logger.warning("TipRanks scrape failed (non-critical): %s", e)
+            tipranks_stocks = await self._load_tipranks_data()
 
             # 1. Screen universe
             symbols = await self.data_feed.screen_universe()
@@ -217,15 +254,7 @@ class StockAgentScheduler:
             logger.info("Universe: %d symbols", len(symbols))
 
             # 2. Fetch fundamentals for all candidates
-            companies: list[CompanyData] = []
-            for sym in symbols:
-                try:
-                    data = await self.data_feed.get_company_fundamentals(sym)
-                    if data:
-                        companies.append(data)
-                except Exception as e:
-                    logger.warning("Failed to fetch fundamentals for %s: %s", sym, e)
-
+            companies = await self._fetch_fundamentals(symbols)
             if not companies:
                 await asyncio.gather(
                     self.telegram.send_message("\u26a0\ufe0f No fundamental data retrieved"),
@@ -233,8 +262,6 @@ class StockAgentScheduler:
                     return_exceptions=True,
                 )
                 return
-
-            logger.info("Fetched fundamentals for %d companies", len(companies))
 
             # 3. GPT-4.1 Nano screening
             ranked = await self.screener.screen_candidates(companies)
@@ -248,68 +275,7 @@ class StockAgentScheduler:
                 logger.error("Failed to send screener results to Discord: %s", e)
 
             # 4. Deep analysis with Perplexity Sonar Pro
-            signals: list[Signal] = []
-            for sym in top_symbols:
-                company = next((c for c in companies if c.symbol == sym), None)
-                if not company:
-                    continue
-
-                try:
-                    # Build TipRanks context for this symbol if available
-                    tipranks_context = ""
-                    if tipranks_stocks:
-                        tr_stock = next(
-                            (s for s in tipranks_stocks if s.symbol.upper() == sym.upper()),
-                            None,
-                        )
-                        if tr_stock:
-                            tipranks_context = (
-                                f"TIPRANKS DATA:\n"
-                                f"- Smart Score: {tr_stock.smart_score}/10\n"
-                                f"- Analyst Consensus: {tr_stock.analyst_consensus}\n"
-                                f"- Analyst Price Target Upside: {tr_stock.analyst_target_upside:+.1f}%\n"
-                                f"- Hedge Fund Signal: {tr_stock.hedge_fund_signal}\n"
-                                f"- Insider Signal: {tr_stock.insider_signal}\n"
-                                f"- News Sentiment: {tr_stock.news_sentiment}\n"
-                            )
-
-                    thesis = await self.analyst.analyze_stock(
-                        sym, company, tipranks_context=tipranks_context
-                    )
-                    if not thesis:
-                        continue
-
-                    self.portfolio.update_thesis(sym, thesis)
-
-                    # Send thesis and analysis to Discord
-                    try:
-                        await asyncio.gather(
-                            self.discord.send_thesis(thesis),
-                            self.discord.send_analysis_report(
-                                sym, thesis.summary + "\n\n**Bull Case:** " + thesis.bull_case + "\n\n**Bear Case:** " + thesis.bear_case,
-                                thesis.sources,
-                            ),
-                            return_exceptions=True,
-                        )
-                    except Exception:
-                        pass
-
-                    if thesis.direction == "BUY" and thesis.conviction >= self.config.MIN_CONVICTION:
-                        pv = self.portfolio.get_portfolio_value()
-                        size_pct = (thesis.conviction / 10.0) * self.config.MAX_POSITION_PCT
-                        signal = Signal(
-                            symbol=sym,
-                            action="BUY",
-                            conviction=thesis.conviction,
-                            thesis=thesis,
-                            entry_price=company.price,
-                            position_size_pct=size_pct,
-                            generated_at=_now_utc(),
-                        )
-                        signals.append(signal)
-                        logger.info("BUY signal: %s conviction=%d", sym, thesis.conviction)
-                except Exception as e:
-                    logger.error("Analysis failed for %s: %s", sym, e)
+            signals = await self._deep_analyze(top_symbols, companies, tipranks_stocks)
 
             # 5. Re-analyze existing positions
             await self._re_analyze_existing_positions(companies)
@@ -348,6 +314,432 @@ class StockAgentScheduler:
                 self.discord.send_error(str(e), context="Weekly analysis"),
                 return_exceptions=True,
             )
+
+    # ── Mid-week analysis (Wednesday) ────────────────────────────────
+
+    async def _run_midweek_analysis(self):
+        """Mid-week re-analysis: re-screen universe and re-analyze positions.
+        Similar to weekly but lighter — focuses on refreshing theses and
+        looking for new opportunities that emerged Mon-Wed.
+        """
+        try:
+            now = _now_et()
+            week_key = now.strftime("%Y-W%W")
+            self._midweek_analysis_done_this_week = week_key
+
+            await self.discord.send_system_log("INFO", "Mid-week analysis starting (Wednesday refresh)")
+
+            # 0. Load TipRanks data if available
+            tipranks_stocks = await self._load_tipranks_data()
+
+            # 1. Screen universe (same as weekly)
+            symbols = await self.data_feed.screen_universe()
+            if not symbols:
+                await self.discord.send_system_log("WARNING", "Mid-week: universe screening returned no symbols")
+                return
+
+            self.portfolio.set_universe(symbols)
+            logger.info("Mid-week universe: %d symbols", len(symbols))
+
+            # 2. Fetch fundamentals
+            companies = await self._fetch_fundamentals(symbols)
+            if not companies:
+                return
+
+            # 3. Screen
+            ranked = await self.screener.screen_candidates(companies)
+            top_symbols = [r["symbol"] for r in ranked[: self.config.DEEP_ANALYSIS_SIZE]]
+
+            try:
+                await self.discord.send_screener_results(ranked[:25])
+            except Exception:
+                pass
+
+            # 4. Deep analysis for new opportunities
+            signals = await self._deep_analyze(top_symbols, companies, tipranks_stocks)
+
+            # 5. Re-analyze all existing positions with fresh data
+            await self._re_analyze_existing_positions(companies)
+
+            # 6. Execute new signals
+            executed = await self._execute_signals(signals)
+
+            await self.discord.send_system_log(
+                "INFO",
+                f"Mid-week analysis complete — {len(signals)} signals, {len(executed)} executed",
+            )
+            logger.info("Mid-week analysis complete — %d signals, %d executed", len(signals), len(executed))
+
+        except Exception as e:
+            logger.exception("Mid-week analysis failed: %s", e)
+            await self.discord.send_error(str(e), context="Mid-week analysis")
+
+    # ── Daily pre-market scan ────────────────────────────────────────
+
+    async def _run_daily_prescan(self):
+        """Daily pre-market scan: quick check for overnight developments
+        and material events on held positions. Lighter than full analysis.
+        """
+        try:
+            now = _now_et()
+            self._daily_prescan_done_today = now.strftime("%Y-%m-%d")
+
+            await self.discord.send_system_log("INFO", "Daily pre-market scan starting")
+
+            # 1. Update prices on all positions
+            positions = self.portfolio.state.positions
+            if positions:
+                symbols = [p.symbol for p in positions]
+                prices = await self.data_feed.get_batch_quotes(symbols)
+                self.portfolio.update_prices(prices)
+
+                # 2. Check for overnight material events on held positions
+                for pos in list(positions):
+                    try:
+                        event_check = await self.analyst.check_for_material_events(
+                            pos.symbol, pos.thesis.symbol if pos.thesis else pos.symbol
+                        )
+                        if event_check.get("material_event"):
+                            severity = event_check.get("severity", 0)
+                            impact = event_check.get("thesis_impact", "neutral")
+                            event_desc = event_check.get("event", "Unknown event")
+
+                            logger.info(
+                                "Pre-market event for %s: %s (severity=%d, impact=%s)",
+                                pos.symbol, event_desc, severity, impact,
+                            )
+
+                            try:
+                                await self.discord.send_material_event(
+                                    pos.symbol, event_desc, impact, severity,
+                                )
+                            except Exception:
+                                pass
+
+                            # Severe negative → queue for sell at market open
+                            if severity >= 7 and impact == "negative":
+                                company = await self.data_feed.get_company_fundamentals(pos.symbol)
+                                if company:
+                                    new_thesis = await self.analyst.re_analyze_position(
+                                        pos.symbol, company, pos.thesis
+                                    )
+                                    if new_thesis and new_thesis.direction == "SELL":
+                                        # If market is open, execute immediately; otherwise queue
+                                        if self._is_market_open(now):
+                                            await self._execute_sell(
+                                                pos, reason=f"Pre-market event: {event_desc}"
+                                            )
+                                        else:
+                                            logger.info(
+                                                "Queuing sell for %s at market open: %s",
+                                                pos.symbol, event_desc,
+                                            )
+                                    elif new_thesis:
+                                        self.portfolio.update_thesis(pos.symbol, new_thesis)
+                    except Exception as e:
+                        logger.error("Pre-market event check failed for %s: %s", pos.symbol, e)
+
+            # 3. Quick scan for new high-conviction opportunities
+            # Only look at a smaller universe for speed
+            try:
+                symbols = await self.data_feed.screen_universe()
+                if symbols:
+                    # Quick screen — top 10 only for daily scan
+                    companies = await self._fetch_fundamentals(symbols[:30])
+                    if companies:
+                        ranked = await self.screener.screen_candidates(companies)
+                        top_5 = [r["symbol"] for r in ranked[:5]]
+                        # Only analyze top 5 and only if conviction would be high
+                        for sym in top_5:
+                            # Skip if already holding
+                            if any(p.symbol == sym for p in self.portfolio.state.positions):
+                                continue
+                            company = next((c for c in companies if c.symbol == sym), None)
+                            if company:
+                                try:
+                                    thesis = await self.analyst.analyze_stock(sym, company)
+                                    if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
+                                        # High conviction from daily scan — queue signal
+                                        pv = self.portfolio.get_portfolio_value()
+                                        signal = Signal(
+                                            symbol=sym,
+                                            action="BUY",
+                                            conviction=thesis.conviction,
+                                            thesis=thesis,
+                                            entry_price=company.price,
+                                            position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
+                                                thesis.conviction, 0.03
+                                            ),
+                                            generated_at=_now_utc(),
+                                        )
+                                        self._pending_signals.append(signal)
+                                        logger.info(
+                                            "Daily scan: queued BUY signal for %s (conviction=%d)",
+                                            sym, thesis.conviction,
+                                        )
+                                except Exception as e:
+                                    logger.error("Daily scan analysis failed for %s: %s", sym, e)
+            except Exception as e:
+                logger.error("Daily scan universe screening failed: %s", e)
+
+            if self._pending_signals:
+                await self.discord.send_system_log(
+                    "INFO",
+                    f"Daily pre-market scan complete — {len(self._pending_signals)} signals queued for market open",
+                )
+            else:
+                await self.discord.send_system_log("INFO", "Daily pre-market scan complete — no new signals")
+
+            logger.info("Daily pre-market scan complete")
+
+        except Exception as e:
+            logger.exception("Daily pre-market scan failed: %s", e)
+            await self.discord.send_error(str(e), context="Daily pre-market scan")
+
+    # ── Earnings-reactive scanning ───────────────────────────────────
+
+    async def _run_earnings_reactive(self):
+        """Check for stocks that just reported earnings (last 1-2 days).
+        If a held position reported, re-analyze thesis.
+        If a non-held high-quality stock had a blowout quarter, flag it.
+        """
+        try:
+            now = _now_et()
+            self._earnings_check_done_today = now.strftime("%Y-%m-%d")
+
+            await self.discord.send_system_log("INFO", "Earnings-reactive scan starting")
+
+            lookback = getattr(self.config, "EARNINGS_LOOKBACK_DAYS", 2)
+
+            # 1. Check held positions for recent earnings
+            for pos in list(self.portfolio.state.positions):
+                try:
+                    earnings = await self.data_feed.get_recent_earnings(
+                        pos.symbol, lookback_days=lookback
+                    )
+                    if not earnings:
+                        continue
+
+                    logger.info("Earnings detected for held position %s", pos.symbol)
+                    await self.discord.send_system_log(
+                        "INFO", f"Earnings detected for {pos.symbol} — re-analyzing thesis"
+                    )
+
+                    # Re-analyze with fresh post-earnings data
+                    company = await self.data_feed.get_company_fundamentals(pos.symbol)
+                    if company:
+                        new_thesis = await self.analyst.re_analyze_position(
+                            pos.symbol, company, pos.thesis
+                        )
+                        if new_thesis:
+                            self.portfolio.update_thesis(pos.symbol, new_thesis)
+                            if new_thesis.direction == "SELL":
+                                logger.info("Post-earnings thesis broken for %s — selling", pos.symbol)
+                                await self._execute_sell(
+                                    pos, reason=f"Post-earnings thesis broken: {new_thesis.summary[:80]}"
+                                )
+                            else:
+                                try:
+                                    await self.discord.send_thesis(new_thesis)
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    logger.error("Earnings check failed for %s: %s", pos.symbol, e)
+
+            # 2. Check universe for blowout earnings (new opportunities)
+            try:
+                universe = self.portfolio.state.universe or []
+                for sym in universe[:30]:  # Limit to avoid excessive API calls
+                    # Skip already held
+                    if any(p.symbol == sym for p in self.portfolio.state.positions):
+                        continue
+                    try:
+                        earnings = await self.data_feed.get_recent_earnings(
+                            sym, lookback_days=lookback
+                        )
+                        if not earnings:
+                            continue
+                        # Only interested in strong beats
+                        if not earnings.get("beat", False):
+                            continue
+                        surprise_pct = earnings.get("surprise_pct", 0)
+                        if surprise_pct < 10:  # Only big beats (>10% surprise)
+                            continue
+
+                        logger.info(
+                            "Blowout earnings for %s: %+.1f%% surprise",
+                            sym, surprise_pct,
+                        )
+
+                        company = await self.data_feed.get_company_fundamentals(sym)
+                        if company:
+                            thesis = await self.analyst.analyze_stock(sym, company)
+                            if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
+                                signal = Signal(
+                                    symbol=sym,
+                                    action="BUY",
+                                    conviction=thesis.conviction,
+                                    thesis=thesis,
+                                    entry_price=company.price,
+                                    position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
+                                        thesis.conviction, 0.03
+                                    ),
+                                    generated_at=_now_utc(),
+                                )
+                                self._pending_signals.append(signal)
+                                logger.info(
+                                    "Earnings-reactive: queued BUY for %s (conviction=%d, surprise=%+.1f%%)",
+                                    sym, thesis.conviction, surprise_pct,
+                                )
+                                await self.discord.send_system_log(
+                                    "INFO",
+                                    f"Earnings beat for {sym} ({surprise_pct:+.1f}%) — "
+                                    f"BUY signal queued (conviction {thesis.conviction})",
+                                )
+                    except Exception as e:
+                        logger.debug("Earnings check for %s failed: %s", sym, e)
+            except Exception as e:
+                logger.error("Earnings-reactive universe scan failed: %s", e)
+
+            await self.discord.send_system_log(
+                "INFO",
+                f"Earnings-reactive scan complete — {len(self._pending_signals)} pending signals",
+            )
+            logger.info("Earnings-reactive scan complete")
+
+        except Exception as e:
+            logger.exception("Earnings-reactive scan failed: %s", e)
+            await self.discord.send_error(str(e), context="Earnings-reactive scan")
+
+    # ── Shared helpers ───────────────────────────────────────────────
+
+    async def _load_tipranks_data(self):
+        """Load TipRanks data if enabled. Returns list or None."""
+        if not getattr(self.config, "TIPRANKS_ENABLED", False):
+            return None
+        try:
+            from stock_agent.tipranks_scraper import scrape_tipranks
+
+            await scrape_tipranks(self.config)
+
+            from stock_agent.tipranks_data import TipRanksData
+
+            tr = TipRanksData(self.config)
+            tipranks_stocks = tr.load_latest()
+            if tipranks_stocks:
+                logger.info("Loaded %d stocks from TipRanks", len(tipranks_stocks))
+                await self.discord.send_system_log(
+                    "INFO", f"TipRanks data loaded: {len(tipranks_stocks)} stocks"
+                )
+                # Report aligned signals
+                aligned = [
+                    s
+                    for s in tipranks_stocks
+                    if s.smart_score >= 9
+                    and s.analyst_consensus == "Strong Buy"
+                    and s.hedge_fund_signal.lower() == "positive"
+                ]
+                if aligned:
+                    symbols_str = ", ".join(s.symbol for s in aligned[:15])
+                    await self.discord.send_system_log(
+                        "INFO",
+                        f"TipRanks aligned signals: {len(aligned)} stocks "
+                        f"with SS9+, Strong Buy, HF Positive: {symbols_str}",
+                    )
+                return tipranks_stocks
+        except Exception as e:
+            logger.warning("TipRanks scrape failed (non-critical): %s", e)
+        return None
+
+    async def _fetch_fundamentals(self, symbols: list[str]) -> list[CompanyData]:
+        """Fetch fundamentals for a list of symbols."""
+        companies: list[CompanyData] = []
+        for sym in symbols:
+            try:
+                data = await self.data_feed.get_company_fundamentals(sym)
+                if data:
+                    companies.append(data)
+            except Exception as e:
+                logger.warning("Failed to fetch fundamentals for %s: %s", sym, e)
+        logger.info("Fetched fundamentals for %d companies", len(companies))
+        return companies
+
+    async def _deep_analyze(
+        self,
+        top_symbols: list[str],
+        companies: list[CompanyData],
+        tipranks_stocks=None,
+    ) -> list[Signal]:
+        """Run deep Perplexity Sonar Pro analysis on top symbols. Returns signals."""
+        signals: list[Signal] = []
+        for sym in top_symbols:
+            company = next((c for c in companies if c.symbol == sym), None)
+            if not company:
+                continue
+
+            try:
+                # Build TipRanks context for this symbol if available
+                tipranks_context = ""
+                if tipranks_stocks:
+                    tr_stock = next(
+                        (s for s in tipranks_stocks if s.symbol.upper() == sym.upper()),
+                        None,
+                    )
+                    if tr_stock:
+                        tipranks_context = (
+                            f"TIPRANKS DATA:\n"
+                            f"- Smart Score: {tr_stock.smart_score}/10\n"
+                            f"- Analyst Consensus: {tr_stock.analyst_consensus}\n"
+                            f"- Analyst Price Target Upside: {tr_stock.analyst_target_upside:+.1f}%\n"
+                            f"- Hedge Fund Signal: {tr_stock.hedge_fund_signal}\n"
+                            f"- Insider Signal: {tr_stock.insider_signal}\n"
+                            f"- News Sentiment: {tr_stock.news_sentiment}\n"
+                        )
+
+                thesis = await self.analyst.analyze_stock(
+                    sym, company, tipranks_context=tipranks_context
+                )
+                if not thesis:
+                    continue
+
+                self.portfolio.update_thesis(sym, thesis)
+
+                # Send thesis and analysis to Discord
+                try:
+                    await asyncio.gather(
+                        self.discord.send_thesis(thesis),
+                        self.discord.send_analysis_report(
+                            sym,
+                            thesis.summary
+                            + "\n\n**Bull Case:** "
+                            + thesis.bull_case
+                            + "\n\n**Bear Case:** "
+                            + thesis.bear_case,
+                            thesis.sources,
+                        ),
+                        return_exceptions=True,
+                    )
+                except Exception:
+                    pass
+
+                if thesis.direction == "BUY" and thesis.conviction >= self.config.MIN_CONVICTION:
+                    signal = Signal(
+                        symbol=sym,
+                        action="BUY",
+                        conviction=thesis.conviction,
+                        thesis=thesis,
+                        entry_price=company.price,
+                        position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
+                            thesis.conviction, 0.03
+                        ),
+                        generated_at=_now_utc(),
+                    )
+                    signals.append(signal)
+                    logger.info("BUY signal: %s conviction=%d", sym, thesis.conviction)
+            except Exception as e:
+                logger.error("Analysis failed for %s: %s", sym, e)
+
+        return signals
 
     async def _re_analyze_existing_positions(self, companies: list[CompanyData]):
         """Re-analyze all existing positions with fresh data."""
@@ -538,13 +930,8 @@ class StockAgentScheduler:
                 continue
 
             sym = signal.symbol
-            sector = signal.thesis.summary[:50]  # fallback
-            # Try to get actual sector from thesis/data
+            # Try to get sector from thesis/data
             company_sector = "Unknown"
-            for p in self.portfolio.state.positions:
-                if p.sector and p.sector != "Unknown":
-                    pass  # We need it from company data
-            # Use the active thesis data
             thesis_data = self.portfolio.state.active_theses.get(sym, {})
             if isinstance(thesis_data, dict):
                 company_sector = thesis_data.get("sector", "Unknown")
@@ -571,7 +958,9 @@ class StockAgentScheduler:
                 logger.info("Position size 0 for %s — skipping", sym)
                 continue
 
-            stop_loss = self.risk_manager.get_stop_loss_price(price)
+            # Volatility-adjusted stop-loss
+            beta = getattr(signal.thesis, "beta", None)
+            stop_loss = self.risk_manager.get_stop_loss_price(price, beta)
             signal.thesis.stop_loss_price = stop_loss
 
             # Execute order
@@ -656,7 +1045,7 @@ class StockAgentScheduler:
                 return_exceptions=True,
             )
             logger.info(
-                "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%+.1%%)",
+                "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%.1f%%)",
                 position.symbol, position.shares, sell_price, pnl, pnl_pct * 100,
             )
 

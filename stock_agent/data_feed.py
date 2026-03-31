@@ -330,6 +330,61 @@ class DataFeed:
         padded = cik.zfill(10)
         return await self._sec_get(f"{SEC_BASE}/submissions/CIK{padded}.json")
 
+    async def get_recent_earnings(
+        self, symbol: str, lookback_days: int = 2
+    ) -> dict | None:
+        """Check if a symbol reported earnings in the last N days.
+
+        Returns dict with beat/miss info, or None if no recent earnings.
+        Uses Finnhub earnings calendar.
+        """
+        from datetime import datetime, timedelta
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        lookback = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        try:
+            data = await self._finnhub_get(
+                "/calendar/earnings",
+                {"from": lookback, "to": today, "symbol": symbol},
+            )
+            if not isinstance(data, dict):
+                return None
+
+            calendar = data.get("earningsCalendar", [])
+            for entry in calendar:
+                if entry.get("symbol", "").upper() == symbol.upper():
+                    actual = entry.get("epsActual")
+                    estimate = entry.get("epsEstimate")
+                    if actual is not None and estimate is not None:
+                        surprise = actual - estimate
+                        surprise_pct = (
+                            (surprise / abs(estimate) * 100) if estimate != 0 else 0
+                        )
+                        return {
+                            "symbol": symbol,
+                            "date": entry.get("date"),
+                            "eps_actual": actual,
+                            "eps_estimate": estimate,
+                            "surprise": surprise,
+                            "surprise_pct": surprise_pct,
+                            "beat": actual > estimate,
+                            "revenue_actual": entry.get("revenueActual"),
+                            "revenue_estimate": entry.get("revenueEstimate"),
+                        }
+                    # Earnings date exists but no actual yet
+                    return {
+                        "symbol": symbol,
+                        "date": entry.get("date"),
+                        "pending": True,
+                        "beat": False,
+                        "surprise_pct": 0,
+                    }
+        except Exception as e:
+            logger.debug("Earnings check failed for %s: %s", symbol, e)
+
+        return None
+
     async def get_historical_prices(
         self, symbol: str, from_date: str, to_date: str
     ) -> list[dict]:

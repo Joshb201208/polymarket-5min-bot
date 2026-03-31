@@ -62,24 +62,40 @@ class RiskManager:
         price: float,
         conviction: int,
     ) -> int:
-        """Calculate number of shares based on conviction and risk limits.
+        """Calculate number of shares using conviction-tiered sizing.
 
-        Base: 5% of portfolio / price = max shares.
-        Scale by conviction: 7 = 70%, 8 = 80%, 9 = 90%, 10 = 100%.
+        Conviction → portfolio %:
+            7 → 3%
+            8 → 4%
+            9 → 5%
+            10 → 6%
         """
         if price <= 0 or portfolio_value <= 0:
             return 0
 
-        max_dollar = portfolio_value * self.config.MAX_POSITION_PCT
-        conviction_scale = conviction / 10.0
-        dollar_amount = max_dollar * conviction_scale
+        # Look up conviction tier; default to minimum 3% for conviction 7
+        size_pct = self.config.CONVICTION_SIZE_MAP.get(
+            conviction, self.config.CONVICTION_SIZE_MAP.get(7, 0.03)
+        )
+        dollar_amount = portfolio_value * size_pct
         shares = int(dollar_amount / price)
 
         return max(shares, 0)
 
-    def get_stop_loss_price(self, entry_price: float) -> float:
-        """Calculate stop-loss price: 5% below entry."""
-        return round(entry_price * (1 - self.config.STOP_LOSS_PCT), 2)
+    def get_stop_loss_price(self, entry_price: float, beta: float | None = None) -> float:
+        """Calculate volatility-adjusted stop-loss price.
+
+        Formula: stop_pct = beta * 5%, clamped to [5%, 10%].
+        If beta is not available, defaults to 5%.
+        """
+        if beta is not None and beta > 0:
+            stop_pct = beta * 0.05
+            # Clamp to configured range
+            stop_pct = max(self.config.STOP_LOSS_PCT_MIN, min(stop_pct, self.config.STOP_LOSS_PCT_MAX))
+        else:
+            stop_pct = self.config.STOP_LOSS_PCT_MIN  # Default 5%
+
+        return round(entry_price * (1 - stop_pct), 2)
 
     def check_pdt_compliance(self, trade_history: list[Trade]) -> bool:
         """Check Pattern Day Trader rule: max 3 day trades per rolling 5 business days.
@@ -115,9 +131,9 @@ class RiskManager:
             logger.warning("PDT limit reached: %d day trades in last 5 days", day_trades)
         return compliant
 
-    def should_stop_loss(self, entry_price: float, current_price: float) -> bool:
+    def should_stop_loss(self, entry_price: float, current_price: float, beta: float | None = None) -> bool:
         """Check if current price has breached stop-loss level."""
-        stop = self.get_stop_loss_price(entry_price)
+        stop = self.get_stop_loss_price(entry_price, beta)
         return current_price <= stop
 
     def check_position_health(
@@ -129,13 +145,15 @@ class RiskManager:
         for pos in state.positions:
             if pos.current_price <= 0:
                 continue
-            if self.should_stop_loss(pos.entry_price, pos.current_price):
+            # Use beta from thesis if available
+            beta = getattr(pos.thesis, "beta", None) if pos.thesis else None
+            if self.should_stop_loss(pos.entry_price, pos.current_price, beta):
                 alerts.append({
                     "symbol": pos.symbol,
                     "action": "STOP_LOSS",
                     "entry_price": pos.entry_price,
                     "current_price": pos.current_price,
                     "loss_pct": (pos.current_price - pos.entry_price) / pos.entry_price,
-                    "reason": f"Stop-loss triggered: ${pos.current_price:.2f} <= ${self.get_stop_loss_price(pos.entry_price):.2f}",
+                    "reason": f"Stop-loss triggered: ${pos.current_price:.2f} <= ${self.get_stop_loss_price(pos.entry_price, beta):.2f}",
                 })
         return alerts
