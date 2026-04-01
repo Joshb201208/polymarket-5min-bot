@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from events_agent.config import EventsConfig
 from events_agent.models import Position
-from nba_agent.utils import parse_utc, utcnow
+from shared.utils import parse_utc, utcnow
 
 logger = logging.getLogger("events_agent.smart_exit")
 

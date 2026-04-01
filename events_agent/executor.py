@@ -8,7 +8,7 @@ from typing import Optional
 
 from events_agent.config import EventsConfig
 from events_agent.models import EdgeResult, Position, Trade
-from nba_agent.utils import utcnow
+from shared.utils import utcnow
 
 logger = logging.getLogger(__name__)
 

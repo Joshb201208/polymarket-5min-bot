@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket Betting Agent (NBA + Events Orchestrator)
+Description=Events Trading Agent
 After=network-online.target
 Wants=network-online.target
 

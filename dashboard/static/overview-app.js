@@ -1,6 +1,6 @@
 /* ===================================================================
    Overview Command Center — overview-app.js
-   Combined NBA + Events agent dashboard logic.
+   Events agent dashboard logic.
    Depends on common.js (fetchJSON, fmt, pnlClass, authToken, etc.)
    =================================================================== */
 
@@ -10,9 +10,7 @@
 // State
 // ---------------------------------------------------------------------------
 let equityChart = null;
-let nbaSparklineChart = null;
 let eventsSparklineChart = null;
-let stocksSparklineChart = null;
 let oddsData = [];
 let oddsSortCol = "edge";
 let oddsSortAsc = false;
@@ -66,15 +64,12 @@ async function refresh() {
     updateLastUpdate();
 
     // Fire all API calls in parallel
-    const [overview, equity, heatmap, activity, odds, sysHealth, apiHealth, stocksSummary] = await Promise.all([
+    const [overview, equity, heatmap, activity, odds] = await Promise.all([
         fetchJSON("/api/combined/overview"),
         fetchJSON("/api/combined/equity-curve"),
         fetchJSON("/api/combined/heatmap"),
         fetchJSON("/api/combined/activity-feed"),
         fetchJSON("/api/combined/odds-snapshot"),
-        fetchJSON("/api/system-health"),
-        fetchJSON("/api/api-health"),
-        fetchJSON("/api/stocks/summary"),
     ]);
 
     if (!overview && !equity && !heatmap && !activity && !odds) {
@@ -90,9 +85,6 @@ async function refresh() {
         renderOddsTable();
         document.getElementById("oddsCount").textContent = `${oddsData.length} markets`;
     }
-    if (apiHealth) renderApiHealth(apiHealth);
-    if (sysHealth) renderSysHealth(sysHealth);
-    if (stocksSummary) renderStocksCard(stocksSummary);
 
     updateLastUpdate();
 }
@@ -109,9 +101,8 @@ function updateLastUpdate() {
 // Render hero KPIs + agent cards from overview data
 // ---------------------------------------------------------------------------
 function renderOverview(data) {
-    // Extract top-level combined stats
+    // Extract top-level stats
     const combined = data.combined || data;
-    const nba = data.nba || {};
     const events = data.events || {};
 
     // ---- Hero KPIs ----
@@ -128,21 +119,15 @@ function renderOverview(data) {
     setKpi("kpiCombinedPnl", fmt.usd(combinedPnl), pnlClass(combinedPnl));
     document.getElementById("kpiCombinedPnlSub").textContent = `ROI: ${fmt.pct(roi)}`;
 
-    // Win rate — derive from per-agent data
-    const nbaWR = nba.win_rate ?? 0;
+    // Win rate
     const evtWR = events.win_rate ?? 0;
-    const nbaTrades = nba.total_trades ?? 0;
     const evtTrades = events.total_trades ?? 0;
-    const totalTrades = nbaTrades + evtTrades;
-    const nbaWins = Math.round(nbaWR / 100 * nbaTrades);
     const evtWins = Math.round(evtWR / 100 * evtTrades);
-    const totalWins = nbaWins + evtWins;
-    const totalLosses = totalTrades - totalWins;
-    const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100) : 0;
-    setKpi("kpiWinRate", fmt.pct(winRate), "");
-    document.getElementById("kpiWins").textContent = totalWins;
+    const totalLosses = evtTrades - evtWins;
+    setKpi("kpiWinRate", fmt.pct(evtWR), "");
+    document.getElementById("kpiWins").textContent = evtWins;
     document.getElementById("kpiLosses").textContent = totalLosses;
-    document.getElementById("kpiTrades").textContent = totalTrades;
+    document.getElementById("kpiTrades").textContent = evtTrades;
 
     // Open positions
     const openPos = combined.total_open_positions ?? combined.open_positions ?? 0;
@@ -156,12 +141,10 @@ function renderOverview(data) {
     setKpi("kpiTodayPnl", fmt.usd(todayPnl), pnlClass(todayPnl));
     document.getElementById("kpiTodaySub").textContent = `${todayTrades} trades today`;
 
-    // ---- Mode badges ----
-    renderModeBadge("modeBadgeNba", nba.mode ?? combined.nba_mode ?? "PAPER");
+    // ---- Mode badge ----
     renderModeBadge("modeBadgeEvents", events.mode ?? combined.events_mode ?? "PAPER");
 
-    // ---- NBA Agent Card ----
-    renderAgentCard("nba", nba, combined);
+    // ---- Events Agent Card ----
     renderAgentCard("events", events, combined);
 
     // ---- Drawdown / PF badges ----
@@ -187,11 +170,8 @@ function renderModeBadge(id, mode) {
     if (!el) return;
     const isLive = (mode || "").toUpperCase() === "LIVE";
     el.className = `mode-badge ${isLive ? "mode-badge-live" : "mode-badge-paper"}`;
-    const modeText = el.querySelector(".mode-text");
     const modeDot = el.querySelector(".mode-dot");
-    // Keep the short label (NBA / EVT) — just update class/dot
     if (!isLive) {
-        // paper amber
         if (modeDot) { modeDot.style.background = "#eab308"; modeDot.style.boxShadow = "0 0 6px #eab308"; }
     } else {
         if (modeDot) { modeDot.style.background = ""; modeDot.style.boxShadow = ""; }
@@ -199,8 +179,7 @@ function renderModeBadge(id, mode) {
 }
 
 function renderAgentCard(agent, data, combined) {
-    const isNba = agent === "nba";
-    const prefix = isNba ? "nba" : "evt";
+    const prefix = "evt";
 
     const todayPnl = data.today_pnl ?? data.daily_pnl ?? 0;
     const openPos = data.open_positions ?? data.open_count ?? 0;
@@ -213,7 +192,7 @@ function renderAgentCard(agent, data, combined) {
     const mode = data.mode ?? "PAPER";
 
     // Update mode badge on card
-    const cardModeBadge = document.getElementById(`${prefix === "nba" ? "nba" : "events"}ModeCard`);
+    const cardModeBadge = document.getElementById("eventsModeCard");
     if (cardModeBadge) {
         const isLive = (mode || "").toUpperCase() === "LIVE";
         cardModeBadge.className = `mode-badge ${isLive ? "mode-badge-live" : "mode-badge-paper"}`;
@@ -235,7 +214,7 @@ function renderAgentCard(agent, data, combined) {
     // Sparkline
     const sparkData = data.equity_curve ?? data.sparkline ?? [];
     if (sparkData.length > 0) {
-        renderSparkline(isNba ? "nbaSparkline" : "eventsSparkline", sparkData, isNba ? "#00f0ff" : "#8b5cf6");
+        renderSparkline("eventsSparkline", sparkData, "#8b5cf6");
     }
 }
 
@@ -258,9 +237,7 @@ function renderSparkline(canvasId, data, color) {
     // Extract values
     const values = data.map(d => (typeof d === "object" ? (d.cumulative_pnl ?? d.value ?? d.y ?? d) : d));
 
-    const existingRef = canvasId === "nbaSparkline" ? nbaSparklineChart :
-                        canvasId === "stocksSparkline" ? stocksSparklineChart : eventsSparklineChart;
-    if (existingRef) existingRef.destroy();
+    if (eventsSparklineChart) eventsSparklineChart.destroy();
 
     const chart = new Chart(canvas, {
         type: "line",
@@ -293,32 +270,23 @@ function renderSparkline(canvasId, data, color) {
         },
     });
 
-    if (canvasId === "nbaSparkline") nbaSparklineChart = chart;
-    else if (canvasId === "stocksSparkline") stocksSparklineChart = chart;
-    else eventsSparklineChart = chart;
+    eventsSparklineChart = chart;
 }
 
 // ---------------------------------------------------------------------------
-// Combined Equity Curve
+// Equity Curve
 // ---------------------------------------------------------------------------
 function renderEquityCurve(data) {
     const canvas = document.getElementById("equityChart");
     if (!canvas) return;
 
-    // Normalize data — accept { nba: [...], events: [...], combined: [...], labels: [...] }
     const labels = data.labels ?? data.dates ?? [];
-    const nbaSeries = normalizeEquitySeries(data.nba_cumulative ?? data.nba ?? data.nba_series ?? []);
     const eventsSeries = normalizeEquitySeries(data.events_cumulative ?? data.events ?? data.events_series ?? []);
-    const combinedSeries = normalizeEquitySeries(data.combined_cumulative ?? data.combined ?? data.combined_series ?? []);
-
-    // Fall back to computing combined if not provided
-    const finalCombined = combinedSeries.length > 0 ? combinedSeries :
-        nbaSeries.map((v, i) => v + (eventsSeries[i] ?? 0));
 
     const finalLabels = labels.length > 0 ? labels :
-        finalCombined.map((_, i) => {
+        eventsSeries.map((_, i) => {
             const d = new Date();
-            d.setDate(d.getDate() - (finalCombined.length - 1 - i));
+            d.setDate(d.getDate() - (eventsSeries.length - 1 - i));
             return fmt.date(d);
         });
 
@@ -326,36 +294,15 @@ function renderEquityCurve(data) {
 
     const ctx = canvas.getContext("2d");
 
-    // Gradient fills
-    const gradNba = ctx.createLinearGradient(0, 0, 0, 280);
-    gradNba.addColorStop(0, "rgba(0,240,255,0.18)");
-    gradNba.addColorStop(1, "rgba(0,240,255,0)");
-
     const gradEvents = ctx.createLinearGradient(0, 0, 0, 280);
     gradEvents.addColorStop(0, "rgba(139,92,246,0.18)");
     gradEvents.addColorStop(1, "rgba(139,92,246,0)");
-
-    const gradCombined = ctx.createLinearGradient(0, 0, 0, 280);
-    gradCombined.addColorStop(0, "rgba(255,255,255,0.10)");
-    gradCombined.addColorStop(1, "rgba(255,255,255,0)");
 
     equityChart = new Chart(canvas, {
         type: "line",
         data: {
             labels: finalLabels,
             datasets: [
-                {
-                    label: "NBA",
-                    data: nbaSeries.length > 0 ? nbaSeries : null,
-                    borderColor: "#00f0ff",
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    pointHoverRadius: 4,
-                    tension: 0.4,
-                    fill: true,
-                    backgroundColor: gradNba,
-                    order: 3,
-                },
                 {
                     label: "Events",
                     data: eventsSeries.length > 0 ? eventsSeries : null,
@@ -366,19 +313,6 @@ function renderEquityCurve(data) {
                     tension: 0.4,
                     fill: true,
                     backgroundColor: gradEvents,
-                    order: 2,
-                },
-                {
-                    label: "Combined",
-                    data: finalCombined.length > 0 ? finalCombined : null,
-                    borderColor: "#ffffff",
-                    borderWidth: 2.5,
-                    pointRadius: 0,
-                    pointHoverRadius: 5,
-                    tension: 0.4,
-                    fill: true,
-                    backgroundColor: gradCombined,
-                    order: 1,
                 },
             ].filter(d => d.data !== null),
         },
@@ -450,7 +384,6 @@ function renderHeatmap(data) {
             if (key) entries[key] = { pnl: d.pnl ?? 0, trades: d.trades ?? 0 };
         });
     } else if (typeof data === "object") {
-        // Object keyed by date string
         Object.entries(data).forEach(([k, v]) => {
             if (k === "days" || k === "summary") return;
             entries[k] = typeof v === "object" ? v : { pnl: v, trades: 0 };
@@ -477,14 +410,12 @@ function renderHeatmap(data) {
     const cellGap = 3;
     const step = cellSize + cellGap;
     const dayLabels = ["", "Mon", "", "Wed", "", "Fri", ""];
-    const leftPad = 32; // for day labels
-    const topPad = 20;  // for month labels
+    const leftPad = 32;
+    const topPad = 20;
 
-    // Find starting day of week for first entry
     const firstDay = days[0].date;
-    const startDow = firstDay.getDay(); // 0=Sun
+    const startDow = firstDay.getDay();
 
-    // Count weeks needed
     const totalDaySlots = startDow + days.length;
     const numWeeks = Math.ceil(totalDaySlots / 7);
 
@@ -493,7 +424,6 @@ function renderHeatmap(data) {
     svg.setAttribute("width", svgWidth);
     svg.setAttribute("height", svgHeight);
 
-    // Clear
     svg.innerHTML = "";
 
     // Day-of-week labels
@@ -568,7 +498,6 @@ function renderHeatmap(data) {
         if (day.pnl !== null && day.pnl < 0) lossDays++;
     });
 
-    // Update badges
     const profEl = document.getElementById("heatmapProfitDays");
     const lossEl = document.getElementById("heatmapLossDays");
     if (profEl) profEl.textContent = `${profitDays} profit days`;
@@ -576,17 +505,17 @@ function renderHeatmap(data) {
 }
 
 function heatmapColor(pnl) {
-    if (pnl === null || pnl === undefined) return "#1a1b24"; // no data
-    if (pnl === 0) return "#1f2937"; // zero
+    if (pnl === null || pnl === undefined) return "#1a1b24";
+    if (pnl === 0) return "#1f2937";
     if (pnl > 0) {
-        if (pnl > 50) return "#22c55e";        // strong profit
-        if (pnl > 20) return "#16a34a";         // medium profit
-        if (pnl > 5)  return "#15803d";         // small profit
-        return "#14532d";                       // tiny profit
+        if (pnl > 50) return "#22c55e";
+        if (pnl > 20) return "#16a34a";
+        if (pnl > 5)  return "#15803d";
+        return "#14532d";
     } else {
-        if (pnl < -50) return "#6b0000";        // big loss
-        if (pnl < -20) return "#991b1b";        // medium loss
-        return "#7f1d1d";                       // small loss
+        if (pnl < -50) return "#6b0000";
+        if (pnl < -20) return "#991b1b";
+        return "#7f1d1d";
     }
 }
 
@@ -632,7 +561,6 @@ function renderActivityFeed(data) {
     const countEl = document.getElementById("activityCount");
     if (!feed) return;
 
-    // Normalize
     const items = Array.isArray(data) ? data : (data.activities ?? data.items ?? data.events ?? []);
 
     if (!items || items.length === 0) {
@@ -641,7 +569,6 @@ function renderActivityFeed(data) {
         return;
     }
 
-    // Show latest 30, newest first
     const sorted = [...items].sort((a, b) => {
         const ta = new Date(a.timestamp ?? a.created_at ?? a.time ?? 0).getTime();
         const tb = new Date(b.timestamp ?? b.created_at ?? b.time ?? 0).getTime();
@@ -652,15 +579,12 @@ function renderActivityFeed(data) {
 
     feed.innerHTML = sorted.map(item => {
         const type = (item.type ?? item.action ?? "bet_placed").toLowerCase();
-        const agent = (item.agent ?? item.source ?? "nba").toLowerCase();
         const ts = item.timestamp ?? item.created_at ?? item.time ?? null;
         const amount = item.amount ?? item.pnl ?? item.stake ?? null;
         const desc = escHtml(item.description ?? item.market ?? item.detail ?? item.message ?? "Activity event");
 
         const { iconHtml, iconClass } = getActivityIcon(type);
-        const agentBadge = agent.includes("event") || agent.includes("evt")
-            ? `<span class="activity-badge activity-badge-events">Events</span>`
-            : `<span class="activity-badge activity-badge-nba">NBA</span>`;
+        const agentBadge = `<span class="activity-badge activity-badge-events">Events</span>`;
 
         const amountHtml = amount != null
             ? `<div class="activity-amount ${pnlClass(amount)}">${fmt.usd(amount)}</div>`
@@ -685,7 +609,6 @@ function getActivityIcon(type) {
     if (type.includes("loss") || type.includes("lose")) {
         return { iconHtml: "✗", iconClass: "activity-icon-loss" };
     }
-    // bet_placed, watching, scan, default
     return { iconHtml: "→", iconClass: "activity-icon-bet" };
 }
 
@@ -699,7 +622,6 @@ function renderOddsTable() {
         return;
     }
 
-    // Sort
     const sorted = [...oddsData].sort((a, b) => {
         const av = getCellValue(a, oddsSortCol);
         const bv = getCellValue(b, oddsSortCol);
@@ -760,90 +682,9 @@ function getStatusBadge(status, edgePct) {
 }
 
 // ---------------------------------------------------------------------------
-// API Health dots
-// ---------------------------------------------------------------------------
-function renderApiHealth(data) {
-    const apis = {
-        dotEspn: data.espn ?? data.ESPN ?? null,
-        dotOdds: data.odds_api ?? data.oddsApi ?? data.odds ?? null,
-        dotBdl: data.balldontlie ?? data.BDL ?? data.bdl ?? null,
-        dotPoly: data.polymarket ?? data.poly ?? null,
-    };
-
-    Object.entries(apis).forEach(([id, status]) => {
-        const dot = document.getElementById(id);
-        if (!dot) return;
-        if (status === null) return;
-        const ok = status === true || status === "ok" || status === "healthy" || status === "up" || status === 200;
-        dot.style.background = ok ? "var(--profit)" : "var(--loss)";
-        dot.style.boxShadow = ok ? "0 0 6px var(--profit)" : "0 0 6px var(--loss)";
-    });
-}
-
-// ---------------------------------------------------------------------------
-// System Health (mode badges)
-// ---------------------------------------------------------------------------
-function renderSysHealth(data) {
-    const nbaModeRaw = data.nba_mode ?? data.nba?.mode ?? null;
-    const eventsModeRaw = data.events_mode ?? data.events?.mode ?? null;
-
-    if (nbaModeRaw) {
-        renderModeBadge("modeBadgeNba", nbaModeRaw);
-        renderModeBadge("nbaModeCard", nbaModeRaw);
-    }
-    if (eventsModeRaw) {
-        renderModeBadge("modeBadgeEvents", eventsModeRaw);
-        renderModeBadge("eventsModeCard", eventsModeRaw);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stock Agent Card
-// ---------------------------------------------------------------------------
-function renderStocksCard(data) {
-    const todayPnl = data.today_pnl ?? data.daily_pnl ?? 0;
-    const openPos = data.open_positions ?? data.open_count ?? 0;
-    const wins = data.wins ?? 0;
-    const losses = data.losses ?? 0;
-    const trades = data.total_trades ?? (wins + losses);
-    const wr = data.win_rate ?? (trades > 0 ? (wins / trades * 100) : 0);
-    const totalPnl = data.total_pnl ?? data.realized_pnl ?? data.pnl ?? 0;
-    const lastScan = data.last_scan ?? data.last_updated ?? null;
-    const mode = data.mode ?? "PAPER";
-
-    // Update mode badge
-    const cardModeBadge = document.getElementById("stocksModeCard");
-    if (cardModeBadge) {
-        const isLive = (mode || "").toUpperCase() === "LIVE";
-        cardModeBadge.className = `mode-badge ${isLive ? "mode-badge-live" : "mode-badge-paper"}`;
-        const dot = cardModeBadge.querySelector(".mode-dot");
-        const txt = cardModeBadge.querySelector(".mode-text");
-        if (txt) txt.textContent = mode.toUpperCase();
-        if (dot && !isLive) { dot.style.background = "#eab308"; dot.style.boxShadow = "0 0 6px #eab308"; }
-    }
-
-    // Stats
-    setStatValue("stocksTodayPnl", fmt.usd(todayPnl), pnlClass(todayPnl));
-    setStatValue("stocksOpenPos", openPos, "");
-    setStatValue("stocksWinRate", fmt.pct(wr), wr >= 55 ? "pnl-positive" : wr < 45 ? "pnl-negative" : "");
-    setStatValue("stocksTrades", trades, "");
-    setStatValue("stocksTotalPnl", fmt.usd(totalPnl), pnlClass(totalPnl));
-    const scanEl = document.getElementById("stocksLastScan");
-    if (scanEl) scanEl.textContent = lastScan ? fmt.relative(lastScan) : "--";
-
-    // Sparkline
-    const sparkData = data.equity_curve ?? data.sparkline ?? [];
-    if (sparkData.length > 0) {
-        renderSparkline("stocksSparkline", sparkData, "#10b981");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Graceful degradation — show placeholders when APIs return null
-// Fills demo/skeleton data so the page still looks good while APIs are loading
 // ---------------------------------------------------------------------------
 function seedPlaceholders() {
-    // Hero KPIs
     const placeholders = {
         kpiTotalPortfolio: "$--",
         kpiCombinedPnl: "$--",

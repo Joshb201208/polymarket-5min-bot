@@ -8,7 +8,7 @@ from pathlib import Path
 
 from events_agent.config import EventsConfig
 from events_agent.models import Position, Trade
-from nba_agent.utils import atomic_json_write, load_json, utcnow
+from shared.utils import atomic_json_write, load_json, utcnow
 
 logger = logging.getLogger(__name__)
 

@@ -11,7 +11,7 @@ import re
 from collections import defaultdict
 
 from intelligence.models import CorrelationReport
-from nba_agent.utils import utcnow
+from shared.utils import utcnow
 
 logger = logging.getLogger("intelligence.correlation")
 

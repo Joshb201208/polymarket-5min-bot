@@ -15,7 +15,7 @@ from pathlib import Path
 import httpx
 
 from events_agent.config import EventsConfig
-from nba_agent.utils import load_json, atomic_json_write, utcnow
+from shared.utils import load_json, atomic_json_write, utcnow
 
 logger = logging.getLogger(__name__)
 

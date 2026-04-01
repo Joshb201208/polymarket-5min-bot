@@ -13,7 +13,7 @@ from events_agent.scanner import EventsScanner
 from events_agent.analyzer import EventsAnalyzer
 from events_agent.executor import EventsExecutor
 from events_agent.portfolio import PortfolioManager
-from nba_agent.utils import utcnow
+from shared.utils import utcnow
 
 logger = logging.getLogger("events_agent")
 
@@ -89,7 +89,7 @@ class EventsAgent:
     @property
     def current_bankroll(self) -> float:
         """Read current bankroll from events-specific bankroll file."""
-        from nba_agent.utils import load_json
+        from shared.utils import load_json
         state = load_json(self._events_bankroll_path, {})
         return float(state.get("current_bankroll", self.config.STARTING_BANKROLL))
 
@@ -265,7 +265,7 @@ class EventsAgent:
     async def _scan_and_trade(self) -> None:
         """Scan markets, evaluate edges via intelligence pipeline, and execute trades."""
         # Check bankroll pause state
-        from nba_agent.utils import load_json
+        from shared.utils import load_json
         bankroll_state = load_json(self._bankroll_path, {})
         if bankroll_state.get("is_paused", False):
             logger.info("Trading paused (stop-loss) — skipping scan")
@@ -323,15 +323,10 @@ class EventsAgent:
                 from shared.bankroll import get_total_exposure
                 total_exposure = get_total_exposure(self.config.DATA_DIR)
 
-                # NBA cash reserve: always keep $90 available for NBA agent
-                available_for_events = bankroll - self.config.NBA_CASH_RESERVE
-                max_total = min(
-                    bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT,
-                    available_for_events,
-                )
+                max_total = bankroll * self.config.MAX_TOTAL_EXPOSURE_PCT
                 if total_exposure >= max_total:
-                    logger.info("Exposure limit reached ($%.2f >= $%.2f, NBA reserve=$%.0f)",
-                                total_exposure, max_total, self.config.NBA_CASH_RESERVE)
+                    logger.info("Exposure limit reached ($%.2f >= $%.2f)",
+                                total_exposure, max_total)
                     break
 
                 # Per-category concentration limit
@@ -406,7 +401,7 @@ class EventsAgent:
                 max_entry = self.config.MAX_ENTRY_PRICE  # default 0.65
                 if market.end_date:
                     try:
-                        from nba_agent.utils import parse_utc
+                        from shared.utils import parse_utc
                         remaining = (parse_utc(market.end_date) - utcnow()).total_seconds() / 86400
                         if remaining <= 14:
                             max_entry = 0.85  # short-duration: wider entry zone
@@ -514,7 +509,7 @@ class EventsAgent:
         open_positions = self.portfolio.get_open_positions()
 
         # Load intelligence context from disk for exit decisions
-        from nba_agent.utils import load_json as _load_json
+        from shared.utils import load_json as _load_json
         intel_data = _load_json(self.config.DATA_DIR / "intelligence_report.json", {})
         scores_list = intel_data.get("scores", [])
         lifecycle_data = intel_data.get("lifecycle_assessments", {})
@@ -686,7 +681,7 @@ class EventsAgent:
         cash = current_bankroll - open_positions_cost
         """
         import json as _json
-        from nba_agent.utils import load_json
+        from shared.utils import load_json
 
         try:
             positions = self.portfolio.load_positions()
@@ -739,7 +734,7 @@ class EventsAgent:
         """
         try:
             from intelligence.manager import IntelligenceManager
-            from nba_agent.utils import load_json
+            from shared.utils import load_json
 
             # Try to read the latest intelligence report from disk
             report_path = self.config.DATA_DIR / "intelligence_report.json"

@@ -1,4 +1,4 @@
-"""Orchestrator — runs NBA + Events + Intelligence agents on their own schedules.
+"""Orchestrator — runs Events + Intelligence agents on their own schedules.
 
 Wires all advanced systems: lifecycle, regime, calibrator, dedup, live quality,
 smart executor, and Telegram command handler.
@@ -12,12 +12,10 @@ import signal
 import sys
 from datetime import datetime, timedelta, timezone
 
-from nba_agent.config import Config as NBAConfig
-from nba_agent.main import NBAAgent, setup_logging
-from events_agent.main import EventsAgent
+from events_agent.main import EventsAgent, setup_logging
 from shared.telegram_digest import CombinedDigest
 from shared.config import SharedConfig
-from nba_agent.utils import utcnow, load_json, atomic_json_write
+from shared.utils import utcnow, load_json, atomic_json_write
 
 logger = logging.getLogger("orchestrator")
 
@@ -103,10 +101,9 @@ def _try_init_telegram_commands(config):
 
 
 class Orchestrator:
-    """Runs all agents concurrently on their own scan intervals."""
+    """Runs events agent and intelligence concurrently on their own scan intervals."""
 
     def __init__(self) -> None:
-        self.nba_agent = NBAAgent()
         self.events_agent = EventsAgent()
         self.digest = CombinedDigest(SharedConfig())
         self.intelligence = _try_init_intelligence()
@@ -139,7 +136,7 @@ class Orchestrator:
 
     async def run(self) -> None:
         """Start all agents as concurrent tasks."""
-        logger.info("Orchestrator starting — NBA + Events agents")
+        logger.info("Orchestrator starting — Events agent")
 
         # Start persistent intelligence connections
         if self.intelligence:
@@ -151,7 +148,6 @@ class Orchestrator:
 
         # Run agents concurrently
         tasks = [
-            asyncio.create_task(self._run_nba()),
             asyncio.create_task(self._run_events()),
             asyncio.create_task(self._run_digest()),
             asyncio.create_task(self._run_telegram_poller()),
@@ -162,20 +158,6 @@ class Orchestrator:
         except asyncio.CancelledError:
             logger.info("Orchestrator tasks cancelled")
 
-    async def _run_nba(self) -> None:
-        """NBA agent loop — runs on its own interval."""
-        logger.info("NBA agent task started (interval=%d min)", self.nba_agent.config.SCAN_INTERVAL)
-        while not self._shutdown:
-            try:
-                await self.nba_agent._tick()
-            except Exception as e:
-                logger.error("NBA agent tick error: %s", e, exc_info=True)
-
-            for _ in range(self.nba_agent.config.SCAN_INTERVAL * 60):
-                if self._shutdown:
-                    break
-                await asyncio.sleep(1)
-
     async def _run_events(self) -> None:
         """Events agent loop — runs on its own interval.
 
@@ -183,12 +165,6 @@ class Orchestrator:
         quality → composite → edge check → smart_executor.
         """
         logger.info("Events agent task started (interval=%d min)", self.events_agent.config.SCAN_INTERVAL)
-
-        # Stagger start: wait 2 minutes so NBA agent gets first scan
-        for _ in range(120):
-            if self._shutdown:
-                return
-            await asyncio.sleep(1)
 
         while not self._shutdown:
             try:
@@ -403,16 +379,16 @@ class Orchestrator:
                 await asyncio.sleep(1)
 
     def shutdown(self) -> None:
-        """Signal graceful shutdown to all agents."""
+        """Signal graceful shutdown."""
         logger.info("Orchestrator shutdown requested")
         self._shutdown = True
-        self.nba_agent.shutdown()
         self.events_agent.shutdown()
 
 
 def main() -> None:
     """Entry point for `python orchestrator.py`."""
-    config = NBAConfig()
+    from events_agent.config import EventsConfig
+    config = EventsConfig()
     setup_logging(config.LOG_LEVEL)
 
     orch = Orchestrator()
@@ -424,8 +400,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
 
     logger.info(
-        "Starting orchestrator — NBA (every %d min) + Events (every %d min)",
-        orch.nba_agent.config.SCAN_INTERVAL,
+        "Starting orchestrator — Events (every %d min)",
         orch.events_agent.config.SCAN_INTERVAL,
     )
 

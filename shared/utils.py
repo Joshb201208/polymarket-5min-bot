@@ -1,4 +1,4 @@
-"""Shared helpers."""
+"""Shared helpers — utility functions used across all agents and modules."""
 
 from __future__ import annotations
 
@@ -75,15 +75,6 @@ def load_json(path: Path, default: Any = None) -> Any:
         return default if default is not None else {}
 
 
-def parse_record(record_str: str) -> tuple[int, int]:
-    """Parse a record string like '25-8' into (wins, losses)."""
-    try:
-        parts = record_str.strip().split("-")
-        return int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
-        return 0, 0
-
-
 def format_price(price: float) -> str:
     """Format a probability price as cents."""
     return f"{price * 100:.0f}¢"
@@ -102,26 +93,3 @@ def format_pct(pct: float) -> str:
 def format_edge(edge: float) -> str:
     """Format an edge value."""
     return f"{edge * 100:.1f}%"
-
-
-def slugify_game(slug: str) -> tuple[str, str, str] | None:
-    """Extract away_abbr, home_abbr, date from a game slug like nba-lac-dal-2026-03-21."""
-    parts = slug.lower().split("-")
-    if len(parts) < 6 or parts[0] != "nba":
-        return None
-    try:
-        # Verify last 3 parts are a date
-        year = int(parts[-3])
-        month = int(parts[-2])
-        day = int(parts[-1])
-        date_str = f"{year}-{month:02d}-{day:02d}"
-        # Team abbreviations are everything between 'nba-' and the date
-        team_parts = parts[1:-3]
-        if len(team_parts) == 2:
-            return team_parts[0].upper(), team_parts[1].upper(), date_str
-        # Some slugs might have 3-letter teams
-        if len(team_parts) >= 2:
-            return team_parts[0].upper(), team_parts[1].upper(), date_str
-    except (ValueError, IndexError):
-        pass
-    return None

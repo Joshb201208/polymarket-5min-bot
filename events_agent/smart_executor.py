@@ -13,7 +13,7 @@ from typing import Optional
 
 from events_agent.config import EventsConfig
 from events_agent.models import EdgeResult, Position, Trade
-from nba_agent.utils import utcnow, atomic_json_write, load_json
+from shared.utils import utcnow, atomic_json_write, load_json
 
 logger = logging.getLogger(__name__)
 

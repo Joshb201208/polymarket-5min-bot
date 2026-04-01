@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timezone
 
 import httpx
 
 from events_agent.config import EventsConfig
 from events_agent.models import EventCategory, EventMarket
-from nba_agent.utils import utcnow, parse_utc
+from shared.utils import utcnow, parse_utc
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,18 @@ _CATEGORY_KEYWORDS: dict[EventCategory, list[str]] = {
 _SECONDARY_SCAN_KEYWORDS = [
     "price", "rate", "above", "below", "over", "under",
 ]
+
+# ---------------------------------------------------------------------------
+# Crypto daily price markets — no informational edge on spot-price predictions
+# ---------------------------------------------------------------------------
+CRYPTO_DAILY_PRICE_RE = re.compile(
+    r'Will (?:the price of )?(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL|Dogecoin|DOGE|'
+    r'Cardano|ADA|Avalanche|AVAX|Polkadot|DOT|Chainlink|LINK|Litecoin|LTC|'
+    r'BNB|MATIC|Polygon)'
+    r'.*?(?:be above|be between|reach|dip to|hit|drop|fall)'
+    r'.*?\$[\d,]+',
+    re.IGNORECASE
+)
 
 
 class EventsScanner:
@@ -273,6 +286,11 @@ class EventsScanner:
     def _passes_filters(self, market: EventMarket) -> bool:
         """Apply all filtering rules to a market."""
         now = utcnow()
+
+        # Block crypto daily price markets (no edge on spot-price predictions)
+        if CRYPTO_DAILY_PRICE_RE.search(market.question):
+            logger.info("Filtered crypto daily price market: %s", market.question[:80])
+            return False
 
         # Must be active and not closed
         if not market.active or market.closed:

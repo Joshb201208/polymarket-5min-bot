@@ -1,4 +1,4 @@
-"""NBA Agent Dashboard — FastAPI Backend.
+"""Events Trading Agent Dashboard — FastAPI Backend.
 
 Reads JSON files from the agent's data directory and serves
 computed stats, positions, trades, and research data.
@@ -20,14 +20,13 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Load .env so API health checks can read ODDS_API_KEY, BALLDONTLIE_API_KEY, etc.
+# Load .env
 _project_root = Path(__file__).resolve().parent.parent
 load_dotenv(_project_root / ".env")
 
 # ---------------------------------------------------------------------------
 # Data directory — /root/polymarket-bot/data/ on VPS, ./data/ locally
 # ---------------------------------------------------------------------------
-# Try local data dir first (development), then VPS path
 _local_data = Path(__file__).parent / "data"
 _vps_data = Path("/root/polymarket-bot/data")
 _env_data = os.environ.get("DATA_DIR")
@@ -48,7 +47,7 @@ else:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Polymarket Agent Dashboard API", version="3.0.0")
+app = FastAPI(title="Events Trading Agent Dashboard API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,635 +145,17 @@ def _parse_ts(ts: str | None) -> datetime | None:
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Health
 # ---------------------------------------------------------------------------
-
-@app.get("/api/status", dependencies=[Depends(_require_auth)])
-def get_status() -> dict:
-    bankroll = _read_json("bankroll.json")
-    positions = _read_json("positions.json").get("positions", [])
-    trades = _read_json("trades.json").get("trades", [])
-
-    # Determine mode from latest trade
-    mode = "paper"
-    if trades:
-        mode = trades[-1].get("mode", "paper")
-
-    # Compute uptime from earliest trade timestamp
-    uptime_hours = 0.0
-    if trades:
-        timestamps = [_parse_ts(t.get("timestamp")) for t in trades]
-        timestamps = [t for t in timestamps if t is not None]
-        if timestamps:
-            earliest = min(timestamps)
-            uptime_hours = round(
-                (datetime.now(timezone.utc) - earliest).total_seconds() / 3600, 1
-            )
-
-    # Last scan time — prefer system_status.json (written each tick)
-    system_status = _read_json("system_status.json")
-    last_scan = system_status.get("nba_last_scan")
-    # Fallback: most recent trade timestamp
-    if not last_scan and trades:
-        timestamps_str = [t.get("timestamp") for t in trades if t.get("timestamp")]
-        if timestamps_str:
-            last_scan = max(timestamps_str)
-
-    open_positions = [p for p in positions if p.get("status") == "open"]
-
-    return {
-        "bankroll": bankroll.get("current_bankroll", 0),
-        "starting_bankroll": bankroll.get("starting_bankroll", 0),
-        "peak_bankroll": bankroll.get("peak_bankroll", 0),
-        "is_paused": bankroll.get("is_paused", False),
-        "mode": mode,
-        "uptime_hours": uptime_hours,
-        "last_scan": last_scan,
-        "open_positions_count": len(open_positions),
-        "total_positions": len(positions),
-        "data_sources": ["ESPN", "The Odds API", "BallDontLie", "NBA CDN"],
-    }
-
-
-@app.get("/api/positions", dependencies=[Depends(_require_auth)])
-def get_positions() -> dict:
-    positions = _read_json("positions.json").get("positions", [])
-    open_pos = [p for p in positions if p.get("status") == "open"]
-    closed_pos = [p for p in positions if p.get("status") != "open"]
-    return {"open": open_pos, "closed": closed_pos}
-
-
-@app.get("/api/live", dependencies=[Depends(_require_auth)])
-def get_live_data() -> dict:
-    """Fetch live prices from Polymarket CLOB and scores from ESPN."""
-    import urllib.request
-
-    positions = _read_json("positions.json").get("positions", [])
-    open_pos = [p for p in positions if p.get("status") == "open"]
-
-    # --- Fetch live market prices from Polymarket Gamma API ---
-    # CLOB API is geoblocked from Bengaluru VPS, so use Gamma API
-    # which returns outcomePrices per market
-    prices = {}
-    # Deduplicate market IDs
-    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
-    market_prices = {}  # token_id -> price
-
-    for mkt_id in market_ids:
-        try:
-            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
-            req = urllib.request.Request(url, headers={
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            })
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                m = json.loads(resp.read())
-                try:
-                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    outcome_prices = []
-                tokens_raw = m.get("clobTokenIds", "") or ""
-                try:
-                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
-                except (json.JSONDecodeError, TypeError):
-                    token_list = []
-                for i, tok in enumerate(token_list):
-                    if i < len(outcome_prices):
-                        try:
-                            market_prices[tok] = float(outcome_prices[i])
-                        except (ValueError, TypeError):
-                            pass
-        except Exception:
-            pass
-
-    # Map token prices to position IDs
-    for p in open_pos:
-        tok = p.get("token_id", "")
-        if tok in market_prices:
-            prices[p["id"]] = market_prices[tok]
-
-    # --- Fetch live NBA scores from ESPN ---
-    scores = {}
-    try:
-        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            espn = json.loads(resp.read())
-            for event in espn.get("events", []):
-                # Get team names and scores
-                comps = event.get("competitions", [{}])[0]
-                teams = comps.get("competitors", [])
-                status_obj = comps.get("status", {})
-                status_type = status_obj.get("type", {})
-                status_name = status_type.get("name", "")  # STATUS_SCHEDULED, STATUS_IN_PROGRESS, STATUS_FINAL
-                status_detail = status_obj.get("type", {}).get("shortDetail", status_obj.get("displayClock", ""))
-                # Try to get a better detail string
-                status_detail = status_type.get("shortDetail", "")
-                if not status_detail:
-                    status_detail = status_obj.get("displayClock", "")
-                    period = status_obj.get("period", 0)
-                    if period > 0 and status_name == "STATUS_IN_PROGRESS":
-                        status_detail = f"Q{period} {status_detail}"
-
-                home_team = ""
-                away_team = ""
-                home_score = 0
-                away_score = 0
-                for t in teams:
-                    name = t.get("team", {}).get("displayName", "")
-                    score = int(t.get("score", 0) or 0)
-                    if t.get("homeAway") == "home":
-                        home_team = name
-                        home_score = score
-                    else:
-                        away_team = name
-                        away_score = score
-
-                game_key = f"{away_team} vs. {home_team}".lower()
-                scores[game_key] = {
-                    "home_team": home_team,
-                    "away_team": away_team,
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "status": status_name,
-                    "detail": status_detail,
-                }
-    except Exception as e:
-        pass  # scores remain empty
-
-    # --- Match scores to positions ---
-    result = []
-    for p in open_pos:
-        q = (p.get("market_question") or "").lower()
-        live_price = prices.get(p["id"])
-        current_value = None
-        pnl_live = None
-        if live_price and live_price > 0:
-            current_value = round(p.get("shares", 0) * live_price, 2)
-            pnl_live = round(current_value - p.get("cost", 0), 2)
-
-        # Try to match ESPN score
-        matched_score = None
-        for game_key, score_data in scores.items():
-            # Match by checking if both team names appear in the question
-            home_short = score_data["home_team"].split()[-1].lower()  # e.g. "Celtics"
-            away_short = score_data["away_team"].split()[-1].lower()
-            if home_short in q and away_short in q:
-                matched_score = score_data
-                break
-
-        result.append({
-            "id": p["id"],
-            "market_question": p.get("market_question"),
-            "live_price": live_price,
-            "entry_price": p.get("entry_price"),
-            "cost": p.get("cost"),
-            "shares": p.get("shares"),
-            "current_value": current_value,
-            "pnl_live": pnl_live,
-            "score": matched_score,
-        })
-
-    return {"positions": result}
-
-
-@app.get("/api/trades", dependencies=[Depends(_require_auth)])
-def get_trades() -> dict:
-    trades = _read_json("trades.json").get("trades", [])
-    return {"trades": trades}
-
-
-@app.get("/api/stats", dependencies=[Depends(_require_auth)])
-def get_stats() -> dict:
-    positions = _read_json("positions.json").get("positions", [])
-    bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 750)
-
-    closed = [p for p in positions if p.get("status") != "open"]
-
-    # Basic counts — determine win/loss from P&L, not status string
-    total_closed = len(closed)
-    wins = [p for p in closed if (p.get("pnl") or 0) > 0]
-    losses = [p for p in closed if (p.get("pnl") or 0) <= 0]
-
-    win_count = len(wins)
-    loss_count = len(losses)
-    win_rate = round((win_count / total_closed * 100) if total_closed > 0 else 0, 1)
-
-    # P&L
-    pnls = [p.get("pnl", 0) or 0 for p in closed]
-    total_pnl = round(sum(pnls), 2)
-    roi = round((total_pnl / starting * 100) if starting > 0 else 0, 1)
-
-    # Average edge
-    edges = [p.get("edge_at_entry", 0) or 0 for p in closed]
-    avg_edge = round((sum(edges) / len(edges) * 100) if edges else 0, 1)
-
-    # Win / loss averages
-    win_pnls = [p.get("pnl", 0) or 0 for p in wins]
-    loss_pnls = [p.get("pnl", 0) or 0 for p in losses]
-    avg_win = round(sum(win_pnls) / len(win_pnls), 2) if win_pnls else 0
-    avg_loss = round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0
-
-    # Profit factor
-    gross_profit = sum(p for p in win_pnls if p > 0)
-    gross_loss = abs(sum(p for p in loss_pnls if p < 0))
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf")
-
-    # Equity curve — build daily P&L and trade counts
-    daily_map: dict[str, float] = defaultdict(float)
-    daily_count: dict[str, int] = defaultdict(int)
-    for p in closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            # Use SGT (UTC+8) for daily grouping
-            from datetime import timedelta as _td
-            _sgt = timezone(_td(hours=8))
-            exit_sgt = exit_ts.astimezone(_sgt)
-            day = exit_sgt.strftime("%Y-%m-%d")
-            daily_map[day] += p.get("pnl", 0) or 0
-            daily_count[day] += 1
-
-    sorted_days = sorted(daily_map.keys())
-    equity_curve = []
-    running = starting
-    for day in sorted_days:
-        running += daily_map[day]
-        equity_curve.append({
-            "date": day,
-            "pnl": round(daily_map[day], 2),
-            "bankroll": round(running, 2),
-            "trades": daily_count[day],
-        })
-
-    # Max drawdown
-    peak = starting
-    max_dd = 0
-    running = starting
-    for day in sorted_days:
-        running += daily_map[day]
-        if running > peak:
-            peak = running
-        dd = (peak - running) / peak * 100 if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
-    max_dd = round(max_dd, 1)
-
-    # Best / worst trade
-    best_trade = max(closed, key=lambda p: p.get("pnl", 0) or 0) if closed else None
-    worst_trade = min(closed, key=lambda p: p.get("pnl", 0) or 0) if closed else None
-
-    # Win rate by bet type (infer from slug)
-    type_wins: dict[str, int] = defaultdict(int)
-    type_total: dict[str, int] = defaultdict(int)
-    for p in closed:
-        slug = (p.get("market_slug") or "").lower()
-        if "-spread-" in slug:
-            bet_type = "spread"
-        elif "-total-" in slug:
-            bet_type = "total"
-        elif "champion" in slug or "finals" in slug:
-            bet_type = "futures"
-        else:
-            bet_type = "moneyline"
-        type_total[bet_type] += 1
-        if (p.get("pnl") or 0) > 0:
-            type_wins[bet_type] += 1
-
-    win_rate_by_type = {}
-    for bt, count in type_total.items():
-        win_rate_by_type[bt] = round(type_wins[bt] / count * 100, 1) if count > 0 else 0
-
-    # Streaks
-    sorted_closed = sorted(
-        closed,
-        key=lambda p: p.get("exit_time") or "",
-    )
-    current_streak = 0
-    streak_type = ""
-    best_streak = 0
-    worst_streak = 0
-    temp_streak = 0
-    for p in sorted_closed:
-        is_win = (p.get("pnl") or 0) > 0
-        if temp_streak == 0:
-            temp_streak = 1 if is_win else -1
-        elif is_win and temp_streak > 0:
-            temp_streak += 1
-        elif not is_win and temp_streak < 0:
-            temp_streak -= 1
-        else:
-            temp_streak = 1 if is_win else -1
-
-        if temp_streak > 0:
-            best_streak = max(best_streak, temp_streak)
-        else:
-            worst_streak = min(worst_streak, temp_streak)
-
-    current_streak = abs(temp_streak)
-    streak_type = "W" if temp_streak > 0 else "L"
-
-    # Total fees paid across all positions (open + closed)
-    all_positions = _read_json("positions.json").get("positions", [])
-    total_fees = round(sum(p.get("fees_paid", 0) or 0 for p in all_positions), 2)
-
-    return {
-        "total_trades": total_closed,
-        "wins": win_count,
-        "losses": loss_count,
-        "win_rate": win_rate,
-        "total_pnl": total_pnl,
-        "total_fees": total_fees,
-        "roi": roi,
-        "avg_edge": avg_edge,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "profit_factor": profit_factor,
-        "max_drawdown": max_dd,
-        "best_trade": {
-            "question": best_trade.get("market_question", ""),
-            "pnl": best_trade.get("pnl", 0),
-        } if best_trade else None,
-        "worst_trade": {
-            "question": worst_trade.get("market_question", ""),
-            "pnl": worst_trade.get("pnl", 0),
-        } if worst_trade else None,
-        "daily_pnl": equity_curve,
-        "win_rate_by_type": win_rate_by_type,
-        "streak": {
-            "current": current_streak,
-            "type": streak_type,
-            "best": best_streak,
-            "worst": abs(worst_streak),
-        },
-    }
-
-
-@app.get("/api/research", dependencies=[Depends(_require_auth)])
-def get_research() -> dict:
-    data = _read_json("research_log.json")
-    research = data.get("research", [])
-    # Sort by game_time descending
-    research.sort(key=lambda r: r.get("game_time", ""), reverse=True)
-    return {"research": research}
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
-@app.get("/api/performance/{period}", dependencies=[Depends(_require_auth)])
-def get_performance(period: str) -> dict:
-    """Return performance stats for a given period: today, week, month, all."""
-    positions = _read_json("positions.json").get("positions", [])
-    bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 242.11)
-
-    closed = [p for p in positions if p.get("status") != "open"]
-
-    # Filter by period — use Singapore time (UTC+8) for "today"
-    from datetime import timedelta as td
-    SGT = timezone(td(hours=8))
-    now_sgt = datetime.now(SGT)
-    now = datetime.now(timezone.utc)
-
-    if period == "today":
-        # Start of today in SGT, converted to UTC
-        sgt_midnight = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = sgt_midnight.astimezone(timezone.utc)
-    elif period == "week":
-        cutoff = now - td(days=7)
-    elif period == "month":
-        cutoff = now - td(days=30)
-    else:  # all
-        cutoff = datetime(2020, 1, 1, tzinfo=timezone.utc)
-
-    filtered = []
-    for p in closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts and exit_ts >= cutoff:
-            filtered.append(p)
-
-    total = len(filtered)
-    wins = [p for p in filtered if (p.get("pnl") or 0) > 0]
-    losses = [p for p in filtered if (p.get("pnl") or 0) <= 0]
-    win_count = len(wins)
-    loss_count = len(losses)
-
-    pnls = [p.get("pnl", 0) or 0 for p in filtered]
-    total_pnl = round(sum(pnls), 2)
-    total_invested = sum(p.get("cost", 0) or 0 for p in filtered)
-    roi = round((total_pnl / total_invested * 100) if total_invested > 0 else 0, 1)
-
-    win_pnls = [p.get("pnl", 0) or 0 for p in wins]
-    loss_pnls = [p.get("pnl", 0) or 0 for p in losses]
-    avg_win = round(sum(win_pnls) / len(win_pnls), 2) if win_pnls else 0
-    avg_loss = round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0
-
-    gross_profit = sum(p for p in win_pnls if p > 0)
-    gross_loss = abs(sum(p for p in loss_pnls if p < 0))
-    pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
-
-    return {
-        "period": period,
-        "bets": total,
-        "wins": win_count,
-        "losses": loss_count,
-        "win_rate": round((win_count / total * 100) if total > 0 else 0, 1),
-        "pnl": total_pnl,
-        "roi": roi,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "profit_factor": pf,
-        "total_invested": round(total_invested, 2),
-    }
-
-
-@app.get("/api/calibration", dependencies=[Depends(_require_auth)])
-def get_calibration() -> dict:
-    """Return self-learning calibration data."""
-    cal_data = _read_json("calibration.json")
-    if not cal_data:
-        return {
-            "total_resolved": 0, "active": False, "bets_until_active": 200,
-            "edge_buckets": {}, "bet_types": {}, "confidence_tiers": {},
-            "adjustments": {},
-        }
-    return {
-        "total_resolved": cal_data.get("total_resolved", 0),
-        "active": cal_data.get("active", False),
-        "bets_until_active": max(0, 200 - cal_data.get("total_resolved", 0)),
-        "edge_buckets": cal_data.get("edge_buckets", {}),
-        "bet_types": cal_data.get("bet_types", {}),
-        "confidence_tiers": cal_data.get("confidence_tiers", {}),
-        "home_away": cal_data.get("home_away", {}),
-        "vegas_accuracy": cal_data.get("vegas_accuracy", {}),
-        "adjustments": cal_data.get("adjustments", {}),
-    }
-
-
-@app.get("/api/analytics", dependencies=[Depends(_require_auth)])
-def get_analytics() -> dict:
-    """Analytics data: entry timing, price drift, opponent strength, P&L by tier."""
-    import urllib.request as _urlreq
-
-    positions = _read_json("positions.json").get("positions", [])
-    closed = [p for p in positions if p.get("status") != "open"]
-
-    # --- Entry timing vs outcome ---
-    timing_data = []
-    for p in closed:
-        hours = p.get("hours_before_tipoff")
-        if hours is not None:
-            timing_data.append({
-                "hours": hours,
-                "won": (p.get("pnl") or 0) > 0,
-                "pnl": p.get("pnl", 0),
-                "market": p.get("market_question", ""),
-            })
-
-    # --- Price drift ---
-    drift_data = []
-    for p in closed:
-        gametime_price = p.get("price_at_gametime")
-        if gametime_price is not None:
-            entry = p.get("entry_price", 0)
-            drift = round((gametime_price - entry) * 100, 1)  # in cents
-            drift_data.append({
-                "entry_price": entry,
-                "gametime_price": gametime_price,
-                "drift_cents": drift,
-                "won": (p.get("pnl") or 0) > 0,
-                "market": p.get("market_question", ""),
-            })
-
-    # --- Opponent strength ---
-    opp_data = []
-    for p in closed:
-        opp_wr = p.get("opponent_win_pct")
-        if opp_wr is not None:
-            opp_data.append({
-                "opponent_win_pct": opp_wr,
-                "won": (p.get("pnl") or 0) > 0,
-                "pnl": p.get("pnl", 0),
-                "market": p.get("market_question", ""),
-            })
-
-    # --- P&L by confidence tier ---
-    tier_pnl = {}
-    for p in closed:
-        conf = p.get("confidence", "LOW")
-        if conf not in tier_pnl:
-            tier_pnl[conf] = {"wins": 0, "losses": 0, "pnl": 0, "trades": 0, "wagered": 0}
-        tier_pnl[conf]["trades"] += 1
-        tier_pnl[conf]["pnl"] += p.get("pnl", 0) or 0
-        tier_pnl[conf]["wagered"] += p.get("cost", 0) or 0
-        if (p.get("pnl") or 0) > 0:
-            tier_pnl[conf]["wins"] += 1
-        else:
-            tier_pnl[conf]["losses"] += 1
-    for v in tier_pnl.values():
-        v["pnl"] = round(v["pnl"], 2)
-        v["wagered"] = round(v["wagered"], 2)
-
-    # --- P&L by entry price range ---
-    range_pnl = {"<15c": {"w": 0, "l": 0, "pnl": 0}, "15-30c": {"w": 0, "l": 0, "pnl": 0},
-                 "30-50c": {"w": 0, "l": 0, "pnl": 0}, ">50c": {"w": 0, "l": 0, "pnl": 0}}
-    for p in closed:
-        ep = p.get("entry_price", 0)
-        pnl_val = p.get("pnl", 0) or 0
-        if ep < 0.15:
-            bucket = "<15c"
-        elif ep < 0.30:
-            bucket = "15-30c"
-        elif ep < 0.50:
-            bucket = "30-50c"
-        else:
-            bucket = ">50c"
-        range_pnl[bucket]["pnl"] += pnl_val
-        if pnl_val > 0:
-            range_pnl[bucket]["w"] += 1
-        else:
-            range_pnl[bucket]["l"] += 1
-    for v in range_pnl.values():
-        v["pnl"] = round(v["pnl"], 2)
-
-    return {
-        "entry_timing": timing_data,
-        "price_drift": drift_data,
-        "opponent_strength": opp_data,
-        "pnl_by_tier": tier_pnl,
-        "pnl_by_price_range": range_pnl,
-    }
-
-
-@app.get("/api/api-health", dependencies=[Depends(_require_auth)])
-def get_api_health() -> dict:
-    """Check connectivity to all external data sources."""
-    import urllib.request as _urlreq
-
-    sources = {}
-
-    # ESPN
-    try:
-        req = _urlreq.Request(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            headers={"Accept": "application/json"},
-        )
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            sources["espn"] = {"status": "ok", "code": resp.status}
-    except Exception as e:
-        sources["espn"] = {"status": "error", "error": str(e)[:80]}
-
-    # The Odds API
-    odds_key = os.environ.get("ODDS_API_KEY", "")
-    if odds_key:
-        try:
-            req = _urlreq.Request(
-                f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={odds_key}&regions=us&markets=h2h&oddsFormat=decimal&bookmakers=draftkings",
-                headers={"Accept": "application/json"},
-            )
-            with _urlreq.urlopen(req, timeout=8) as resp:
-                remaining = resp.headers.get("x-requests-remaining", "?")
-                sources["odds_api"] = {"status": "ok", "credits_remaining": remaining}
-        except Exception as e:
-            sources["odds_api"] = {"status": "error", "error": str(e)[:80]}
-    else:
-        sources["odds_api"] = {"status": "no_key"}
-
-    # BallDontLie
-    bdl_key = os.environ.get("BALLDONTLIE_API_KEY", "")
-    if bdl_key:
-        try:
-            req = _urlreq.Request(
-                "https://api.balldontlie.io/v1/teams",
-                headers={"Accept": "application/json", "Authorization": bdl_key},
-            )
-            with _urlreq.urlopen(req, timeout=5) as resp:
-                sources["balldontlie"] = {"status": "ok", "code": resp.status}
-        except Exception as e:
-            sources["balldontlie"] = {"status": "error", "error": str(e)[:80]}
-    else:
-        sources["balldontlie"] = {"status": "no_key"}
-
-    # Polymarket Gamma API
-    try:
-        req = _urlreq.Request(
-            "https://gamma-api.polymarket.com/markets?limit=1&active=true",
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-        )
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            sources["polymarket"] = {"status": "ok", "code": resp.status}
-    except Exception as e:
-        sources["polymarket"] = {"status": "error", "error": str(e)[:80]}
-
-    return {"sources": sources}
-
 
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "data_dir": str(DATA_DIR), "exists": DATA_DIR.exists()}
 
+
+# ---------------------------------------------------------------------------
+# Deploy
+# ---------------------------------------------------------------------------
 
 @app.post("/api/deploy", dependencies=[Depends(_require_auth)])
 def deploy() -> dict:
@@ -822,7 +203,7 @@ def deploy() -> dict:
         svc_src = project_dir / "deploy" / "agents.service"
         if svc_src.exists():
             subprocess.run(
-                ["cp", str(svc_src), "/etc/systemd/system/nba-agent.service"],
+                ["cp", str(svc_src), "/etc/systemd/system/events-agent.service"],
                 capture_output=True, timeout=5,
             )
             subprocess.run(
@@ -848,17 +229,17 @@ def deploy() -> dict:
     # Restart agent service
     try:
         restart = subprocess.run(
-            ["systemctl", "restart", "nba-agent"],
+            ["systemctl", "restart", "events-agent"],
             capture_output=True,
             text=True,
             timeout=15,
         )
-        results["restart_nba-agent"] = {
+        results["restart_events-agent"] = {
             "ok": restart.returncode == 0,
             "stderr": restart.stderr.strip()[-200:] if restart.returncode != 0 else "",
         }
     except Exception as e:
-        results["restart_nba-agent"] = {"ok": False, "error": str(e)[:200]}
+        results["restart_events-agent"] = {"ok": False, "error": str(e)[:200]}
 
     # Restart dashboard service (picks up new API code)
     # Uses subprocess.Popen to avoid blocking — the current process will be killed
@@ -879,88 +260,14 @@ def deploy() -> dict:
     return results
 
 
-@app.get("/api/system-health", dependencies=[Depends(_require_auth)])
-def get_system_health() -> dict:
-    """Return last scan times, API status, uptime info."""
-    import urllib.request as _urlreq
-
-    bankroll = _read_json("bankroll.json")
-
-    # Primary source: system_status.json written by agent each tick
-    system_status = _read_json("system_status.json")
-    nba_last_scan = system_status.get("nba_last_scan")
-
-    # Fallback: derive from trade timestamps if system_status not yet populated
-    if not nba_last_scan:
-        nba_trades = _read_json("trades.json").get("trades", [])
-        if nba_trades:
-            timestamps = [t.get("timestamp") for t in nba_trades if t.get("timestamp")]
-            if timestamps:
-                nba_last_scan = max(timestamps)
-
-    # Uptime from earliest trade
-    nba_trades = _read_json("trades.json").get("trades", [])
-    uptime_hours = 0.0
-    if nba_trades:
-        timestamps = [_parse_ts(t.get("timestamp")) for t in nba_trades]
-        timestamps = [t for t in timestamps if t is not None]
-        if timestamps:
-            earliest = min(timestamps)
-            uptime_hours = round(
-                (datetime.now(timezone.utc) - earliest).total_seconds() / 3600, 1
-            )
-
-    # Odds API credits remaining
-    odds_api_credits = system_status.get("odds_api_credits")
-    if odds_api_credits is None:
-        odds_key = os.environ.get("ODDS_API_KEY", "")
-        if odds_key:
-            try:
-                req = _urlreq.Request(
-                    f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={odds_key}&regions=us&markets=h2h&oddsFormat=decimal&bookmakers=draftkings",
-                    headers={"Accept": "application/json"},
-                )
-                with _urlreq.urlopen(req, timeout=5) as resp:
-                    odds_api_credits = int(resp.headers.get("x-requests-remaining", 0))
-            except Exception:
-                odds_api_credits = None
-
-    # Quick API health checks
-    apis = {}
-    try:
-        req = _urlreq.Request(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            headers={"Accept": "application/json"},
-        )
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            apis["espn"] = resp.status == 200
-    except Exception:
-        apis["espn"] = False
-
-    try:
-        req = _urlreq.Request(
-            "https://gamma-api.polymarket.com/markets?limit=1&active=true",
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-        )
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            apis["polymarket"] = resp.status == 200
-    except Exception:
-        apis["polymarket"] = False
-
-    return {
-        "nba_last_scan": nba_last_scan,
-        "events_last_scan": system_status.get("events_last_scan"),
-        "odds_api_credits": odds_api_credits,
-        "uptime_hours": uptime_hours,
-        "apis": apis,
-        "bankroll": bankroll.get("current_bankroll", 0),
-        "is_paused": bankroll.get("is_paused", False),
-    }
-
-
 # ===========================================================================
 # Events Agent Endpoints
 # ===========================================================================
+
+# Events agent starting bankroll — ground truth after extreme_pricing damage.
+# Original deposit $440.58 minus ~$198 locked in unsellable junk positions.
+EVENTS_STARTING_BANKROLL = 242.11
+
 
 @app.get("/api/events/status", dependencies=[Depends(_require_auth)])
 def get_events_status() -> dict:
@@ -1094,17 +401,12 @@ def get_events_stats() -> dict:
     }
 
 
-# Events agent starting bankroll — ground truth after extreme_pricing damage.
-# Original deposit $440.58 minus ~$198 locked in unsellable junk positions.
-EVENTS_STARTING_BANKROLL = 242.11
-
-
 @app.get("/api/events/portfolio_value", dependencies=[Depends(_require_auth)])
 def get_events_portfolio_value() -> dict:
     """Mark-to-market portfolio value: cash + current value of all positions.
 
     Recalculates from first principles every call using the events-specific
-    starting bankroll ($242.11) — not the shared NBA bankroll ($440.58).
+    starting bankroll ($242.11).
     """
     import urllib.request as _urlreq
 
@@ -1443,11 +745,16 @@ def get_events_exit_status() -> dict:
 
         result.append({
             "id": p.get("id"),
-            "market_question": p.get("market_question"),
+            "market_question": (p.get("market_question") or "")[:60],
             "pnl_pct": round(pnl_pct, 1),
             "zone": zone,
             "zone_label": zone_label,
             "zone_icon": zone_icon,
+            "entry_price": p.get("entry_price"),
+            "current_price": live_price,
+            "cost": cost,
+            "peak_pnl_pct": p.get("peak_pnl_pct"),
+            "trailing_stop_pct": p.get("trailing_stop_pct"),
         })
 
     return {"positions": result}
@@ -1455,166 +762,118 @@ def get_events_exit_status() -> dict:
 
 @app.get("/api/events/categories", dependencies=[Depends(_require_auth)])
 def get_events_categories() -> dict:
-    """Category breakdown with $ amount and count per category."""
+    """Category-level P&L and position counts."""
     positions = _read_json("events_positions.json").get("positions", [])
-    open_pos = [p for p in positions if p.get("status") == "open"]
+    real_positions = [p for p in positions if _is_real_trade(p) or p.get("status") == "open"]
 
     categories: dict[str, dict] = {}
-    for p in open_pos:
+    for p in real_positions:
         cat = p.get("category", "other")
         if cat not in categories:
-            categories[cat] = {"count": 0, "amount": 0.0}
-        categories[cat]["count"] += 1
-        categories[cat]["amount"] += p.get("cost", 0) or 0
+            categories[cat] = {"open": 0, "closed": 0, "pnl": 0.0, "invested": 0.0}
+        if p.get("status") == "open":
+            categories[cat]["open"] += 1
+            categories[cat]["invested"] += p.get("cost", 0) or 0
+        else:
+            categories[cat]["closed"] += 1
+            categories[cat]["pnl"] += p.get("pnl", 0) or 0
+            categories[cat]["invested"] += p.get("cost", 0) or 0
 
-    # Round amounts
-    for v in categories.values():
-        v["amount"] = round(v["amount"], 2)
+    result = []
+    for cat, data in sorted(categories.items(), key=lambda x: -x[1]["invested"]):
+        roi = round(data["pnl"] / data["invested"] * 100, 1) if data["invested"] > 0 else 0
+        result.append({
+            "category": cat,
+            "open": data["open"],
+            "closed": data["closed"],
+            "pnl": round(data["pnl"], 2),
+            "invested": round(data["invested"], 2),
+            "roi": roi,
+        })
 
-    return {"categories": categories}
+    return {"categories": result}
 
 
 @app.get("/api/events/ticker", dependencies=[Depends(_require_auth)])
 def get_events_ticker() -> dict:
-    """Live price ticker data for active positions."""
-    import urllib.request as _urlreq
-
+    """Real-time ticker: last 20 events across trades and position changes."""
+    trades = _read_json("events_trades.json").get("trades", [])
     positions = _read_json("events_positions.json").get("positions", [])
-    open_pos = [p for p in positions if p.get("status") == "open"]
 
-    market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
-    market_prices: dict[str, float] = {}
-    for mkt_id in market_ids:
-        try:
-            url = f"https://gamma-api.polymarket.com/markets/{mkt_id}"
-            req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
-            with _urlreq.urlopen(req, timeout=8) as resp:
-                m = json.loads(resp.read())
-                try:
-                    outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    outcome_prices = []
-                tokens_raw = m.get("clobTokenIds", "") or ""
-                try:
-                    token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
-                except (json.JSONDecodeError, TypeError):
-                    token_list = []
-                for i, tok in enumerate(token_list):
-                    if i < len(outcome_prices):
-                        try:
-                            market_prices[tok] = float(outcome_prices[i])
-                        except (ValueError, TypeError):
-                            pass
-        except Exception:
-            pass
+    events = []
 
-    ticker = []
-    for p in open_pos:
-        tok = p.get("token_id", "")
-        live_price = market_prices.get(tok)
-        entry_price = p.get("entry_price", 0) or 0
-        question = p.get("market_question", "")
-        # Shorten question for ticker
-        short_q = question[:30] + ("..." if len(question) > 30 else "")
+    # Recent trades
+    for t in trades[-30:]:
+        action = t.get("action", "BUY")
+        question = (t.get("market_question") or "")[:50]
+        cost = t.get("cost", 0) or 0
+        price = t.get("price", 0) or 0
+        price_cents = f"{price * 100:.1f}¢"
+        pnl = t.get("pnl")
 
-        change_pct = 0
-        direction = "\u2192"
-        if live_price and entry_price > 0:
-            change_pct = (live_price - entry_price) / entry_price * 100
-            if change_pct > 0.5:
-                direction = "\u2191"
-            elif change_pct < -0.5:
-                direction = "\u2193"
+        if action == "BUY":
+            desc = f"BUY {question} @ {price_cents}"
+            evt_type = "buy"
+        else:
+            pnl_str = f"+${pnl:.2f}" if pnl and pnl > 0 else f"${pnl:.2f}" if pnl else ""
+            desc = f"SELL {question} {pnl_str}"
+            evt_type = "sell"
 
-        ticker.append({
-            "id": p.get("id"),
-            "question": short_q,
-            "price": round(live_price, 4) if live_price else None,
-            "entry_price": entry_price,
-            "change_pct": round(change_pct, 1),
-            "direction": direction,
-            "highlight": abs(change_pct) > 3,
+        events.append({
+            "time": t.get("timestamp"),
+            "type": evt_type,
+            "description": desc,
+            "amount": round(cost, 2) if action == "BUY" else round(abs(pnl or 0), 2),
         })
 
-    return {"ticker": ticker, "count": len(ticker)}
+    events.sort(key=lambda e: e["time"] or "", reverse=True)
+    return {"events": events[:20]}
 
 
 @app.get("/api/events/trade/{trade_id}", dependencies=[Depends(_require_auth)])
 def get_events_trade_detail(trade_id: str) -> dict:
-    """Single trade with signal attribution."""
-    positions = _read_json("events_positions.json").get("positions", [])
-    closed = [p for p in positions if p.get("status") != "open"]
-
-    trade = None
-    for p in closed:
-        if p.get("id") == trade_id:
-            trade = p
-            break
-
-    if not trade:
-        raise HTTPException(status_code=404, detail="Trade not found")
-
-    # Hold duration
-    entry_ts = _parse_ts(trade.get("entry_time"))
-    exit_ts = _parse_ts(trade.get("exit_time"))
-    hold_hours = None
-    if entry_ts and exit_ts:
-        hold_hours = round((exit_ts - entry_ts).total_seconds() / 3600, 1)
-
-    # Signal accuracy: if entry signals predicted the correct direction and trade was profitable
-    pnl = trade.get("pnl", 0) or 0
-    signals_correct = pnl > 0
-
-    return {
-        **trade,
-        "hold_hours": hold_hours,
-        "signals_correct": signals_correct,
-    }
+    """Get full details for a single trade."""
+    trades = _read_json("events_trades.json").get("trades", [])
+    for t in trades:
+        if t.get("id") == trade_id or t.get("position_id") == trade_id:
+            return t
+    raise HTTPException(status_code=404, detail="Trade not found")
 
 
 @app.post("/api/events/close/{position_id}", dependencies=[Depends(_require_auth)])
 def close_events_position(position_id: str) -> dict:
-    """Manually close a position — triggers smart executor exit."""
-    positions_data = _read_json("events_positions.json")
-    positions = positions_data.get("positions", [])
+    """Manual close: write a close request file that the agent picks up."""
+    close_dir = DATA_DIR / "close_requests"
+    close_dir.mkdir(parents=True, exist_ok=True)
 
-    target = None
-    for p in positions:
-        if p.get("id") == position_id and p.get("status") == "open":
-            target = p
-            break
-
-    if not target:
-        raise HTTPException(status_code=404, detail="Open position not found")
-
-    # Write a close request file that the executor will pick up
-    close_request = {
+    request_file = close_dir / f"{position_id}.json"
+    request_file.write_text(json.dumps({
         "position_id": position_id,
-        "market_id": target.get("market_id"),
-        "token_id": target.get("token_id"),
-        "side": target.get("side"),
-        "shares": target.get("shares"),
-        "reason": "manual_close_dashboard",
         "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard",
+    }))
+
+    return {"status": "queued", "position_id": position_id}
+
+
+@app.get("/api/events/lifecycle", dependencies=[Depends(_require_auth)])
+def get_events_lifecycle() -> dict:
+    """Lifecycle assessments for active markets."""
+    data = _read_json("lifecycle_assessments.json")
+    return {
+        "assessments": data.get("assessments", {}),
+        "timestamp": data.get("timestamp"),
     }
 
-    close_file = DATA_DIR / "close_requests.json"
-    existing = []
-    if close_file.exists():
-        try:
-            existing = json.loads(close_file.read_text())
-            if not isinstance(existing, list):
-                existing = []
-        except (json.JSONDecodeError, OSError):
-            existing = []
 
-    existing.append(close_request)
-    try:
-        close_file.write_text(json.dumps(existing, indent=2))
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write close request: {e}")
-
-    return {"ok": True, "message": f"Close request queued for position {position_id}", "position_id": position_id}
+@app.get("/api/events/regime", dependencies=[Depends(_require_auth)])
+def get_events_regime() -> dict:
+    """Regime detection for active markets."""
+    data = _read_json("regime_assessments.json")
+    return {
+        "assessments": data.get("assessments", {}),
+        "timestamp": data.get("timestamp"),
+    }
 
 
 # ===========================================================================
@@ -1623,179 +882,41 @@ def close_events_position(position_id: str) -> dict:
 
 @app.get("/api/intelligence/signals", dependencies=[Depends(_require_auth)])
 def get_intelligence_signals() -> dict:
-    """All recent signals (last 24h)."""
+    """Latest intelligence signals from all sources."""
     data = _read_json("intelligence_signals.json")
     signals = data.get("signals", []) if isinstance(data, dict) else []
-    return {"signals": signals}
 
+    # Sort by timestamp descending
+    signals.sort(key=lambda s: s.get("timestamp", ""), reverse=True)
 
-@app.get("/api/intelligence/scores", dependencies=[Depends(_require_auth)])
-def get_intelligence_scores() -> dict:
-    """Current composite scores per market."""
-    data = _read_json("intelligence_scores.json")
-    scores = data.get("scores", {}) if isinstance(data, dict) else {}
-    return {"scores": scores}
+    return {
+        "signals": signals[:100],
+        "total": len(signals),
+        "timestamp": data.get("timestamp") if isinstance(data, dict) else None,
+    }
 
 
 @app.get("/api/intelligence/health", dependencies=[Depends(_require_auth)])
 def get_intelligence_health() -> dict:
-    """Source health status."""
+    """Health status of all intelligence sources."""
     data = _read_json("intelligence_health.json")
-    if not data or not isinstance(data, dict):
-        # Return default health for all known sources
-        sources = [
-            "x_scanner", "orderbook", "metaculus",
-            "google_trends", "congress", "whale_tracker", "cross_market",
-        ]
-        data = {
-            s: {"status": "waiting", "last_update": None, "error": None}
-            for s in sources
-        }
-    return {"sources": data}
-
-
-@app.get("/api/intelligence/market/{market_id}", dependencies=[Depends(_require_auth)])
-def get_intelligence_market(market_id: str) -> dict:
-    """Deep-dive data for a single market — signals, composite, orderbook, prices."""
-    # Signals for this market
-    sig_data = _read_json("intelligence_signals.json")
-    all_signals = sig_data.get("signals", []) if isinstance(sig_data, dict) else []
-    market_signals = [s for s in all_signals if s.get("market_id") == market_id]
-
-    # Composite score
-    score_data = _read_json("intelligence_scores.json")
-    scores = score_data.get("scores", {}) if isinstance(score_data, dict) else {}
-    composite = scores.get(market_id, {})
-
-    # Orderbook depth (from orderbook_depth.json if available)
-    depth_data = _read_json("orderbook_depth.json")
-    orderbook_depth = {}
-    if isinstance(depth_data, dict):
-        orderbook_depth = depth_data.get(market_id, {})
-
-    # Price history (from price_history directory if available)
-    price_history = []
-    price_dir = DATA_DIR / "price_history"
-    if price_dir.exists():
-        price_file = price_dir / f"{market_id}.json"
-        if price_file.exists():
-            try:
-                pdata = json.loads(price_file.read_text())
-                price_history = pdata.get("prices", [])
-            except (json.JSONDecodeError, OSError):
-                pass
-
+    if not isinstance(data, dict):
+        return {"sources": {}, "timestamp": None}
     return {
-        "market_id": market_id,
-        "signals": market_signals,
-        "composite": composite,
-        "orderbook_depth": orderbook_depth,
-        "price_history": price_history,
+        "sources": {k: v for k, v in data.items() if k != "timestamp"},
+        "timestamp": data.get("timestamp"),
     }
 
 
-@app.get("/api/intelligence/backtest", dependencies=[Depends(_require_auth)])
-def get_intelligence_backtest(days: int = 30) -> dict:
-    """Run backtest and return results."""
-    try:
-        from intelligence.backtester import Backtester
-        bt = Backtester()
-        report = bt.run(days=days)
-        return report.to_dict()
-    except ImportError:
-        return {
-            "period_days": days,
-            "total_signals": 0,
-            "by_source": {},
-            "by_tier": {},
-            "equity_curve": [],
-            "best_source": "",
-            "worst_source": "",
-            "message": "Backtester not available — collecting data...",
-        }
-    except Exception as e:
-        return {
-            "period_days": days,
-            "total_signals": 0,
-            "by_source": {},
-            "by_tier": {},
-            "equity_curve": [],
-            "best_source": "",
-            "worst_source": "",
-            "error": str(e)[:200],
-        }
-
-
-# ===========================================================================
-# Advanced Intelligence Endpoints (lifecycle, regime, calibration, quality, dedup)
-# ===========================================================================
-
-@app.get("/api/events/lifecycle", dependencies=[Depends(_require_auth)])
-def get_events_lifecycle() -> dict:
-    """Lifecycle stages for all active markets."""
-    data = _read_json("lifecycle_assessments.json")
-    return {"assessments": data.get("assessments", {})}
-
-
-@app.get("/api/events/regime", dependencies=[Depends(_require_auth)])
-def get_events_regime() -> dict:
-    """Regime detection data for all active markets."""
-    data = _read_json("regime_assessments.json")
-    return {"assessments": data.get("assessments", {})}
-
-
-@app.get("/api/intelligence/calibration", dependencies=[Depends(_require_auth)])
-def get_intelligence_calibration() -> dict:
-    """Calibrator weights, accuracy, and history."""
-    history = _read_json("calibration_history.json")
-    entries = history.get("entries", [])
-
-    # Default weights for comparison
-    default_weights = {
-        "metaculus": 0.25, "x_scanner": 0.20, "orderbook": 0.15,
-        "whale_tracker": 0.15, "google_trends": 0.10, "congress": 0.08,
-        "cross_market": 0.07,
-    }
-
-    latest = entries[-1] if entries else {}
+@app.get("/api/intelligence/composite", dependencies=[Depends(_require_auth)])
+def get_intelligence_composite() -> dict:
+    """Composite scores for active markets."""
+    data = _read_json("composite_scores.json")
+    scores = data.get("scores", {}) if isinstance(data, dict) else {}
     return {
-        "default_weights": default_weights,
-        "current_weights": latest.get("weights", default_weights),
-        "source_accuracy": latest.get("source_accuracy", {}),
-        "last_calibrated": latest.get("timestamp"),
-        "total_resolved": latest.get("total_resolved", 0),
-        "history": entries[-30:],  # Last 30 calibration snapshots
+        "scores": scores,
+        "timestamp": data.get("timestamp") if isinstance(data, dict) else None,
     }
-
-
-@app.get("/api/intelligence/quality", dependencies=[Depends(_require_auth)])
-def get_intelligence_quality() -> dict:
-    """Live signal quality scores for each source."""
-    data = _read_json("live_quality_log.json")
-    report = data.get("health_report", {})
-
-    # If no pre-computed report, build a simple one from log entries
-    if not report:
-        entries = data.get("entries", [])
-        by_source: dict[str, dict] = {}
-        for e in entries[-200:]:  # Last 200 entries
-            src = e.get("source", "")
-            if src not in by_source:
-                by_source[src] = {"correct": 0, "total": 0}
-            by_source[src]["total"] += 1
-            if e.get("outcome") == "correct":
-                by_source[src]["correct"] += 1
-
-        for src, info in by_source.items():
-            acc = info["correct"] / info["total"] if info["total"] > 0 else 0
-            report[src] = {
-                "accuracy_7d": round(acc, 3),
-                "signals_7d": info["total"],
-                "status": "hot" if acc > 0.65 else ("cold" if acc < 0.40 else "normal"),
-                "multiplier": min(1.3, max(0.5, acc / 0.5)) if info["total"] >= 3 else 1.0,
-            }
-
-    return {"sources": report}
 
 
 @app.get("/api/intelligence/dedup", dependencies=[Depends(_require_auth)])
@@ -1812,28 +933,17 @@ def get_intelligence_dedup() -> dict:
 
 
 # ===========================================================================
-# Cross-Agent Analytics Endpoints
+# Analytics Endpoints
 # ===========================================================================
 
 @app.get("/api/analytics/equity_curve", dependencies=[Depends(_require_auth)])
 def get_analytics_equity_curve() -> dict:
-    """Combined equity curve data — NBA, Events, and Combined."""
+    """Equity curve data — events only."""
     bankroll_data = _read_json("bankroll.json")
     starting = bankroll_data.get("starting_bankroll", 242.11)
     from datetime import timedelta as _td
 
     SGT = timezone(_td(hours=8))
-
-    # NBA equity data
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
-
-    nba_daily: dict[str, float] = defaultdict(float)
-    for p in nba_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
-            nba_daily[day] += p.get("pnl", 0) or 0
 
     # Events equity data
     events_positions = _read_json("events_positions.json").get("positions", [])
@@ -1846,145 +956,58 @@ def get_analytics_equity_curve() -> dict:
             day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
             events_daily[day] += p.get("pnl", 0) or 0
 
-    # Merge all days
-    all_days = sorted(set(list(nba_daily.keys()) + list(events_daily.keys())))
+    all_days = sorted(events_daily.keys())
 
-    nba_curve = []
     events_curve = []
-    combined_curve = []
-    nba_running = 0
     events_running = 0
 
     for day in all_days:
-        nba_running += nba_daily.get(day, 0)
         events_running += events_daily.get(day, 0)
-        nba_curve.append({"date": day, "value": round(nba_running, 2)})
         events_curve.append({"date": day, "value": round(events_running, 2)})
-        combined_curve.append({"date": day, "value": round(nba_running + events_running, 2)})
 
     return {
-        "nba": nba_curve,
         "events": events_curve,
-        "combined": combined_curve,
         "starting_bankroll": starting,
     }
 
 
-@app.get("/api/analytics/correlation", dependencies=[Depends(_require_auth)])
-def get_analytics_correlation() -> dict:
-    """Agent P&L correlation matrix — NBA vs Events daily returns."""
-    from datetime import timedelta as _td
-
-    SGT = timezone(_td(hours=8))
-
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
-
-    events_positions = _read_json("events_positions.json").get("positions", [])
-    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
-
-    # Build daily P&L maps
-    nba_daily: dict[str, float] = defaultdict(float)
-    events_daily: dict[str, float] = defaultdict(float)
-
-    for p in nba_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
-            nba_daily[day] += p.get("pnl", 0) or 0
-
-    for p in events_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
-            events_daily[day] += p.get("pnl", 0) or 0
-
-    # Find shared days for correlation calculation
-    shared_days = sorted(set(nba_daily.keys()) & set(events_daily.keys()))
-
-    nba_values = [nba_daily[d] for d in shared_days]
-    events_values = [events_daily[d] for d in shared_days]
-
-    # Calculate Pearson correlation
-    def pearson(x: list, y: list) -> float:
-        n = len(x)
-        if n < 3:
-            return 0.0
-        mean_x = sum(x) / n
-        mean_y = sum(y) / n
-        num = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y))
-        den_x = sum((a - mean_x) ** 2 for a in x) ** 0.5
-        den_y = sum((b - mean_y) ** 2 for b in y) ** 0.5
-        if den_x == 0 or den_y == 0:
-            return 0.0
-        return round(num / (den_x * den_y), 3)
-
-    nba_events_corr = pearson(nba_values, events_values)
-
-    # 3x3 matrix (NBA, Events, Intelligence — Intelligence placeholder for now)
-    matrix = {
-        "agents": ["NBA", "Events", "Intelligence"],
-        "values": [
-            [1.0, nba_events_corr, 0.0],
-            [nba_events_corr, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        "shared_days": len(shared_days),
-    }
-
-    return matrix
-
-
 @app.get("/api/analytics/allocation", dependencies=[Depends(_require_auth)])
 def get_analytics_allocation() -> dict:
-    """Current bankroll allocation across agents."""
+    """Current bankroll allocation."""
     bankroll_data = _read_json("bankroll.json")
     total_bankroll = bankroll_data.get("current_bankroll", 0)
-    starting = bankroll_data.get("starting_bankroll", 242.11)
-
-    # NBA open positions
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_open = [p for p in nba_positions if p.get("status") == "open"]
-    nba_deployed = sum(p.get("cost", 0) or 0 for p in nba_open)
 
     # Events open positions
     events_positions = _read_json("events_positions.json").get("positions", [])
     events_open = [p for p in events_positions if p.get("status") == "open"]
     events_deployed = sum(p.get("cost", 0) or 0 for p in events_open)
 
-    total_deployed = nba_deployed + events_deployed
-    cash = max(0, total_bankroll - total_deployed)
+    cash = max(0, total_bankroll - events_deployed)
 
     return {
         "total_bankroll": round(total_bankroll, 2),
         "segments": [
-            {"label": "NBA", "value": round(nba_deployed, 2), "color": "#00f0ff"},
             {"label": "Events", "value": round(events_deployed, 2), "color": "#8B5CF6"},
             {"label": "Cash", "value": round(cash, 2), "color": "#374151"},
         ],
-        "total_deployed": round(total_deployed, 2),
-        "deployed_pct": round(total_deployed / total_bankroll * 100, 1) if total_bankroll > 0 else 0,
+        "total_deployed": round(events_deployed, 2),
+        "deployed_pct": round(events_deployed / total_bankroll * 100, 1) if total_bankroll > 0 else 0,
     }
 
 
 @app.get("/api/analytics/risk", dependencies=[Depends(_require_auth)])
 def get_analytics_risk() -> dict:
-    """Portfolio risk dashboard — exposure by agent, theme concentration, diversification."""
+    """Portfolio risk dashboard — exposure, theme concentration, diversification."""
     bankroll_data = _read_json("bankroll.json")
     total_bankroll = bankroll_data.get("current_bankroll", 0) or 1
     max_exposure_pct = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
-
-    # NBA exposure
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_open = [p for p in nba_positions if p.get("status") == "open"]
-    nba_exposure = sum(p.get("cost", 0) or 0 for p in nba_open)
 
     # Events exposure
     events_positions = _read_json("events_positions.json").get("positions", [])
     events_open = [p for p in events_positions if p.get("status") == "open"]
     events_exposure = sum(p.get("cost", 0) or 0 for p in events_open)
 
-    total_exposure = nba_exposure + events_exposure
+    total_exposure = events_exposure
 
     # Theme concentration (from events positions)
     theme_map = {
@@ -2012,24 +1035,19 @@ def get_analytics_risk() -> dict:
             theme_exposure["other"] += cost
 
     # Diversification score (0-100)
-    # More themes = more diversified; single theme = concentrated
     if total_exposure > 0:
         theme_pcts = [v / total_exposure for v in theme_exposure.values()]
-        # Herfindahl-Hirschman Index based score
         hhi = sum(p ** 2 for p in theme_pcts) if theme_pcts else 1.0
-        # HHI of 1.0 = completely concentrated, 1/n = perfectly diversified
         n = max(len(theme_pcts), 1)
         min_hhi = 1.0 / n
         div_score = max(0, min(100, int((1.0 - (hhi - min_hhi) / (1.0 - min_hhi + 0.01)) * 100)))
     else:
-        div_score = 100  # No positions = no risk
+        div_score = 100
 
     return {
         "total_bankroll": round(total_bankroll, 2),
         "total_deployed": round(total_exposure, 2),
         "available": round(max(0, total_bankroll - total_exposure), 2),
-        "nba_exposure": round(nba_exposure, 2),
-        "nba_pct": round(nba_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
         "events_exposure": round(events_exposure, 2),
         "events_pct": round(events_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
         "total_pct": round(total_exposure / total_bankroll * 100, 1) if total_bankroll else 0,
@@ -2097,12 +1115,12 @@ def get_analytics_signal_performance() -> dict:
 
 
 # ===========================================================================
-# Dashboard Overhaul — Combined & Enhanced Endpoints
+# Combined / Overview Endpoints
 # ===========================================================================
 
 @app.get("/api/combined/overview", dependencies=[Depends(_require_auth)])
 def get_combined_overview() -> dict:
-    """Combined portfolio overview across NBA and Events agents."""
+    """Portfolio overview — events agent."""
     from datetime import timedelta as td
 
     SGT = timezone(td(hours=8))
@@ -2111,36 +1129,6 @@ def get_combined_overview() -> dict:
 
     bankroll_data = _read_json("bankroll.json")
     system_status = _read_json("system_status.json")
-
-    # --- NBA agent data ---
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_trades_raw = _read_json("trades.json").get("trades", [])
-    nba_open = [p for p in nba_positions if p.get("status") == "open"]
-    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
-
-    nba_mode = "paper"
-    if nba_trades_raw:
-        nba_mode = nba_trades_raw[-1].get("mode", "paper")
-
-    nba_total_pnl = sum(p.get("pnl", 0) or 0 for p in nba_closed)
-    nba_total_trades = len(nba_closed)
-    nba_wins = sum(1 for p in nba_closed if (p.get("pnl") or 0) > 0)
-    nba_win_rate = round(nba_wins / nba_total_trades * 100, 1) if nba_total_trades > 0 else 0.0
-
-    # NBA today P&L and trades (SGT)
-    nba_today_pnl = 0.0
-    nba_today_trades = 0
-    for p in nba_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts and exit_ts >= today_start:
-            nba_today_pnl += p.get("pnl", 0) or 0
-            nba_today_trades += 1
-
-    nba_last_scan = system_status.get("nba_last_scan")
-    if not nba_last_scan and nba_trades_raw:
-        ts_list = [t.get("timestamp") for t in nba_trades_raw if t.get("timestamp")]
-        if ts_list:
-            nba_last_scan = max(ts_list)
 
     # --- Events agent data ---
     events_positions = _read_json("events_positions.json").get("positions", [])
@@ -2168,26 +1156,15 @@ def get_combined_overview() -> dict:
 
     events_last_scan = system_status.get("events_last_scan")
 
-    # --- Combined totals ---
-    total_open = nba_open + events_open
-    total_exposure = sum(p.get("cost", 0) or 0 for p in total_open)
+    total_exposure = sum(p.get("cost", 0) or 0 for p in events_open)
 
     return {
         "total_portfolio": round(bankroll_data.get("current_bankroll", 0), 2),
-        "total_pnl": round(nba_total_pnl + events_total_pnl, 2),
-        "total_open_positions": len(total_open),
+        "total_pnl": round(events_total_pnl, 2),
+        "total_open_positions": len(events_open),
         "total_exposure": round(total_exposure, 2),
-        "today_pnl": round(nba_today_pnl + events_today_pnl, 2),
-        "today_trades": nba_today_trades + events_today_trades,
-        "nba": {
-            "mode": nba_mode,
-            "open_count": len(nba_open),
-            "today_pnl": round(nba_today_pnl, 2),
-            "today_trades": nba_today_trades,
-            "win_rate": nba_win_rate,
-            "total_trades": nba_total_trades,
-            "last_scan": nba_last_scan,
-        },
+        "today_pnl": round(events_today_pnl, 2),
+        "today_trades": events_today_trades,
         "events": {
             "mode": events_mode,
             "open_count": len(events_open),
@@ -2202,22 +1179,12 @@ def get_combined_overview() -> dict:
 
 @app.get("/api/combined/equity-curve", dependencies=[Depends(_require_auth)])
 def get_combined_equity_curve() -> dict:
-    """Daily cumulative P&L for NBA, Events, and combined — grouped by SGT date."""
+    """Daily cumulative P&L — grouped by SGT date."""
     from datetime import timedelta as td
 
     SGT = timezone(td(hours=8))
     bankroll_data = _read_json("bankroll.json")
     starting = bankroll_data.get("starting_bankroll", 242.11)
-
-    # NBA daily P&L
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
-    nba_daily: dict[str, float] = defaultdict(float)
-    for p in nba_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
-            nba_daily[day] += p.get("pnl", 0) or 0
 
     # Events daily P&L
     events_positions = _read_json("events_positions.json").get("positions", [])
@@ -2229,55 +1196,33 @@ def get_combined_equity_curve() -> dict:
             day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
             events_daily[day] += p.get("pnl", 0) or 0
 
-    all_days = sorted(set(list(nba_daily.keys()) + list(events_daily.keys())))
+    all_days = sorted(events_daily.keys())
 
     dates = []
-    nba_cumulative = []
     events_cumulative = []
-    combined_cumulative = []
-    nba_running = 0.0
     events_running = 0.0
 
     for day in all_days:
-        nba_running += nba_daily.get(day, 0.0)
         events_running += events_daily.get(day, 0.0)
         dates.append(day)
-        nba_cumulative.append(round(nba_running, 2))
         events_cumulative.append(round(events_running, 2))
-        combined_cumulative.append(round(nba_running + events_running, 2))
 
     return {
         "dates": dates,
-        "nba_cumulative": nba_cumulative,
         "events_cumulative": events_cumulative,
-        "combined_cumulative": combined_cumulative,
         "starting_bankroll": starting,
     }
 
 
 @app.get("/api/combined/heatmap", dependencies=[Depends(_require_auth)])
 def get_combined_heatmap() -> dict:
-    """90-day calendar heatmap: daily P&L and trade counts across both agents."""
+    """90-day calendar heatmap: daily P&L and trade counts."""
     from datetime import timedelta as td
 
     SGT = timezone(td(hours=8))
     now_sgt = datetime.now(SGT)
     cutoff = now_sgt - td(days=90)
     cutoff_str = cutoff.strftime("%Y-%m-%d")
-
-    # Collect daily stats from NBA
-    nba_positions = _read_json("positions.json").get("positions", [])
-    nba_closed = [p for p in nba_positions if p.get("status") != "open"]
-
-    nba_day_pnl: dict[str, float] = defaultdict(float)
-    nba_day_trades: dict[str, int] = defaultdict(int)
-    for p in nba_closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day = exit_ts.astimezone(SGT).strftime("%Y-%m-%d")
-            if day >= cutoff_str:
-                nba_day_pnl[day] += p.get("pnl", 0) or 0
-                nba_day_trades[day] += 1
 
     # Collect daily stats from Events
     events_positions = _read_json("events_positions.json").get("positions", [])
@@ -2293,18 +1238,16 @@ def get_combined_heatmap() -> dict:
                 events_day_pnl[day] += p.get("pnl", 0) or 0
                 events_day_trades[day] += 1
 
-    all_days = sorted(set(list(nba_day_pnl.keys()) + list(events_day_pnl.keys())))
+    all_days = sorted(events_day_pnl.keys())
 
     days_out = []
     for day in all_days:
-        nba_pnl = nba_day_pnl.get(day, 0.0)
         ev_pnl = events_day_pnl.get(day, 0.0)
-        total_trades = nba_day_trades.get(day, 0) + events_day_trades.get(day, 0)
+        total_trades = events_day_trades.get(day, 0)
         days_out.append({
             "date": day,
-            "pnl": round(nba_pnl + ev_pnl, 2),
+            "pnl": round(ev_pnl, 2),
             "trades": total_trades,
-            "nba_pnl": round(nba_pnl, 2),
             "events_pnl": round(ev_pnl, 2),
         })
 
@@ -2313,39 +1256,8 @@ def get_combined_heatmap() -> dict:
 
 @app.get("/api/combined/activity-feed", dependencies=[Depends(_require_auth)])
 def get_combined_activity_feed() -> dict:
-    """Last 50 activities (trades placed / resolved) across both agents, newest first."""
+    """Last 50 activities (trades placed / resolved), newest first."""
     activities: list[dict] = []
-
-    # --- NBA: derive from positions (closed = resolved, open = placed) ---
-    nba_positions = _read_json("positions.json").get("positions", [])
-    for p in nba_positions:
-        question = p.get("market_question") or ""
-        short_q = question[:60] + ("..." if len(question) > 60 else "")
-        pnl = p.get("pnl") or 0
-
-        if p.get("status") != "open" and p.get("exit_time"):
-            # Resolved trade
-            won = pnl > 0
-            label = f"WIN +${pnl:.2f}" if won else f"LOSS ${pnl:.2f}"
-            activities.append({
-                "time": p["exit_time"],
-                "agent": "nba",
-                "type": "win" if won else "loss",
-                "description": f"{short_q} — {label}",
-                "amount": round(abs(pnl), 2),
-            })
-        elif p.get("status") == "open" and p.get("entry_time"):
-            # Bet placed
-            cost = p.get("cost", 0) or 0
-            side = p.get("side", "YES")
-            entry_price = p.get("entry_price", 0) or 0
-            activities.append({
-                "time": p["entry_time"],
-                "agent": "nba",
-                "type": "bet_placed",
-                "description": f"{short_q} — {side} @ {entry_price:.2f}",
-                "amount": round(cost, 2),
-            })
 
     # --- Events: derive from positions ---
     events_positions = _read_json("events_positions.json").get("positions", [])
@@ -2383,139 +1295,9 @@ def get_combined_activity_feed() -> dict:
     return {"activities": activities[:50]}
 
 
-@app.get("/api/nba/enhanced-analytics", dependencies=[Depends(_require_auth)])
-def get_nba_enhanced_analytics() -> dict:
-    """Enhanced NBA analytics: P&L histogram, day-of-week, hourly heatmap, streaks, scatter."""
-    from datetime import timedelta as td
-    import math
-
-    SGT = timezone(td(hours=8))
-
-    nba_positions = _read_json("positions.json").get("positions", [])
-    closed = [p for p in nba_positions if p.get("status") != "open"]
-    # Sort chronologically for streak computation
-    closed_sorted = sorted(closed, key=lambda p: p.get("exit_time") or "")
-
-    # --- P&L Distribution Histogram ---
-    pnl_values = [p.get("pnl", 0) or 0 for p in closed]
-    # Fixed bucket boundaries
-    buckets = [
-        (float("-inf"), -30, "< -$30"),
-        (-30, -20, "-$30 to -$20"),
-        (-20, -10, "-$20 to -$10"),
-        (-10, 0,  "-$10 to $0"),
-        (0,   10,  "$0 to $10"),
-        (10,  20,  "$10 to $20"),
-        (20,  30,  "$20 to $30"),
-        (30,  float("inf"), "> $30"),
-    ]
-    bucket_counts: dict[str, int] = {label: 0 for _, _, label in buckets}
-    for pnl in pnl_values:
-        for lo, hi, label in buckets:
-            if lo <= pnl < hi:
-                bucket_counts[label] += 1
-                break
-    pnl_distribution = [{"bucket": label, "count": cnt} for label, cnt in bucket_counts.items()]
-
-    # --- Day-of-Week breakdown (SGT exit date) ---
-    days_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    dow_data: dict[str, dict] = {d: {"trades": 0, "pnl": 0.0, "wins": 0} for d in days_order}
-    for p in closed:
-        exit_ts = _parse_ts(p.get("exit_time"))
-        if exit_ts:
-            day_abbr = exit_ts.astimezone(SGT).strftime("%a")  # Mon, Tue, ...
-            if day_abbr in dow_data:
-                dow_data[day_abbr]["trades"] += 1
-                dow_data[day_abbr]["pnl"] += p.get("pnl", 0) or 0
-                if (p.get("pnl") or 0) > 0:
-                    dow_data[day_abbr]["wins"] += 1
-    day_of_week = []
-    for d in days_order:
-        v = dow_data[d]
-        t = v["trades"]
-        wr = round(v["wins"] / t * 100, 1) if t > 0 else 0.0
-        day_of_week.append({"day": d, "trades": t, "pnl": round(v["pnl"], 2), "win_rate": wr})
-
-    # --- Entry Hour Heatmap (UTC hour of entry_time) ---
-    hour_data: dict[int, dict] = {h: {"trades": 0, "pnl": 0.0, "wins": 0} for h in range(24)}
-    for p in closed:
-        entry_ts = _parse_ts(p.get("entry_time"))
-        if entry_ts:
-            h = entry_ts.astimezone(timezone.utc).hour
-            hour_data[h]["trades"] += 1
-            hour_data[h]["pnl"] += p.get("pnl", 0) or 0
-            if (p.get("pnl") or 0) > 0:
-                hour_data[h]["wins"] += 1
-    entry_hour_heatmap = []
-    for h in range(24):
-        v = hour_data[h]
-        t = v["trades"]
-        wr = round(v["wins"] / t * 100, 1) if t > 0 else 0.0
-        entry_hour_heatmap.append({"hour": h, "trades": t, "pnl": round(v["pnl"], 2), "win_rate": wr})
-
-    # --- Streak History (chronological W/L sequence) ---
-    streak_history = []
-    for p in closed_sorted:
-        streak_history.append("W" if (p.get("pnl") or 0) > 0 else "L")
-
-    # --- Opponent Scatter (opponent win% vs edge at entry) ---
-    opponent_scatter = []
-    for p in closed:
-        opp_wr = p.get("opponent_win_pct")
-        edge = p.get("edge_at_entry")
-        cost = p.get("cost", 0) or 0
-        if opp_wr is not None and edge is not None:
-            opponent_scatter.append({
-                "opponent_wr": round(float(opp_wr), 4),
-                "edge": round(float(edge), 4),
-                "bet_size": round(cost, 2),
-                "won": (p.get("pnl") or 0) > 0,
-                "market": (p.get("market_question") or "")[:60],
-            })
-
-    # --- Edge vs Outcome Scatter ---
-    edge_vs_outcome = []
-    for p in closed:
-        edge = p.get("edge_at_entry")
-        pnl = p.get("pnl") or 0
-        if edge is not None:
-            edge_vs_outcome.append({
-                "edge_at_entry": round(float(edge), 4),
-                "pnl": round(pnl, 2),
-                "won": pnl > 0,
-                "market": (p.get("market_question") or "")[:60],
-            })
-
-    # --- Sizing Funnel ---
-    raw_kelly_values = [p.get("raw_kelly") for p in closed if p.get("raw_kelly") is not None]
-    capped_values   = [p.get("kelly_capped") for p in closed if p.get("kelly_capped") is not None]
-    floored_values  = [p.get("kelly_floored") for p in closed if p.get("kelly_floored") is not None]
-    final_sizes     = [p.get("cost", 0) or 0 for p in closed]
-
-    def _avg(lst: list) -> float:
-        return round(sum(lst) / len(lst), 4) if lst else 0.0
-
-    sizing_funnel = {
-        "raw_kelly_avg": _avg(raw_kelly_values),
-        "after_cap": _avg(capped_values),
-        "after_floor": _avg(floored_values),
-        "final_avg": round(_avg(final_sizes), 2),
-    }
-
-    return {
-        "pnl_distribution": pnl_distribution,
-        "day_of_week": day_of_week,
-        "entry_hour_heatmap": entry_hour_heatmap,
-        "streak_history": streak_history,
-        "opponent_scatter": opponent_scatter,
-        "edge_vs_outcome": edge_vs_outcome,
-        "sizing_funnel": sizing_funnel,
-    }
-
-
 @app.get("/api/combined/odds-snapshot", dependencies=[Depends(_require_auth)])
 def get_combined_odds_snapshot() -> dict:
-    """Current odds being watched across both agents. Reads odds_snapshots.json."""
+    """Current odds being watched. Reads odds_snapshots.json."""
     data = _read_json("odds_snapshots.json")
     if not data:
         return {"snapshots": [], "last_updated": None}
@@ -2529,176 +1311,6 @@ def get_combined_odds_snapshot() -> dict:
         last_updated = data.get("last_updated") or data.get("timestamp")
 
     return {"snapshots": snapshots, "last_updated": last_updated}
-
-
-# ---------------------------------------------------------------------------
-# Stock Agent endpoints
-# ---------------------------------------------------------------------------
-_STOCK_DATA_SUBDIR = "stock_agent"
-
-
-def _read_stock_json(filename: str) -> Any:
-    """Read a JSON file from the stock agent's data directory."""
-    # Try primary data dir first, then VPS path
-    for base in [DATA_DIR, Path("/root/polymarket-bot/data")]:
-        path = base / _STOCK_DATA_SUBDIR / filename
-        if path.exists():
-            try:
-                return json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-    return {}
-
-
-@app.get("/api/stocks/summary", dependencies=[Depends(_require_auth)])
-def stocks_summary() -> dict:
-    """Return stock portfolio summary KPIs."""
-    portfolio = _read_stock_json("portfolio.json")
-    if not portfolio:
-        return {
-            "portfolio_value": 0, "cash": 0, "invested": 0,
-            "total_pnl": 0, "roi": 0, "wins": 0, "losses": 0,
-            "total_trades": 0, "win_rate": 0, "open_positions": 0,
-            "exposure_pct": 0, "today_pnl": 0, "today_trades": 0,
-            "mode": "PAPER", "max_drawdown": 0, "sharpe_ratio": 0,
-        }
-
-    # Support both flat and nested formats
-    summary = portfolio.get("summary", portfolio)
-    positions = portfolio.get("positions", [])
-    trades = portfolio.get("trades", [])
-
-    cash = summary.get("cash", summary.get("cash_balance", 0))
-    invested = summary.get("invested", summary.get("positions_value", 0))
-    portfolio_value = summary.get("portfolio_value", summary.get("total_value", cash + invested))
-
-    wins = summary.get("wins", 0)
-    losses = summary.get("losses", 0)
-    total_trades = summary.get("total_trades", wins + losses)
-    win_rate = summary.get("win_rate", (wins / total_trades * 100) if total_trades > 0 else 0)
-
-    open_positions = len([p for p in positions if p.get("status", "open") == "open"]) if positions else summary.get("open_positions", summary.get("open_count", 0))
-
-    return {
-        "portfolio_value": portfolio_value,
-        "cash": cash,
-        "invested": invested,
-        "total_pnl": summary.get("total_pnl", summary.get("realized_pnl", 0)),
-        "roi": summary.get("roi", 0),
-        "wins": wins,
-        "losses": losses,
-        "total_trades": total_trades,
-        "win_rate": round(win_rate, 1),
-        "open_positions": open_positions,
-        "exposure_pct": summary.get("exposure_pct", 0),
-        "today_pnl": summary.get("today_pnl", summary.get("daily_pnl", 0)),
-        "today_trades": summary.get("today_trades", 0),
-        "mode": summary.get("mode", "PAPER"),
-        "max_drawdown": summary.get("max_drawdown", 0),
-        "sharpe_ratio": summary.get("sharpe_ratio", 0),
-        "last_scan": summary.get("last_scan", summary.get("last_updated", None)),
-        "equity_curve": summary.get("equity_curve", summary.get("sparkline", [])),
-    }
-
-
-@app.get("/api/stocks/positions", dependencies=[Depends(_require_auth)])
-def stocks_positions() -> list:
-    """Return current stock positions with theses."""
-    portfolio = _read_stock_json("portfolio.json")
-    positions = portfolio.get("positions", [])
-    if not positions:
-        # Try standalone positions file
-        positions_data = _read_stock_json("positions.json")
-        if isinstance(positions_data, list):
-            positions = positions_data
-        elif isinstance(positions_data, dict):
-            positions = positions_data.get("positions", [])
-
-    # Filter to open only
-    return [p for p in positions if p.get("status", "open") == "open"]
-
-
-@app.get("/api/stocks/trades", dependencies=[Depends(_require_auth)])
-def stocks_trades() -> list:
-    """Return stock trade history."""
-    portfolio = _read_stock_json("portfolio.json")
-    trades = portfolio.get("trades", [])
-    if not trades:
-        trades_data = _read_stock_json("trades.json")
-        if isinstance(trades_data, list):
-            trades = trades_data
-        elif isinstance(trades_data, dict):
-            trades = trades_data.get("trades", [])
-
-    # Sort newest first
-    trades.sort(
-        key=lambda t: t.get("timestamp", t.get("exit_time", t.get("closed_at", ""))),
-        reverse=True,
-    )
-    return trades[:50]
-
-
-@app.get("/api/stocks/signals", dependencies=[Depends(_require_auth)])
-def stocks_signals() -> list:
-    """Return recent stock signals."""
-    signals_data = _read_stock_json("signals.json")
-    if isinstance(signals_data, list):
-        signals = signals_data
-    elif isinstance(signals_data, dict):
-        signals = signals_data.get("signals", signals_data.get("items", []))
-    else:
-        signals = []
-
-    signals.sort(
-        key=lambda s: s.get("timestamp", s.get("created_at", s.get("time", ""))),
-        reverse=True,
-    )
-    return signals[:30]
-
-
-@app.get("/api/stocks/equity-curve", dependencies=[Depends(_require_auth)])
-def stocks_equity_curve() -> dict:
-    """Return equity curve data for charting."""
-    equity_data = _read_stock_json("equity_curve.json")
-    if not equity_data:
-        # Fall back to portfolio.json
-        portfolio = _read_stock_json("portfolio.json")
-        curve = portfolio.get("equity_curve", portfolio.get("history", []))
-        if isinstance(curve, list) and len(curve) > 0:
-            if isinstance(curve[0], dict):
-                labels = [d.get("date", d.get("day", "")) for d in curve]
-                values = [d.get("value", d.get("portfolio_value", d.get("cumulative_pnl", 0))) for d in curve]
-            else:
-                labels = []
-                values = curve
-            return {"labels": labels, "portfolio": values, "benchmark": []}
-        return {"labels": [], "portfolio": [], "benchmark": []}
-
-    if isinstance(equity_data, list):
-        if len(equity_data) > 0 and isinstance(equity_data[0], dict):
-            labels = [d.get("date", d.get("day", "")) for d in equity_data]
-            values = [d.get("value", d.get("portfolio_value", d.get("cumulative_pnl", 0))) for d in equity_data]
-        else:
-            labels = []
-            values = equity_data
-        return {"labels": labels, "portfolio": values, "benchmark": []}
-
-    return {
-        "labels": equity_data.get("labels", equity_data.get("dates", [])),
-        "portfolio": equity_data.get("portfolio", equity_data.get("equity", equity_data.get("values", []))),
-        "benchmark": equity_data.get("benchmark", []),
-    }
-
-
-@app.get("/api/stocks/theses", dependencies=[Depends(_require_auth)])
-def stocks_theses() -> list:
-    """Return active theses."""
-    theses_data = _read_stock_json("theses.json")
-    if isinstance(theses_data, list):
-        return theses_data
-    if isinstance(theses_data, dict):
-        return theses_data.get("theses", theses_data.get("items", []))
-    return []
 
 
 if __name__ == "__main__":

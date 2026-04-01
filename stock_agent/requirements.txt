@@ -1,5 +1,0 @@
-# Stock Agent dependencies (already in main requirements.txt)
-httpx>=0.24
-pydantic>=2.0
-python-dotenv>=1.0
-playwright>=1.40

@@ -17,7 +17,7 @@ import httpx
 
 from intelligence.config import IntelligenceConfig
 from intelligence.models import Signal
-from nba_agent.utils import utcnow
+from shared.utils import utcnow
 
 logger = logging.getLogger("intelligence.cross_market")
 

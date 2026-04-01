@@ -1,4 +1,4 @@
-"""Combined midnight Telegram digest — merges all agents into one summary."""
+"""Combined midnight Telegram digest — events agent summary."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from shared.config import SharedConfig
-from nba_agent.utils import load_json, utcnow
+from shared.utils import load_json, utcnow
 
 logger = logging.getLogger(__name__)
 
 
 class CombinedDigest:
-    """Sends a single combined daily summary for all agents at midnight SGT (16:00 UTC)."""
+    """Sends a daily summary at midnight SGT (16:00 UTC)."""
 
     def __init__(self, config: SharedConfig | None = None) -> None:
         self.config = config or SharedConfig()
@@ -33,7 +33,7 @@ class CombinedDigest:
         return True
 
     async def send_combined_digest(self) -> bool:
-        """Generate and send the combined daily digest."""
+        """Generate and send the daily digest."""
         now = utcnow()
         data_dir = self.config.DATA_DIR
 
@@ -43,28 +43,18 @@ class CombinedDigest:
         starting = bankroll_data.get("starting_bankroll", 0)
         is_paused = bankroll_data.get("is_paused", False)
 
-        # Read NBA data
-        nba_stats = self._get_agent_stats(
-            data_dir / "positions.json",
-            data_dir / "trades.json",
-        )
-
         # Read Events data
         events_stats = self._get_agent_stats(
             data_dir / "events_positions.json",
             data_dir / "events_trades.json",
         )
 
-        # Combined stats
-        total_open = nba_stats["open"] + events_stats["open"]
-        total_trades = nba_stats["trades_today"] + events_stats["trades_today"]
-        total_pnl = nba_stats["daily_pnl"] + events_stats["daily_pnl"]
+        total_pnl = events_stats["daily_pnl"]
         total_roi = (total_pnl / starting * 100) if starting > 0 else 0
 
         # Build message
         date_str = now.strftime("%B %d, %Y")
         pnl_sign = "+" if total_pnl >= 0 else ""
-        pnl_emoji = "+" if total_pnl >= 0 else ""
 
         text = (
             f"<b>DAILY DIGEST — {date_str}</b>\n"
@@ -75,27 +65,13 @@ class CombinedDigest:
         text += (
             f"<b>Portfolio</b>\n"
             f"Bankroll: ${bankroll:,.2f}\n"
-            f"Open Positions: {total_open}\n"
-            f"Today's Trades: {total_trades}\n"
+            f"Open Positions: {events_stats['open']}\n"
+            f"Today's Trades: {events_stats['trades_today']}\n"
             f"Today's P&L: {pnl_sign}${total_pnl:,.2f}\n"
         )
 
         if is_paused:
             text += "STATUS: PAUSED (stop-loss)\n"
-
-        # NBA section
-        text += f"\n<b>NBA Agent</b>\n"
-        if nba_stats["trades_today"] > 0 or nba_stats["open"] > 0:
-            nba_pnl_sign = "+" if nba_stats["daily_pnl"] >= 0 else ""
-            text += (
-                f"Open: {nba_stats['open']} | Trades: {nba_stats['trades_today']}\n"
-                f"P&L: {nba_pnl_sign}${nba_stats['daily_pnl']:.2f}\n"
-            )
-            if nba_stats["wins"] + nba_stats["losses"] > 0:
-                wr = nba_stats["wins"] / (nba_stats["wins"] + nba_stats["losses"]) * 100
-                text += f"Win Rate: {wr:.0f}% ({nba_stats['wins']}W/{nba_stats['losses']}L)\n"
-        else:
-            text += "No activity today\n"
 
         # Events section
         text += f"\n<b>Events Agent</b>\n"
@@ -169,7 +145,7 @@ class CombinedDigest:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(url, json=payload)
                 if resp.status_code == 200:
-                    logger.info("Combined daily digest sent")
+                    logger.info("Daily digest sent")
                     return True
                 logger.error("Telegram send failed: %d %s", resp.status_code, resp.text)
                 return False

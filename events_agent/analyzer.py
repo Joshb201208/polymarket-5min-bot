@@ -128,7 +128,7 @@ class EventsAnalyzer:
         often have predictable outcomes. The remaining uncertainty creates
         a small but reliable edge.
         """
-        from nba_agent.utils import utcnow, parse_utc
+        from shared.utils import utcnow, parse_utc
 
         if not market.end_date:
             return None

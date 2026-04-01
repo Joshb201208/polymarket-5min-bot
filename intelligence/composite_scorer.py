@@ -12,7 +12,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from intelligence.models import CompositeScore, Signal
-from nba_agent.utils import utcnow
+from shared.utils import utcnow
 
 logger = logging.getLogger("intelligence.composite_scorer")
 

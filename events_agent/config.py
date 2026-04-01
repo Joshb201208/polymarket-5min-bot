@@ -15,25 +15,22 @@ load_dotenv(_PROJECT_ROOT / ".env")
 class EventsConfig:
     """Central configuration for the Events agent."""
 
-    # Telegram (shared with NBA agent)
+    # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Trading mode
     TRADING_MODE: str = os.getenv("EVENTS_TRADING_MODE", "live")
 
-    # Polymarket credentials (live mode only — shared with NBA)
+    # Polymarket credentials (live mode only)
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
     POLYMARKET_API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")
     POLYMARKET_API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     PRIVATE_KEY: str = os.getenv("PRIVATE_KEY", "")
     FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
 
-    # Bankroll — events-specific starting point
-    # Adjusted for extreme_pricing damage (~$198 lost/locked on Polymarket).
-    # Original deposit was $440.58. Real available for events agent: $242.11
-    # Uses EVENTS_STARTING_BANKROLL (not shared STARTING_BANKROLL) to avoid
-    # conflict with NBA agent which uses the full $440.58.
+    # Bankroll — adjusted for extreme_pricing damage (~$198 lost/locked on Polymarket).
+    # Original deposit was $440.58. Real available: $242.11
     STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "242.11"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.02"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
@@ -47,9 +44,6 @@ class EventsConfig:
     # Position limits
     MAX_CONCURRENT_POSITIONS: int = int(os.getenv("EVENTS_MAX_POSITIONS", "999"))  # No hard cap
     MIN_BET_SIZE: float = float(os.getenv("EVENTS_MIN_BET_SIZE", "5.0"))
-
-    # NBA cash reserve — always keep this much available for NBA agent
-    NBA_CASH_RESERVE: float = float(os.getenv("EVENTS_NBA_CASH_RESERVE", "90.0"))
 
     # Per-category concentration limit — max positions in a single category
     MAX_PER_CATEGORY: int = int(os.getenv("EVENTS_MAX_PER_CATEGORY", "10"))
