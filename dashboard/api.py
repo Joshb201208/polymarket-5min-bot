@@ -1476,3 +1476,76 @@ def unpause_events() -> dict:
     pause_path = DATA_DIR / "events_paused.json"
     pause_path.write_text(_json.dumps({"paused": False}))
     return {"status": "unpaused"}
+
+
+@app.get("/api/events/wallet_positions", dependencies=[Depends(_require_auth)])
+def get_wallet_positions() -> dict:
+    """Diagnostic: show ALL positions from Polymarket wallet (CLOB + Data API)."""
+    import threading
+    from events_agent.config import EventsConfig
+    
+    config = EventsConfig()
+    result = {"clob_count": 0, "data_api_count": 0, "bot_tracked": 0, "junk": 0, "positions": []}
+    
+    # Try CLOB
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        
+        client = ClobClient(
+            config.CLOB_API_BASE,
+            key=config.PRIVATE_KEY,
+            chain_id=137,
+            signature_type=1,
+            funder=config.FUNDER_ADDRESS,
+        )
+        if config.POLYMARKET_API_KEY and config.POLYMARKET_API_SECRET and config.POLYMARKET_API_PASSPHRASE:
+            client.set_api_creds(ApiCreds(
+                api_key=config.POLYMARKET_API_KEY,
+                api_secret=config.POLYMARKET_API_SECRET,
+                api_passphrase=config.POLYMARKET_API_PASSPHRASE,
+            ))
+        else:
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+        
+        clob_positions = client.get_positions()
+        result["clob_count"] = len(clob_positions)
+        result["clob_raw_sample"] = clob_positions[:3] if clob_positions else []
+        
+        for pos in clob_positions:
+            asset = pos.get("asset", {})
+            token_id = asset.get("token_id", "") if isinstance(asset, dict) else str(asset)
+            size = float(pos.get("size", 0))
+            if size > 0.01:
+                result["positions"].append({
+                    "token_id": token_id[:20] + "...",
+                    "shares": round(size, 2),
+                    "avg_price": pos.get("avgPrice"),
+                })
+    except Exception as e:
+        result["clob_error"] = str(e)[:200]
+    
+    # Try Data API
+    try:
+        import urllib.request
+        url = f"https://data-api.polymarket.com/positions?user={config.FUNDER_ADDRESS}&limit=500&sizeThreshold=0"
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            if isinstance(data, list):
+                result["data_api_count"] = len(data)
+                result["data_api_sample"] = [{"title": p.get("title","?")[:40], "size": p.get("size"), "asset": p.get("asset","")[:20]} for p in data[:3]]
+            else:
+                result["data_api_response"] = str(data)[:200]
+    except Exception as e:
+        result["data_api_error"] = str(e)[:200]
+    
+    result["funder_address"] = config.FUNDER_ADDRESS[:20] + "..." if config.FUNDER_ADDRESS else "NOT SET"
+    
+    # Bot tracked
+    positions_data = _read_json("events_positions.json")
+    open_pos = [p for p in positions_data.get("positions", []) if p.get("status") == "open"]
+    result["bot_tracked"] = len(open_pos)
+    
+    return result
