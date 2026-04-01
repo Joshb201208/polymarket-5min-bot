@@ -3,6 +3,9 @@
 Scans the wallet for ALL open positions, identifies ones NOT tracked by the bot
 (these are the extreme_pricing junk), and sells them via GTC limit orders.
 
+Uses CLOB client.get_positions() as primary method (authenticated, complete),
+with Data API pagination as fallback.
+
 Usage: python -m events_agent.cleanup_extreme
 """
 
@@ -16,41 +19,71 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("cleanup")
 
 
-def get_wallet_positions(funder_address: str) -> list[dict]:
-    """Fetch ALL positions from Polymarket for this wallet."""
-    positions = []
-    # Try the data API first
+def get_positions_from_clob(client) -> list[dict]:
+    """Primary method: use authenticated CLOB client to get all positions."""
     try:
-        url = f"https://data-api.polymarket.com/positions?user={funder_address}"
-        req = urllib.request.Request(url, headers={
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        })
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-            if isinstance(data, list):
-                positions = data
-            logger.info("Found %d positions from data API", len(positions))
-    except Exception as e:
-        logger.error("Data API failed: %s", e)
+        all_positions = client.get_positions()
+        logger.info("CLOB returned %d positions", len(all_positions))
 
-    if not positions:
-        # Fallback: try gamma API
+        wallet_positions = []
+        for pos in all_positions:
+            # asset can be a dict with token_id or a string
+            asset = pos.get("asset", {})
+            token_id = asset.get("token_id", "") if isinstance(asset, dict) else str(asset)
+            size = float(pos.get("size", 0))
+            if size > 0.01:  # Skip dust
+                wallet_positions.append({
+                    "token_id": token_id,
+                    "shares": size,
+                    "avg_price": float(pos.get("avgPrice", 0)),
+                })
+        return wallet_positions
+    except Exception as e:
+        logger.error("CLOB get_positions() failed: %s", e)
+        return []
+
+
+def get_positions_from_data_api(address: str) -> list[dict]:
+    """Fallback: paginate through Data API to get all positions."""
+    wallet_positions = []
+    offset = 0
+    limit = 500
+    while True:
         try:
-            url = f"https://gamma-api.polymarket.com/positions?user={funder_address}&limit=500"
+            url = (
+                f"https://data-api.polymarket.com/positions"
+                f"?user={address}&limit={limit}&offset={offset}&sizeThreshold=0"
+            )
             req = urllib.request.Request(url, headers={
                 "Accept": "application/json",
                 "User-Agent": "Mozilla/5.0",
             })
             with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-                if isinstance(data, list):
-                    positions = data
-                logger.info("Found %d positions from gamma API", len(positions))
-        except Exception as e:
-            logger.error("Gamma API failed: %s", e)
+                batch = json.loads(resp.read())
 
-    return positions
+            if not isinstance(batch, list):
+                break
+
+            for pos in batch:
+                token_id = pos.get("asset", "")
+                size = float(pos.get("size", 0))
+                if size > 0.01:
+                    wallet_positions.append({
+                        "token_id": token_id,
+                        "shares": size,
+                        "avg_price": float(pos.get("curPrice", 0)),
+                    })
+
+            if len(batch) < limit:
+                break
+            offset += limit
+
+        except Exception as e:
+            logger.error("Data API failed at offset %d: %s", offset, e)
+            break
+
+    logger.info("Data API returned %d positions (after dust filter)", len(wallet_positions))
+    return wallet_positions
 
 
 def get_bot_tracked_token_ids() -> set[str]:
@@ -70,7 +103,26 @@ def get_bot_tracked_token_ids() -> set[str]:
         return set()
 
 
-def sell_position_gtc(client, token_id: str, shares: float, market_question: str) -> str:
+def get_market_question(token_id: str) -> tuple[str, bool]:
+    """Fetch market question and neg_risk from Gamma API."""
+    try:
+        url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            markets = json.loads(resp.read())
+            if markets and len(markets) > 0:
+                question = markets[0].get("question", token_id[:20])
+                neg_risk = markets[0].get("neg_risk", False)
+                return question, neg_risk
+    except Exception:
+        pass
+    return token_id[:20], False
+
+
+def sell_position_gtc(client, token_id: str, shares: float, market_question: str, neg_risk: bool) -> str:
     """Sell a position using GTC limit order at slightly below midpoint."""
     from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import SELL
@@ -78,29 +130,29 @@ def sell_position_gtc(client, token_id: str, shares: float, market_question: str
     try:
         # Get tick size and midpoint
         tick_size = str(client.get_tick_size(token_id))
-        mid_data = client.get_midpoint(token_id)
-        midpoint = float(mid_data.get("mid", 0)) if isinstance(mid_data, dict) else float(mid_data)
+
+        try:
+            mid_data = client.get_midpoint(token_id)
+            midpoint = float(mid_data.get("mid", 0)) if isinstance(mid_data, dict) else float(mid_data)
+        except Exception as e:
+            logger.warning("SKIP (midpoint error, likely resolved market): %s | %s",
+                           market_question[:50], e)
+            return ""
 
         if midpoint <= 0.01:
             logger.warning("SKIP: midpoint too low (%.4f) for %s", midpoint, market_question[:50])
+            return ""
+
+        # Skip tiny-value positions (not worth the effort)
+        position_value = shares * midpoint
+        if position_value < 0.50:
+            logger.info("SKIP: value too low ($%.2f) for %s", position_value, market_question[:50])
             return ""
 
         # Sell at 95% of midpoint for faster fill on junk positions
         decimals = len(tick_size.split('.')[-1]) if '.' in tick_size else 2
         sell_price = round(midpoint * 0.95, decimals)
         sell_price = max(sell_price, 0.01)
-
-        # Check neg_risk
-        neg_risk = False
-        try:
-            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
-            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                markets = json.loads(resp.read())
-                if markets and len(markets) > 0:
-                    neg_risk = markets[0].get("neg_risk", False)
-        except Exception:
-            pass
 
         order_args = OrderArgs(
             token_id=token_id,
@@ -160,11 +212,17 @@ def main():
 
     logger.info("CLOB client initialized")
 
-    # Step 2: Get all wallet positions
-    all_positions = get_wallet_positions(config.FUNDER_ADDRESS)
+    # Step 2: Get all wallet positions (CLOB primary, Data API fallback)
+    all_positions = get_positions_from_clob(client)
+    if not all_positions:
+        logger.warning("CLOB returned no positions, trying Data API fallback...")
+        all_positions = get_positions_from_data_api(config.FUNDER_ADDRESS)
+
     if not all_positions:
         logger.info("No positions found in wallet")
         return
+
+    logger.info("Total positions found: %d", len(all_positions))
 
     # Step 3: Get bot-tracked positions
     bot_token_ids = get_bot_tracked_token_ids()
@@ -173,23 +231,11 @@ def main():
     # Step 4: Identify junk (positions NOT tracked by bot)
     junk = []
     for pos in all_positions:
-        token_id = pos.get("token_id") or pos.get("asset") or ""
+        token_id = pos["token_id"]
         if token_id and token_id not in bot_token_ids:
-            shares = float(pos.get("size", 0) or pos.get("shares", 0) or 0)
-            if shares > 0:
-                market_q = pos.get("market", {}).get("question", "") or pos.get("title", "") or token_id[:20]
-                current_price = float(pos.get("current_price", 0) or pos.get("price", 0) or 0)
-                value = shares * current_price if current_price > 0 else 0
-                junk.append({
-                    "token_id": token_id,
-                    "shares": shares,
-                    "question": market_q,
-                    "price": current_price,
-                    "value": value,
-                })
+            junk.append(pos)
 
-    logger.info("Found %d junk positions to sell (total value ~$%.2f)",
-                len(junk), sum(j["value"] for j in junk))
+    logger.info("Found %d junk positions to sell", len(junk))
 
     if not junk:
         logger.info("No junk positions found — wallet is clean")
@@ -198,30 +244,35 @@ def main():
     # Step 5: Sell all junk positions
     sold = 0
     failed = 0
-    total_value = 0
+    skipped = 0
 
     for j in junk:
-        if j["shares"] < 0.01:
-            continue
+        token_id = j["token_id"]
+
+        # Get market info for logging and neg_risk
+        question, neg_risk = get_market_question(token_id)
 
         order_id = sell_position_gtc(
             client,
-            j["token_id"],
+            token_id,
             j["shares"],
-            j["question"],
+            question,
+            neg_risk,
         )
 
         if order_id:
             sold += 1
-            total_value += j["value"]
+        elif order_id == "":
+            # Empty string means skipped or failed
+            skipped += 1
         else:
             failed += 1
 
         # Rate limit: don't spam the API
         time.sleep(1)
 
-    logger.info("Cleanup complete: %d sold, %d failed, ~$%.2f in GTC sell orders posted",
-                sold, failed, total_value)
+    logger.info("Cleanup complete: %d sold, %d skipped, %d failed",
+                sold, skipped, failed)
     logger.info("GTC orders will fill as buyers match. Check wallet in 1-2 hours.")
 
 
