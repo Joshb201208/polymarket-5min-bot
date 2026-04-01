@@ -1015,8 +1015,7 @@ def get_events_trades() -> dict:
 def get_events_stats() -> dict:
     """Events stats — P&L, win rate, category breakdown, exit analysis."""
     positions = _read_json("events_positions.json").get("positions", [])
-    bankroll_data = _read_json("events_bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 242.11)
+    starting = EVENTS_STARTING_BANKROLL
 
     # Filter to real trades only — exclude purge/cleanup/worthless/extreme_pricing
     closed = [p for p in positions if p.get("status") != "open" and _is_real_trade(p)]
@@ -1083,17 +1082,21 @@ def get_events_stats() -> dict:
     }
 
 
+# Events agent starting bankroll — ground truth after extreme_pricing damage.
+# Original deposit $440.58 minus ~$198 locked in unsellable junk positions.
+EVENTS_STARTING_BANKROLL = 242.11
+
+
 @app.get("/api/events/portfolio_value", dependencies=[Depends(_require_auth)])
 def get_events_portfolio_value() -> dict:
     """Mark-to-market portfolio value: cash + current value of all positions.
 
-    Uses bankroll.json (recalculated from first principles by the agent every
-    tick) as the source of truth for cash and realized P&L.
+    Recalculates from first principles every call using the events-specific
+    starting bankroll ($242.11) — not the shared NBA bankroll ($440.58).
     """
     import urllib.request as _urlreq
 
-    bankroll_data = _read_json("events_bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 242.11)
+    starting = EVENTS_STARTING_BANKROLL
 
     positions = _read_json("events_positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
