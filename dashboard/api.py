@@ -528,7 +528,7 @@ def get_performance(period: str) -> dict:
     """Return performance stats for a given period: today, week, month, all."""
     positions = _read_json("positions.json").get("positions", [])
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
 
     closed = [p for p in positions if p.get("status") != "open"]
 
@@ -1016,7 +1016,7 @@ def get_events_stats() -> dict:
     """Events stats — P&L, win rate, category breakdown, exit analysis."""
     positions = _read_json("events_positions.json").get("positions", [])
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
 
     # Filter to real trades only — exclude purge/cleanup/worthless/extreme_pricing
     closed = [p for p in positions if p.get("status") != "open" and _is_real_trade(p)]
@@ -1093,7 +1093,7 @@ def get_events_portfolio_value() -> dict:
     import urllib.request as _urlreq
 
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
 
     positions = _read_json("events_positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
@@ -1804,7 +1804,7 @@ def get_intelligence_dedup() -> dict:
 def get_analytics_equity_curve() -> dict:
     """Combined equity curve data — NBA, Events, and Combined."""
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
     from datetime import timedelta as _td
 
     SGT = timezone(_td(hours=8))
@@ -1925,7 +1925,7 @@ def get_analytics_allocation() -> dict:
     """Current bankroll allocation across agents."""
     bankroll_data = _read_json("bankroll.json")
     total_bankroll = bankroll_data.get("current_bankroll", 0)
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
 
     # NBA open positions
     nba_positions = _read_json("positions.json").get("positions", [])
@@ -2192,7 +2192,7 @@ def get_combined_equity_curve() -> dict:
 
     SGT = timezone(td(hours=8))
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 440.58)
+    starting = bankroll_data.get("starting_bankroll", 242.11)
 
     # NBA daily P&L
     nba_positions = _read_json("positions.json").get("positions", [])

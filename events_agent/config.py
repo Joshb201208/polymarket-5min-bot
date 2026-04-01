@@ -30,7 +30,10 @@ class EventsConfig:
     FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
 
     # Bankroll (shared)
-    STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "440.58"))
+    # Adjusted starting bankroll: synced to actual Polymarket wallet balance
+    # after accounting for extreme_pricing damage (~$198 lost/locked).
+    # Original deposit was $440.58. Real available for agent: $242.11
+    STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "242.11"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.02"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 
