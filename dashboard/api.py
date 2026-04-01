@@ -198,12 +198,26 @@ def deploy() -> dict:
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
 
-    # Copy service file + daemon-reload (in case service config changed)
+    # Copy service file + daemon-reload + migrate from old nba-agent name
     try:
         svc_src = project_dir / "deploy" / "agents.service"
         if svc_src.exists():
             subprocess.run(
                 ["cp", str(svc_src), "/etc/systemd/system/events-agent.service"],
+                capture_output=True, timeout=5,
+            )
+            # Disable old nba-agent service if it exists (migration)
+            subprocess.run(
+                ["systemctl", "disable", "nba-agent"],
+                capture_output=True, timeout=5,
+            )
+            subprocess.run(
+                ["systemctl", "stop", "nba-agent"],
+                capture_output=True, timeout=5,
+            )
+            # Enable the new events-agent service
+            subprocess.run(
+                ["systemctl", "enable", "events-agent"],
                 capture_output=True, timeout=5,
             )
             subprocess.run(
