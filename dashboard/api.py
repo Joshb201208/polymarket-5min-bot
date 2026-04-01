@@ -954,7 +954,7 @@ def get_system_health() -> dict:
 def get_events_status() -> dict:
     """Status for events agent."""
     system_status = _read_json("system_status.json")
-    bankroll = _read_json("bankroll.json")
+    bankroll = _read_json("events_bankroll.json")
     events_positions = _read_json("events_positions.json").get("positions", [])
     events_trades = _read_json("events_trades.json").get("trades", [])
 
@@ -967,7 +967,7 @@ def get_events_status() -> dict:
         "events_last_scan": system_status.get("events_last_scan"),
         "open_positions": len([p for p in events_positions if p.get("status") == "open"]),
         "total_positions": len(events_positions),
-        "bankroll": bankroll.get("current_bankroll", 0),
+        "bankroll": bankroll.get("current_bankroll", 242.11),
     }
 
 
@@ -1015,7 +1015,7 @@ def get_events_trades() -> dict:
 def get_events_stats() -> dict:
     """Events stats — P&L, win rate, category breakdown, exit analysis."""
     positions = _read_json("events_positions.json").get("positions", [])
-    bankroll_data = _read_json("bankroll.json")
+    bankroll_data = _read_json("events_bankroll.json")
     starting = bankroll_data.get("starting_bankroll", 242.11)
 
     # Filter to real trades only — exclude purge/cleanup/worthless/extreme_pricing
@@ -1092,7 +1092,7 @@ def get_events_portfolio_value() -> dict:
     """
     import urllib.request as _urlreq
 
-    bankroll_data = _read_json("bankroll.json")
+    bankroll_data = _read_json("events_bankroll.json")
     starting = bankroll_data.get("starting_bankroll", 242.11)
 
     positions = _read_json("events_positions.json").get("positions", [])

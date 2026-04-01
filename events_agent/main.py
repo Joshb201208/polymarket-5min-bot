@@ -80,16 +80,17 @@ class EventsAgent:
         except Exception as e:
             logger.error("Failed to initialize intelligence manager: %s", e)
 
-        # Bankroll state — loaded from shared bankroll file
+        # Bankroll state — events agent uses its own bankroll file
         self._bankroll_path = self.config.DATA_DIR / "bankroll.json"
+        self._events_bankroll_path = self.config.DATA_DIR / "events_bankroll.json"
 
         self._shutdown = False
 
     @property
     def current_bankroll(self) -> float:
-        """Read current bankroll from shared state."""
+        """Read current bankroll from events-specific bankroll file."""
         from nba_agent.utils import load_json
-        state = load_json(self._bankroll_path, {})
+        state = load_json(self._events_bankroll_path, {})
         return float(state.get("current_bankroll", self.config.STARTING_BANKROLL))
 
     async def run(self) -> None:
@@ -705,7 +706,7 @@ class EventsAgent:
             cash = current_bankroll - open_cost
 
             # Preserve existing fields (is_paused, peak_bankroll, etc.)
-            state = load_json(self._bankroll_path, {})
+            state = load_json(self._events_bankroll_path, {})
             state["starting_bankroll"] = self.config.STARTING_BANKROLL
             state["current_bankroll"] = round(current_bankroll, 2)
             state["cash"] = round(cash, 2)
@@ -717,7 +718,7 @@ class EventsAgent:
             if current_bankroll > peak:
                 state["peak_bankroll"] = round(current_bankroll, 2)
 
-            self._bankroll_path.write_text(_json.dumps(state, default=str))
+            self._events_bankroll_path.write_text(_json.dumps(state, default=str))
             logger.info(
                 "Bankroll recalculated: $%.2f (realized=$%.2f, open_cost=$%.2f, cash=$%.2f)",
                 current_bankroll, realized_pnl, open_cost, cash,
