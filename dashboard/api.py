@@ -1458,3 +1458,21 @@ def get_combined_odds_snapshot() -> dict:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
+
+
+@app.post("/api/events/pause", dependencies=[Depends(_require_auth)])
+def pause_events() -> dict:
+    """Pause the events agent."""
+    import json as _json
+    pause_path = DATA_DIR / "events_paused.json"
+    pause_path.write_text(_json.dumps({"paused": True, "paused_at": datetime.now(timezone.utc).isoformat()}))
+    return {"status": "paused"}
+
+
+@app.post("/api/events/unpause", dependencies=[Depends(_require_auth)])
+def unpause_events() -> dict:
+    """Unpause the events agent."""
+    import json as _json
+    pause_path = DATA_DIR / "events_paused.json"
+    pause_path.write_text(_json.dumps({"paused": False}))
+    return {"status": "unpaused"}

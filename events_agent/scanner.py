@@ -132,12 +132,35 @@ _SECONDARY_SCAN_KEYWORDS = [
 # ---------------------------------------------------------------------------
 # Crypto daily price markets — no informational edge on spot-price predictions
 # ---------------------------------------------------------------------------
+
+# Sports markets — filter out completely
+SPORTS_RE = re.compile(
+    r'(?:'
+    r'(?:vs\.?|versus)\s'  # "X vs Y" pattern (common in sports)
+    r'|O/U\s+\d'  # Over/Under lines
+    r'|(?:Games? Total|Total (?:Points|Goals|Runs))'
+    r'|(?:NBA|NFL|NHL|MLB|UEFA|FIFA|EPL|LaLiga|Serie A|Bundesliga|Ligue 1)'
+    r'|(?:Moneyline|Spread|Point Spread|Handicap)'
+    r'|(?:Will .+ win (?:the |their )?(?:game|match|series))'
+    r')',
+    re.IGNORECASE
+)
+
 CRYPTO_DAILY_PRICE_RE = re.compile(
+    r'(?:
+    # Pattern 1: "Will the price of X be above/between $Y"
     r'Will (?:the price of )?(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL|Dogecoin|DOGE|'
     r'Cardano|ADA|Avalanche|AVAX|Polkadot|DOT|Chainlink|LINK|Litecoin|LTC|'
     r'BNB|MATIC|Polygon)'
     r'.*?(?:be above|be between|reach|dip to|hit|drop|fall)'
-    r'.*?\$[\d,]+',
+    r'.*?\$[\d,]+'
+    r'|'
+    # Pattern 2: "Bitcoin Up or Down" style markets
+    r'(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL)\s+(?:Up|Down|up|down)\s+(?:or|Or)'
+    r'|'
+    # Pattern 3: "Will Bitcoin reach/hit/dip" without $ sign
+    r'Will (?:Bitcoin|BTC|Ethereum|ETH)\s+(?:reach|hit|dip|pump|dump|crash)'
+    r')',
     re.IGNORECASE
 )
 
@@ -288,6 +311,9 @@ class EventsScanner:
         now = utcnow()
 
         # Block crypto daily price markets (no edge on spot-price predictions)
+        if SPORTS_RE.search(market.question):
+            logger.info("Filtered sports market: %s", market.question[:80])
+            continue
         if CRYPTO_DAILY_PRICE_RE.search(market.question):
             logger.info("Filtered crypto daily price market: %s", market.question[:80])
             return False
