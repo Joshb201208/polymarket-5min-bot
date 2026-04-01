@@ -113,9 +113,69 @@ class EventsAgent:
                     break
                 await asyncio.sleep(1)
 
+    def _process_close_requests(self) -> None:
+        """Process manual close requests from dashboard."""
+        close_dir = self.config.DATA_DIR / "close_requests"
+        if not close_dir.exists():
+            return
+
+        for request_file in close_dir.glob("*.json"):
+            try:
+                import json as _json
+                request = _json.loads(request_file.read_text())
+                position_id = request.get("position_id")
+
+                # Find the position
+                positions = self.portfolio.load_positions()
+                position = next((p for p in positions if p.id == position_id and p.status == "open"), None)
+
+                if not position:
+                    logger.warning("Close request for unknown/closed position: %s", position_id)
+                    request_file.unlink()
+                    continue
+
+                # Get current price from Gamma API
+                current_price = self._get_current_price_gamma(position)
+                if current_price and current_price > 0:
+                    trade = self.executor.execute_sell(position, current_price, "Manual close from dashboard")
+                    if trade:
+                        self.portfolio.save_position(position)
+                        self.portfolio.log_trade(trade)
+                        logger.info("Manual close executed: %s at $%.4f", position.market_question[:50], current_price)
+                else:
+                    logger.warning("Cannot get price for manual close: %s", position.market_question[:50])
+                    continue  # Don't delete request file — retry next tick
+
+                # Remove the request file after successful processing
+                request_file.unlink()
+            except Exception as e:
+                logger.error("Error processing close request %s: %s", request_file.name, e)
+
+    def _get_current_price_gamma(self, position) -> float | None:
+        """Fetch current price for a position's token from Gamma API."""
+        import json as _json
+        import urllib.request
+        try:
+            url = f"https://gamma-api.polymarket.com/markets/{position.market_id}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                m = _json.loads(resp.read())
+                outcome_prices = _json.loads(m.get("outcomePrices", "[]") or "[]")
+                tokens_raw = m.get("clobTokenIds", "") or ""
+                token_list = _json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                for i, tok in enumerate(token_list):
+                    if tok == position.token_id and i < len(outcome_prices):
+                        return float(outcome_prices[i])
+        except Exception as e:
+            logger.warning("Failed to fetch price for %s: %s", position.market_id, e)
+        return None
+
     async def _tick(self) -> None:
         """Single cycle: scan, evaluate, trade, check exits."""
         now = utcnow()
+
+        # 0. Process manual close requests from dashboard (FIRST)
+        self._process_close_requests()
 
         # --- One-time cleanup: purge positions from broken extreme_pricing strategy ---
         cleanup_flag = self.config.DATA_DIR / ".extreme_pricing_cleanup_done"

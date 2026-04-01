@@ -862,6 +862,81 @@ def close_events_position(position_id: str) -> dict:
     return {"status": "queued", "position_id": position_id}
 
 
+class ResetRequest(BaseModel):
+    new_starting_bankroll: float
+
+
+@app.post("/api/events/reset", dependencies=[Depends(_require_auth)])
+def reset_events_pnl(body: ResetRequest) -> dict:
+    """Reset P&L tracking: archive old data and start fresh.
+
+    1. Archives events_positions.json and events_trades.json
+    2. Creates fresh positions file with only current open positions
+    3. Creates fresh empty trades file
+    4. Updates events_bankroll.json with new starting_bankroll
+    """
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+
+    # Archive existing files
+    archive_dir = DATA_DIR / "archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    positions_path = DATA_DIR / "events_positions.json"
+    trades_path = DATA_DIR / "events_trades.json"
+    bankroll_path = DATA_DIR / "events_bankroll.json"
+
+    archived = []
+    for src, name in [(positions_path, "events_positions"), (trades_path, "events_trades")]:
+        if src.exists():
+            dest = archive_dir / f"{name}_{ts}.json"
+            dest.write_text(src.read_text())
+            archived.append(str(dest.name))
+
+    # Read current open positions to preserve them
+    positions_data = {}
+    if positions_path.exists():
+        try:
+            positions_data = json.loads(positions_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            positions_data = {}
+
+    open_positions = [
+        p for p in positions_data.get("positions", [])
+        if p.get("status") == "open"
+    ]
+
+    # Write fresh positions file (only open positions)
+    positions_path.write_text(json.dumps({"positions": open_positions}, indent=2, default=str))
+
+    # Write fresh empty trades file
+    trades_path.write_text(json.dumps({"trades": []}, indent=2))
+
+    # Update bankroll
+    bankroll_data = {}
+    if bankroll_path.exists():
+        try:
+            bankroll_data = json.loads(bankroll_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            bankroll_data = {}
+
+    bankroll_data["starting_bankroll"] = body.new_starting_bankroll
+    bankroll_data["current_bankroll"] = body.new_starting_bankroll
+    bankroll_data["realized_pnl"] = 0.0
+    bankroll_data["reset_at"] = now.isoformat()
+    bankroll_data["reset_reason"] = "manual_reset_from_dashboard"
+
+    bankroll_path.write_text(json.dumps(bankroll_data, indent=2, default=str))
+
+    return {
+        "status": "reset_complete",
+        "new_starting_bankroll": body.new_starting_bankroll,
+        "open_positions_preserved": len(open_positions),
+        "archived_files": archived,
+        "reset_at": now.isoformat(),
+    }
+
+
 @app.get("/api/events/lifecycle", dependencies=[Depends(_require_auth)])
 def get_events_lifecycle() -> dict:
     """Lifecycle assessments for active markets."""

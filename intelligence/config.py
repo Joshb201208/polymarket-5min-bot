@@ -25,6 +25,11 @@ INTELLIGENCE_MODULES = {
     "cross_market": _bool_env("CROSS_MARKET_ENABLED"),
     "whale_tracker": _bool_env("WHALE_TRACKER_ENABLED"),
     "reference_price": _bool_env("REFERENCE_PRICE_ENABLED"),
+    "gdelt": _bool_env("GDELT_ENABLED"),
+    "kalshi": _bool_env("KALSHI_ENABLED"),
+    "consensus": _bool_env("CONSENSUS_ENABLED"),
+    "fred": _bool_env("FRED_ENABLED"),
+    "defi_llama": _bool_env("DEFI_LLAMA_ENABLED"),
 }
 
 # Composite Scoring
@@ -41,6 +46,11 @@ SOURCE_WEIGHTS = {
     "google_trends": 0.10,
     "congress": 0.07,
     "cross_market": 0.08,
+    "gdelt": 0.20,
+    "kalshi": 0.20,
+    "consensus": 0.15,
+    "fred": 0.15,
+    "defi_llama": 0.10,
 }
 
 
@@ -57,6 +67,11 @@ class IntelligenceConfig:
         "cross_market": _bool_env("CROSS_MARKET_ENABLED"),
         "whale_tracker": _bool_env("WHALE_TRACKER_ENABLED"),
         "reference_price": _bool_env("REFERENCE_PRICE_ENABLED"),
+        "gdelt": _bool_env("GDELT_ENABLED"),
+        "kalshi": _bool_env("KALSHI_ENABLED"),
+        "consensus": _bool_env("CONSENSUS_ENABLED"),
+        "fred": _bool_env("FRED_ENABLED"),
+        "defi_llama": _bool_env("DEFI_LLAMA_ENABLED"),
     }
 
     # X/Twitter Scanner

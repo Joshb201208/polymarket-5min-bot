@@ -29,6 +29,11 @@ _SOURCE_ENABLED_VARS: dict[str, str] = {
     "google_trends": "GOOGLE_TRENDS_ENABLED",
     "congress": "CONGRESS_TRACKER_ENABLED",
     "cross_market": "CROSS_MARKET_ENABLED",
+    "gdelt": "GDELT_ENABLED",
+    "kalshi": "KALSHI_ENABLED",
+    "consensus": "CONSENSUS_ENABLED",
+    "fred": "FRED_ENABLED",
+    "defi_llama": "DEFI_LLAMA_ENABLED",
 }
 
 
@@ -86,6 +91,11 @@ class CompositeScorer:
         "google_trends": 0.12,
         "congress": 0.10,
         "cross_market": 0.08,
+        "gdelt": 0.20,
+        "kalshi": 0.20,
+        "consensus": 0.15,
+        "fred": 0.15,
+        "defi_llama": 0.10,
     }
 
     def __init__(self) -> None:

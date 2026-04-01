@@ -115,6 +115,41 @@ class IntelligenceManager:
             except ImportError:
                 logger.warning("reference_price module not available yet")
 
+        if modules.get("gdelt"):
+            try:
+                from intelligence.gdelt import GDELTMonitor
+                self._modules["gdelt"] = GDELTMonitor()
+            except ImportError:
+                logger.warning("gdelt module not available yet")
+
+        if modules.get("kalshi"):
+            try:
+                from intelligence.kalshi import KalshiCrossMarket
+                self._modules["kalshi"] = KalshiCrossMarket()
+            except ImportError:
+                logger.warning("kalshi module not available yet")
+
+        if modules.get("consensus"):
+            try:
+                from intelligence.consensus import ConsensusAggregator
+                self._modules["consensus"] = ConsensusAggregator()
+            except ImportError:
+                logger.warning("consensus module not available yet")
+
+        if modules.get("fred"):
+            try:
+                from intelligence.fred import FREDMonitor
+                self._modules["fred"] = FREDMonitor()
+            except ImportError:
+                logger.warning("fred module not available yet")
+
+        if modules.get("defi_llama"):
+            try:
+                from intelligence.defi_llama import DeFiLlamaMonitor
+                self._modules["defi_llama"] = DeFiLlamaMonitor()
+            except ImportError:
+                logger.warning("defi_llama module not available yet")
+
         try:
             from intelligence.composite_scorer import CompositeScorer
             self._composite_scorer = CompositeScorer()
