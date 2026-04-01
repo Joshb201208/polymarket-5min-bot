@@ -44,10 +44,16 @@ REGIME_DESCRIPTIONS = {
 
 # ── Thresholds ───────────────────────────────────────────────────────
 
-# SPX support/resistance levels (updated periodically)
+# SPX support/resistance levels (updated periodically from analyst research)
 SPX_SUPPORT_LOW = 6200       # Newton's lower support target
 SPX_SUPPORT_HIGH = 6300      # Newton's upper support target
+SPX_RESISTANCE_1 = 6543      # First resistance on bounce
+SPX_RESISTANCE_2 = 6584      # Second resistance
 SPX_RESISTANCE_CONFIRM = 6653  # Break above = trend confirmed bullish
+
+# QQQ (Nasdaq 100 ETF) levels
+QQQ_RESISTANCE_1 = 581       # First resistance
+QQQ_RESISTANCE_2 = 586       # Second resistance
 
 # VIX thresholds
 VIX_ELEVATED = 25            # Above this = market stressed
@@ -63,6 +69,13 @@ DRAWDOWN_SEVERE = 12.0       # 12% from high = severe — potential opportunity
 # Note: $110 WTI ≈ USO in $130s range approximately
 CRUDE_ELEVATED = 135         # USO price signaling crude stress
 
+# 10Y yield proxy: TLT (20+ Year Treasury ETF) — falling TLT = rising yields
+# TLT below ~85 signals yields pushing uncomfortably high
+TLT_YIELD_STRESS = 85        # TLT below this = yields elevated, equity headwind
+
+# US Dollar proxy: UUP (Dollar Bull ETF) — rising = stronger dollar
+UUP_STRONG = 28.5            # Dollar strength headwind
+
 
 @dataclass
 class MacroSnapshot:
@@ -72,12 +85,18 @@ class MacroSnapshot:
     spx_change_pct: float = 0.0
     spx_52w_high: float = 0.0
     spx_drawdown_pct: float = 0.0      # % below recent high
+    spx_vs_resistance: str = ""         # Where SPX sits relative to key levels
+    qqq_price: float = 0.0
+    qqq_change_pct: float = 0.0
+    qqq_vs_resistance: str = ""         # Where QQQ sits relative to key levels
     vix_level: float = 0.0
     vix_change_pct: float = 0.0
     crude_price: float = 0.0           # USO ETF as proxy
     crude_change_pct: float = 0.0
     tlt_price: float = 0.0             # Treasury bond ETF (inverse of yields)
     tlt_change_pct: float = 0.0
+    uup_price: float = 0.0             # US Dollar ETF
+    uup_change_pct: float = 0.0
     regime: str = REGIME_NORMAL
     regime_score: int = 0              # -10 (max fear) to +10 (max greed)
     regime_description: str = ""
@@ -158,13 +177,40 @@ class MacroMonitor:
 
         # 1. Fetch current quotes
         spx = await self._fmp_quote("^GSPC")
+        qqq = await self._fmp_quote("QQQ")
         vix = await self._fmp_quote("^VIX")
         crude = await self._fmp_quote("USO")
         tlt = await self._fmp_quote("TLT")
+        uup = await self._fmp_quote("UUP")
 
         if spx:
             snapshot.spx_price = spx.get("price", 0)
             snapshot.spx_change_pct = spx.get("changesPercentage", 0) or 0
+            # Determine where SPX sits relative to key levels
+            p = snapshot.spx_price
+            if p >= SPX_RESISTANCE_CONFIRM:
+                snapshot.spx_vs_resistance = f"Above {SPX_RESISTANCE_CONFIRM} — uptrend confirmed"
+            elif p >= SPX_RESISTANCE_2:
+                snapshot.spx_vs_resistance = f"Between R2 ({SPX_RESISTANCE_2}) and confirmation ({SPX_RESISTANCE_CONFIRM})"
+            elif p >= SPX_RESISTANCE_1:
+                snapshot.spx_vs_resistance = f"Between R1 ({SPX_RESISTANCE_1}) and R2 ({SPX_RESISTANCE_2})"
+            elif p >= SPX_SUPPORT_HIGH:
+                snapshot.spx_vs_resistance = f"Below R1 ({SPX_RESISTANCE_1}), above support ({SPX_SUPPORT_HIGH})"
+            elif p >= SPX_SUPPORT_LOW:
+                snapshot.spx_vs_resistance = f"IN SUPPORT ZONE ({SPX_SUPPORT_LOW}-{SPX_SUPPORT_HIGH})"
+            else:
+                snapshot.spx_vs_resistance = f"BELOW SUPPORT ({SPX_SUPPORT_LOW}) — deep value zone"
+
+        if qqq:
+            snapshot.qqq_price = qqq.get("price", 0)
+            snapshot.qqq_change_pct = qqq.get("changesPercentage", 0) or 0
+            p = snapshot.qqq_price
+            if p >= QQQ_RESISTANCE_2:
+                snapshot.qqq_vs_resistance = f"Above R2 ({QQQ_RESISTANCE_2}) — strength confirmed"
+            elif p >= QQQ_RESISTANCE_1:
+                snapshot.qqq_vs_resistance = f"Between R1 ({QQQ_RESISTANCE_1}) and R2 ({QQQ_RESISTANCE_2})"
+            else:
+                snapshot.qqq_vs_resistance = f"Below R1 ({QQQ_RESISTANCE_1})"
 
         if vix:
             snapshot.vix_level = vix.get("price", 0)
@@ -177,6 +223,10 @@ class MacroMonitor:
         if tlt:
             snapshot.tlt_price = tlt.get("price", 0)
             snapshot.tlt_change_pct = tlt.get("changesPercentage", 0) or 0
+
+        if uup:
+            snapshot.uup_price = uup.get("price", 0)
+            snapshot.uup_change_pct = uup.get("changesPercentage", 0) or 0
 
         # 2. Calculate SPX drawdown from recent high
         from_date = (now - __import__("datetime").timedelta(days=90)).strftime("%Y-%m-%d")
@@ -259,6 +309,24 @@ class MacroMonitor:
         if snap.crude_price > CRUDE_ELEVATED:
             score += 1
             signals.append(f"Crude (USO) at ${snap.crude_price:.0f} — oil elevated, headwind for equities")
+
+        # ── 10Y yield signals (TLT as inverse proxy) ────────────────
+        if snap.tlt_price > 0 and snap.tlt_price < TLT_YIELD_STRESS:
+            score += 1
+            signals.append(f"TLT at ${snap.tlt_price:.2f} (below {TLT_YIELD_STRESS}) — yields elevated, equity headwind")
+        elif snap.tlt_price > 0 and snap.tlt_change_pct > 1.0:
+            signals.append(f"TLT up {snap.tlt_change_pct:+.1f}% — yields falling, positive for equities")
+
+        # ── US Dollar signals ─────────────────────────────────────────
+        if snap.uup_price > UUP_STRONG:
+            score += 1
+            signals.append(f"Dollar (UUP) at ${snap.uup_price:.2f} — strong dollar, headwind for equities")
+
+        # ── SPX/QQQ level awareness ───────────────────────────────────
+        if snap.spx_vs_resistance:
+            signals.append(f"SPX positioning: {snap.spx_vs_resistance}")
+        if snap.qqq_vs_resistance:
+            signals.append(f"QQQ positioning: {snap.qqq_vs_resistance}")
 
         # ── Determine regime ─────────────────────────────────────────
         snap.regime_score = max(-10, min(10, score))
@@ -381,11 +449,14 @@ class MacroMonitor:
             {"name": "Regime", "value": f"{emoji} **{snapshot.regime.replace('_', ' ').title()}**", "inline": True},
             {"name": "Score", "value": f"`{score:+d}` / \u00b110\n{bar_label}", "inline": True},
             {"name": "\u200b", "value": "\u200b", "inline": True},
-            {"name": "S&P 500", "value": f"${snapshot.spx_price:,.0f} ({snapshot.spx_change_pct:+.1f}%)", "inline": True},
-            {"name": "Drawdown", "value": f"{snapshot.spx_drawdown_pct:.1f}% from high", "inline": True},
+            {"name": "S&P 500", "value": f"${snapshot.spx_price:,.0f} ({snapshot.spx_change_pct:+.1f}%)\n{snapshot.spx_vs_resistance}", "inline": True},
+            {"name": "QQQ", "value": f"${snapshot.qqq_price:,.2f} ({snapshot.qqq_change_pct:+.1f}%)\n{snapshot.qqq_vs_resistance}", "inline": True},
+            {"name": "Drawdown", "value": f"{snapshot.spx_drawdown_pct:.1f}% from 90d high", "inline": True},
             {"name": "VIX", "value": f"{snapshot.vix_level:.1f} ({snapshot.vix_change_pct:+.1f}%)", "inline": True},
+            {"name": "10Y Yield (TLT)", "value": f"${snapshot.tlt_price:.2f} ({snapshot.tlt_change_pct:+.1f}%)\n{'\u26a0 Yields elevated' if snapshot.tlt_price < TLT_YIELD_STRESS else 'Yields normal'}", "inline": True},
             {"name": "Crude (USO)", "value": f"${snapshot.crude_price:.2f} ({snapshot.crude_change_pct:+.1f}%)", "inline": True},
-            {"name": "Bonds (TLT)", "value": f"${snapshot.tlt_price:.2f} ({snapshot.tlt_change_pct:+.1f}%)", "inline": True},
+            {"name": "Dollar (UUP)", "value": f"${snapshot.uup_price:.2f} ({snapshot.uup_change_pct:+.1f}%)", "inline": True},
+            {"name": "\u200b", "value": "\u200b", "inline": True},
             {"name": "\u200b", "value": "\u200b", "inline": True},
         ]
 
