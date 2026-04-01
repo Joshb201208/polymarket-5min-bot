@@ -83,11 +83,11 @@
     <!-- DASHBOARD -->
     <div id="dashboardContent" class="dashboard-hidden">
 
-    <!-- HEADER — Slim topbar -->
+    <!-- HEADER -->
     <header class="header">
         <div class="header-left">
             <div class="logo">
-                <svg width="22" height="22" viewBox="0 0 32 32" fill="none">
+                <svg width="20" height="20" viewBox="0 0 32 32" fill="none">
                     <circle cx="16" cy="16" r="14" stroke="#20808D" stroke-width="2" fill="none" opacity="0.3"/>
                     <circle cx="16" cy="16" r="8" stroke="#20808D" stroke-width="2" fill="none"/>
                     <circle cx="16" cy="16" r="3" fill="#20808D"/>
@@ -98,6 +98,7 @@
                 </svg>
                 <div class="logo-text">
                     <span class="logo-title">POLYMARKET</span>
+                    <span class="logo-sep">/</span>
                     <span class="logo-subtitle">ANALYTICS</span>
                 </div>
             </div>
@@ -115,88 +116,86 @@
         </div>
     </header>
 
-    <!-- PERFORMANCE KPIs — Compact row -->
-    <section class="analytics-kpis">
-        <div class="kpi-card ev-kpi-purple">
+    <!-- PERFORMANCE KPIs -->
+    <section class="kpi-strip kpi-strip-7">
+        <div class="kpi-cell kpi-primary">
             <div class="kpi-label">Total Trades</div>
             <div class="kpi-value" id="kpiTotalTrades">0</div>
             <div class="kpi-sub" id="kpiWinsLosses">0W / 0L</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">Win Rate</div>
             <div class="kpi-value" id="kpiWinRate">0%</div>
             <div class="kpi-sub" id="kpiWinRateSub">--</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">Realized P&L</div>
             <div class="kpi-value" id="kpiRealizedPnl">$0.00</div>
             <div class="kpi-sub" id="kpiRealizedSub">--</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">Profit Factor</div>
             <div class="kpi-value" id="kpiProfitFactor">--</div>
             <div class="kpi-sub">gross wins / gross losses</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">Avg Win</div>
             <div class="kpi-value pnl-positive" id="kpiAvgWin">--</div>
             <div class="kpi-sub" id="kpiAvgWinSub">--</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">Avg Loss</div>
             <div class="kpi-value pnl-negative" id="kpiAvgLoss">--</div>
             <div class="kpi-sub" id="kpiAvgLossSub">--</div>
         </div>
-        <div class="kpi-card ev-kpi-purple">
+        <div class="kpi-cell">
             <div class="kpi-label">ROI</div>
             <div class="kpi-value" id="kpiROI">0%</div>
             <div class="kpi-sub" id="kpiROISub">vs starting bankroll</div>
         </div>
     </section>
 
-    <!-- CHARTS ROW 1: Win Rate by Category + P&L by Category -->
-    <section class="analytics-grid">
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">Win Rate by Category</h2></div>
+    <!-- CHARTS ROW 1 -->
+    <section class="grid-2">
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Win Rate by Category</h2></div>
             <div class="chart-wrap"><canvas id="winRateByCatChart"></canvas></div>
         </div>
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">P&L by Category</h2></div>
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">P&L by Category</h2></div>
             <div class="chart-wrap"><canvas id="pnlByCatChart"></canvas></div>
         </div>
     </section>
 
-    <!-- CHARTS ROW 2: Entry Price Analysis + Exit Analysis -->
-    <section class="analytics-grid">
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">Entry Price Analysis</h2></div>
+    <!-- CHARTS ROW 2 -->
+    <section class="grid-2">
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Entry Price Analysis</h2></div>
             <div class="chart-wrap"><canvas id="entryPriceChart"></canvas></div>
         </div>
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">Exit Analysis</h2></div>
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Exit Analysis</h2></div>
             <div class="chart-wrap"><canvas id="exitAnalysisChart"></canvas></div>
         </div>
     </section>
 
-    <!-- CHARTS ROW 3: Hold Time Analysis + Equity Curve -->
-    <section class="analytics-grid">
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">Hold Time Analysis</h2></div>
+    <!-- CHARTS ROW 3 -->
+    <section class="grid-2">
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Hold Time Analysis</h2></div>
             <div class="chart-wrap"><canvas id="holdTimeChart"></canvas></div>
         </div>
-        <div class="card">
-            <div class="card-header"><h2 class="card-title">Equity Curve</h2></div>
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Equity Curve</h2></div>
             <div class="chart-wrap"><canvas id="equityCurveChart"></canvas></div>
         </div>
     </section>
 
-    <!-- TRADE HISTORY TABLE -->
-    <section class="card" style="margin: 0 16px 8px;">
-        <div class="card-header">
-            <h2 class="card-title">Trade History</h2>
-            <div class="card-header-right">
-                <span class="badge" id="tradeCountBadge">0 trades</span>
-            </div>
+    <!-- TRADE HISTORY -->
+    <section class="panel panel-flush">
+        <div class="panel-header">
+            <h2 class="panel-title">Trade History</h2>
+            <span class="badge" id="tradeCountBadge">0 trades</span>
         </div>
         <div class="analytics-table-wrap">
             <table class="trade-table">
@@ -209,7 +208,7 @@
                         <th class="sortable" data-sort="entry">Entry <span class="sort-arrow">&#x25B2;</span></th>
                         <th class="sortable" data-sort="exit">Exit <span class="sort-arrow">&#x25B2;</span></th>
                         <th class="sortable" data-sort="pnl">P&L <span class="sort-arrow">&#x25B2;</span></th>
-                        <th class="sortable" data-sort="hold">Hold Time <span class="sort-arrow">&#x25B2;</span></th>
+                        <th class="sortable" data-sort="hold">Hold <span class="sort-arrow">&#x25B2;</span></th>
                         <th>Exit Reason</th>
                     </tr>
                 </thead>
@@ -220,7 +219,7 @@
 
     <!-- FOOTER -->
     <footer class="footer">
-        <span class="footer-text">Polymarket Agent — Analytics Dashboard — Auto-refreshes every 30s</span>
+        <span>Polymarket Agent &mdash; Analytics &mdash; Auto-refreshes every 30s</span>
     </footer>
 
     </div>
