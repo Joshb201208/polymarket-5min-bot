@@ -67,6 +67,7 @@ class StockAgentScheduler:
         self._first_run_done = False
         self._pending_signals: list[Signal] = []
         self._macro_check_done_today: str | None = None
+        self._morning_brief_done_today: str | None = None
 
     def shutdown(self):
         logger.info("Shutdown requested")
@@ -134,6 +135,11 @@ class StockAgentScheduler:
             logger.info("Starting mid-week analysis cycle")
             await self._run_midweek_analysis()
 
+        # ── Morning brief: Mon-Fri, 8:15-8:45 AM ET (after macro check, before scan) ──
+        if self._should_send_morning_brief(now_et):
+            logger.info("Sending morning brief")
+            await self._send_morning_brief()
+
         # ── Daily pre-market scan: Mon-Fri, 8-9 AM ET ──
         if self._should_run_daily_prescan(now_et):
             logger.info("Starting daily pre-market scan")
@@ -172,6 +178,16 @@ class StockAgentScheduler:
             return False
         current_time = now_et.time()
         return time(6, 30) <= current_time <= time(7, 30)
+
+    def _should_send_morning_brief(self, now_et: datetime) -> bool:
+        """Send morning brief Mon-Fri, 8:15-8:45 AM ET (8:15-8:45 PM SGT)."""
+        if now_et.weekday() >= 5:
+            return False
+        today_str = now_et.strftime("%Y-%m-%d")
+        if self._morning_brief_done_today == today_str:
+            return False
+        current_time = now_et.time()
+        return time(8, 15) <= current_time <= time(8, 45)
 
     def _should_run_weekly(self, now_et: datetime) -> bool:
         """Run weekly analysis on Sunday between 6-8 PM ET."""
@@ -1117,6 +1133,245 @@ class StockAgentScheduler:
                 self.discord.send_error(str(e), context=f"Sell execution for {position.symbol}"),
                 return_exceptions=True,
             )
+
+    # ── Morning Brief ────────────────────────────────────────────────
+
+    async def _send_morning_brief(self):
+        """Comprehensive morning brief posted to #announcements.
+
+        Includes: portfolio status, market regime, yesterday's activity,
+        today's outlook, key levels, and what the bot plans to do.
+        """
+        try:
+            now = _now_et()
+            self._morning_brief_done_today = now.strftime("%Y-%m-%d")
+            today_str = now.strftime("%A, %B %d, %Y")
+            sgt_str = datetime.now(SGT).strftime("%I:%M %p SGT")
+
+            embeds: list[dict] = []
+
+            # ── 1. PORTFOLIO STATUS ──────────────────────────────
+            # Sync from Alpaca for accurate data
+            alpaca_account = await self.executor.get_account()
+            alpaca_positions = await self.executor.get_positions()
+
+            if alpaca_account:
+                equity = float(alpaca_account.get("equity", 0))
+                cash = float(alpaca_account.get("cash", 0))
+                last_equity = float(alpaca_account.get("last_equity", 0))
+                day_pnl = equity - last_equity
+                day_pnl_pct = (day_pnl / last_equity * 100) if last_equity > 0 else 0
+                starting = self.portfolio.state.starting_capital
+                total_pnl = equity - starting
+                total_pnl_pct = (total_pnl / starting * 100) if starting > 0 else 0
+                invested = equity - cash
+                exposure_pct = (invested / equity * 100) if equity > 0 else 0
+
+                # Also sync internal portfolio
+                if alpaca_positions:
+                    self.portfolio.sync_from_alpaca(alpaca_positions, alpaca_account)
+
+                pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
+                day_emoji = "\u2705" if day_pnl >= 0 else "\u274c"
+
+                portfolio_fields = [
+                    {"name": "Portfolio Value", "value": f"**${equity:,.2f}**", "inline": True},
+                    {"name": "Cash Available", "value": f"${cash:,.0f}", "inline": True},
+                    {"name": "Exposure", "value": f"{exposure_pct:.1f}% (${invested:,.0f})", "inline": True},
+                    {"name": f"{day_emoji} Yesterday P&L", "value": f"${day_pnl:+,.2f} ({day_pnl_pct:+.2f}%)", "inline": True},
+                    {"name": f"{pnl_emoji} Total P&L", "value": f"${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)", "inline": True},
+                    {"name": "Positions", "value": f"{len(alpaca_positions)} / {self.config.MAX_POSITIONS} slots", "inline": True},
+                ]
+
+                # Position table
+                if alpaca_positions:
+                    # Sort by unrealized P&L descending
+                    sorted_pos = sorted(
+                        alpaca_positions,
+                        key=lambda p: float(p.get("unrealized_pl", 0)),
+                        reverse=True,
+                    )
+                    pos_lines = []
+                    for p in sorted_pos:
+                        sym = p.get("symbol", "?")
+                        upnl = float(p.get("unrealized_pl", 0))
+                        upnl_pct = float(p.get("unrealized_plpc", 0)) * 100
+                        cur = float(p.get("current_price", 0))
+                        mv = float(p.get("market_value", 0))
+                        emoji = "\u2705" if upnl >= 0 else "\u274c"
+                        pos_lines.append(
+                            f"{emoji} **{sym}** ${cur:,.2f} | ${upnl:+,.0f} ({upnl_pct:+.1f}%) | ${mv:,.0f}"
+                        )
+                    pos_text = "\n".join(pos_lines)
+                    if len(pos_text) <= 1024:
+                        portfolio_fields.append(
+                            {"name": "\U0001f4bc Open Positions", "value": pos_text, "inline": False}
+                        )
+                    else:
+                        # Split into two fields
+                        mid = len(pos_lines) // 2
+                        portfolio_fields.append(
+                            {"name": "\U0001f4bc Positions (1/2)", "value": "\n".join(pos_lines[:mid]), "inline": False}
+                        )
+                        portfolio_fields.append(
+                            {"name": "\U0001f4bc Positions (2/2)", "value": "\n".join(pos_lines[mid:]), "inline": False}
+                        )
+
+                embeds.append({
+                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
+                    "description": f"Good {'morning' if now.hour < 12 else 'evening'}. Here's your daily update. ({sgt_str})",
+                    "color": 0x3B82F6,
+                    "fields": portfolio_fields,
+                })
+            else:
+                embeds.append({
+                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
+                    "description": "Could not fetch Alpaca account data.",
+                    "color": 0xEF4444,
+                })
+
+            # ── 2. MARKET REGIME ─────────────────────────────────
+            macro_snap = self.macro.get_last_snapshot()
+            if macro_snap:
+                regime_embed = self.macro.format_discord_brief(macro_snap)
+                regime_embed["title"] = "\U0001f30d Market Conditions"
+                embeds.append(regime_embed)
+            else:
+                # Run a fresh check if none exists
+                try:
+                    macro_snap = await self.macro.check_conditions()
+                    regime_embed = self.macro.format_discord_brief(macro_snap)
+                    regime_embed["title"] = "\U0001f30d Market Conditions"
+                    embeds.append(regime_embed)
+                except Exception as e:
+                    logger.warning("Could not fetch macro data for morning brief: %s", e)
+
+            # ── 3. YESTERDAY RECAP ───────────────────────────────
+            yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            yesterday_trades = [
+                t for t in self.portfolio.state.trade_history
+                if t.timestamp.strftime("%Y-%m-%d") == yesterday_str
+            ]
+
+            recap_lines = []
+            if yesterday_trades:
+                for t in yesterday_trades:
+                    pnl_str = ""
+                    if t.pnl is not None:
+                        pnl_str = f" \u2192 ${t.pnl:+,.0f}"
+                    recap_lines.append(f"\u2022 **{t.action}** {t.symbol} x{t.shares} @ ${t.price:.2f}{pnl_str}")
+            else:
+                recap_lines.append("No trades executed yesterday. The bot held steady.")
+
+            # What scans ran
+            scan_info = []
+            day_of_week = now.weekday()
+            yesterday_dow = (now - timedelta(days=1)).weekday()
+            if yesterday_dow == 6:  # Sunday
+                scan_info.append("\u2022 Weekly full analysis ran (Sunday cycle)")
+            if yesterday_dow == 2:  # Wednesday
+                scan_info.append("\u2022 Mid-week analysis ran (Wednesday refresh)")
+            if yesterday_dow < 5:  # Weekday
+                scan_info.append("\u2022 Daily pre-market scan completed")
+                scan_info.append("\u2022 Market monitoring ran every 30 min during market hours")
+
+            recap_text = "**Trades:**\n" + "\n".join(recap_lines)
+            if scan_info:
+                recap_text += "\n\n**Bot Activity:**\n" + "\n".join(scan_info)
+
+            embeds.append({
+                "title": "\U0001f4cb Yesterday's Recap",
+                "description": recap_text,
+                "color": 0x6B7280,
+            })
+
+            # ── 4. TODAY'S OUTLOOK ───────────────────────────────
+            outlook_lines = []
+
+            # What's scheduled today
+            if day_of_week < 5:  # Weekday
+                outlook_lines.append("\u2022 **6:30 AM ET** \u2014 Macro conditions check")
+                outlook_lines.append("\u2022 **7:00 AM ET** \u2014 Earnings-reactive scan")
+                outlook_lines.append("\u2022 **8:00 AM ET** \u2014 Daily pre-market scan")
+                outlook_lines.append("\u2022 **9:30 AM - 4:00 PM ET** \u2014 Market monitoring (every 30 min)")
+                outlook_lines.append("\u2022 **4:05 PM ET** \u2014 Daily summary")
+            if day_of_week == 2:  # Wednesday
+                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Mid-week full analysis (Wednesday refresh)")
+            if day_of_week == 6:  # Sunday
+                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Weekly full analysis")
+
+            # Regime-driven behavior
+            regime = self.macro.get_current_regime()
+            min_conv = self.macro.get_effective_min_conviction()
+            scan_depth = self.macro.get_effective_universe_size()
+            analysis_depth = self.macro.get_effective_analysis_depth()
+
+            outlook_lines.append("")
+            outlook_lines.append(f"**Active Regime:** {regime.replace('_', ' ').title()}")
+            outlook_lines.append(f"**Conviction Threshold:** {min_conv}/10")
+            outlook_lines.append(f"**Scan Depth:** {scan_depth} stocks \u2192 analyze top {analysis_depth}")
+
+            # Available slots and firepower
+            open_slots = self.config.MAX_POSITIONS - len(self.portfolio.state.positions)
+            if open_slots > 0 and alpaca_account:
+                outlook_lines.append(f"**Open Slots:** {open_slots} positions available")
+                outlook_lines.append(f"**Buying Power:** ${cash:,.0f} ready to deploy")
+            elif open_slots <= 0:
+                outlook_lines.append("**Slots:** Fully invested \u2014 no new positions unless one is sold")
+
+            # Pending signals
+            if self._pending_signals:
+                outlook_lines.append(f"\n**\U0001f4e1 {len(self._pending_signals)} signal(s) queued** for market open")
+                for sig in self._pending_signals[:5]:
+                    outlook_lines.append(f"  \u2022 {sig.action} {sig.symbol} (conviction {sig.conviction})")
+
+            embeds.append({
+                "title": "\U0001f3af Today's Plan",
+                "description": "\n".join(outlook_lines),
+                "color": 0x8B5CF6,
+            })
+
+            # ── 5. KEY LEVELS ────────────────────────────────────
+            from stock_agent.macro_monitor import (
+                SPX_SUPPORT_LOW, SPX_SUPPORT_HIGH,
+                SPX_RESISTANCE_1, SPX_RESISTANCE_2, SPX_RESISTANCE_CONFIRM,
+                QQQ_RESISTANCE_1, QQQ_RESISTANCE_2,
+            )
+
+            spx_price = macro_snap.spx_price if macro_snap else 0
+            qqq_price = macro_snap.qqq_price if macro_snap else 0
+
+            levels_text = (
+                f"**S&P 500** (current: ${spx_price:,.0f})\n"
+                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                f"\U0001f534 Support: {SPX_SUPPORT_LOW:,} - {SPX_SUPPORT_HIGH:,} (buy zone)\n"
+                f"\U0001f7e1 Resistance 1: {SPX_RESISTANCE_1:,}\n"
+                f"\U0001f7e1 Resistance 2: {SPX_RESISTANCE_2:,}\n"
+                f"\U0001f7e2 Trend Confirmed: {SPX_RESISTANCE_CONFIRM:,}\n"
+                f"\n"
+                f"**QQQ** (current: ${qqq_price:,.2f})\n"
+                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                f"\U0001f7e1 Resistance 1: {QQQ_RESISTANCE_1}\n"
+                f"\U0001f7e1 Resistance 2: {QQQ_RESISTANCE_2}\n"
+            )
+
+            embeds.append({
+                "title": "\U0001f4ca Key Levels to Watch",
+                "description": levels_text,
+                "color": 0xF59E0B,
+            })
+
+            # ── POST TO DISCORD ──────────────────────────────────
+            # Post to announcements channel as multi-embed message
+            ch = self.discord.channels.get("announcements", "")
+            if ch:
+                # Discord allows max 10 embeds — we should have 5
+                await self.discord._send_multi_embed(ch, embeds)
+
+            logger.info("Morning brief sent — %d embeds", len(embeds))
+
+        except Exception as e:
+            logger.exception("Morning brief failed: %s", e)
 
     # ── Sector backfill ──────────────────────────────────────────────
 
