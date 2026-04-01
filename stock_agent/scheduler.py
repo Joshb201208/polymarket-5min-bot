@@ -20,6 +20,7 @@ from stock_agent.risk_manager import RiskManager
 from stock_agent.screener import Screener
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
+from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class StockAgentScheduler:
         self.executor = Executor(self.config)
         self.telegram = TelegramReporter(self.config)
         self.discord = DiscordReporter(self.config)
+        self.macro = MacroMonitor(self.config)
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
@@ -64,6 +66,7 @@ class StockAgentScheduler:
         self._earnings_check_done_today: str | None = None
         self._first_run_done = False
         self._pending_signals: list[Signal] = []
+        self._macro_check_done_today: str | None = None
 
     def shutdown(self):
         logger.info("Shutdown requested")
@@ -116,6 +119,11 @@ class StockAgentScheduler:
                 await self._execute_signals(self._pending_signals)
                 self._pending_signals.clear()
 
+        # ── Macro conditions check: Mon-Fri, 7-8 AM ET (before everything else) ──
+        if self._should_run_macro_check(now_et):
+            logger.info("Running macro conditions check")
+            await self._run_macro_check()
+
         # ── Weekly analysis: Sunday, between 6-8 PM ET ──
         if self._should_run_weekly(now_et):
             logger.info("Starting weekly analysis cycle")
@@ -154,6 +162,16 @@ class StockAgentScheduler:
             await self._send_daily_summary()
 
     # ── Schedule checks ──────────────────────────────────────────────
+
+    def _should_run_macro_check(self, now_et: datetime) -> bool:
+        """Run macro conditions check Mon-Fri, 6:30-7:30 AM ET (before pre-market scan)."""
+        if now_et.weekday() >= 5:
+            return False
+        today_str = now_et.strftime("%Y-%m-%d")
+        if self._macro_check_done_today == today_str:
+            return False
+        current_time = now_et.time()
+        return time(6, 30) <= current_time <= time(7, 30)
 
     def _should_run_weekly(self, now_et: datetime) -> bool:
         """Run weekly analysis on Sunday between 6-8 PM ET."""
@@ -231,6 +249,43 @@ class StockAgentScheduler:
 
     # ── Weekly analysis ──────────────────────────────────────────────
 
+    async def _run_macro_check(self):
+        """Run macro conditions check and post brief to Discord."""
+        try:
+            now = _now_et()
+            self._macro_check_done_today = now.strftime("%Y-%m-%d")
+
+            snapshot = await self.macro.check_conditions()
+
+            # Post macro brief to Discord
+            embed = self.macro.format_discord_brief(snapshot)
+            await self.discord.send_embed(self.discord.channels.get("macro", ""), embed)
+
+            # If regime changed, also post to announcements
+            if snapshot.regime_changed:
+                regime_name = snapshot.regime.replace('_', ' ').title()
+                prev_name = snapshot.previous_regime.replace('_', ' ').title()
+                await self.discord.send_embed(
+                    self.discord.channels.get("announcements", ""),
+                    {
+                        "title": "\u26a1 Market Regime Change",
+                        "description": (
+                            f"Regime shifted from **{prev_name}** to **{regime_name}**\n\n"
+                            f"{snapshot.regime_description}"
+                        ),
+                        "color": 0xF59E0B,
+                        "fields": [{"name": "Signals", "value": "\n".join(f"\u2022 {s}" for s in snapshot.signals[:8]) or "None", "inline": False}],
+                    },
+                )
+
+            logger.info(
+                "Macro check complete: regime=%s, score=%d, signals=%d",
+                snapshot.regime, snapshot.regime_score, len(snapshot.signals),
+            )
+
+        except Exception as e:
+            logger.exception("Macro check failed: %s", e)
+
     async def _run_weekly_analysis(self):
         """Full weekly research cycle."""
         try:
@@ -268,7 +323,7 @@ class StockAgentScheduler:
 
             # 3. GPT-4.1 Nano screening
             ranked = await self.screener.screen_candidates(companies)
-            top_symbols = [r["symbol"] for r in ranked[: self.config.DEEP_ANALYSIS_SIZE]]
+            top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
             logger.info("Top %d for deep analysis: %s", len(top_symbols), top_symbols)
 
             # Send screener results to Discord
@@ -351,7 +406,7 @@ class StockAgentScheduler:
 
             # 3. Screen
             ranked = await self.screener.screen_candidates(companies)
-            top_symbols = [r["symbol"] for r in ranked[: self.config.DEEP_ANALYSIS_SIZE]]
+            top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
 
             try:
                 await self.discord.send_screener_results(ranked[:25])
@@ -725,7 +780,7 @@ class StockAgentScheduler:
                 except Exception:
                     pass
 
-                if thesis.direction == "BUY" and thesis.conviction >= self.config.MIN_CONVICTION:
+                if thesis.direction == "BUY" and thesis.conviction >= self.macro.get_effective_min_conviction():
                     signal = Signal(
                         symbol=sym,
                         action="BUY",
@@ -1097,7 +1152,7 @@ class StockAgentScheduler:
         except Exception:
             pass
 
-        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram, self.discord]:
+        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram, self.discord, self.macro]:
             try:
                 await resource.close()
             except Exception:
