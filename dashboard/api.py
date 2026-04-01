@@ -104,6 +104,25 @@ def logout(request: Request) -> dict:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _is_real_trade(p: dict) -> bool:
+    """Return True if this position is a real trade (not purge/cleanup/worthless).
+
+    Used to filter out noise from P&L calculations.
+    """
+    exit_reason = (p.get("exit_reason") or "").lower()
+    edge_source = (p.get("edge_source") or "").lower()
+
+    if edge_source == "extreme_pricing":
+        return False
+
+    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing")
+    for kw in noise_keywords:
+        if kw in exit_reason:
+            return False
+
+    return True
+
+
 def _read_json(filename: str) -> Any:
     """Read a JSON file from the data directory. Returns {} on failure."""
     path = DATA_DIR / filename
@@ -954,20 +973,42 @@ def get_events_status() -> dict:
 
 @app.get("/api/events/positions", dependencies=[Depends(_require_auth)])
 def get_events_positions() -> dict:
-    """Events positions (open + closed)."""
+    """Events positions (open + closed, filtered to real trades)."""
     positions = _read_json("events_positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
-    closed_pos = [p for p in positions if p.get("status") != "open"]
+    closed_pos = [p for p in positions if p.get("status") != "open" and _is_real_trade(p)]
     return {"open": open_pos, "closed": closed_pos}
 
 
 @app.get("/api/events/trades", dependencies=[Depends(_require_auth)])
 def get_events_trades() -> dict:
-    """Events trades + closed positions for history table."""
-    trades = _read_json("events_trades.json").get("trades", [])
+    """Events trades + closed positions for history table.
+
+    Filters out purge/cleanup/worthless entries so the dashboard shows
+    only real trades, sorted most-recent first.
+    """
+    trades_raw = _read_json("events_trades.json").get("trades", [])
     positions = _read_json("events_positions.json").get("positions", [])
-    closed = [p for p in positions if p.get("status") != "open"]
-    return {"trades": trades, "closed_positions": closed}
+
+    # Build set of position IDs that are purge/cleanup (not real trades)
+    noise_position_ids = set()
+    for p in positions:
+        if not _is_real_trade(p):
+            noise_position_ids.add(p.get("id", ""))
+
+    # Filter trades: exclude those linked to noise positions
+    clean_trades = [
+        t for t in trades_raw
+        if t.get("position_id", "") not in noise_position_ids
+    ]
+
+    # Sort most recent first
+    clean_trades.sort(key=lambda t: t.get("timestamp", ""), reverse=True)
+
+    closed = [p for p in positions if p.get("status") != "open" and _is_real_trade(p)]
+    closed.sort(key=lambda p: p.get("exit_time", ""), reverse=True)
+
+    return {"trades": clean_trades, "closed_positions": closed}
 
 
 @app.get("/api/events/stats", dependencies=[Depends(_require_auth)])
@@ -975,9 +1016,10 @@ def get_events_stats() -> dict:
     """Events stats — P&L, win rate, category breakdown, exit analysis."""
     positions = _read_json("events_positions.json").get("positions", [])
     bankroll_data = _read_json("bankroll.json")
-    starting = bankroll_data.get("starting_bankroll", 500)
+    starting = bankroll_data.get("starting_bankroll", 440.58)
 
-    closed = [p for p in positions if p.get("status") != "open"]
+    # Filter to real trades only — exclude purge/cleanup/worthless/extreme_pricing
+    closed = [p for p in positions if p.get("status") != "open" and _is_real_trade(p)]
 
     total_closed = len(closed)
     wins = [p for p in closed if (p.get("pnl") or 0) > 0]
@@ -1043,16 +1085,24 @@ def get_events_stats() -> dict:
 
 @app.get("/api/events/portfolio_value", dependencies=[Depends(_require_auth)])
 def get_events_portfolio_value() -> dict:
-    """Mark-to-market portfolio value: cash + current value of all positions."""
+    """Mark-to-market portfolio value: cash + current value of all positions.
+
+    Uses bankroll.json (recalculated from first principles by the agent every
+    tick) as the source of truth for cash and realized P&L.
+    """
     import urllib.request as _urlreq
 
     bankroll_data = _read_json("bankroll.json")
-    total_bankroll = bankroll_data.get("current_bankroll", 0)
-    starting = bankroll_data.get("starting_bankroll", 500)
+    starting = bankroll_data.get("starting_bankroll", 440.58)
 
     positions = _read_json("events_positions.json").get("positions", [])
     open_pos = [p for p in positions if p.get("status") == "open"]
     closed_pos = [p for p in positions if p.get("status") != "open"]
+
+    # --- Recalculate bankroll from first principles (same as agent) ---
+    real_closed = [p for p in closed_pos if _is_real_trade(p)]
+    realized_pnl = sum(p.get("pnl", 0) or 0 for p in real_closed)
+    current_bankroll = starting + realized_pnl
 
     # Fetch live prices for open positions
     market_ids = list({p.get("market_id", "") for p in open_pos if p.get("market_id")})
@@ -1098,7 +1148,6 @@ def get_events_portfolio_value() -> dict:
         tok = p.get("token_id", "")
         shares = p.get("shares", 0) or 0
         live_price = market_prices.get(tok)
-        entry_price = p.get("entry_price", 0) or 0
 
         if live_price and shares > 0:
             cv = shares * live_price
@@ -1119,11 +1168,8 @@ def get_events_portfolio_value() -> dict:
         else:
             current_value_total += cost
 
-    cash = max(0, total_bankroll - deployed)
+    cash = max(0, current_bankroll - deployed)
     portfolio_value = cash + current_value_total
-
-    # Realized P&L
-    realized_pnl = sum(p.get("pnl", 0) or 0 for p in closed_pos)
 
     # Avg hold time for open positions
     avg_hold_hours = None
@@ -1139,10 +1185,11 @@ def get_events_portfolio_value() -> dict:
     return {
         "portfolio_value": round(portfolio_value, 2),
         "starting_bankroll": starting,
+        "current_bankroll": round(current_bankroll, 2),
         "cash": round(cash, 2),
-        "cash_pct": round(cash / total_bankroll * 100, 1) if total_bankroll > 0 else 100,
+        "cash_pct": round(cash / current_bankroll * 100, 1) if current_bankroll > 0 else 100,
         "deployed": round(deployed, 2),
-        "deployed_pct": round(deployed / total_bankroll * 100, 1) if total_bankroll > 0 else 0,
+        "deployed_pct": round(deployed / current_bankroll * 100, 1) if current_bankroll > 0 else 0,
         "unrealized_pnl": round(unrealized_pnl, 2),
         "unrealized_pnl_pct": round(unrealized_pnl / deployed * 100, 1) if deployed > 0 else 0,
         "realized_pnl": round(realized_pnl, 2),
@@ -1152,7 +1199,6 @@ def get_events_portfolio_value() -> dict:
         "best_position": best_pos,
         "worst_position": worst_pos,
         "avg_hold_hours": avg_hold_hours,
-        "total_bankroll": round(total_bankroll, 2),
     }
 
 
@@ -1776,7 +1822,7 @@ def get_analytics_equity_curve() -> dict:
 
     # Events equity data
     events_positions = _read_json("events_positions.json").get("positions", [])
-    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
 
     events_daily: dict[str, float] = defaultdict(float)
     for p in events_closed:
@@ -1820,7 +1866,7 @@ def get_analytics_correlation() -> dict:
     nba_closed = [p for p in nba_positions if p.get("status") != "open"]
 
     events_positions = _read_json("events_positions.json").get("positions", [])
-    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
 
     # Build daily P&L maps
     nba_daily: dict[str, float] = defaultdict(float)
@@ -2085,7 +2131,7 @@ def get_combined_overview() -> dict:
     events_positions = _read_json("events_positions.json").get("positions", [])
     events_trades_raw = _read_json("events_trades.json").get("trades", [])
     events_open = [p for p in events_positions if p.get("status") == "open"]
-    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
 
     events_mode = "paper"
     if events_trades_raw:
@@ -2160,7 +2206,7 @@ def get_combined_equity_curve() -> dict:
 
     # Events daily P&L
     events_positions = _read_json("events_positions.json").get("positions", [])
-    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
     events_daily: dict[str, float] = defaultdict(float)
     for p in events_closed:
         exit_ts = _parse_ts(p.get("exit_time"))
@@ -2220,7 +2266,7 @@ def get_combined_heatmap() -> dict:
 
     # Collect daily stats from Events
     events_positions = _read_json("events_positions.json").get("positions", [])
-    events_closed = [p for p in events_positions if p.get("status") != "open"]
+    events_closed = [p for p in events_positions if p.get("status") != "open" and _is_real_trade(p)]
 
     events_day_pnl: dict[str, float] = defaultdict(float)
     events_day_trades: dict[str, int] = defaultdict(int)

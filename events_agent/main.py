@@ -37,6 +37,28 @@ CATEGORY_PRIORITY: dict[str, float] = {
 }
 
 
+def _is_real_trade(position) -> bool:
+    """Return True if this is a real trade (not purge/cleanup/worthless).
+
+    Used to filter out noise from P&L calculations and dashboard stats.
+    """
+    exit_reason = getattr(position, "exit_reason", "") or ""
+    edge_source = getattr(position, "edge_source", "") or ""
+
+    # Exclude extreme_pricing positions (broken strategy)
+    if edge_source == "extreme_pricing":
+        return False
+
+    # Exclude purge/cleanup/worthless exit reasons
+    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing")
+    exit_lower = exit_reason.lower()
+    for keyword in noise_keywords:
+        if keyword in exit_lower:
+            return False
+
+    return True
+
+
 class EventsAgent:
     """Main events agent orchestrator — runs scan cycles, exit checks, and summaries."""
 
@@ -224,11 +246,17 @@ class EventsAgent:
         except Exception:
             pass
 
+        # 0. Recalculate bankroll from first principles every tick
+        self._recalculate_bankroll()
+
         # 1. Check for early exits on existing positions
         await self._check_exits()
 
         # 2. Check for resolved positions
         await self._check_resolutions()
+
+        # 3b. Recalculate bankroll again after resolutions may have changed P&L
+        self._recalculate_bankroll()
 
         # 3. Scan for new opportunities
         await self._scan_and_trade()
@@ -650,18 +678,56 @@ class EventsAgent:
                 except Exception as e:
                     logger.debug("Resolution check failed for %s: %s", market_id, e)
 
-    def _update_bankroll(self, payout: float) -> None:
-        """Add resolved payout back to bankroll."""
+    def _recalculate_bankroll(self) -> None:
+        """Recalculate bankroll from first principles — authoritative source of truth.
+
+        current_bankroll = starting_bankroll + realized_pnl (real trades only)
+        cash = current_bankroll - open_positions_cost
+        """
+        import json as _json
+        from nba_agent.utils import load_json
+
         try:
-            from nba_agent.utils import load_json
+            positions = self.portfolio.load_positions()
+
+            # Only count REAL closed trades — exclude purge/cleanup/worthless
+            real_closed = [
+                p for p in positions
+                if p.status == "closed"
+                and _is_real_trade(p)
+            ]
+
+            realized_pnl = sum(p.pnl or 0 for p in real_closed)
+            open_positions = [p for p in positions if p.status == "open"]
+            open_cost = sum(p.cost or 0 for p in open_positions)
+
+            current_bankroll = self.config.STARTING_BANKROLL + realized_pnl
+            cash = current_bankroll - open_cost
+
+            # Preserve existing fields (is_paused, peak_bankroll, etc.)
             state = load_json(self._bankroll_path, {})
-            current = float(state.get("current_bankroll", self.config.STARTING_BANKROLL))
-            state["current_bankroll"] = round(current + payout, 2)
-            import json as _json
+            state["starting_bankroll"] = self.config.STARTING_BANKROLL
+            state["current_bankroll"] = round(current_bankroll, 2)
+            state["cash"] = round(cash, 2)
+            state["realized_pnl"] = round(realized_pnl, 2)
+            state["open_positions_cost"] = round(open_cost, 2)
+
+            # Update peak bankroll
+            peak = float(state.get("peak_bankroll", current_bankroll))
+            if current_bankroll > peak:
+                state["peak_bankroll"] = round(current_bankroll, 2)
+
             self._bankroll_path.write_text(_json.dumps(state, default=str))
-            logger.info("Bankroll updated: +$%.2f → $%.2f", payout, state["current_bankroll"])
+            logger.info(
+                "Bankroll recalculated: $%.2f (realized=$%.2f, open_cost=$%.2f, cash=$%.2f)",
+                current_bankroll, realized_pnl, open_cost, cash,
+            )
         except Exception as e:
-            logger.error("Failed to update bankroll: %s", e)
+            logger.error("Failed to recalculate bankroll: %s", e)
+
+    def _update_bankroll(self, payout: float) -> None:
+        """Legacy hook — just triggers a full recalculation now."""
+        self._recalculate_bankroll()
 
     def _record_signal_attribution(self, position, market) -> None:
         """Record which intelligence signals drove a trade entry.

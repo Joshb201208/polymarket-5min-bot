@@ -30,7 +30,7 @@ class EventsConfig:
     FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
 
     # Bankroll (shared)
-    STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "500"))
+    STARTING_BANKROLL: float = float(os.getenv("STARTING_BANKROLL", "440.58"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.02"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 
