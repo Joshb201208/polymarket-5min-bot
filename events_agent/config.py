@@ -31,7 +31,7 @@ class EventsConfig:
 
     # Bankroll — adjusted for extreme_pricing damage (~$198 lost/locked on Polymarket).
     # Original deposit was $440.58. Real available: $242.11
-    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "242.11"))
+    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "192.0"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.05"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
 

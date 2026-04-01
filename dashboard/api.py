@@ -286,7 +286,7 @@ def deploy() -> dict:
 
 # Events agent starting bankroll — ground truth after extreme_pricing damage.
 # Original deposit $440.58 minus ~$198 locked in unsellable junk positions.
-EVENTS_STARTING_BANKROLL = 242.11
+EVENTS_STARTING_BANKROLL = 192.0
 
 
 @app.get("/api/events/status", dependencies=[Depends(_require_auth)])
@@ -874,6 +874,35 @@ def close_events_position(position_id: str) -> dict:
     }))
 
     return {"status": "queued", "position_id": position_id}
+
+
+@app.post("/api/events/force_close/{position_id}", dependencies=[Depends(_require_auth)])
+def force_close_position(position_id: str) -> dict:
+    """Mark a position as closed without executing a sell.
+
+    Used for positions manually sold on Polymarket or otherwise
+    closed outside the bot's control.
+    """
+    positions_path = DATA_DIR / "events_positions.json"
+    data = _read_json("events_positions.json")
+    positions = data.get("positions", [])
+
+    found = False
+    for p in positions:
+        if p.get("id") == position_id and p.get("status") == "open":
+            p["status"] = "closed"
+            p["exit_reason"] = "Manual close (force_close)"
+            p["exit_time"] = datetime.now(timezone.utc).isoformat()
+            p["exit_price"] = 0  # Unknown — sold manually
+            p["pnl"] = 0  # Will be excluded from P&L calculations
+            found = True
+            break
+
+    if not found:
+        raise HTTPException(status_code=404, detail="Position not found or already closed")
+
+    positions_path.write_text(json.dumps(data, indent=2, default=str))
+    return {"status": "force_closed", "position_id": position_id}
 
 
 class ResetRequest(BaseModel):
