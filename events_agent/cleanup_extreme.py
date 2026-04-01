@@ -212,11 +212,11 @@ def main():
 
     logger.info("CLOB client initialized")
 
-    # Step 2: Get all wallet positions (CLOB primary, Data API fallback)
-    all_positions = get_positions_from_clob(client)
+    # Step 2: Get all wallet positions (Data API primary — CLOB has auth issues from VPS)
+    all_positions = get_positions_from_data_api(config.FUNDER_ADDRESS)
     if not all_positions:
-        logger.warning("CLOB returned no positions, trying Data API fallback...")
-        all_positions = get_positions_from_data_api(config.FUNDER_ADDRESS)
+        logger.warning("Data API returned no positions, trying CLOB fallback...")
+        all_positions = get_positions_from_clob(client)
 
     if not all_positions:
         logger.info("No positions found in wallet")
