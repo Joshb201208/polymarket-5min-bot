@@ -42,7 +42,7 @@ class FREDMonitor:
 
     def __init__(self, config: IntelligenceConfig | None = None) -> None:
         self.config = config or IntelligenceConfig()
-        self._api_key = os.environ.get("FRED_API_KEY", "")
+        self._api_key = os.environ.get("FRED_API_KEY", "bbe655dfc916200f56a95e28c653a32f")
         self._cache_path = self.config.DATA_DIR / "fred_cache.json"
         self._series_cache: dict[str, dict] = {}  # series_id -> {value, prev_value, date}
 
