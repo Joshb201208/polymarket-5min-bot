@@ -47,6 +47,10 @@ _SPORTS_KEYWORDS = {
     "-goals-", "-saves-", "-strikeouts-",
     # Player props
     "-1h-", "-1q-", "-halftime-",
+    # Additional sports terms
+    "o-u-", "over-under", "game-total", "points-total", "match-winner",
+    "first-half", "second-half", "corners", "penalty", "red-card",
+    "yellow-card", "wickets", "innings",
 }
 
 # ---------------------------------------------------------------------------
@@ -126,7 +130,8 @@ _CATEGORY_KEYWORDS: dict[EventCategory, list[str]] = {
 
 # Secondary scan keywords — commodity/macro markets often phrase questions this way
 _SECONDARY_SCAN_KEYWORDS = [
-    "price", "rate", "above", "below", "over", "under",
+    "oil price", "gold price", "federal reserve", "interest rate",
+    "inflation", "CPI", "GDP", "tariff", "sanctions",
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,28 +143,25 @@ SPORTS_RE = re.compile(
     r'(?:'
     r'(?:vs\.?|versus)\s'  # "X vs Y" pattern (common in sports)
     r'|O/U\s+\d'  # Over/Under lines
+    r'|\bO/U\b'  # standalone O/U
+    r'|\bover[/-]under\b'
     r'|(?:Games? Total|Total (?:Points|Goals|Runs))'
     r'|(?:NBA|NFL|NHL|MLB|UEFA|FIFA|EPL|LaLiga|Serie A|Bundesliga|Ligue 1)'
     r'|(?:Moneyline|Spread|Point Spread|Handicap)'
     r'|(?:Will .+ win (?:the |their )?(?:game|match|series))'
+    r'|(?:first|second)\s+half'
+    r'|(?:total|combined)\s+(?:points|goals|runs|score)'
+    r'|(?:home|away)\s+(?:team|side)'
     r')',
     re.IGNORECASE
 )
 
 CRYPTO_DAILY_PRICE_RE = re.compile(
-    r'(?:
-    # Pattern 1: "Will the price of X be above/between $Y"
-    r'Will (?:the price of )?(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL|Dogecoin|DOGE|'
-    r'Cardano|ADA|Avalanche|AVAX|Polkadot|DOT|Chainlink|LINK|Litecoin|LTC|'
-    r'BNB|MATIC|Polygon)'
-    r'.*?(?:be above|be between|reach|dip to|hit|drop|fall)'
-    r'.*?\$[\d,]+'
-    r'|'
-    # Pattern 2: "Bitcoin Up or Down" style markets
-    r'(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL)\s+(?:Up|Down|up|down)\s+(?:or|Or)'
-    r'|'
-    # Pattern 3: "Will Bitcoin reach/hit/dip" without $ sign
-    r'Will (?:Bitcoin|BTC|Ethereum|ETH)\s+(?:reach|hit|dip|pump|dump|crash)'
+    r'(?:'
+    r'Will (?:the price of )?(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL|Dogecoin|DOGE|Cardano|ADA|Avalanche|AVAX|Polkadot|DOT|Chainlink|LINK|Litecoin|LTC|BNB|MATIC|Polygon).*?(?:be above|be between|reach|dip to|hit|drop|fall|close above|close below).*?\$[\d,]+'
+    r'|(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL)\s+(?:Up|Down)\s+(?:or|Or)'
+    r'|Will (?:Bitcoin|BTC|Ethereum|ETH)\s+(?:reach|hit|dip|pump|dump|crash)'
+    r'|(?:Bitcoin|BTC|Ethereum|ETH|XRP|Solana|SOL)\s+(?:price range|daily|hourly)'
     r')',
     re.IGNORECASE
 )
@@ -313,7 +315,7 @@ class EventsScanner:
         # Block crypto daily price markets (no edge on spot-price predictions)
         if SPORTS_RE.search(market.question):
             logger.info("Filtered sports market: %s", market.question[:80])
-            continue
+            return False
         if CRYPTO_DAILY_PRICE_RE.search(market.question):
             logger.info("Filtered crypto daily price market: %s", market.question[:80])
             return False
@@ -343,6 +345,17 @@ class EventsScanner:
             try:
                 end_dt = parse_utc(market.end_date)
                 if end_dt <= now:
+                    return False
+            except ValueError:
+                pass
+
+        # Don't enter markets expiring within 4 hours — not enough time for signals
+        if market.end_date:
+            try:
+                end_dt = parse_utc(market.end_date)
+                hours_remaining = (end_dt - now).total_seconds() / 3600
+                if hours_remaining < 4:
+                    logger.debug("Rejected %s: expires in %.1f hours (min 4h)", market.slug, hours_remaining)
                     return False
             except ValueError:
                 pass

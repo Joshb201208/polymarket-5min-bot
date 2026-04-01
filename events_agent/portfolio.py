@@ -8,7 +8,7 @@ from pathlib import Path
 
 from events_agent.config import EventsConfig
 from events_agent.models import Position, Trade
-from shared.utils import atomic_json_write, load_json, utcnow
+from shared.utils import atomic_json_write, load_json, parse_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,22 @@ class PortfolioManager:
         """Check if we already have an open position in this market."""
         positions = self.get_open_positions()
         return any(p.market_id == market_id for p in positions)
+
+    def has_recently_exited(self, market_id: str, days: int = 7) -> bool:
+        """Check if we recently exited a position in this market."""
+        from datetime import timedelta
+        cutoff = utcnow() - timedelta(days=days)
+        positions = self.load_positions()
+        for p in positions:
+            if p.market_id == market_id and p.status == "closed":
+                if p.exit_time:
+                    try:
+                        exit_dt = parse_utc(p.exit_time)
+                        if exit_dt > cutoff:
+                            return True
+                    except (ValueError, TypeError):
+                        pass
+        return False
 
     # ------------------------------------------------------------------
     # Summary generation

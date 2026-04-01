@@ -361,6 +361,10 @@ class EventsAgent:
                 if self.portfolio.has_existing_position(market.id):
                     continue
 
+                if self.portfolio.has_recently_exited(market.id, days=7):
+                    logger.info("Skipping %s: recently exited (7-day cooldown)", market.question[:50])
+                    continue
+
                 # Re-check max positions (may have added during this loop)
                 if len(open_positions) >= self.config.MAX_CONCURRENT_POSITIONS:
                     logger.info("Max positions reached (%d) — stopping scan loop",
@@ -537,7 +541,7 @@ class EventsAgent:
         kelly_fraction = (edge / odds_against) * 0.50  # Half Kelly
         bet_size = bankroll * kelly_fraction
 
-        # Cap at MAX_BET_PCT (2% for events)
+        # Cap at MAX_BET_PCT (5% of bankroll)
         max_bet = bankroll * self.config.MAX_BET_PCT
         bet_size = min(bet_size, max_bet)
 
