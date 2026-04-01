@@ -250,24 +250,12 @@ class EventsAgent:
                             min_price = 0.01
                         order_id = None
                         try:
-                            # GTC limit sell at 85% of midpoint — sits on book and fills
-                            sell_price = round(mid * 0.85, 2)
-                            if sell_price >= 0.01:
-                                order_id = self.executor._execute_limit_sell(
-                                    token_id, adjusted_shares, sell_price,
-                                )
+                            order_id = self.executor._execute_live_sell(
+                                token_id, adjusted_shares, getattr(p, "market_id", ""),
+                            )
                         except Exception as sell_err:
-                            logger.warning("Limit sell failed for %s: %s",
+                            logger.warning("Sell failed for %s: %s",
                                            getattr(p, "market_question", "")[:40], sell_err)
-                        # Fallback: FOK at minimum price
-                        if not order_id:
-                            try:
-                                order_id = self.executor._execute_live_sell(
-                                    token_id, adjusted_shares, getattr(p, "market_id", ""),
-                                )
-                            except Exception as sell_err2:
-                                logger.warning("FOK sell also failed for %s: %s",
-                                               getattr(p, "market_question", "")[:40], sell_err2)
                         if order_id:
                             sold_count += 1
                             sold_value += shares * mid

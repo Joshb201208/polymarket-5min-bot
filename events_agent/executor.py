@@ -315,66 +315,123 @@ class EventsExecutor:
             return ""
 
     def _execute_live_sell(self, token_id: str, shares: float, market_id: str) -> str:
-        """Execute a live FOK market sell order."""
+        """Execute a live sell — GTC limit first, FOK market fallback."""
         try:
-            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.clob_types import (
+                OrderArgs, OrderType, PartialCreateOrderOptions,
+                MarketOrderArgs,
+            )
             from py_clob_client.order_builder.constants import SELL
 
             client = self._get_live_client()
             if not client:
                 return ""
 
-            mo = MarketOrderArgs(
-                token_id=token_id,
-                amount=shares,
-                side=SELL,
-                order_type=OrderType.FOK,
-            )
-            signed = client.create_market_order(mo)
-            resp = client.post_order(signed, OrderType.FOK)
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
-            logger.info("Live SELL: order=%s shares=%.2f", order_id, shares)
-            return order_id
-        except Exception as e:
-            logger.error("Live SELL failed: %s", e)
-            return ""
+            # Get tick size and midpoint
+            tick_size = str(client.get_tick_size(token_id))
+            mid_data = client.get_midpoint(token_id)
+            midpoint = float(mid_data.get("mid", 0)) if isinstance(mid_data, dict) else float(mid_data)
 
-    def _execute_limit_sell(self, token_id: str, shares: float, price: float) -> str:
-        """Execute a GTC limit sell at a specific price.
-
-        Used for cleanup sells where FOK fails due to low liquidity.
-        Price should be slightly below midpoint for faster fills.
-        """
-        try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import SELL
-
-            client = self._get_live_client()
-            if not client:
+            if midpoint <= 0.01:
+                # Price too low, not worth selling
+                logger.warning("SELL skipped: midpoint too low (%.4f) for %s", midpoint, token_id[:16])
                 return ""
 
-            rounded_price = round(price, 2)
-            if rounded_price <= 0.01:
-                return ""
-
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=rounded_price,
-                size=shares,
-                side=SELL,
-            )
+            # Step 1: GTC limit sell at midpoint (willing to sell at current price)
+            # Slight discount to midpoint for faster fill
+            sell_price = round(midpoint * 0.98, len(tick_size.split('.')[-1]) if '.' in tick_size else 2)
+            sell_price = max(sell_price, 0.01)
 
             neg_risk = False
             try:
-                neg_risk = client.get_neg_risk(token_id)
+                # Check if market uses neg_risk
+                import urllib.request, json
+                url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    markets = json.loads(resp.read())
+                    if markets and len(markets) > 0:
+                        neg_risk = markets[0].get("neg_risk", False)
             except Exception:
                 pass
 
-            signed = client.create_order(order_args, {"neg_risk": neg_risk})
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=sell_price,
+                size=round(shares, 2),
+                side=SELL,
+            )
+            options = PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=neg_risk if neg_risk else None,
+            )
+            signed = client.create_order(order_args, options)
             resp = client.post_order(signed, OrderType.GTC)
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
-            logger.info("LIMIT SELL: order=%s shares=%.2f @ %.3f", order_id, shares, rounded_price)
-            return order_id
+
+            if order_id:
+                logger.info("GTC SELL posted: order=%s price=%.2f¢ shares=%.2f",
+                            order_id[:16], sell_price * 100, shares)
+
+                # Poll for fill (up to 30 seconds)
+                for _ in range(6):
+                    time.sleep(5)
+                    try:
+                        order_info = client.get_order(order_id)
+                        if isinstance(order_info, dict):
+                            status = order_info.get("status", "").upper()
+                            if status in ("MATCHED", "FILLED"):
+                                logger.info("GTC SELL filled: %s", order_id[:16])
+                                return order_id
+                            elif status in ("CANCELLED", "EXPIRED"):
+                                break
+                    except Exception:
+                        pass
+
+                # Cancel unfilled GTC order
+                try:
+                    client.cancel_orders([order_id])
+                except Exception:
+                    pass
+
+            # Step 2: Fallback — try FOK market sell
+            logger.info("GTC SELL not filled, trying FOK market sell...")
+            try:
+                mo = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(shares, 2),
+                    side=SELL,
+                    order_type=OrderType.FOK,
+                )
+                signed = client.create_market_order(mo)
+                resp = client.post_order(signed, OrderType.FOK)
+                fok_id = resp.get("orderID", "") if isinstance(resp, dict) else str(resp)
+                if fok_id:
+                    logger.info("FOK SELL executed: %s", fok_id[:16])
+                    return fok_id
+            except Exception as e:
+                logger.warning("FOK SELL failed: %s", e)
+
+            # Step 3: Last resort — post GTC limit sell at midpoint and leave it
+            # Don't wait, just post and return. It'll fill eventually.
+            try:
+                order_args2 = OrderArgs(
+                    token_id=token_id,
+                    price=sell_price,
+                    size=round(shares, 2),
+                    side=SELL,
+                )
+                signed2 = client.create_order(order_args2, options)
+                resp2 = client.post_order(signed2, OrderType.GTC)
+                gtc_id = resp2.get("orderID", "") if isinstance(resp2, dict) else str(resp2)
+                if gtc_id:
+                    logger.info("GTC SELL (persistent) posted: %s at %.2f¢", gtc_id[:16], sell_price * 100)
+                    return gtc_id
+            except Exception as e:
+                logger.error("Persistent GTC SELL failed: %s", e)
+
+            return ""
+
         except Exception as e:
-            logger.error("LIMIT SELL failed: %s", e)
+            logger.error("Live SELL failed: %s", e)
             return ""
