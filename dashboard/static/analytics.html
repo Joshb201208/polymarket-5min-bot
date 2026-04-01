@@ -11,27 +11,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
     <link rel="stylesheet" href="style.css">
-    <style>
-        /* Analytics-specific layout */
-        .analytics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 0 24px; margin-bottom: 20px; }
-        .analytics-grid .card { margin: 0; }
-        .analytics-full { grid-column: 1 / -1; }
-        .analytics-kpis { display: grid; grid-template-columns: repeat(7, 1fr); gap: 16px; padding: 0 24px; margin-bottom: 20px; }
-        .analytics-kpis .kpi-card { min-width: 0; }
-        .chart-wrap { position: relative; height: 300px; padding: 16px; }
-        .chart-wrap canvas { width: 100% !important; height: 100% !important; }
-
-        /* Trade history table in analytics */
-        .analytics-table-wrap { max-height: 500px; overflow-y: auto; }
-
-        @media (max-width: 1200px) {
-            .analytics-kpis { grid-template-columns: repeat(4, 1fr); }
-        }
-        @media (max-width: 768px) {
-            .analytics-grid { grid-template-columns: 1fr; }
-            .analytics-kpis { grid-template-columns: repeat(2, 1fr); }
-        }
-    </style>
 </head>
 <body>
 
@@ -50,24 +29,24 @@
                     <circle cx="60" cy="60" r="46" stroke="url(#ringGrad2)" stroke-width="0.75" stroke-dasharray="3 6" opacity="0.3"/>
                     <defs>
                         <linearGradient id="ringGrad" x1="0" y1="0" x2="120" y2="120">
-                            <stop offset="0%" stop-color="#00f0ff"/>
+                            <stop offset="0%" stop-color="#20808D"/>
                             <stop offset="100%" stop-color="#8b5cf6"/>
                         </linearGradient>
                         <linearGradient id="ringGrad2" x1="120" y1="0" x2="0" y2="120">
                             <stop offset="0%" stop-color="#8b5cf6"/>
-                            <stop offset="100%" stop-color="#00f0ff"/>
+                            <stop offset="100%" stop-color="#20808D"/>
                         </linearGradient>
                     </defs>
                 </svg>
                 <div class="login-logo-core">
                     <svg width="40" height="40" viewBox="0 0 32 32" fill="none">
-                        <circle cx="16" cy="16" r="12" stroke="#00f0ff" stroke-width="1.5" fill="none" opacity="0.5"/>
-                        <circle cx="16" cy="16" r="6" stroke="#00f0ff" stroke-width="1.5" fill="none"/>
-                        <circle cx="16" cy="16" r="2.5" fill="#00f0ff"/>
-                        <line x1="16" y1="4" x2="16" y2="10" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
-                        <line x1="16" y1="22" x2="16" y2="28" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
-                        <line x1="4" y1="16" x2="10" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
-                        <line x1="22" y1="16" x2="28" y2="16" stroke="#00f0ff" stroke-width="1" opacity="0.4"/>
+                        <circle cx="16" cy="16" r="12" stroke="#20808D" stroke-width="1.5" fill="none" opacity="0.5"/>
+                        <circle cx="16" cy="16" r="6" stroke="#20808D" stroke-width="1.5" fill="none"/>
+                        <circle cx="16" cy="16" r="2.5" fill="#20808D"/>
+                        <line x1="16" y1="4" x2="16" y2="10" stroke="#20808D" stroke-width="1" opacity="0.4"/>
+                        <line x1="16" y1="22" x2="16" y2="28" stroke="#20808D" stroke-width="1" opacity="0.4"/>
+                        <line x1="4" y1="16" x2="10" y2="16" stroke="#20808D" stroke-width="1" opacity="0.4"/>
+                        <line x1="22" y1="16" x2="28" y2="16" stroke="#20808D" stroke-width="1" opacity="0.4"/>
                     </svg>
                 </div>
             </div>
@@ -104,28 +83,28 @@
     <!-- DASHBOARD -->
     <div id="dashboardContent" class="dashboard-hidden">
 
-    <!-- HEADER -->
+    <!-- HEADER — Slim topbar -->
     <header class="header">
         <div class="header-left">
             <div class="logo">
-                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-                    <circle cx="16" cy="16" r="14" stroke="#00f0ff" stroke-width="2" fill="none" opacity="0.3"/>
-                    <circle cx="16" cy="16" r="8" stroke="#00f0ff" stroke-width="2" fill="none"/>
-                    <circle cx="16" cy="16" r="3" fill="#00f0ff"/>
-                    <line x1="16" y1="2" x2="16" y2="8" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="16" y1="24" x2="16" y2="30" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="2" y1="16" x2="8" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
-                    <line x1="24" y1="16" x2="30" y2="16" stroke="#00f0ff" stroke-width="1.5" opacity="0.5"/>
+                <svg width="22" height="22" viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="14" stroke="#20808D" stroke-width="2" fill="none" opacity="0.3"/>
+                    <circle cx="16" cy="16" r="8" stroke="#20808D" stroke-width="2" fill="none"/>
+                    <circle cx="16" cy="16" r="3" fill="#20808D"/>
+                    <line x1="16" y1="2" x2="16" y2="8" stroke="#20808D" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="16" y1="24" x2="16" y2="30" stroke="#20808D" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="2" y1="16" x2="8" y2="16" stroke="#20808D" stroke-width="1.5" opacity="0.5"/>
+                    <line x1="24" y1="16" x2="30" y2="16" stroke="#20808D" stroke-width="1.5" opacity="0.5"/>
                 </svg>
                 <div class="logo-text">
-                    <span class="logo-title" style="color:#00f0ff;">POLYMARKET</span>
+                    <span class="logo-title">POLYMARKET</span>
                     <span class="logo-subtitle">ANALYTICS</span>
                 </div>
             </div>
         </div>
         <div class="header-center">
             <a href="/" class="nav-link">Trading</a>
-            <a href="/analytics.html" class="nav-link active" style="color:#00f0ff;background:rgba(0,240,255,0.12);">Analytics</a>
+            <a href="/analytics.html" class="nav-link active">Analytics</a>
         </div>
         <div class="header-right">
             <div class="connection-status" id="connectionStatus">
@@ -136,7 +115,7 @@
         </div>
     </header>
 
-    <!-- PERFORMANCE SUMMARY KPIs -->
+    <!-- PERFORMANCE KPIs — Compact row -->
     <section class="analytics-kpis">
         <div class="kpi-card ev-kpi-purple">
             <div class="kpi-label">Total Trades</div>
@@ -212,7 +191,7 @@
     </section>
 
     <!-- TRADE HISTORY TABLE -->
-    <section class="card" style="margin: 0 24px 20px;">
+    <section class="card" style="margin: 0 16px 8px;">
         <div class="card-header">
             <h2 class="card-title">Trade History</h2>
             <div class="card-header-right">
