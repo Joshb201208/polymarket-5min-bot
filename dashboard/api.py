@@ -860,6 +860,18 @@ def deploy() -> dict:
     except Exception as e:
         results["restart_nba-agent"] = {"ok": False, "error": str(e)[:200]}
 
+    # Restart dashboard service (picks up new API code)
+    # Uses subprocess.Popen to avoid blocking — the current process will be killed
+    try:
+        subprocess.Popen(
+            ["systemctl", "restart", "dashboard"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        results["restart_dashboard"] = {"ok": True}
+    except Exception as e:
+        results["restart_dashboard"] = {"ok": False, "error": str(e)[:200]}
+
     results["status"] = "deployed" if all(
         r.get("ok") for r in results.values()
     ) else "partial"
