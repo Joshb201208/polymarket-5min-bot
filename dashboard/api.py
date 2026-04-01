@@ -905,6 +905,24 @@ def force_close_position(position_id: str) -> dict:
     return {"status": "force_closed", "position_id": position_id}
 
 
+@app.post("/api/events/cleanup_extreme", dependencies=[Depends(_require_auth)])
+def trigger_cleanup() -> dict:
+    """Trigger one-time cleanup of extreme_pricing junk positions."""
+    import threading
+
+    def run_cleanup():
+        try:
+            from events_agent.cleanup_extreme import main
+            main()
+        except Exception as e:
+            logger.error("Cleanup failed: %s", e)
+
+    t = threading.Thread(target=run_cleanup, daemon=True)
+    t.start()
+
+    return {"status": "cleanup_started", "message": "Scanning wallet and posting GTC sell orders for all junk positions"}
+
+
 class ResetRequest(BaseModel):
     new_starting_bankroll: float
 
