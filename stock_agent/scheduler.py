@@ -83,6 +83,9 @@ class StockAgentScheduler:
         except Exception as e:
             logger.error("Failed to send startup message: %s", e)
 
+        # Backfill missing sectors on existing positions
+        await self._backfill_sectors()
+
         try:
             while not self._shutdown:
                 now = _now_et()
@@ -899,7 +902,7 @@ class StockAgentScheduler:
                 self.discord.send_eli5_daily(summary),
                 return_exceptions=True,
             )
-            logger.info("Daily summary sent — PV=$%,.0f, Day P&L=$%+,.0f", pv, day_pnl)
+            logger.info("Daily summary sent — PV=$%.0f, Day P&L=$%+.0f", pv, day_pnl)
 
         except Exception as e:
             logger.exception("Daily summary failed: %s", e)
@@ -930,11 +933,14 @@ class StockAgentScheduler:
                 continue
 
             sym = signal.symbol
-            # Try to get sector from thesis/data
+            # Get sector from company fundamentals (FMP profile)
             company_sector = "Unknown"
-            thesis_data = self.portfolio.state.active_theses.get(sym, {})
-            if isinstance(thesis_data, dict):
-                company_sector = thesis_data.get("sector", "Unknown")
+            try:
+                company_data = await self.data_feed.get_company_fundamentals(sym)
+                if company_data and company_data.sector:
+                    company_sector = company_data.sector
+            except Exception:
+                pass
 
             price = signal.entry_price or 0
             if price <= 0:
@@ -1056,6 +1062,26 @@ class StockAgentScheduler:
                 self.discord.send_error(str(e), context=f"Sell execution for {position.symbol}"),
                 return_exceptions=True,
             )
+
+    # ── Sector backfill ──────────────────────────────────────────────
+
+    async def _backfill_sectors(self):
+        """One-time backfill: fetch sector for positions marked 'Unknown'."""
+        updated = 0
+        for pos in self.portfolio.state.positions:
+            if pos.sector and pos.sector != "Unknown":
+                continue
+            try:
+                company = await self.data_feed.get_company_fundamentals(pos.symbol)
+                if company and company.sector and company.sector != "Unknown":
+                    pos.sector = company.sector
+                    updated += 1
+                    logger.info("Backfilled sector for %s: %s", pos.symbol, company.sector)
+            except Exception as e:
+                logger.warning("Sector backfill failed for %s: %s", pos.symbol, e)
+        if updated:
+            self.portfolio._save()
+            logger.info("Backfilled sectors for %d positions", updated)
 
     # ── Cleanup ──────────────────────────────────────────────────────
 

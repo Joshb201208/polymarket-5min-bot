@@ -241,24 +241,24 @@ class DataFeed:
         return None
 
     async def get_batch_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """Get quotes for multiple symbols."""
+        """Get quotes for multiple symbols (one at a time — FMP stable API
+        no longer supports comma-separated multi-symbol queries)."""
         results = {}
-        # FMP supports comma-separated symbols in quote endpoint
-        batch_size = 20
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
-            sym_str = ",".join(batch)
-            data = await self._fmp_get("/quote", {"symbol": sym_str})
-            if isinstance(data, list):
-                for q in data:
-                    sym = q.get("symbol", "")
-                    results[sym] = {
-                        "symbol": sym,
+        for sym in symbols:
+            try:
+                data = await self._fmp_get("/quote", {"symbol": sym})
+                if isinstance(data, list) and data:
+                    q = data[0]
+                    results[q.get("symbol", sym)] = {
+                        "symbol": q.get("symbol", sym),
                         "price": q.get("price", 0),
                         "change": q.get("change", 0),
                         "change_pct": q.get("changesPercentage") or q.get("changePercentage") or 0,
                         "volume": q.get("volume", 0),
                     }
+                await asyncio.sleep(0.15)  # Gentle rate-limit
+            except Exception as e:
+                logger.warning("Quote fetch failed for %s: %s", sym, e)
         return results
 
     async def get_earnings_calendar(self, from_date: str, to_date: str) -> list[dict]:
