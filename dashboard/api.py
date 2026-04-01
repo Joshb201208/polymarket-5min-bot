@@ -214,8 +214,14 @@ def deploy() -> dict:
     except Exception as e:
         results["service_updated"] = {"ok": False, "error": str(e)[:100]}
 
-    # Reload nginx to pick up any static file changes
+    # Copy updated nginx config + reload
     try:
+        nginx_src = project_dir / "dashboard" / "nginx.conf"
+        if nginx_src.exists():
+            subprocess.run(
+                ["cp", str(nginx_src), "/etc/nginx/sites-available/dashboard"],
+                capture_output=True, timeout=5,
+            )
         nginx_reload = subprocess.run(
             ["systemctl", "reload", "nginx"],
             capture_output=True,
