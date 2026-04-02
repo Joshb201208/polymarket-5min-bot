@@ -300,9 +300,14 @@ def get_events_status() -> dict:
     events_positions = _read_json("events_positions.json").get("positions", [])
     events_trades = _read_json("events_trades.json").get("trades", [])
 
-    mode = "paper"
-    if events_trades:
-        mode = events_trades[-1].get("mode", "paper")
+    # Determine mode: check pause state, then default to live
+    pause_data = _read_json("events_paused.json")
+    if pause_data.get("paused"):
+        mode = "paused"
+    elif events_trades:
+        mode = events_trades[-1].get("mode", "live")
+    else:
+        mode = "live"  # Default: agent runs live unless explicitly paused
 
     return {
         "mode": mode,
