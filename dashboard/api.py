@@ -198,33 +198,36 @@ def deploy() -> dict:
     except Exception as e:
         results["git_pull"] = {"ok": False, "error": str(e)[:200]}
 
-    # Copy service file + daemon-reload + migrate from old nba-agent name
+    # Copy service files + daemon-reload
     try:
+        # Agent service
         svc_src = project_dir / "deploy" / "agents.service"
         if svc_src.exists():
             subprocess.run(
                 ["cp", str(svc_src), "/etc/systemd/system/events-agent.service"],
                 capture_output=True, timeout=5,
             )
-            # Disable old nba-agent service if it exists (migration)
+        # Dashboard service (has ExecStartPre for git pull on restart)
+        dash_svc = project_dir / "dashboard" / "dashboard.service"
+        if dash_svc.exists():
             subprocess.run(
-                ["systemctl", "disable", "nba-agent"],
+                ["cp", str(dash_svc), "/etc/systemd/system/dashboard.service"],
                 capture_output=True, timeout=5,
             )
-            subprocess.run(
-                ["systemctl", "stop", "nba-agent"],
-                capture_output=True, timeout=5,
-            )
-            # Enable the new events-agent service
-            subprocess.run(
-                ["systemctl", "enable", "events-agent"],
-                capture_output=True, timeout=5,
-            )
-            subprocess.run(
-                ["systemctl", "daemon-reload"],
-                capture_output=True, timeout=5,
-            )
-            results["service_updated"] = {"ok": True}
+        # Disable old nba-agent service if it exists (one-time migration)
+        subprocess.run(
+            ["systemctl", "disable", "nba-agent"],
+            capture_output=True, timeout=5,
+        )
+        subprocess.run(
+            ["systemctl", "stop", "nba-agent"],
+            capture_output=True, timeout=5,
+        )
+        # Enable services
+        subprocess.run(["systemctl", "enable", "events-agent"], capture_output=True, timeout=5)
+        subprocess.run(["systemctl", "enable", "dashboard"], capture_output=True, timeout=5)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=5)
+        results["service_updated"] = {"ok": True}
     except Exception as e:
         results["service_updated"] = {"ok": False, "error": str(e)[:100]}
 
