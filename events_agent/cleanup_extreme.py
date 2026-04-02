@@ -22,7 +22,7 @@ logger = logging.getLogger("cleanup")
 def get_positions_from_clob(client) -> list[dict]:
     """Primary method: use authenticated CLOB client to get all positions."""
     try:
-        all_positions = client.get_positions()
+        all_positions = []  # VPS py-clob-client version lacks get_positions()
         logger.info("CLOB returned %d positions", len(all_positions))
 
         wallet_positions = []
