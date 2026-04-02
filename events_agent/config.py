@@ -46,7 +46,7 @@ class EventsConfig:
     MIN_BET_SIZE: float = float(os.getenv("EVENTS_MIN_BET_SIZE", "8.0"))
 
     # Per-category concentration limit — max positions in a single category
-    MAX_PER_CATEGORY: int = int(os.getenv("EVENTS_MAX_PER_CATEGORY", "10"))
+    MAX_PER_CATEGORY: int = int(os.getenv("EVENTS_MAX_PER_CATEGORY", "15"))
 
     # Liquidity floor
     MIN_LIQUIDITY: float = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
