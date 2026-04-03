@@ -89,6 +89,19 @@ class RegimeDetector:
             prices = price_history or []
             volumes = volume_history or []
 
+            # No data → UNKNOWN (allow trading), not STALE (block trading)
+            if len(prices) < 3:
+                adj = REGIME_ADJUSTMENTS[Regime.UNKNOWN]
+                return RegimeAssessment(
+                    regime="unknown",
+                    volatility=0.0,
+                    trend_strength=0.0,
+                    volume_ratio=1.0,
+                    edge_multiplier=adj["edge_multiplier"],
+                    size_multiplier=adj["size_multiplier"],
+                    recommendation=adj["recommendation"],
+                )
+
             # Calculate metrics
             volatility = self._calc_volatility(prices)
             trend_strength = self._calc_trend_strength(prices)

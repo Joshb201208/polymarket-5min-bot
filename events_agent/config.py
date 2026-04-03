@@ -33,7 +33,7 @@ class EventsConfig:
     # Original deposit was $440.58. Real available: $242.11
     STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "223.87"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.15"))
-    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
+    MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.95"))
 
     # Scan interval (minutes)
     SCAN_INTERVAL: int = int(os.getenv("EVENTS_SCAN_INTERVAL_MINUTES", "45"))
