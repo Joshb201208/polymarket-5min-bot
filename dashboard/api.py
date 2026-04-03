@@ -1557,3 +1557,31 @@ def get_wallet_positions() -> dict:
     result["bot_tracked"] = len(open_pos)
     
     return result
+
+
+@app.post("/api/events/inject_position", dependencies=[Depends(_require_auth)])
+def inject_position(body: dict) -> dict:
+    """Add an untracked position to the bot's portfolio for management."""
+    import json as _json
+    positions_path = DATA_DIR / "events_positions.json"
+    data = _read_json("events_positions.json")
+    positions = data.get("positions", [])
+    
+    new_pos = {
+        "id": f"evt_pos_injected_{int(datetime.now(timezone.utc).timestamp())}",
+        "market_id": body["market_id"],
+        "market_question": body["market_question"],
+        "token_id": body["token_id"],
+        "side": body["side"],
+        "category": body.get("category", "other"),
+        "entry_price": body["entry_price"],
+        "shares": body["shares"],
+        "cost": body["cost"],
+        "entry_time": body.get("entry_time", datetime.now(timezone.utc).isoformat()),
+        "status": "open",
+        "edge_source": "manual_inject",
+    }
+    positions.append(new_pos)
+    data["positions"] = positions
+    positions_path.write_text(_json.dumps(data, indent=2, default=str))
+    return {"status": "injected", "position_id": new_pos["id"]}
