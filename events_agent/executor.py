@@ -272,17 +272,26 @@ class EventsExecutor:
                         if isinstance(order_info, dict):
                             status = order_info.get("status", "").upper()
                             if status in ("MATCHED", "FILLED"):
+                                logger.info("LIMIT BUY filled: %s", order_id[:16])
                                 return order_id
                             elif status in ("CANCELLED", "EXPIRED"):
-                                break
+                                logger.info("LIMIT BUY %s — falling back to market", status)
+                                return self._execute_market_buy(token_id, amount, neg_risk)
                     except Exception:
                         pass
 
+                # GTC order didn't fill in 30s — DO NOT fall back to market buy.
+                # The GTC may have partially filled. Cancel remaining and return
+                # the GTC order_id. This avoids double-buying.
+                logger.info("LIMIT BUY not confirmed in 30s — cancelling remainder, no market fallback")
                 try:
                     client.cancel_orders([order_id])
                 except Exception:
                     pass
+                # Return the order_id — any partial fills are recorded on Polymarket
+                return order_id
 
+            # No order_id at all — GTC failed to post, try market buy
             return self._execute_market_buy(token_id, amount, neg_risk)
 
         except Exception as e:
