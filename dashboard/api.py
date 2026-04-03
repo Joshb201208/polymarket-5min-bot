@@ -114,12 +114,12 @@ def _is_real_trade(p: dict) -> bool:
     if edge_source == "extreme_pricing":
         return False
 
-    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing", "force_close", "manual close")
+    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing", "force_close")
     for kw in noise_keywords:
         if kw in exit_reason:
             return False
 
-    # Skip injected positions that were closed without trading
+    # Skip injected positions that were closed without real P&L
     if edge_source == "manual_inject" and p.get("pnl", 0) == 0:
         return False
 
@@ -902,11 +902,37 @@ def force_close_position(position_id: str) -> dict:
     found = False
     for p in positions:
         if p.get("id") == position_id and p.get("status") == "open":
+            # Try to fetch current price for P&L estimate
+            exit_price = 0.0
+            pnl = 0.0
+            try:
+                token_id = p.get("token_id", "")
+                market_id = p.get("market_id", "")
+                if market_id:
+                    import urllib.request as _urlreq
+                    url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+                    req = _urlreq.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+                    with _urlreq.urlopen(req, timeout=5) as resp:
+                        m = json.loads(resp.read())
+                        outcome_prices = json.loads(m.get("outcomePrices", "[]") or "[]")
+                        tokens_raw = m.get("clobTokenIds", "") or ""
+                        token_list = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+                        for i, tok in enumerate(token_list):
+                            if tok == token_id and i < len(outcome_prices):
+                                exit_price = float(outcome_prices[i])
+                                break
+                if exit_price > 0:
+                    shares = p.get("shares", 0) or 0
+                    cost = p.get("cost", 0) or 0
+                    pnl = round((shares * exit_price) - cost, 2)
+            except Exception:
+                pass
+
             p["status"] = "closed"
-            p["exit_reason"] = "Manual close (force_close)"
+            p["exit_reason"] = "Manual sell" if pnl != 0 else "Manual close (force_close)"
             p["exit_time"] = datetime.now(timezone.utc).isoformat()
-            p["exit_price"] = 0  # Unknown — sold manually
-            p["pnl"] = 0  # Will be excluded from P&L calculations
+            p["exit_price"] = exit_price
+            p["pnl"] = pnl
             found = True
             break
 
