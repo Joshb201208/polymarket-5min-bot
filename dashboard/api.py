@@ -114,10 +114,14 @@ def _is_real_trade(p: dict) -> bool:
     if edge_source == "extreme_pricing":
         return False
 
-    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing")
+    noise_keywords = ("purge", "worthless", "no_shares", "extreme_pricing", "force_close", "manual close")
     for kw in noise_keywords:
         if kw in exit_reason:
             return False
+
+    # Skip injected positions that were closed without trading
+    if edge_source == "manual_inject" and p.get("pnl", 0) == 0:
+        return False
 
     return True
 
