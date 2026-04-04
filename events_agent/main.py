@@ -448,7 +448,7 @@ class EventsAgent:
                     continue
 
                 # --- HARD GATE: refuse to trade without intelligence signals ---
-                if edge_result.edge_source not in ("intelligence_blend", "time_decay", "orderbook", "reference_price", "cross_market", "metaculus", "whale_tracker"):
+                if edge_result.edge_source not in ("intelligence_blend", "time_decay", "orderbook", "reference_price", "cross_market", "metaculus", "whale_tracker", "no_bias"):
                     logger.warning(
                         "Blocking trade on %s: no intelligence signals (source=%s)",
                         market.slug, edge_result.edge_source,

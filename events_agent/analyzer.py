@@ -44,6 +44,10 @@ class EventsAnalyzer:
             if result and result.has_edge:
                 return result
 
+            result = self._analyze_no_bias(market)
+            if result and result.has_edge:
+                return result
+
             return None
         except Exception as e:
             logger.error("Edge calculation failed for %s: %s", market.slug, e)
@@ -325,3 +329,39 @@ class EventsAnalyzer:
             return Confidence.MEDIUM
         else:
             return Confidence.LOW
+
+    def _analyze_no_bias(self, market: EventMarket) -> EdgeResult | None:
+        """Detect edge from structural NO bias.
+
+        Prediction markets have a known YES bias — people overbet on events
+        happening. NO positions at reasonable prices have a structural edge
+        because most events DON'T happen (base rate ~30-40% for political events).
+
+        This is a weak but persistent edge.
+        """
+        if len(market.outcome_prices) < 2:
+            return None
+
+        yes_price = market.outcome_prices[0]
+        no_price = market.outcome_prices[1] if len(market.outcome_prices) > 1 else (1 - yes_price)
+
+        # NO bias edge: if NO is priced 20-60¢, there's likely a small edge
+        # because YES is overpaid by retail participants
+        if 0.15 <= no_price <= 0.60:
+            # Edge scales with how much YES is overpriced
+            # At YES=70¢/NO=30¢ → ~5% edge on NO
+            # At YES=50¢/NO=50¢ → ~2% edge on NO
+            # At YES=40¢/NO=60¢ → ~1% edge on NO
+            estimated_edge = max(0.01, (yes_price - 0.50) * 0.10 + self.config.NO_BIAS_FACTOR)
+
+            if estimated_edge >= self.config.MIN_EDGE:
+                return EdgeResult(
+                    has_edge=True,
+                    edge=estimated_edge,
+                    side="NO",
+                    market_price=no_price,
+                    fair_value=no_price + estimated_edge,
+                    edge_source="no_bias",
+                )
+
+        return None
