@@ -280,16 +280,30 @@ class EventsExecutor:
                     except Exception:
                         pass
 
-                # GTC order didn't fill in 30s — DO NOT fall back to market buy.
-                # The GTC may have partially filled. Cancel remaining and return
-                # the GTC order_id. This avoids double-buying.
-                logger.info("LIMIT BUY not confirmed in 30s — cancelling remainder, no market fallback")
+                # GTC order didn't confirm in 30s — cancel it.
+                logger.info("LIMIT BUY not confirmed in 30s — cancelling")
                 try:
                     client.cancel_orders([order_id])
                 except Exception:
                     pass
-                # Return the order_id — any partial fills are recorded on Polymarket
-                return order_id
+
+                # Check if any shares actually filled before we cancelled
+                time.sleep(2)  # Give API time to settle
+                try:
+                    order_info = client.get_order(order_id)
+                    if isinstance(order_info, dict):
+                        filled = float(order_info.get("size_matched", 0) or 0)
+                        if filled > 0.1:
+                            logger.info("GTC partial fill: %.2f shares — accepting", filled)
+                            return order_id
+                        else:
+                            logger.info("GTC had 0 fills — order was empty, trying market buy")
+                            return self._execute_market_buy(token_id, amount, neg_risk)
+                except Exception:
+                    pass
+
+                # Couldn't verify fills — don't assume success, try market buy
+                return self._execute_market_buy(token_id, amount, neg_risk)
 
             # No order_id at all — GTC failed to post, try market buy
             return self._execute_market_buy(token_id, amount, neg_risk)
