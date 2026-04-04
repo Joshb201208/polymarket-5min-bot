@@ -381,8 +381,13 @@ class EventsAgent:
                 logger.error("Intelligence scan failed: %s", e, exc_info=True)
 
         if intel_report is None:
-            logger.warning("No intelligence data available — skipping all entries")
-            return
+            logger.warning("No intelligence data — proceeding with base analysis only")
+            # Create a minimal empty report so the loop can proceed
+            from types import SimpleNamespace
+            intel_report = SimpleNamespace(
+                scores={}, lifecycle_assessments={}, regime_assessments={},
+                quality_adjustments=None,
+            )
 
         bankroll = self.current_bankroll
 
