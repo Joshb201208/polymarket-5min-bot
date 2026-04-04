@@ -60,7 +60,6 @@ class EventsConfig:
     MAX_ENTRY_PRICE: float = float(os.getenv("EVENTS_MAX_ENTRY_PRICE", "0.75"))
 
     # NO bias factor (76% of markets historically resolve NO)
-    NO_BIAS_FACTOR: float = float(os.getenv("EVENTS_NO_BIAS_FACTOR", "0.04"))
 
     # Smart exit engine parameters
     TRAILING_STOP_DRAWDOWN: float = float(os.getenv("EVENTS_TRAILING_STOP_DRAWDOWN", "0.40"))
