@@ -293,7 +293,7 @@ def deploy() -> dict:
 
 # Events agent starting bankroll — ground truth after extreme_pricing damage.
 # Original deposit $440.58 minus ~$198 locked in unsellable junk positions.
-EVENTS_STARTING_BANKROLL = 223.87
+EVENTS_STARTING_BANKROLL = 244.91
 
 
 @app.get("/api/events/status", dependencies=[Depends(_require_auth)])
