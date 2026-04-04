@@ -44,10 +44,6 @@ class EventsAnalyzer:
             if result and result.has_edge:
                 return result
 
-            result = self._analyze_no_bias(market)
-            if result and result.has_edge:
-                return result
-
             return None
         except Exception as e:
             logger.error("Edge calculation failed for %s: %s", market.slug, e)
