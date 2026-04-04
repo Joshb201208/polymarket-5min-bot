@@ -1615,3 +1615,55 @@ def inject_position(body: dict) -> dict:
     data["positions"] = positions
     positions_path.write_text(_json.dumps(data, indent=2, default=str))
     return {"status": "injected", "position_id": new_pos["id"]}
+
+
+@app.get("/api/events/scan_debug", dependencies=[Depends(_require_auth)])
+def scan_debug() -> dict:
+    """Run a diagnostic scan and report what happens at each pipeline stage."""
+    import asyncio
+    from events_agent.config import EventsConfig
+    from events_agent.scanner import EventsScanner
+
+    config = EventsConfig()
+    scanner = EventsScanner(config)
+
+    result = {"stages": {}}
+
+    # Stage 1: Fetch markets
+    try:
+        markets = asyncio.get_event_loop().run_until_complete(scanner.scan())
+        result["stages"]["1_markets_found"] = len(markets)
+        result["sample_markets"] = [
+            {"question": m.question[:50], "category": str(m.category), "prices": m.outcome_prices[:2]}
+            for m in markets[:5]
+        ]
+    except Exception as e:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            markets = loop.run_until_complete(scanner.scan())
+            result["stages"]["1_markets_found"] = len(markets)
+        except Exception as e2:
+            result["stages"]["1_markets_found"] = f"ERROR: {str(e2)[:200]}"
+            markets = []
+
+    # Stage 2: Check how many pass existing position check
+    positions_data = _read_json("events_positions.json")
+    open_ids = {p.get("market_id") for p in positions_data.get("positions", []) if p.get("status") == "open"}
+    closed_ids = {p.get("market_id") for p in positions_data.get("positions", []) if p.get("status") == "closed"}
+
+    new_markets = [m for m in markets if m.id not in open_ids]
+    result["stages"]["2_after_existing_filter"] = len(new_markets)
+
+    # Stage 3: Check re-entry cooldown
+    not_cooled = [m for m in new_markets if m.id not in closed_ids]
+    result["stages"]["3_after_cooldown"] = len(not_cooled)
+    result["stages"]["3_blocked_by_cooldown"] = len(new_markets) - len(not_cooled)
+
+    # Stage 4: Check price range
+    in_price_range = [m for m in not_cooled if len(m.outcome_prices) >= 2 and
+                      config.MIN_ENTRY_PRICE <= min(m.outcome_prices[0], m.outcome_prices[1]) or
+                      config.MIN_ENTRY_PRICE <= max(m.outcome_prices[0], m.outcome_prices[1]) <= config.MAX_ENTRY_PRICE]
+    result["stages"]["4_in_price_range"] = len(in_price_range)
+
+    return result
