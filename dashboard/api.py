@@ -1668,6 +1668,7 @@ def scan_debug() -> dict:
     return result
 
 
+
 @app.post("/api/events/set_env", dependencies=[Depends(_require_auth)])
 def set_env_var(body: dict) -> dict:
     """Set an environment variable in the .env file on VPS."""
@@ -1675,18 +1676,13 @@ def set_env_var(body: dict) -> dict:
     value = body.get("value", "")
     if not key or not value:
         raise HTTPException(status_code=400, detail="key and value required")
-    
+
     env_path = Path("/root/polymarket-bot/.env")
+    lines = []
     if env_path.exists():
         existing = env_path.read_text()
-        # Remove old value if present
-        lines = [l for l in existing.splitlines() if not l.startswith(f"{key}=")]
-        lines.append(f"{key}={value}")
-        env_path.write_text("
-".join(lines) + "
-")
-    else:
-        env_path.write_text(f"{key}={value}
-")
-    
+        lines = [line for line in existing.splitlines() if not line.startswith(key + "=")]
+    lines.append(key + "=" + value)
+    env_path.write_text(chr(10).join(lines) + chr(10))
+
     return {"status": "set", "key": key}
