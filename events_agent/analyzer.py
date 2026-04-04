@@ -205,9 +205,9 @@ class EventsAnalyzer:
             composite = scores.get(market.id)
 
             if composite is None:
-                # No intelligence data — do NOT fall back to base analysis
-                # Only time_decay is safe to use without intelligence
-                if base_result and base_result.edge_source == "time_decay":
+                # No intelligence data for this market — fall back to base analysis
+                # Base analysis uses orderbook, cross_market, reference_price etc.
+                if base_result and base_result.edge > self.config.MIN_EDGE:
                     return base_result
                 return None
 
