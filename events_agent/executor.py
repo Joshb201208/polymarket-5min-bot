@@ -151,6 +151,7 @@ class EventsExecutor:
             market_slug=market.slug,
             fees_paid=entry_fee,
             edge_source=edge_result.edge_source,
+            signal_source=getattr(edge_result, "signal_source", ""),
         )
 
         trade = Trade(

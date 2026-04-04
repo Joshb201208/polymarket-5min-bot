@@ -96,7 +96,8 @@ class EdgeResult:
     confidence: Confidence
     side: str  # "YES" or "NO"
     side_index: int  # index into outcomes
-    edge_source: str = ""  # e.g., "spread_analysis", "time_decay", "liquidity_imbalance"
+    edge_source: str = ""  # e.g., "spread_analysis", "time_decay", "intelligence_blend"
+    signal_source: str = ""  # "specialist", "universal", or "blended"
 
     @property
     def has_edge(self) -> bool:
@@ -132,6 +133,7 @@ class Position:
     market_slug: str = ""
     fees_paid: float = 0.0
     edge_source: str = ""
+    signal_source: str = ""  # "specialist", "universal", or "blended"
     # Peak tracking (smart exit engine)
     peak_pnl_pct: float = 0.0
     peak_price: float = 0.0

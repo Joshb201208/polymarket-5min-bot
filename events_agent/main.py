@@ -453,7 +453,13 @@ class EventsAgent:
                     continue
 
                 # --- HARD GATE: refuse to trade without intelligence signals ---
-                if edge_result.edge_source not in ("intelligence_blend", "time_decay", "orderbook", "reference_price", "cross_market", "metaculus", "whale_tracker"):
+                # Now also accepts universal edge sources (base_rate, llm_probability, etc.)
+                _ALLOWED_EDGE_SOURCES = (
+                    "intelligence_blend", "time_decay", "orderbook",
+                    "reference_price", "cross_market", "metaculus",
+                    "whale_tracker",
+                )
+                if edge_result.edge_source not in _ALLOWED_EDGE_SOURCES:
                     logger.warning(
                         "Blocking trade on %s: no intelligence signals (source=%s)",
                         market.slug, edge_result.edge_source,
@@ -507,19 +513,36 @@ class EventsAgent:
                 # Apply category priority weight to effective score for ranking
                 cat_weight = CATEGORY_PRIORITY.get(market.category.value.lower(), 0.50)
 
+                # Determine signal_source for this trade
+                trade_signal_source = getattr(edge_result, "signal_source", "") or ""
+                if not trade_signal_source:
+                    # Infer from composite score
+                    composite = intel_report.scores.get(market.id)
+                    if composite is not None:
+                        if hasattr(composite, "signal_source"):
+                            trade_signal_source = composite.signal_source
+                        elif isinstance(composite, dict):
+                            trade_signal_source = composite.get("signal_source", "")
+
                 logger.info(
-                    "EDGE FOUND: %s | edge=%.1f%% conf=%s fair=%.2f market=%.2f src=%s cat_wt=%.2f",
+                    "EDGE FOUND: %s | edge=%.1f%% conf=%s fair=%.2f market=%.2f src=%s signal=%s cat_wt=%.2f",
                     market.question[:60],
                     edge_result.edge * 100,
                     edge_result.confidence.value,
                     edge_result.our_fair_price,
                     edge_result.market_price,
                     edge_result.edge_source,
+                    trade_signal_source,
                     cat_weight,
                 )
 
                 # Calculate bet size — Half Kelly capped at MAX_BET_PCT
                 bet_size = self._calculate_bet_size(edge_result, bankroll)
+
+                # Universal-only trades use 70% of normal position sizing
+                if trade_signal_source == "universal":
+                    bet_size = round(bet_size * 0.70, 2)
+                    logger.info("Universal-only trade: reduced bet to $%.2f (70%%)", bet_size)
                 if bet_size <= 0:
                     logger.debug("Bet size too small for %s", market.question[:40])
                     continue
@@ -541,6 +564,9 @@ class EventsAgent:
                 # Execute trade
                 position, trade = self.executor.execute_buy(edge_result, bet_size)
                 if position and trade:
+                    # Record signal source (specialist/universal/blended)
+                    position.signal_source = trade_signal_source
+
                     # Record signal attribution at entry time
                     self._record_signal_attribution(position, market)
 

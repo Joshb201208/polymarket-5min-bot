@@ -290,6 +290,13 @@ class EventsAnalyzer:
             # 8. Set confidence from intelligence tier
             confidence = _INTEL_TIER_CONFIDENCE.get(intel_tier, Confidence.LOW)
 
+            # Determine signal_source from composite score
+            signal_source = ""
+            if hasattr(composite, "signal_source"):
+                signal_source = composite.signal_source
+            elif isinstance(composite, dict):
+                signal_source = composite.get("signal_source", "")
+
             side_index = 0 if base_side == "YES" else 1
             market_price = market.outcome_prices[side_index] if side_index < len(market.outcome_prices) else 0
 
@@ -302,6 +309,7 @@ class EventsAnalyzer:
                 side=base_side,
                 side_index=side_index,
                 edge_source="intelligence_blend",
+                signal_source=signal_source,
             )
 
         except Exception as e:

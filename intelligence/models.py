@@ -56,6 +56,7 @@ class CompositeScore:
     signal_breakdown: dict = field(default_factory=dict)
     consensus_count: int = 0
     timestamp: str = ""
+    signal_source: str = ""    # "specialist", "universal", or "blended"
 
     def __post_init__(self):
         if not self.timestamp:

@@ -150,6 +150,42 @@ class IntelligenceManager:
             except ImportError:
                 logger.warning("defi_llama module not available yet")
 
+        # --- Universal edge detection modules ---
+        if modules.get("base_rate"):
+            try:
+                from intelligence.base_rate import BaseRateAnalyzer
+                self._modules["base_rate"] = BaseRateAnalyzer()
+            except ImportError:
+                logger.warning("base_rate module not available yet")
+
+        if modules.get("time_decay_universal"):
+            try:
+                from intelligence.time_decay_universal import TimeDecayUniversal
+                self._modules["time_decay_universal"] = TimeDecayUniversal()
+            except ImportError:
+                logger.warning("time_decay_universal module not available yet")
+
+        if modules.get("llm_probability"):
+            try:
+                from intelligence.llm_probability import LLMProbabilityEstimator
+                self._modules["llm_probability"] = LLMProbabilityEstimator()
+            except ImportError:
+                logger.warning("llm_probability module not available yet")
+
+        if modules.get("momentum"):
+            try:
+                from intelligence.momentum import MomentumAnalyzer
+                self._modules["momentum"] = MomentumAnalyzer()
+            except ImportError:
+                logger.warning("momentum module not available yet")
+
+        if modules.get("resolution_pattern"):
+            try:
+                from intelligence.resolution_pattern import ResolutionPatternAnalyzer
+                self._modules["resolution_pattern"] = ResolutionPatternAnalyzer()
+            except ImportError:
+                logger.warning("resolution_pattern module not available yet")
+
         try:
             from intelligence.composite_scorer import CompositeScorer
             self._composite_scorer = CompositeScorer()

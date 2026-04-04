@@ -29,9 +29,8 @@ class EventsConfig:
     PRIVATE_KEY: str = os.getenv("PRIVATE_KEY", "")
     FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
 
-    # Bankroll — adjusted for extreme_pricing damage (~$198 lost/locked on Polymarket).
-    # Original deposit was $440.58. Real available: $242.11
-    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "244.91"))
+    # Bankroll — synced to actual wallet value (portfolio ~$263 + cash ~$100).
+    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "363"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.15"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.95"))
 

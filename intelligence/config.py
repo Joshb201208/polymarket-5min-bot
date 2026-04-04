@@ -30,6 +30,12 @@ INTELLIGENCE_MODULES = {
     "consensus": _bool_env("CONSENSUS_ENABLED"),
     "fred": _bool_env("FRED_ENABLED"),
     "defi_llama": _bool_env("DEFI_LLAMA_ENABLED"),
+    # Universal edge detection modules — work for ANY market
+    "base_rate": _bool_env("BASE_RATE_ENABLED"),
+    "time_decay_universal": _bool_env("TIME_DECAY_UNIVERSAL_ENABLED"),
+    "llm_probability": _bool_env("LLM_PROBABILITY_ENABLED"),
+    "momentum": _bool_env("MOMENTUM_ENABLED"),
+    "resolution_pattern": _bool_env("RESOLUTION_PATTERN_ENABLED"),
 }
 
 # Composite Scoring
@@ -51,7 +57,22 @@ SOURCE_WEIGHTS = {
     "consensus": 0.15,
     "fred": 0.15,
     "defi_llama": 0.10,
+    # Universal edge detection modules
+    "base_rate": 0.12,
+    "time_decay_universal": 0.15,
+    "llm_probability": 0.20,
+    "momentum": 0.10,
+    "resolution_pattern": 0.10,
 }
+
+# Universal module names — used to identify universal-only trades
+UNIVERSAL_SOURCES = frozenset({
+    "base_rate",
+    "time_decay_universal",
+    "llm_probability",
+    "momentum",
+    "resolution_pattern",
+})
 
 
 class IntelligenceConfig:
@@ -72,6 +93,12 @@ class IntelligenceConfig:
         "consensus": _bool_env("CONSENSUS_ENABLED"),
         "fred": _bool_env("FRED_ENABLED"),
         "defi_llama": _bool_env("DEFI_LLAMA_ENABLED"),
+        # Universal edge detection modules
+        "base_rate": _bool_env("BASE_RATE_ENABLED"),
+        "time_decay_universal": _bool_env("TIME_DECAY_UNIVERSAL_ENABLED"),
+        "llm_probability": _bool_env("LLM_PROBABILITY_ENABLED"),
+        "momentum": _bool_env("MOMENTUM_ENABLED"),
+        "resolution_pattern": _bool_env("RESOLUTION_PATTERN_ENABLED"),
     }
 
     # X/Twitter Scanner

@@ -34,7 +34,19 @@ _SOURCE_ENABLED_VARS: dict[str, str] = {
     "consensus": "CONSENSUS_ENABLED",
     "fred": "FRED_ENABLED",
     "defi_llama": "DEFI_LLAMA_ENABLED",
+    # Universal edge detection modules
+    "base_rate": "BASE_RATE_ENABLED",
+    "time_decay_universal": "TIME_DECAY_UNIVERSAL_ENABLED",
+    "llm_probability": "LLM_PROBABILITY_ENABLED",
+    "momentum": "MOMENTUM_ENABLED",
+    "resolution_pattern": "RESOLUTION_PATTERN_ENABLED",
 }
+
+# Universal source names — used to determine signal_source for trades
+UNIVERSAL_SOURCES: frozenset[str] = frozenset({
+    "base_rate", "time_decay_universal", "llm_probability",
+    "momentum", "resolution_pattern",
+})
 
 
 def _is_source_enabled(source: str) -> bool:
@@ -96,6 +108,12 @@ class CompositeScorer:
         "consensus": 0.15,
         "fred": 0.15,
         "defi_llama": 0.10,
+        # Universal edge detection modules
+        "base_rate": 0.12,
+        "time_decay_universal": 0.15,
+        "llm_probability": 0.20,
+        "momentum": 0.10,
+        "resolution_pattern": 0.10,
     }
 
     def __init__(self) -> None:
@@ -211,6 +229,18 @@ class CompositeScorer:
                 max_bet_pct = bet_pct
                 break
 
+        # Determine signal source: specialist, universal, or blended
+        active_sources = set(source_scores.keys())
+        specialist_sources = active_sources - UNIVERSAL_SOURCES
+        universal_sources_present = active_sources & UNIVERSAL_SOURCES
+
+        if specialist_sources and universal_sources_present:
+            signal_source = "blended"
+        elif specialist_sources:
+            signal_source = "specialist"
+        else:
+            signal_source = "universal"
+
         return CompositeScore(
             market_id=market_id,
             composite=round(composite, 4),
@@ -220,6 +250,7 @@ class CompositeScorer:
             signal_breakdown=source_scores,
             consensus_count=consensus_count,
             timestamp=now,
+            signal_source=signal_source,
         )
 
     def _empty_score(self, market_id: str, now: datetime) -> CompositeScore:
