@@ -6,6 +6,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 from events_agent.config import EventsConfig
@@ -83,6 +84,9 @@ class EventsAgent:
         # Bankroll state — events agent uses its own bankroll file
         self._bankroll_path = self.config.DATA_DIR / "bankroll.json"
         self._events_bankroll_path = self.config.DATA_DIR / "events_bankroll.json"
+
+        # Telegram commands — wired in by orchestrator for health alerts
+        self.telegram_commands = None
 
         self._shutdown = False
 
@@ -310,6 +314,33 @@ class EventsAgent:
         # 3. Scan for new opportunities
         await self._scan_and_trade()
 
+        # 4. Run health checks (wallet reconciliation, orphans, etc.)
+        self._run_health_checks()
+
+    def _run_health_checks(self) -> None:
+        """Run health checks after every scan tick."""
+        try:
+            from events_agent.health_monitor import HealthMonitor
+            monitor = HealthMonitor(self.config, self.portfolio)
+            issues = monitor.run_all_checks()
+            if issues:
+                alert_text = "🏥 Health Monitor Alert:\n\n" + "\n".join(issues)
+                logger.warning("Health issues found: %s", issues)
+                # Send Telegram alert if telegram_commands is wired in
+                if hasattr(self, "telegram_commands") and self.telegram_commands:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(self.telegram_commands.send_message(alert_text))
+                        else:
+                            asyncio.run(self.telegram_commands.send_message(alert_text))
+                    except Exception as e:
+                        logger.error("Failed to send health alert via Telegram: %s", e)
+            else:
+                logger.info("Health check passed — no issues found")
+        except Exception as e:
+            logger.error("Health check failed: %s", e)
+
     async def _scan_and_trade(self) -> None:
         """Scan markets, evaluate edges via intelligence pipeline, and execute trades."""
         # Check bankroll pause state
@@ -520,6 +551,41 @@ class EventsAgent:
                         edge_result.confidence.value,
                         market.category.value,
                     )
+
+                    # Post-trade verification: confirm shares exist on wallet
+                    if self.config.is_live:
+                        time.sleep(10)  # Wait for settlement
+                        try:
+                            from events_agent.health_monitor import HealthMonitor
+                            monitor = HealthMonitor(self.config, self.portfolio)
+                            if not monitor.verify_position_exists(position):
+                                logger.error(
+                                    "PHANTOM TRADE: %s not found on wallet — marking failed",
+                                    position.market_question[:50],
+                                )
+                                position.status = "closed"
+                                position.exit_reason = "phantom_trade_post_verification"
+                                position.exit_time = utcnow().isoformat()
+                                position.exit_price = 0.0
+                                position.pnl = round(-position.cost, 2)
+                                self.portfolio.save_position(position)
+                                # Alert via Telegram
+                                if hasattr(self, "telegram_commands") and self.telegram_commands:
+                                    alert = (
+                                        f"⚠️ Trade on {position.market_question[:50]} "
+                                        f"failed — shares not found on wallet"
+                                    )
+                                    try:
+                                        loop = asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            loop.create_task(
+                                                self.telegram_commands.send_message(alert)
+                                            )
+                                    except Exception:
+                                        pass
+                                continue  # Don't count this position
+                        except Exception as e:
+                            logger.error("Post-trade verification error: %s", e)
 
                     open_positions = self.portfolio.get_open_positions()
 

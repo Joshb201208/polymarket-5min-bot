@@ -131,6 +131,9 @@ class Orchestrator:
             self.telegram_commands.live_quality = self.live_quality
             self.telegram_commands.dedup = self.dedup
 
+        # Wire telegram_commands into events_agent for health monitor alerts
+        self.events_agent.telegram_commands = self.telegram_commands
+
         # Calibration tracking
         self._last_calibration: datetime | None = None
 
