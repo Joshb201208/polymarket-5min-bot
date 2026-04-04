@@ -137,23 +137,18 @@ class HealthMonitor:
 
             wallet_shares = wallet.get(token_id, 0)
             if wallet_shares < 0.1 and pos.shares > 0.1:
-                # Phantom position — wallet has no shares
+                # Potential phantom — wallet has no shares for this token
+                # ALERT ONLY — do NOT auto-close. GTC orders may fill late.
                 logger.warning(
-                    "PHANTOM: %s has %.2f shares in bot but 0 on wallet",
+                    "POSSIBLE PHANTOM: %s has %.2f shares in bot but 0 on wallet",
                     pos.market_question[:50], pos.shares,
                 )
-                pos.status = "closed"
-                pos.exit_reason = "phantom_position_health_check"
-                pos.exit_time = utcnow().isoformat()
-                pos.exit_price = 0.0
-                pos.pnl = round(-pos.cost, 2)
-                self.portfolio.save_position(pos)
                 phantom_count += 1
 
         if phantom_count > 0:
             issues.append(
-                f"⚠️ Removed {phantom_count} phantom positions — "
-                f"orders didn't fill on Polymarket"
+                f"⚠️ {phantom_count} positions may not exist on wallet — "
+                f"check Polymarket manually (NOT auto-closed)"
             )
 
         return issues
@@ -285,12 +280,9 @@ class HealthMonitor:
                 # Keep the first (oldest), close the rest
                 dupes_sorted = sorted(dupes, key=lambda p: p.entry_time or "")
                 for dup in dupes_sorted[1:]:
-                    dup.status = "closed"
-                    dup.exit_reason = "double_buy_health_check"
-                    dup.exit_time = utcnow().isoformat()
-                    dup.exit_price = dup.entry_price
-                    dup.pnl = 0.0
-                    self.portfolio.save_position(dup)
+                    # ALERT ONLY — do not auto-close duplicates
+
+                    pass
 
                 market_q = dupes_sorted[0].market_question[:50]
                 issues.append(
