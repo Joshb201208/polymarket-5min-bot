@@ -100,7 +100,7 @@ class EdgeResult:
 
     @property
     def has_edge(self) -> bool:
-        return self.edge >= 0.05  # 5% minimum
+        return self.edge >= 0.03  # Minimum edge threshold
 
 
 @dataclass

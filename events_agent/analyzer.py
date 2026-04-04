@@ -356,11 +356,13 @@ class EventsAnalyzer:
 
             if estimated_edge >= self.config.MIN_EDGE:
                 return EdgeResult(
-                    has_edge=True,
-                    edge=estimated_edge,
-                    side="NO",
+                    market=market,
+                    our_fair_price=no_price + estimated_edge,
                     market_price=no_price,
-                    fair_value=no_price + estimated_edge,
+                    edge=estimated_edge,
+                    confidence=Confidence.LOW,
+                    side="NO",
+                    side_index=1,
                     edge_source="no_bias",
                 )
 
