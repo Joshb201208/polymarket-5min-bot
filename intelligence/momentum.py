@@ -18,6 +18,7 @@ from pathlib import Path
 
 from intelligence.config import IntelligenceConfig
 from intelligence.models import Signal
+from intelligence.sports_filter import is_sports_market
 
 logger = logging.getLogger("intelligence.momentum")
 
@@ -50,6 +51,10 @@ class MomentumAnalyzer:
 
         for market in active_markets:
             try:
+                if is_sports_market(market):
+                    logger.debug("Skipping sports market: %s", getattr(market, "id", ""))
+                    continue
+
                 market_id = getattr(market, "id", str(market))
                 question = getattr(market, "question", "")
                 prices = getattr(market, "outcome_prices", [])

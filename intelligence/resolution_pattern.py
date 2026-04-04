@@ -22,6 +22,7 @@ import httpx
 
 from intelligence.config import IntelligenceConfig
 from intelligence.models import Signal
+from intelligence.sports_filter import is_sports_market
 
 logger = logging.getLogger("intelligence.resolution_pattern")
 
@@ -119,6 +120,10 @@ class ResolutionPatternAnalyzer:
 
         for market in active_markets:
             try:
+                if is_sports_market(market):
+                    logger.debug("Skipping sports market: %s", getattr(market, "id", ""))
+                    continue
+
                 question = getattr(market, "question", "")
                 market_id = getattr(market, "id", str(market))
                 prices = getattr(market, "outcome_prices", [])

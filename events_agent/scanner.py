@@ -10,6 +10,7 @@ import httpx
 
 from events_agent.config import EventsConfig
 from events_agent.models import EventCategory, EventMarket
+from intelligence.sports_filter import is_sports_market
 from shared.utils import utcnow, parse_utc
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,11 @@ class EventsScanner:
                     if self._is_sports_event(market.slug, market.question):
                         continue
 
+                    # Comprehensive sports check (includes regex patterns, tags, category)
+                    if is_sports_market(market):
+                        logger.debug("Skipping sports market: %s", market.id)
+                        continue
+
                     market.category = self._detect_category(
                         market.slug, market.question, event_slug, event_title
                     )
@@ -280,11 +286,17 @@ class EventsScanner:
         return all_events
 
     def _is_sports_event(self, slug: str, title: str) -> bool:
-        """Check if this event is sports-related — reject if so."""
-        slug_lower = slug.lower()
-        title_lower = title.lower()
-        combined = slug_lower + " " + title_lower
+        """Check if this event is sports-related — reject if so.
 
+        Uses the shared ``is_sports_market()`` utility for comprehensive
+        detection (keywords, regex patterns, category/tags fields).
+        """
+        proxy = {"slug": slug, "question": title, "event_slug": slug, "event_title": title}
+        if is_sports_market(proxy):
+            return True
+
+        # Keep legacy keyword check as a safety net
+        combined = slug.lower() + " " + title.lower()
         for keyword in _SPORTS_KEYWORDS:
             if keyword in combined:
                 return True

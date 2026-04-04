@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 from intelligence.config import IntelligenceConfig
 from intelligence.models import Signal
+from intelligence.sports_filter import is_sports_market
 from shared.utils import utcnow, parse_utc
 
 logger = logging.getLogger("intelligence.time_decay_universal")
@@ -49,6 +50,10 @@ class TimeDecayUniversal:
 
         for market in active_markets:
             try:
+                if is_sports_market(market):
+                    logger.debug("Skipping sports market: %s", getattr(market, "id", ""))
+                    continue
+
                 question = getattr(market, "question", "")
                 market_id = getattr(market, "id", str(market))
                 end_date_str = getattr(market, "end_date", "")
