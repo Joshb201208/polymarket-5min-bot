@@ -36,10 +36,10 @@ class EventsConfig:
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.95"))
 
     # Scan interval (minutes)
-    SCAN_INTERVAL: int = int(os.getenv("EVENTS_SCAN_INTERVAL_MINUTES", "45"))
+    SCAN_INTERVAL: int = int(os.getenv("EVENTS_SCAN_INTERVAL_MINUTES", "30"))
 
     # Edge thresholds
-    MIN_EDGE: float = float(os.getenv("EVENTS_MIN_EDGE", "0.05"))
+    MIN_EDGE: float = float(os.getenv("EVENTS_MIN_EDGE", "0.03"))
 
     # Position limits
     MAX_CONCURRENT_POSITIONS: int = int(os.getenv("EVENTS_MAX_POSITIONS", "999"))  # No hard cap
@@ -57,10 +57,10 @@ class EventsConfig:
 
     # Entry price filter (backtest-derived profitable zone)
     MIN_ENTRY_PRICE: float = float(os.getenv("EVENTS_MIN_ENTRY_PRICE", "0.15"))
-    MAX_ENTRY_PRICE: float = float(os.getenv("EVENTS_MAX_ENTRY_PRICE", "0.65"))
+    MAX_ENTRY_PRICE: float = float(os.getenv("EVENTS_MAX_ENTRY_PRICE", "0.75"))
 
     # NO bias factor (76% of markets historically resolve NO)
-    NO_BIAS_FACTOR: float = float(os.getenv("EVENTS_NO_BIAS_FACTOR", "0.06"))
+    NO_BIAS_FACTOR: float = float(os.getenv("EVENTS_NO_BIAS_FACTOR", "0.04"))
 
     # Smart exit engine parameters
     TRAILING_STOP_DRAWDOWN: float = float(os.getenv("EVENTS_TRAILING_STOP_DRAWDOWN", "0.40"))
