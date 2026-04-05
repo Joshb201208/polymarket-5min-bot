@@ -1620,15 +1620,17 @@ def inject_position(body: dict) -> dict:
 def scan_debug() -> dict:
     """Run a diagnostic scan and report what happens at each pipeline stage."""
     import asyncio
+    import os
     from events_agent.config import EventsConfig
     from events_agent.scanner import EventsScanner
+    from intelligence.composite_scorer import CompositeScorer, UNIVERSAL_SOURCES
 
     config = EventsConfig()
     scanner = EventsScanner(config)
 
     result = {"stages": {}}
 
-    # Stage 1: Fetch markets
+    # Stage 1: Fetch markets (scanner.scan() now includes quality gate)
     try:
         markets = asyncio.get_event_loop().run_until_complete(scanner.scan())
         result["stages"]["1_markets_found"] = len(markets)
@@ -1664,6 +1666,46 @@ def scan_debug() -> dict:
                       config.MIN_ENTRY_PRICE <= min(m.outcome_prices[0], m.outcome_prices[1]) or
                       config.MIN_ENTRY_PRICE <= max(m.outcome_prices[0], m.outcome_prices[1]) <= config.MAX_ENTRY_PRICE]
     result["stages"]["4_in_price_range"] = len(in_price_range)
+
+    # Stage 5: Quality gate stats (volume/liquidity minimums applied inside scanner.scan())
+    min_vol = float(os.getenv("EVENTS_MIN_VOLUME_24H", "5000"))
+    min_liq = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
+    result["stages"]["5_after_quality_gate"] = len(markets)
+    result["quality_gate"] = {
+        "min_volume_24h": min_vol,
+        "min_liquidity": min_liq,
+    }
+    if markets:
+        vols = [m.volume_24h for m in markets]
+        liqs = [m.liquidity for m in markets]
+        result["quality_stats"] = {
+            "volume_min": round(min(vols), 2),
+            "volume_max": round(max(vols), 2),
+            "volume_avg": round(sum(vols) / len(vols), 2),
+            "liquidity_min": round(min(liqs), 2),
+            "liquidity_max": round(max(liqs), 2),
+            "liquidity_avg": round(sum(liqs) / len(liqs), 2),
+        }
+
+    # Simulate universal-only blocking: identify markets that would be blocked
+    # by the architecture gate (only universal modules fire, no specialist)
+    try:
+        signals_data = _read_json("events_signals.json")
+        all_signals = signals_data.get("signals", [])
+        blocked_universal_only = []
+        for m in markets:
+            market_signals = [s for s in all_signals if s.get("market_id") == m.id]
+            if not market_signals:
+                continue
+            sources = {s.get("source") for s in market_signals}
+            specialist = sources - UNIVERSAL_SOURCES
+            if not specialist and sources & UNIVERSAL_SOURCES:
+                blocked_universal_only.append(m.slug)
+        result["blocked_universal_only"] = blocked_universal_only
+        result["blocked_universal_only_count"] = len(blocked_universal_only)
+    except Exception:
+        result["blocked_universal_only"] = []
+        result["blocked_universal_only_count"] = 0
 
     return result
 

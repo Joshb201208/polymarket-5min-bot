@@ -134,6 +134,7 @@ class CompositeScorer:
         signals: list[Signal],
         lifecycle_overrides: dict[str, float] | None = None,
         quality_multipliers: dict[str, float] | None = None,
+        market_context: dict | None = None,
     ) -> CompositeScore:
         """Combine signals into a composite score for a market.
 
@@ -240,6 +241,43 @@ class CompositeScorer:
             signal_source = "specialist"
         else:
             signal_source = "universal"
+
+        # ARCHITECTURE GATE: Universal-only signals cannot independently approve trades.
+        # Universal modules are confidence BOOSTERS, not standalone signal generators.
+        if signal_source == "universal":
+            # Check high-quality exception: high volume + liquidity + strong LLM confidence
+            allow_universal_standalone = False
+            if market_context:
+                vol = market_context.get("volume_24h", 0)
+                liq = market_context.get("liquidity", 0)
+                # Check if LLM module fired with high confidence
+                llm_signal = source_scores.get("llm_probability", {})
+                llm_conf = llm_signal.get("confidence", 0) if llm_signal else 0
+                if vol >= 50000 and liq >= 100000 and llm_conf >= 0.75:
+                    allow_universal_standalone = True
+                    signal_source = "universal_high_quality"
+                    logger.info(
+                        "Universal standalone ALLOWED for %s: vol=$%.0f, liq=$%.0f, llm_conf=%.2f",
+                        market_id, vol, liq, llm_conf,
+                    )
+
+            if not allow_universal_standalone:
+                logger.info(
+                    "Universal-only signals for %s — blocking (no specialist data). "
+                    "Sources: %s",
+                    market_id, list(active_sources),
+                )
+                return CompositeScore(
+                    market_id=market_id,
+                    composite=0.0,
+                    direction=consensus_direction,
+                    confidence_tier="LOW",
+                    max_bet_pct=0.0,
+                    signal_breakdown=source_scores,
+                    consensus_count=consensus_count,
+                    timestamp=now,
+                    signal_source="universal_only",
+                )
 
         return CompositeScore(
             market_id=market_id,

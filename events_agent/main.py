@@ -539,10 +539,10 @@ class EventsAgent:
                 # Calculate bet size — Half Kelly capped at MAX_BET_PCT
                 bet_size = self._calculate_bet_size(edge_result, bankroll)
 
-                # Universal-only trades use 70% of normal position sizing
-                if trade_signal_source == "universal":
+                # Universal-only / universal_high_quality trades use 70% of normal sizing
+                if trade_signal_source in ("universal", "universal_high_quality"):
                     bet_size = round(bet_size * 0.70, 2)
-                    logger.info("Universal-only trade: reduced bet to $%.2f (70%%)", bet_size)
+                    logger.info("Universal trade (%s): reduced bet to $%.2f (70%%)", trade_signal_source, bet_size)
                 if bet_size <= 0:
                     logger.debug("Bet size too small for %s", market.question[:40])
                     continue

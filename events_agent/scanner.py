@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import timezone
 
@@ -209,6 +210,25 @@ class EventsScanner:
                         markets.append(market)
                 except Exception as e:
                     logger.warning("Failed to parse market %s: %s", raw_market.get("id"), e)
+
+        # Market quality gate — minimum volume and liquidity
+        min_vol = float(os.getenv("EVENTS_MIN_VOLUME_24H", "5000"))
+        min_liq = float(os.getenv("EVENTS_MIN_LIQUIDITY", "10000"))
+        pre_quality = len(markets)
+        filtered_markets = []
+        for m in markets:
+            if m.volume_24h < min_vol or m.liquidity < min_liq:
+                logger.debug(
+                    "Quality gate: skipping %s (vol=$%.0f, liq=$%.0f)",
+                    m.slug, m.volume_24h, m.liquidity,
+                )
+                continue
+            filtered_markets.append(m)
+        markets = filtered_markets
+        logger.info(
+            "Quality gate: %d → %d markets (min_vol=$%.0f, min_liq=$%.0f)",
+            pre_quality, len(markets), min_vol, min_liq,
+        )
 
         logger.info("Scanner found %d events markets after filtering", len(markets))
         return markets

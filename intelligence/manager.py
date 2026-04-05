@@ -424,11 +424,16 @@ class IntelligenceManager:
                     lc = lifecycle_assessments.get(market_id)
                     lc_overrides = lc.signal_weight_overrides if lc else {}
 
+                    market_context = {
+                        "volume_24h": getattr(market, "volume_24h", 0),
+                        "liquidity": getattr(market, "liquidity", 0),
+                    }
                     market_scores[market_id] = self._composite_scorer.score(
                         market_id,
                         market_signals,
                         lifecycle_overrides=lc_overrides,
                         quality_multipliers=quality_adjustments,
+                        market_context=market_context,
                     )
 
         # ── Step 9: Correlation analysis ──

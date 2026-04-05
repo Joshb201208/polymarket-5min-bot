@@ -135,7 +135,7 @@ async def _call_claude(
     client: httpx.AsyncClient,
 ) -> dict | None:
     """Call Claude API for probability estimation."""
-    prompt = f"""You are a calibrated prediction market analyst. Estimate the probability that the following market question resolves YES.
+    prompt = f"""You are a calibrated prediction market analyst. Estimate the probability AND assess whether we have informational edge on this market.
 
 Market question: {question}
 Current market price (YES): {yes_price:.1%}
@@ -147,14 +147,20 @@ Analyze this step by step:
 2. What current evidence supports YES or NO?
 3. How does the timeframe affect the probability?
 4. Is the current market price reasonable?
+5. Do we have informational edge? Consider:
+   - Is this a well-known, actively traded event where the market is likely efficient?
+   - Are there asymmetric information sources that could give us an edge?
+   - Is this an obscure local election/event where the small number of traders may not be well-informed?
+   - For obscure events with few traders, the market is ALSO likely efficient because there is no alpha.
 
 Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
-{{"probability": 0.XX, "confidence": 0.XX, "direction": "YES or NO", "reasoning": "one sentence"}}
+{{"probability": 0.XX, "confidence": 0.XX, "direction": "YES or NO", "reasoning": "one sentence", "edge_assessment": "HIGH_EDGE or MODERATE_EDGE or LOW_EDGE or NO_EDGE"}}
 
 Where:
 - probability: your calibrated estimate (0.0 to 1.0) that the market resolves YES
 - confidence: how confident you are in your estimate (0.0 to 1.0)
 - direction: whether you'd bet YES or NO given the current price
+- edge_assessment: HIGH_EDGE (major event, price clearly wrong, strong thesis), MODERATE_EDGE (meaningful discrepancy with identifiable catalyst), LOW_EDGE (small discrepancy, mostly efficient), NO_EDGE (no informational advantage)
 """
 
     try:
@@ -258,6 +264,7 @@ def _parse_llm_response(text: str) -> dict | None:
         confidence = float(result.get("confidence", 0))
         direction = str(result.get("direction", "")).upper()
         reasoning = str(result.get("reasoning", ""))
+        edge_assessment = str(result.get("edge_assessment", "NO_EDGE")).upper().replace(" ", "_")
 
         # Validate
         if not (0 <= probability <= 1):
@@ -267,11 +274,17 @@ def _parse_llm_response(text: str) -> dict | None:
 
         confidence = max(0.0, min(1.0, confidence))
 
+        # Normalize edge_assessment to valid values
+        valid_edges = {"HIGH_EDGE", "MODERATE_EDGE", "LOW_EDGE", "NO_EDGE"}
+        if edge_assessment not in valid_edges:
+            edge_assessment = "NO_EDGE"
+
         return {
             "probability": probability,
             "confidence": confidence,
             "direction": direction,
             "reasoning": reasoning,
+            "edge_assessment": edge_assessment,
         }
 
     except (json.JSONDecodeError, ValueError, TypeError) as e:
@@ -404,6 +417,15 @@ class LLMProbabilityEstimator:
         probability = result["probability"]
         confidence = result["confidence"]
         reasoning = result.get("reasoning", "")
+        edge_assessment = result.get("edge_assessment", "NO_EDGE")
+
+        # Only emit signals for HIGH_EDGE and MODERATE_EDGE
+        if edge_assessment in ("NO_EDGE", "LOW_EDGE"):
+            logger.debug(
+                "LLM edge assessment %s for %s — no signal emitted",
+                edge_assessment, question[:60],
+            )
+            return None
 
         # Compare LLM estimate to market price
         deviation = probability - yes_price
@@ -427,6 +449,10 @@ class LLMProbabilityEstimator:
         # Scale confidence with LLM's own confidence
         adj_confidence = min(0.80, confidence * 0.7 + abs(deviation) * 0.5)
 
+        # MODERATE_EDGE gets reduced confidence
+        if edge_assessment == "MODERATE_EDGE":
+            adj_confidence = round(adj_confidence * 0.7, 3)
+
         return Signal(
             source="llm_probability",
             market_id=market_id,
@@ -441,5 +467,6 @@ class LLMProbabilityEstimator:
                 "deviation": round(deviation, 3),
                 "llm_confidence": round(confidence, 3),
                 "reasoning": reasoning[:200],
+                "edge_assessment": edge_assessment,
             },
         )
