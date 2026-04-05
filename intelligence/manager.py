@@ -427,6 +427,7 @@ class IntelligenceManager:
                     market_context = {
                         "volume_24h": getattr(market, "volume_24h", 0),
                         "liquidity": getattr(market, "liquidity", 0),
+                        "category_boost": getattr(market, "category_boost", 1.0),
                     }
                     market_scores[market_id] = self._composite_scorer.score(
                         market_id,

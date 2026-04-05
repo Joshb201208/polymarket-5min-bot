@@ -221,6 +221,10 @@ class CompositeScorer:
         elif consensus_direction == "NO":
             composite = min(composite + NO_BIAS_FACTOR, 1.0)
 
+        # 4c. Category boost: multiply by market's category priority weight
+        category_boost = (market_context or {}).get("category_boost", 1.0)
+        composite = min(composite * category_boost, 1.0)
+
         # 5. Map to confidence tier
         confidence_tier = "LOW"
         max_bet_pct = 0.0

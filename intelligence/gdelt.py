@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -23,19 +24,41 @@ from shared.utils import atomic_json_write, load_json, utcnow
 
 logger = logging.getLogger("intelligence.gdelt")
 
-# Common stop words to filter when extracting keywords from market questions
-_STOP_WORDS = frozenset({
-    "will", "the", "a", "an", "be", "is", "are", "was", "were", "by",
-    "in", "on", "at", "to", "for", "of", "with", "and", "or", "that",
-    "this", "it", "do", "does", "did", "has", "have", "had", "not", "no",
-    "yes", "before", "after", "than", "more", "most", "what", "when",
-    "where", "who", "how", "which", "there", "here", "if", "any", "all",
-    "some", "much", "many", "its", "into", "over", "under", "also",
-    "between", "through", "during", "about", "from", "each", "but",
-    "their", "other", "would", "could", "should", "may", "might",
-})
-
 GDELT_API_BASE = "http://api.gdeltproject.org/api/v2/doc/doc"
+
+# Minimum 24h volume for a market to be queried via GDELT (rate-limit budget)
+GDELT_MIN_VOLUME = 50_000
+
+# ---------------------------------------------------------------------------
+# Keyword extraction: geopolitical entities, leaders, and noise filters
+# ---------------------------------------------------------------------------
+_GEO_ENTITIES = frozenset({
+    "us", "usa", "iran", "russia", "ukraine", "china", "israel", "nato",
+    "eu", "un", "north korea", "syria", "gaza", "taiwan", "india",
+    "pakistan", "houthi", "hezbollah", "hamas", "taliban", "iraq",
+    "afghanistan", "yemen", "lebanon", "turkey", "saudi arabia",
+    "south korea", "japan", "mexico", "canada", "brazil", "uk",
+    "germany", "france", "australia", "wti", "opec",
+})
+_LEADERS = frozenset({
+    "trump", "putin", "xi", "jinping", "netanyahu", "zelensky", "khamenei",
+    "biden", "modi", "erdogan", "macron", "scholz", "starmer", "milei",
+})
+_MONTH_NAMES = frozenset({
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+})
+_QUESTION_WORDS = frozenset({
+    "will", "would", "could", "should", "did", "does", "do", "is", "are",
+    "was", "were", "has", "have", "the", "by", "before", "after", "in", "on",
+    "be", "been", "being", "get", "win", "lose", "hit", "a", "an", "or",
+    "and", "of", "to", "for", "at", "with", "not", "no", "yes", "if",
+    "than", "more", "most", "any", "all", "some", "its", "into", "over",
+    "under", "about", "from", "each", "but", "their", "other", "between",
+    "through", "during", "also", "much", "many", "there", "here",
+    "what", "when", "where", "who", "how", "which", "that", "this", "it",
+})
 
 
 @dataclass
@@ -55,27 +78,36 @@ def _extract_query_keywords(question: str) -> str:
     """Extract search keywords from a market question for GDELT queries.
 
     Strategy:
-    - Extract proper nouns (capitalized words)
-    - Extract key verbs and nouns (non-stop words)
-    - Combine with OR/AND for GDELT query
+    1. Match known geopolitical entities and leaders (word-boundary, case-insensitive).
+    2. Extract proper nouns including ALL-CAPS tokens (US, NATO, WTI).
+    3. Filter out month names and common question/stop words.
     """
-    # Extract proper nouns (capitalized multi-word names)
-    proper_nouns = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", question)
+    q_lower = question.lower()
+    noise = _QUESTION_WORDS | _MONTH_NAMES
 
-    # Extract all meaningful words
-    words = re.findall(r"\b\w+\b", question)
-    keywords = [w for w in words if w.lower() not in _STOP_WORDS and len(w) > 2]
+    # 1. Check for known entities with word boundaries
+    found_entities: list[str] = []
+    for entity in _GEO_ENTITIES | _LEADERS:
+        # Use regex word boundary to avoid "un" matching inside "June"
+        if re.search(r"\b" + re.escape(entity) + r"\b", q_lower):
+            found_entities.append(entity)
 
-    # Proper nouns get priority; combine with OR
-    if proper_nouns:
-        # Use the most specific proper nouns as query
-        query_parts = [f'"{pn}"' if " " in pn else pn for pn in proper_nouns[:3]]
-        return " OR ".join(query_parts)
+    # 2. Extract individual proper nouns (Capitalized or ALL-CAPS 2-5 chars)
+    proper_nouns = re.findall(r"\b[A-Z][a-z]+\b", question)
+    allcaps = re.findall(r"\b[A-Z]{2,5}\b", question)
+    candidates = list(dict.fromkeys(proper_nouns + allcaps))  # dedupe, preserve order
 
-    # Fallback: join top keywords with AND
-    if keywords:
-        return " AND ".join(keywords[:4])
+    # Filter noise words individually
+    candidates = [w for w in candidates if w.lower() not in noise]
 
+    # 3. Build query from entities + proper nouns
+    parts: list[str] = list(dict.fromkeys(
+        found_entities + [w.lower() for w in candidates[:4]]
+    ))
+    parts = [p for p in parts if len(p) > 1 and p not in _MONTH_NAMES]
+
+    if parts:
+        return " ".join(parts[:4])
     return ""
 
 
@@ -86,17 +118,39 @@ class GDELTMonitor:
         self.config = config or IntelligenceConfig()
         self._cache_path = self.config.DATA_DIR / "gdelt_cache.json"
         self._article_history: dict[str, list[int]] = {}  # market_id -> [counts]
+        # Rate limiting: GDELT allows 1 request per 5 seconds
+        self._rate_limiter = asyncio.Semaphore(1)
+        self._last_request_time: float = 0.0
+
+    async def _throttled_get(self, client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
+        """Make a rate-limited GET request to GDELT (max 1 req / 5.5s)."""
+        async with self._rate_limiter:
+            elapsed = time.time() - self._last_request_time
+            if elapsed < 5.5:
+                await asyncio.sleep(5.5 - elapsed)
+            self._last_request_time = time.time()
+            return await client.get(url, params=params)
 
     async def scan(self, active_markets: list) -> list[Signal]:
-        """Scan GDELT for news signals related to active markets."""
+        """Scan GDELT for news signals related to active markets.
+
+        Only queries markets with volume_24h >= $50K to stay under rate limits.
+        """
+        # Filter to high-volume markets only (rate-limit budget)
+        high_vol = [m for m in active_markets if getattr(m, "volume_24h", 0) >= GDELT_MIN_VOLUME]
+        logger.info(
+            "GDELT: scanning %d high-volume markets (of %d total)",
+            len(high_vol), len(active_markets),
+        )
+
         signals: list[Signal] = []
         self._load_cache()
 
-        for market in active_markets:
+        for market in high_vol:
             try:
                 signal = await asyncio.wait_for(
                     self._scan_market(market),
-                    timeout=15,
+                    timeout=30,
                 )
                 if signal:
                     signals.append(signal)
@@ -106,7 +160,7 @@ class GDELTMonitor:
                 logger.debug("GDELT error for %s: %s", getattr(market, "id", "?"), e)
 
         self._save_cache()
-        logger.info("GDELT scan: %d signals from %d markets", len(signals), len(active_markets))
+        logger.info("GDELT scan: %d signals from %d markets", len(signals), len(high_vol))
         return signals
 
     async def _scan_market(self, market) -> Signal | None:
@@ -190,18 +244,17 @@ class GDELTMonitor:
     async def _fetch_article_count(self, query: str, timespan: str = "15min") -> int:
         """Fetch article count from GDELT for a query and timespan."""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 params = {
                     "query": query,
-                    "mode": "ArtCount",
+                    "mode": "TimelineVol",  # was ArtCount which is invalid in v2
                     "format": "json",
                     "timespan": timespan,
                 }
-                resp = await client.get(GDELT_API_BASE, params=params)
+                resp = await self._throttled_get(client, GDELT_API_BASE, params)
                 if resp.status_code != 200:
                     return 0
                 data = resp.json()
-                # GDELT returns timeline data; sum all counts
                 timeline = data.get("timeline", [])
                 if not timeline:
                     return 0
@@ -217,18 +270,17 @@ class GDELTMonitor:
     async def _fetch_tone(self, query: str) -> float:
         """Fetch average tone from GDELT for a query (last 24h)."""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 params = {
                     "query": query,
                     "mode": "ToneChart",
                     "format": "json",
                     "timespan": "24h",
                 }
-                resp = await client.get(GDELT_API_BASE, params=params)
+                resp = await self._throttled_get(client, GDELT_API_BASE, params)
                 if resp.status_code != 200:
                     return 0.0
                 data = resp.json()
-                # ToneChart returns tone timeline; average it
                 timeline = data.get("timeline", [])
                 if not timeline:
                     return 0.0
@@ -258,3 +310,7 @@ class GDELTMonitor:
             })
         except Exception as e:
             logger.warning("Failed to save GDELT cache: %s", e)
+
+
+# Alias for backwards compatibility
+GDELTAnalyzer = GDELTMonitor

@@ -1707,6 +1707,31 @@ def scan_debug() -> dict:
         result["blocked_universal_only"] = []
         result["blocked_universal_only_count"] = 0
 
+    # ---- Priority tiers & category breakdown ----
+    tier_counts: dict[str, int] = {}
+    cat_counts: dict[str, int] = {}
+    for m in markets:
+        tier = getattr(m, "priority_tier", "UNKNOWN")
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        cat = getattr(m, "target_category", "other")
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    result["priority_tiers"] = tier_counts
+    result["categories"] = cat_counts
+
+    # Top 20 markets by volume with diagnostic info
+    top_20 = markets[:20]  # already sorted by volume desc from scanner
+    result["top_markets"] = [
+        {
+            "question": m.question[:100],
+            "volume_24h": round(m.volume_24h, 2),
+            "liquidity": round(m.liquidity, 2),
+            "priority_tier": getattr(m, "priority_tier", "UNKNOWN"),
+            "target_category": getattr(m, "target_category", "other"),
+            "category_boost": getattr(m, "category_boost", 1.0),
+        }
+        for m in top_20
+    ]
+
     return result
 
 

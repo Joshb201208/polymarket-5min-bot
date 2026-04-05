@@ -169,6 +169,81 @@ CRYPTO_DAILY_PRICE_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Market priority tiers (by 24h volume)
+# ---------------------------------------------------------------------------
+PRIORITY_TIERS = {
+    "TIER_1": 100_000,  # >$100K — always process, all modules
+    "TIER_2": 50_000,   # >$50K  — process with GDELT + all specialist modules
+    "TIER_3": 10_000,   # >$10K  — only if specialist modules have data
+}
+
+# ---------------------------------------------------------------------------
+# Category targeting — keyword matching → priority boost multiplier
+# ---------------------------------------------------------------------------
+TARGET_CATEGORIES: dict[str, dict] = {
+    "us_politics": {
+        "keywords": ["trump", "president", "congress", "senate", "house",
+                      "election", "democrat", "republican", "2028",
+                      "presidential", "governor"],
+        "priority_boost": 1.5,
+    },
+    "geopolitics_conflict": {
+        "keywords": ["iran", "russia", "ukraine", "war", "military",
+                      "ceasefire", "invasion", "nato", "china", "taiwan",
+                      "israel", "gaza", "houthi", "sanctions", "nuclear"],
+        "priority_boost": 1.5,
+    },
+    "macro_economics": {
+        "keywords": ["fed", "rate", "interest", "inflation", "cpi", "gdp",
+                      "recession", "tariff", "trade war", "treasury",
+                      "yield", "employment", "unemployment"],
+        "priority_boost": 1.5,
+    },
+    "commodities": {
+        "keywords": ["oil", "crude", "wti", "gold", "silver", "commodity",
+                      "brent", "natural gas"],
+        "priority_boost": 1.5,
+    },
+    "foreign_elections": {
+        "keywords": ["peru", "brazil", "canada", "australia", "germany",
+                      "france", "uk", "mexico", "india", "south korea"],
+        "priority_boost": 0.7,
+    },
+}
+
+
+def _assign_priority_tier(volume_24h: float) -> str:
+    """Return the priority tier for a given 24h volume."""
+    if volume_24h >= PRIORITY_TIERS["TIER_1"]:
+        return "TIER_1"
+    if volume_24h >= PRIORITY_TIERS["TIER_2"]:
+        return "TIER_2"
+    if volume_24h >= PRIORITY_TIERS["TIER_3"]:
+        return "TIER_3"
+    return "UNTIERED"
+
+
+def _assign_target_category(question: str) -> tuple[str, float]:
+    """Return (category_name, boost) for a market question. Default ('other', 1.0).
+
+    When two categories tie on keyword hits, prefer the one whose keywords are
+    more specific (lower boost means more restrictive category).
+    """
+    q_lower = question.lower()
+    best_cat = "other"
+    best_boost = 1.0
+    best_hits = 0
+    for cat_name, cat_info in TARGET_CATEGORIES.items():
+        hits = sum(1 for kw in cat_info["keywords"] if kw in q_lower)
+        if hits > best_hits or (hits == best_hits and hits > 0
+                                and cat_info["priority_boost"] < best_boost):
+            best_hits = hits
+            best_cat = cat_name
+            best_boost = cat_info["priority_boost"]
+    return best_cat, best_boost
+
+
 class EventsScanner:
     """Scans Polymarket Gamma API for non-sports events markets."""
 
@@ -229,6 +304,19 @@ class EventsScanner:
             "Quality gate: %d → %d markets (min_vol=$%.0f, min_liq=$%.0f)",
             pre_quality, len(markets), min_vol, min_liq,
         )
+
+        # ---- Priority tiers + category targeting ----
+        # Sort by volume descending so highest-value markets are processed first
+        markets.sort(key=lambda m: m.volume_24h, reverse=True)
+
+        for m in markets:
+            m.priority_tier = _assign_priority_tier(m.volume_24h)
+            m.target_category, m.category_boost = _assign_target_category(m.question)
+
+        tier_counts = {}
+        for m in markets:
+            tier_counts[m.priority_tier] = tier_counts.get(m.priority_tier, 0) + 1
+        logger.info("Priority tiers: %s", tier_counts)
 
         logger.info("Scanner found %d events markets after filtering", len(markets))
         return markets
