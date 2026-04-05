@@ -227,55 +227,45 @@ class SmartExitEngine:
         base: dict,
         long_market: bool = False,
     ) -> ExitDecision | None:
-        """Dynamic take-profit with multiple tiers.
+        """Prediction market take-profit: hold to resolution by default.
 
-        For long markets (>60d), thresholds are tighter:
-        - Tier 4 at +10% instead of +15%
-        - Tier 2 at +20% instead of +25%
+        In prediction markets, positions converge to $0 or $1 at resolution.
+        Selling early at +40% leaves money on the table if the position would
+        resolve at $1 (often +100-300% from entry).
+
+        Only take profit early if:
+        1. Price > 92¢ — within 8% of max payout, lock it in
+        2. Edge reversal already handled separately
+        3. Trailing stop handles momentum shifts
         """
-        # Tier 1: >40% → always take profit
-        if pnl_pct > 0.40:
-            reason = f"Smart TP: unrealized P&L {pnl_pct * 100:.1f}% > 40% hard cap"
-            logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
-            return ExitDecision(
-                should_exit=True, reason=reason, urgency="immediate",
-                method="twap", trigger_type="smart_tp", **base,
-            )
+        current_price = base.get("current_price", 0)
 
-        # Tier 2: >25% AND late/terminal lifecycle (>20% for long markets)
-        tp2_threshold = 0.20 if long_market else 0.25
-        if pnl_pct > tp2_threshold and lifecycle_stage in ("LATE", "TERMINAL"):
+        # Near-payout exit: price > 92¢ → only 8% more upside, take the profit
+        if current_price > 0.92:
             reason = (
-                f"Smart TP: P&L {pnl_pct * 100:.1f}% > {tp2_threshold * 100:.0f}% in {lifecycle_stage} stage"
+                f"Near-payout TP: price {current_price * 100:.1f}¢ > 92¢, "
+                f"only {(1 - current_price) * 100:.1f}% upside remaining. "
+                f"P&L {pnl_pct * 100:.1f}%. Locking in profit."
             )
             logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
             return ExitDecision(
                 should_exit=True, reason=reason, urgency="immediate",
-                method="twap", trigger_type="smart_tp", **base,
-            )
-
-        # Tier 3: >20% AND volatile regime
-        if pnl_pct > 0.20 and regime == "VOLATILE":
-            reason = f"Smart TP: P&L {pnl_pct * 100:.1f}% > 20% in VOLATILE regime"
-            logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
-            return ExitDecision(
-                should_exit=True, reason=reason, urgency="next_cycle",
                 method="limit", trigger_type="smart_tp", **base,
             )
 
-        # Tier 4: >15% AND remaining edge < 3% (>10% for long markets)
-        tp4_threshold = 0.10 if long_market else 0.15
-        if pnl_pct > tp4_threshold and remaining_edge is not None and remaining_edge < 0.03:
+        # TERMINAL lifecycle + profitable → market about to resolve, take it
+        if lifecycle_stage == "TERMINAL" and pnl_pct > 0.10:
             reason = (
-                f"Smart TP: P&L {pnl_pct * 100:.1f}% > 15% with "
-                f"remaining edge {remaining_edge * 100:.1f}% < 3%"
+                f"Terminal TP: market in TERMINAL stage, P&L {pnl_pct * 100:.1f}%. "
+                f"Resolution imminent — locking in profit."
             )
             logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
             return ExitDecision(
-                should_exit=True, reason=reason, urgency="next_cycle",
+                should_exit=True, reason=reason, urgency="immediate",
                 method="limit", trigger_type="smart_tp", **base,
             )
 
+        # Default: HOLD to resolution — the $1 payout is worth waiting for
         return None
 
     def _check_trailing_stop(
