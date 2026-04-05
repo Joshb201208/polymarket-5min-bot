@@ -249,17 +249,7 @@ class SmartExitEngine:
         if days_to_resolve is not None and days_to_resolve < 7 and pnl_pct > 0:
             return None
 
-        # Rule 2: Price > 90c -> near guaranteed payout, lock it in
-        if current_price > 0.90:
-            reason = (
-                f"Near-payout TP: price {current_price * 100:.1f}c > 90c. "
-                f"P&L {pnl_pct * 100:.1f}%. Locking in profit."
-            )
-            logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
-            return ExitDecision(
-                should_exit=True, reason=reason, urgency="immediate",
-                method="limit", trigger_type="smart_tp", **base,
-            )
+        # Rule 2: (removed — at 90c+ just hold for the guaranteed  payout)
 
         # Rule 3: Edge consumed — price reached our fair value estimate
         if remaining_edge is not None and remaining_edge <= 0.02 and pnl_pct > 0.10:
