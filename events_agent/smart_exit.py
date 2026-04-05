@@ -227,24 +227,32 @@ class SmartExitEngine:
         base: dict,
         long_market: bool = False,
     ) -> ExitDecision | None:
-        """Prediction market take-profit: hold to resolution by default.
+        """Edge-consumed take profit for prediction markets.
 
-        In prediction markets, positions converge to $0 or $1 at resolution.
-        Selling early at +40% leaves money on the table if the position would
-        resolve at $1 (often +100-300% from entry).
-
-        Only take profit early if:
-        1. Price > 92¢ — within 8% of max payout, lock it in
-        2. Edge reversal already handled separately
-        3. Trailing stop handles momentum shifts
+        Take profit when the edge is consumed (market caught up to our estimate),
+        UNLESS resolution is imminent (< 7 days) — then hold for the $1 payout.
         """
         current_price = base.get("current_price", 0)
+        position = base.get("position")
 
-        # Near-payout exit: price > 92¢ → only 8% more upside, take the profit
-        if current_price > 0.92:
+        # Get days to resolution
+        days_to_resolve = None
+        if position and hasattr(position, "end_date") and position.end_date:
+            try:
+                from shared.utils import parse_utc, utcnow
+                end_dt = parse_utc(position.end_date)
+                days_to_resolve = (end_dt - utcnow()).total_seconds() / 86400
+            except Exception:
+                pass
+
+        # Rule 1: Near resolution (< 7 days) + profitable -> HOLD for $1 payout
+        if days_to_resolve is not None and days_to_resolve < 7 and pnl_pct > 0:
+            return None
+
+        # Rule 2: Price > 90c -> near guaranteed payout, lock it in
+        if current_price > 0.90:
             reason = (
-                f"Near-payout TP: price {current_price * 100:.1f}¢ > 92¢, "
-                f"only {(1 - current_price) * 100:.1f}% upside remaining. "
+                f"Near-payout TP: price {current_price * 100:.1f}c > 90c. "
                 f"P&L {pnl_pct * 100:.1f}%. Locking in profit."
             )
             logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
@@ -253,19 +261,31 @@ class SmartExitEngine:
                 method="limit", trigger_type="smart_tp", **base,
             )
 
-        # TERMINAL lifecycle + profitable → market about to resolve, take it
-        if lifecycle_stage == "TERMINAL" and pnl_pct > 0.10:
+        # Rule 3: Edge consumed — price reached our fair value estimate
+        if remaining_edge is not None and remaining_edge <= 0.02 and pnl_pct > 0.10:
             reason = (
-                f"Terminal TP: market in TERMINAL stage, P&L {pnl_pct * 100:.1f}%. "
-                f"Resolution imminent — locking in profit."
+                f"Edge consumed: remaining edge {remaining_edge * 100:.1f}% "
+                f"(market caught up). P&L {pnl_pct * 100:.1f}%."
             )
             logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
             return ExitDecision(
-                should_exit=True, reason=reason, urgency="immediate",
+                should_exit=True, reason=reason, urgency="next_cycle",
                 method="limit", trigger_type="smart_tp", **base,
             )
 
-        # Default: HOLD to resolution — the $1 payout is worth waiting for
+        # Rule 4: Big profit + far from resolution -> lock in gains
+        if days_to_resolve is not None and days_to_resolve > 30 and pnl_pct > 0.40:
+            reason = (
+                f"Time-risk TP: P&L {pnl_pct * 100:.1f}% with {days_to_resolve:.0f} days "
+                f"to resolution. Locking in gains."
+            )
+            logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
+            return ExitDecision(
+                should_exit=True, reason=reason, urgency="next_cycle",
+                method="limit", trigger_type="smart_tp", **base,
+            )
+
+        # Default: HOLD
         return None
 
     def _check_trailing_stop(
