@@ -44,6 +44,14 @@ _LEADERS = frozenset({
     "trump", "putin", "xi", "jinping", "netanyahu", "zelensky", "khamenei",
     "biden", "modi", "erdogan", "macron", "scholz", "starmer", "milei",
 })
+# GDELT rejects keywords shorter than 3 characters. Map abbreviations to full forms.
+_SHORT_TO_FULL = {
+    "us": "United States",
+    "uk": "United Kingdom",
+    "eu": "European Union",
+    "un": "United Nations",
+    "xi": "Jinping",
+}
 _MONTH_NAMES = frozenset({
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
@@ -101,10 +109,19 @@ def _extract_query_keywords(question: str) -> str:
     candidates = [w for w in candidates if w.lower() not in noise]
 
     # 3. Build query from entities + proper nouns
-    parts: list[str] = list(dict.fromkeys(
+    raw_parts: list[str] = list(dict.fromkeys(
         found_entities + [w.lower() for w in candidates[:4]]
     ))
-    parts = [p for p in parts if len(p) > 1 and p not in _MONTH_NAMES]
+    raw_parts = [p for p in raw_parts if len(p) > 1 and p not in _MONTH_NAMES]
+
+    # 4. Expand short abbreviations that GDELT rejects (< 3 chars)
+    parts: list[str] = []
+    for p in raw_parts:
+        if p in _SHORT_TO_FULL:
+            parts.append(f'"{_SHORT_TO_FULL[p]}"')  # quoted phrase for GDELT
+        elif len(p) >= 3:
+            parts.append(p)
+        # else: skip too-short keywords without a mapping
 
     if parts:
         return " ".join(parts[:4])
