@@ -292,7 +292,7 @@ def deploy() -> dict:
 # ===========================================================================
 
 # Events agent starting bankroll — synced to actual wallet value (portfolio ~$263 + cash ~$100).
-EVENTS_STARTING_BANKROLL = 363.0
+EVENTS_STARTING_BANKROLL = 258.84
 
 
 @app.get("/api/events/status", dependencies=[Depends(_require_auth)])
