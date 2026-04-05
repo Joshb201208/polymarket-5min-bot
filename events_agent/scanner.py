@@ -183,9 +183,11 @@ PRIORITY_TIERS = {
 # ---------------------------------------------------------------------------
 TARGET_CATEGORIES: dict[str, dict] = {
     "us_politics": {
-        "keywords": ["trump", "president", "congress", "senate", "house",
-                      "election", "democrat", "republican", "2028",
-                      "presidential", "governor"],
+        "keywords": ["trump", "congress", "senate", "house",
+                      "democrat", "republican", "2028",
+                      "governor", "vance", "newsom", "desantis",
+                      "scotus", "supreme court", "white house",
+                      "us president", "american"],
         "priority_boost": 1.5,
     },
     "geopolitics_conflict": {
@@ -206,8 +208,12 @@ TARGET_CATEGORIES: dict[str, dict] = {
         "priority_boost": 1.5,
     },
     "foreign_elections": {
-        "keywords": ["peru", "brazil", "canada", "australia", "germany",
-                      "france", "uk", "mexico", "india", "south korea"],
+        "keywords": ["peru", "peruvian", "brazil", "brazilian", "canada",
+                      "canadian", "australia", "australian", "germany",
+                      "german", "france", "french", "uk", "mexico",
+                      "mexican", "india", "indian", "south korea",
+                      "korean", "hungary", "hungarian", "fidesz",
+                      "parliament", "prime minister", "presidential election"],
         "priority_boost": 0.7,
     },
 }
