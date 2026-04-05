@@ -263,19 +263,7 @@ class SmartExitEngine:
                 method="limit", trigger_type="smart_tp", **base,
             )
 
-        # Rule 4: Big profit + far from resolution -> lock in gains
-        if days_to_resolve is not None and days_to_resolve > 30 and pnl_pct > 0.40:
-            reason = (
-                f"Time-risk TP: P&L {pnl_pct * 100:.1f}% with {days_to_resolve:.0f} days "
-                f"to resolution. Locking in gains."
-            )
-            logger.info("EXIT TRIGGER [smart_tp]: %s", reason)
-            return ExitDecision(
-                should_exit=True, reason=reason, urgency="next_cycle",
-                method="limit", trigger_type="smart_tp", **base,
-            )
-
-        # Default: HOLD
+        # Default: HOLD — thesis intact, wait for resolution
         return None
 
     def _check_trailing_stop(
