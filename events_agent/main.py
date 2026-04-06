@@ -583,8 +583,17 @@ class EventsAgent:
                         market.category.value,
                     )
 
-                    # Post-trade verification: confirm shares exist on wallet
-                    if self.config.is_live:
+                    # Post-trade verification REMOVED — Polymarket takes >10s to settle
+                    # and the 10s check was causing false phantom detections, marking
+                    # real positions as failed and recording full cost as loss.
+                    # The health monitor's periodic wallet reconciliation handles this.
+                    if False:  # disabled
+                        time.sleep(10)
+                        try:
+                            pass
+                        except Exception:
+                            pass
+                    if False:  # was: if self.config.is_live:
                         time.sleep(10)  # Wait for settlement
                         try:
                             from events_agent.health_monitor import HealthMonitor
