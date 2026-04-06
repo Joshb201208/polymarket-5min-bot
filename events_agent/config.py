@@ -30,7 +30,7 @@ class EventsConfig:
     FUNDER_ADDRESS: str = os.getenv("FUNDER_ADDRESS", "")
 
     # Bankroll — synced to actual wallet value (portfolio ~$263 + cash ~$100).
-    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "258.84"))
+    STARTING_BANKROLL: float = float(os.getenv("EVENTS_STARTING_BANKROLL", "259.76"))
     MAX_BET_PCT: float = float(os.getenv("EVENTS_MAX_BET_PCT", "0.15"))
     MAX_TOTAL_EXPOSURE_PCT: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.95"))
 
