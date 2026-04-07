@@ -223,6 +223,9 @@ class CompositeScorer:
 
         # 4c. Category boost: multiply by market's category priority weight
         category_boost = (market_context or {}).get("category_boost", 1.0)
+        # 0.0 boost = category is blocked entirely
+        if category_boost == 0.0:
+            return None
         composite = min(composite * category_boost, 1.0)
 
         # 5. Map to confidence tier

@@ -207,14 +207,18 @@ TARGET_CATEGORIES: dict[str, dict] = {
                       "brent", "natural gas"],
         "priority_boost": 1.5,
     },
+    # Foreign elections are blocked in _passes_filters — do not trade these.
+    # We have no informational edge on foreign state/national elections.
     "foreign_elections": {
         "keywords": ["peru", "peruvian", "brazil", "brazilian", "canada",
                       "canadian", "australia", "australian", "germany",
                       "german", "france", "french", "uk", "mexico",
                       "mexican", "india", "indian", "south korea",
                       "korean", "hungary", "hungarian", "fidesz",
-                      "parliament", "prime minister", "presidential election"],
-        "priority_boost": 0.7,
+                      "parliament", "prime minister", "presidential election",
+                      "legislative assembly", "west bengal", "bjp",
+                      "congress party", "lok sabha"],
+        "priority_boost": 0.0,  # Block entirely
     },
 }
 
