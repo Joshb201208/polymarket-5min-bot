@@ -1262,7 +1262,9 @@ class StockAgentScheduler:
                         )
 
                     if order:
-                        fill_price = signal.entry_price
+                        # Use max_debit as fill price proxy; fall back to 0.0
+                        fill_price = getattr(signal, 'max_debit_per_contract', None) or \
+                                     getattr(signal, 'min_credit_per_contract', None) or 0.0
                         regime = self.macro.get_current_regime()
                         pos = self.options_portfolio.open_position(
                             signal=signal,
