@@ -78,6 +78,11 @@ class StockAgentScheduler:
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
         self._options_scan_done_today: str | None = None
+        # Event-triggered scanning state
+        self._last_event_spx: float = 0.0
+        self._last_event_vix: float = 0.0
+        self._last_event_regime: str = ""
+        self._event_scan_cooldown: datetime | None = None  # Don’t fire twice in 30 min
 
     def shutdown(self):
         logger.info("Shutdown requested")
@@ -178,6 +183,8 @@ class StockAgentScheduler:
                 await self._run_market_monitoring()
                 # Check options positions for auto-close triggers
                 await self._check_options_positions()
+                # Check for major market events that should trigger immediate re-scan
+                await self._check_for_market_event()
 
         # ── Daily summary at market close ──
         if self._should_send_daily_summary(now_et):
@@ -1355,6 +1362,128 @@ class StockAgentScheduler:
 
         except Exception as e:
             logger.error("Options position check failed: %s", e)
+
+    # ── Event-Triggered Scanning ────────────────────────────────────────────
+
+    async def _check_for_market_event(self):
+        """After each market monitoring cycle, check if a major event occurred.
+
+        Triggers an immediate full analysis cycle (re-scan + re-analyze positions)
+        when ANY of these thresholds are crossed since the last check:
+
+        - SPX moved > 1.5% in either direction
+        - VIX spiked > 3 points
+        - Macro regime changed
+        - Oil (crude) moved > 3%
+
+        Cooldown of 30 minutes prevents back-to-back triggers.
+        """
+        try:
+            # Respect cooldown
+            now = _now_et()
+            if self._event_scan_cooldown:
+                elapsed = (now - self._event_scan_cooldown).total_seconds()
+                if elapsed < 1800:  # 30-minute cooldown
+                    return
+
+            # Run a fresh macro check to get current values
+            snap = await self.macro.check_conditions()
+
+            # Compare against last known values
+            spx_now = snap.spx_price
+            vix_now = snap.vix_level
+            regime_now = snap.regime
+
+            events_detected: list[str] = []
+
+            # SPX move > 1.5%
+            if self._last_event_spx > 0 and spx_now > 0:
+                spx_move_pct = abs(spx_now - self._last_event_spx) / self._last_event_spx * 100
+                if spx_move_pct >= 1.5:
+                    events_detected.append(
+                        f"SPX moved {spx_move_pct:+.1f}% ({self._last_event_spx:,.0f} → {spx_now:,.0f})"
+                    )
+
+            # VIX spike > 3 points
+            if self._last_event_vix > 0 and vix_now > 0:
+                vix_change = vix_now - self._last_event_vix
+                if abs(vix_change) >= 3.0:
+                    events_detected.append(
+                        f"VIX moved {vix_change:+.1f} pts ({self._last_event_vix:.1f} → {vix_now:.1f})"
+                    )
+
+            # Regime change
+            if self._last_event_regime and regime_now != self._last_event_regime:
+                events_detected.append(
+                    f"Regime changed: {self._last_event_regime} → {regime_now}"
+                )
+
+            # Update last known values
+            self._last_event_spx = spx_now
+            self._last_event_vix = vix_now
+            self._last_event_regime = regime_now
+
+            if not events_detected:
+                return
+
+            # Something significant happened — trigger immediate full scan
+            self._event_scan_cooldown = now
+            event_summary = " | ".join(events_detected)
+
+            logger.info("MARKET EVENT DETECTED: %s — triggering immediate scan", event_summary)
+
+            # Notify Discord
+            await self.discord.send_embed(
+                self.discord.channels.get("announcements", ""),
+                {
+                    "title": "\u26a1 Market Event — Immediate Scan Triggered",
+                    "description": (
+                        f"Significant market movement detected. Running full analysis now.\n\n"
+                        f"**Events:**\n" + "\n".join(f"\u2022 {e}" for e in events_detected)
+                    ),
+                    "color": 0xF59E0B,
+                    "fields": [
+                        {"name": "Regime", "value": regime_now.replace('_', ' ').title(), "inline": True},
+                        {"name": "SPX", "value": f"${spx_now:,.0f}", "inline": True},
+                        {"name": "VIX", "value": f"{vix_now:.1f}", "inline": True},
+                    ],
+                },
+            )
+
+            # 1. Re-analyze all existing positions with fresh data
+            if self.portfolio.state.positions:
+                symbols = [p.symbol for p in self.portfolio.state.positions]
+                companies = await self._fetch_fundamentals(symbols)
+                await self._re_analyze_existing_positions(companies)
+
+            # 2. Run a fresh universe screen and deep analysis for new opportunities
+            symbols = await self.data_feed.screen_universe()
+            if symbols:
+                self.portfolio.set_universe(symbols)
+                companies = await self._fetch_fundamentals(symbols)
+                if companies:
+                    ranked = await self.screener.screen_candidates(companies)
+                    top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
+                    signals = await self._deep_analyze(top_symbols, companies)
+                    # Execute signals if market is open
+                    if self._is_market_open(now):
+                        executed = await self._execute_signals(signals)
+                    else:
+                        self._pending_signals.extend(signals)
+                        executed = []
+
+            # 3. Re-run options scan if in market hours
+            if self._is_market_open(now):
+                self._options_scan_done_today = None  # Reset so it runs again
+                await self._run_options_scan()
+
+            logger.info(
+                "Event-triggered scan complete — event: %s",
+                event_summary,
+            )
+
+        except Exception as e:
+            logger.error("Event check failed: %s", e)
 
     # ── Morning Brief ────────────────────────────────────────────────
 
