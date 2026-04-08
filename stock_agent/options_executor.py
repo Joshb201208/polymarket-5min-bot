@@ -182,21 +182,41 @@ class OptionsExecutor:
     async def close_option_position(
         self,
         contract_symbol: str,
-        qty: Optional[int] = None,
+        qty: int = 1,
+        position_side: str = "long",
     ) -> Optional[dict]:
-        """Close an open options position by submitting the offsetting order.
+        """Close an open options position using an offsetting market order.
 
-        Uses the Alpaca close-position endpoint which automatically determines
-        the correct side and quantity.
+        Uses a regular BUY/SELL order rather than DELETE /v2/positions,
+        which Alpaca rejects as an uncovered option on paper accounts.
 
         Args:
-            contract_symbol: OCC contract symbol or Alpaca position ID.
-            qty:             Partial close quantity.  ``None`` closes the full
-                             position.
+            contract_symbol: OCC contract symbol.
+            qty:             Number of contracts to close (positive integer).
+            position_side:   ``"long"`` (we hold it, sell to close) or
+                             ``"short"`` (we wrote it, buy to close).
 
         Returns:
             Alpaca order dict on success, ``None`` on failure.
         """
+        close_side = OptionSide.SELL if position_side == "long" else OptionSide.BUY
+        logger.info(
+            "Closing %s option position: %s x%d (%s to close)",
+            position_side, contract_symbol, qty, close_side.value,
+        )
+        return await self.place_option_order(
+            contract_symbol=contract_symbol,
+            qty=abs(qty),
+            side=close_side,
+            order_type=OptionOrderType.MARKET,
+        )
+
+    async def _close_option_position_legacy(
+        self,
+        contract_symbol: str,
+        qty: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Legacy DELETE-based close (kept for reference — rejected on paper)."""
         client = await self._get_client()
         url = f"{_TRADING_BASE}/v2/positions/{contract_symbol}"
         params: dict = {}

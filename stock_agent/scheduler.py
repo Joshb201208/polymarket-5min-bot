@@ -1216,8 +1216,24 @@ class StockAgentScheduler:
 
             # Build screener candidates: (symbol, conviction, price, target_price)
             screener_candidates: list[tuple[str, int, float, float | None]] = []
+
+            # Track underlyings already in options portfolio to prevent duplicates
+            import re as _re
+            existing_options_underlyings: set[str] = set()
+            for op in self.options_portfolio.state.positions:
+                m = _re.match(r'([A-Z]+)', op.contract_symbol)
+                if m:
+                    existing_options_underlyings.add(m.group(1))
+            if existing_options_underlyings:
+                logger.info(
+                    "Skipping options scan for underlyings with existing positions: %s",
+                    existing_options_underlyings,
+                )
+
             universe = self.portfolio.state.universe or []
             for sym in universe[:30]:
+                if sym in existing_options_underlyings:
+                    continue  # Already have an options position on this underlying
                 try:
                     company = await self.data_feed.get_company_fundamentals(sym)
                     if not company or company.price <= 0:
@@ -1235,12 +1251,18 @@ class StockAgentScheduler:
 
             current_exposure = self.options_portfolio.total_exposure_pct
 
+            # Filter stock_positions to exclude underlyings with existing options
+            filtered_stock_positions = {
+                sym: shares for sym, shares in stock_positions.items()
+                if sym not in existing_options_underlyings
+            }
+
             # Run the engine
             signals = await self.options_engine.scan_opportunities(
                 portfolio_value=portfolio_value,
                 open_options_count=self.options_portfolio.open_position_count,
                 current_options_exposure=current_exposure,
-                stock_positions=stock_positions,
+                stock_positions=filtered_stock_positions,
                 screener_candidates=screener_candidates,
             )
 
@@ -1321,8 +1343,12 @@ class StockAgentScheduler:
                 logger.info("Options auto-close: %s — %s", pos.contract_symbol, reason)
 
                 try:
+                    # Determine position side from sign of qty
+                    pos_side = "long" if pos.qty > 0 else "short"
                     order = await self.options_executor.close_option_position(
-                        pos.contract_symbol
+                        pos.contract_symbol,
+                        qty=abs(pos.qty),
+                        position_side=pos_side,
                     )
                     if order:
                         self.options_portfolio.close_position(
