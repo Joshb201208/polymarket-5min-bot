@@ -49,28 +49,28 @@ logger = logging.getLogger(__name__)
 
 # ── Risk constants ────────────────────────────────────────────────────
 
-MAX_OPTIONS_POSITIONS = 5           # Hard cap on concurrent options positions
-MAX_SINGLE_TRADE_PCT = 0.05         # 5% of portfolio per trade
+MAX_OPTIONS_POSITIONS = 10          # Hard cap (paper)
+MAX_SINGLE_TRADE_PCT = 0.07         # 7% of portfolio per trade
 MAX_TOTAL_OPTIONS_EXPOSURE_PCT = 0.15  # 15% of portfolio in options total
-MIN_REWARD_TO_RISK = 2.0            # Minimum R:R for spread strategies
+MIN_REWARD_TO_RISK = 1.5            # 1.5 R:R for paper trading
 SHARES_PER_CONTRACT = 100           # Standard US options contract size
 
 # ── Strategy parameters ───────────────────────────────────────────────
 
 # Covered call / CSP target DTE window
 CC_MIN_DTE = 14    # 2 weeks
-CC_MAX_DTE = 28    # 4 weeks
+CC_MAX_DTE = 35    # 5 weeks
 
 # Directional spreads DTE window
-SPREAD_MIN_DTE = 30
+SPREAD_MIN_DTE = 14  # 14 days minimum
 SPREAD_MAX_DTE = 45
 
 # Minimum premium for cash-secured puts (annualised, as fraction of strike)
-MIN_PUT_PREMIUM_MONTHLY_PCT = 0.01  # 1% of strike per month minimum
+MIN_PUT_PREMIUM_MONTHLY_PCT = 0.005  # 0.5% per month
 
 # Spread width targets (in dollars)
-SPREAD_WIDTH_NARROW = 5.0   # For sub-$150 stocks
-SPREAD_WIDTH_WIDE = 10.0    # For $150+ stocks
+SPREAD_WIDTH_NARROW = 10.0   # Sub-$150 (widened)
+SPREAD_WIDTH_WIDE = 20.0    # $150+ (widened)
 
 
 class OptionsEngine:
@@ -473,7 +473,7 @@ class OptionsEngine:
         max_expiry = date.today() + timedelta(days=SPREAD_MAX_DTE)
 
         # Buy strike: slightly OTM (just above current price)
-        buy_strike = self._round_to_strike(current_price * 1.01)
+        buy_strike = self._round_to_strike(current_price * 1.03)  # 3% OTM
 
         # Spread width: $5 for stocks < $150, $10 for stocks >= $150
         width = SPREAD_WIDTH_WIDE if current_price >= 150 else SPREAD_WIDTH_NARROW
