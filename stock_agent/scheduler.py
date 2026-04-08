@@ -25,6 +25,7 @@ from stock_agent.options_data import OptionsDataFeed
 from stock_agent.options_engine import OptionsEngine
 from stock_agent.options_executor import OptionsExecutor
 from stock_agent.options_portfolio import OptionsPortfolio
+from stock_agent.options_models import OptionSide, OptionOrderType
 
 logger = logging.getLogger(__name__)
 
@@ -1247,17 +1248,18 @@ class StockAgentScheduler:
                             short_symbol=signal.leg2_contract_symbol,
                             qty=signal.qty,
                             is_debit=True,
-                            limit_price=signal.limit_price,
+                            limit_price=None,  # Market order for paper
                         )
                     else:
-                        # Single-leg order
-                        side = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
+                        # Single-leg order — resolve side to proper enum
+                        side_str = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
+                        side_enum = OptionSide.SELL if side_str == "sell" else OptionSide.BUY
                         order = await self.options_executor.place_option_order(
                             contract_symbol=signal.contract_symbol,
                             qty=signal.qty,
-                            side=side,
-                            order_type="market",
-                            limit_price=None,  # Use market order for paper trading simplicity
+                            side=side_enum,
+                            order_type=OptionOrderType.MARKET,
+                            limit_price=None,
                         )
 
                     if order:
