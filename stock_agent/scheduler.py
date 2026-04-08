@@ -1247,8 +1247,7 @@ class StockAgentScheduler:
                             long_symbol=signal.contract_symbol,
                             short_symbol=signal.leg2_contract_symbol,
                             qty=signal.qty,
-                            is_debit=True,
-                            limit_price=None,  # Market order for paper
+                            order_type=OptionOrderType.MARKET,
                         )
                     else:
                         # Single-leg order — resolve side to proper enum
