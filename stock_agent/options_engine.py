@@ -150,13 +150,13 @@ class OptionsEngine:
         )
 
         # ── 1. Covered calls on existing positions ────────────────────
-        # Paper trading: attempt covered calls even with <100 shares
-        # (for learning — Alpaca paper won't enforce the coverage requirement)
+        # Only attempt covered calls if we have >= 100 shares (Alpaca requirement)
+        # Our current positions are all < 100 shares so this will be skipped
         for symbol, shares in stock_positions.items():
-            if shares > 0 and slots_remaining > 0:  # Paper: no 100-share minimum
+            if shares >= SHARES_PER_CONTRACT and slots_remaining > 0:
                 cc_signal = await self._evaluate_covered_call(
                     symbol=symbol,
-                    shares=max(shares, SHARES_PER_CONTRACT),  # Treat as 1 contract
+                    shares=shares,
                     portfolio_value=portfolio_value,
                     regime=regime,
                     snap=snap,
