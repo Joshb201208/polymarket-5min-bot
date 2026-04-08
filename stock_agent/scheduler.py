@@ -380,8 +380,17 @@ class StockAgentScheduler:
             # 5. Re-analyze existing positions
             await self._re_analyze_existing_positions(companies)
 
-            # 6. Execute trades from signals
-            executed_signals = await self._execute_signals(signals)
+            # 6. Queue signals — execute at next market open (weekly runs Sunday evening, market is closed)
+            if self._is_market_open(_now_et()):
+                executed_signals = await self._execute_signals(signals)
+            else:
+                # Store for execution at next market open
+                self._pending_signals.extend(signals)
+                executed_signals = []
+                logger.info(
+                    "Market closed — queued %d signals for next open: %s",
+                    len(signals), [s.symbol for s in signals]
+                )
 
             # 7. Report
             stats = self.portfolio.calculate_stats()
@@ -461,8 +470,16 @@ class StockAgentScheduler:
             # 5. Re-analyze all existing positions with fresh data
             await self._re_analyze_existing_positions(companies)
 
-            # 6. Execute new signals
-            executed = await self._execute_signals(signals)
+            # 6. Queue or execute signals
+            if self._is_market_open(_now_et()):
+                executed = await self._execute_signals(signals)
+            else:
+                self._pending_signals.extend(signals)
+                executed = []
+                logger.info(
+                    "Mid-week: market closed — queued %d signals for next open: %s",
+                    len(signals), [s.symbol for s in signals]
+                )
 
             await self.discord.send_system_log(
                 "INFO",
@@ -1052,7 +1069,13 @@ class StockAgentScheduler:
                 self.portfolio.state, sym, company_sector, price
             )
             if not ok:
-                logger.info("Risk check blocked %s: %s", sym, reason)
+                logger.warning("Risk check BLOCKED %s (sector=%s): %s", sym, company_sector, reason)
+                try:
+                    await self.discord.send_system_log(
+                        "WARNING", f"Trade blocked for {sym}: {reason}"
+                    )
+                except Exception:
+                    pass
                 continue
 
             pv = self.portfolio.get_portfolio_value()
