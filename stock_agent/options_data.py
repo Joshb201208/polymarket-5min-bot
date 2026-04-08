@@ -198,7 +198,7 @@ class OptionsDataFeed:
 
         client = await self._get_client()
         results: dict[str, OptionsQuote] = {}
-        batch_size = 500  # Stay well under Alpaca limits
+        batch_size = 50  # Alpaca enforces 100-symbol max; use 50 for safety
 
         for i in range(0, len(contract_symbols), batch_size):
             batch = contract_symbols[i : i + batch_size]

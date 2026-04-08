@@ -1240,18 +1240,18 @@ class StockAgentScheduler:
             signals_executed = 0
             for signal in signals:
                 try:
-                    if signal.short_contract_symbol:
+                    if signal.leg2_contract_symbol:
                         # Spread order
                         order = await self.options_executor.place_spread_order(
                             long_symbol=signal.contract_symbol,
-                            short_symbol=signal.short_contract_symbol,
+                            short_symbol=signal.leg2_contract_symbol,
                             qty=signal.qty,
                             is_debit=True,
                             limit_price=signal.limit_price,
                         )
                     else:
                         # Single-leg order
-                        side = "sell" if signal.side.value == "sell" else "buy"
+                        side = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
                         order = await self.options_executor.place_option_order(
                             contract_symbol=signal.contract_symbol,
                             qty=signal.qty,
