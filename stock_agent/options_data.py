@@ -92,6 +92,8 @@ class OptionsDataFeed:
             List of :class:`OptionsContract` objects sorted by expiration then strike.
         """
         client = await self._get_client()
+        # Alpaca uses dots not hyphens for class shares (BRK.B not BRK-B)
+        underlying = underlying.replace("-", ".")
         params: dict[str, str | int] = {
             "underlying_symbols": underlying,
             "status": "active",
@@ -327,4 +329,21 @@ class OptionsDataFeed:
         symbols = [c.symbol for c in contracts]
         quotes = await self.fetch_snapshot(symbols)
 
-        return [(c, quotes.get(c.symbol)) for c in contracts]
+        # For contracts without live quotes, create a fallback from close_price
+        result: list[tuple[OptionsContract, Optional[OptionsQuote]]] = []
+        for c in contracts:
+            q = quotes.get(c.symbol)
+            if q is None and c.close_price is not None and c.close_price > 0:
+                # Create a minimal quote from the contract's close price
+                from stock_agent.options_models import OptionsQuote
+                q = OptionsQuote(
+                    symbol=c.symbol,
+                    close=c.close_price,
+                )
+            elif q is not None and (q.fair_value is None or q.fair_value <= 0):
+                # Live quote returned but no usable price — patch in close
+                if c.close_price is not None and c.close_price > 0:
+                    q.close = c.close_price
+            result.append((c, q))
+
+        return result

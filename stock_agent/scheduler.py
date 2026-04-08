@@ -196,14 +196,18 @@ class StockAgentScheduler:
         return time(6, 30) <= current_time <= time(7, 30)
 
     def _should_run_options_scan(self, now_et: datetime) -> bool:
-        """Run options scan Mon-Fri, 9:00-9:30 AM ET (just before market open)."""
+        """Run options scan Mon-Fri, 10:00-10:30 AM ET.
+
+        Runs 30 min after market open so live bid/ask quotes are populated.
+        Pre-market (9 AM) only has close prices for puts — calls are empty.
+        """
         if now_et.weekday() >= 5:
             return False
         today_str = now_et.strftime("%Y-%m-%d")
         if self._options_scan_done_today == today_str:
             return False
         current_time = now_et.time()
-        return time(9, 0) <= current_time <= time(9, 30)
+        return time(10, 0) <= current_time <= time(10, 30)
 
     def _should_send_morning_brief(self, now_et: datetime) -> bool:
         """Send morning brief Mon-Fri, 8:15-8:45 AM ET (8:15-8:45 PM SGT)."""

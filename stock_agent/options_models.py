@@ -97,6 +97,7 @@ class OptionsQuote(BaseModel):
     ask: Optional[float] = None
     last: Optional[float] = None
     mid: Optional[float] = None         # Computed as (bid + ask) / 2
+    close: Optional[float] = None       # Previous close (fallback when live data unavailable)
     open_interest: Optional[int] = None
     volume: Optional[int] = None
     greeks: OptionsGreeks = Field(default_factory=OptionsGreeks)
@@ -104,10 +105,14 @@ class OptionsQuote(BaseModel):
 
     @property
     def fair_value(self) -> Optional[float]:
-        """Return mid-price when available, else last."""
-        if self.mid is not None:
+        """Return mid-price when available, else last, else close."""
+        if self.mid is not None and self.mid > 0:
             return self.mid
-        return self.last
+        if self.last is not None and self.last > 0:
+            return self.last
+        if self.close is not None and self.close > 0:
+            return self.close
+        return None
 
 
 # ── Open position ────────────────────────────────────────────────────

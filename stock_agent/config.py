@@ -46,7 +46,7 @@ class Config:
     # Risk limits — conviction-tiered sizing
     MAX_POSITION_PCT = 0.06      # Absolute cap per position (conviction 10 = 6%)
     MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "0.50"))  # 50%
-    MAX_POSITIONS = 10           # Max concurrent positions
+    MAX_POSITIONS = 20           # Max concurrent positions
     MAX_SECTOR_PCT = 0.30        # 30% max in any sector
 
     # Conviction-tiered position sizing: conviction score → % of portfolio
@@ -96,14 +96,14 @@ class Config:
 
     # Options trading
     OPTIONS_ENABLED = os.environ.get("OPTIONS_ENABLED", "true").lower() == "true"
-    OPTIONS_MAX_POSITIONS = 5              # Max open options positions
-    OPTIONS_MAX_SINGLE_TRADE_PCT = 0.05    # Max 5% of portfolio per trade
+    OPTIONS_MAX_POSITIONS = 10              # Max open options positions
+    OPTIONS_MAX_SINGLE_TRADE_PCT = 0.07    # Max 5% of portfolio per trade
     OPTIONS_MAX_TOTAL_EXPOSURE_PCT = 0.15  # Max 15% total options exposure
     OPTIONS_AUTO_CLOSE_PROFIT_PCT = 0.50   # Auto-close at 50% profit
     OPTIONS_AUTO_CLOSE_DTE = 3             # Auto-close at 3 DTE
     OPTIONS_MIN_DTE = 14                   # Minimum 14 DTE for new positions
     OPTIONS_MAX_DTE = 45                   # Maximum 45 DTE for new positions
-    OPTIONS_MIN_PREMIUM_PCT = 0.01         # Minimum 1% monthly premium for CSPs
+    OPTIONS_MIN_PREMIUM_PCT = 0.005         # Minimum 1% monthly premium for CSPs
     OPTIONS_SPREAD_WIDTH_MIN = 5.0         # Min spread width $5
     OPTIONS_SPREAD_WIDTH_MAX = 10.0        # Max spread width $10
     OPTIONS_MIN_RR_RATIO = 2.0             # Minimum 2:1 reward-to-risk for spreads

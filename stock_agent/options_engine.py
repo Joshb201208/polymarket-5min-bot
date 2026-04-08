@@ -150,11 +150,13 @@ class OptionsEngine:
         )
 
         # ── 1. Covered calls on existing positions ────────────────────
+        # Paper trading: attempt covered calls even with <100 shares
+        # (for learning — Alpaca paper won't enforce the coverage requirement)
         for symbol, shares in stock_positions.items():
-            if shares >= SHARES_PER_CONTRACT and slots_remaining > 0:
+            if shares > 0 and slots_remaining > 0:  # Paper: no 100-share minimum
                 cc_signal = await self._evaluate_covered_call(
                     symbol=symbol,
-                    shares=shares,
+                    shares=max(shares, SHARES_PER_CONTRACT),  # Treat as 1 contract
                     portfolio_value=portfolio_value,
                     regime=regime,
                     snap=snap,
@@ -167,11 +169,10 @@ class OptionsEngine:
         for symbol, conviction, price, target_price in screener_candidates:
             if slots_remaining <= 0:
                 break
-            # Focus CSPs on moderate-conviction stocks (6-7) — not enough
-            # conviction for an outright buy but want exposure at lower price
-            if conviction < 6 or conviction > 7:
+            # Paper trading: allow CSPs on conviction 6-8 (not just 6-7)
+            if conviction < 6 or conviction > 8:
                 continue
-            # Don't sell puts on stocks we already hold (avoid doubling down)
+            # Don't double up on already-held stocks via CSP
             if symbol in stock_positions:
                 continue
 
@@ -188,14 +189,16 @@ class OptionsEngine:
                 signals.append(csp_signal)
                 slots_remaining -= 1
 
-        # ── 3. Directional spreads (regime-gated) ────────────────────
-        if regime in (REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY):
-            # Bull call spreads on highest-conviction stocks
+        # ── 3. Directional plays ──────────────────────────────────
+        # Paper trading: bull call spreads allowed in ANY regime (not just dip modes)
+        # Bear put spreads only in CAUTIOUS
+        if regime != REGIME_CAUTIOUS:
+            # Bull call spreads: conviction 8+ stocks
             high_conviction = [
                 (s, cv, p, tp)
                 for s, cv, p, tp in screener_candidates
                 if cv >= 8
-            ]
+            ][:5]  # Cap at 5 to avoid over-trading
             for symbol, conviction, price, target_price in high_conviction:
                 if slots_remaining <= 0:
                     break
@@ -212,7 +215,7 @@ class OptionsEngine:
                     signals.append(spread_signal)
                     slots_remaining -= 1
 
-        elif regime == REGIME_CAUTIOUS:
+        if regime == REGIME_CAUTIOUS:
             # Bear put spreads as portfolio hedges
             for symbol, conviction, price, target_price in screener_candidates[:3]:
                 if slots_remaining <= 0:
