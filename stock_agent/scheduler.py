@@ -1328,7 +1328,13 @@ class StockAgentScheduler:
             await self.discord.send_error(str(e), context="Options scan")
 
     async def _check_options_positions(self):
-        """Check options positions for auto-close triggers (50% profit, 3 DTE)."""
+        """Monitor options positions and send expiry alerts.
+
+        Note: Auto-close via order submission is disabled because Alpaca paper
+        trading rejects SELL orders on long options as 'uncovered'. Positions
+        will be managed to expiry or closed manually. Only expiry warnings
+        (3 DTE) are sent as alerts.
+        """
         try:
             if not self.options_portfolio.state.positions:
                 return
@@ -1337,36 +1343,7 @@ class StockAgentScheduler:
             portfolio_value = self.portfolio.get_portfolio_value()
             await self.options_portfolio.refresh_positions(portfolio_value)
 
-            # Check for auto-close candidates (returns list of (position, reason) tuples)
-            candidates = self.options_portfolio.get_auto_close_candidates()
-            for pos, reason in candidates:
-                logger.info("Options auto-close: %s — %s", pos.contract_symbol, reason)
-
-                try:
-                    # Determine position side from sign of qty
-                    pos_side = "long" if pos.qty > 0 else "short"
-                    order = await self.options_executor.close_option_position(
-                        pos.contract_symbol,
-                        qty=abs(pos.qty),
-                        position_side=pos_side,
-                    )
-                    if order:
-                        self.options_portfolio.close_position(
-                            pos.position_id,
-                            close_price=pos.current_price,
-                            reason=reason,
-                        )
-                        try:
-                            embed = self.options_portfolio.format_position_alert(pos, "CLOSED")
-                            await self.discord.send_embed(
-                                self.discord.channels.get("trades", ""), embed
-                            )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.error("Failed to auto-close %s: %s", pos.contract_symbol, e)
-
-            # Check expiry alerts (positions expiring within 3 days)
+            # Expiry alerts only (3 DTE warning)
             expiry_alerts = self.options_portfolio.get_expiry_alerts()
             for pos in expiry_alerts:
                 try:
@@ -1377,8 +1354,10 @@ class StockAgentScheduler:
                             "description": (
                                 f"**{pos.contract_symbol}** expires in **{pos.dte} days**\n"
                                 f"Strategy: {pos.strategy.value}\n"
-                                f"P&L: ${pos.unrealized_pnl:+,.0f} ({pos.unrealized_pnl_pct:+.1f}%)\n"
-                                f"Consider closing or rolling."
+                                f"Unrealized P&L tracked internally only — "
+                                f"positions will run to expiry.\n"
+                                f"Strike: ${getattr(pos, 'strike', '?')}  "
+                                f"Expiry: {getattr(pos, 'expiration_date', '?')}"
                             ),
                             "color": 0xF59E0B,
                         },
