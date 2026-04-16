@@ -311,8 +311,9 @@ class DataFeed:
         # Filter out mutual funds, ETFs with 5-char symbols, BRK.A class shares,
         # and any symbol with a dot, hyphen, or more than 5 chars
         EXCLUDED = {
-            "BRK-A", "BRK.A", "BRK-B",  # Berkshire class A not optionable
+            "BRK-A", "BRK.A", "BRK-B",  # Berkshire class shares
             "VTSAX", "VSMPX", "VITSX", "VFFSX", "VFIAX", "VEXAX",  # Vanguard mutual funds
+            "VFINX", "FXAIX", "SWPPX", "SWTSX",  # More mutual funds
         }
         filtered = [
             sym for sym in all_symbols

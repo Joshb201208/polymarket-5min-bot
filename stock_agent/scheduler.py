@@ -1078,7 +1078,8 @@ class StockAgentScheduler:
                     continue
 
             ok, reason = self.risk_manager.can_open_position(
-                self.portfolio.state, sym, company_sector, price
+                self.portfolio.state, sym, company_sector, price,
+                conviction=signal.conviction,
             )
             if not ok:
                 logger.warning("Risk check BLOCKED %s (sector=%s): %s", sym, company_sector, reason)
@@ -1090,16 +1091,39 @@ class StockAgentScheduler:
                     pass
                 continue
 
+            is_add_on = (reason == "ADD_TO_EXISTING")
             pv = self.portfolio.get_portfolio_value()
-            qty = self.risk_manager.calculate_position_size(pv, price, signal.conviction)
-            if qty <= 0:
-                logger.info("Position size 0 for %s — skipping", sym)
-                continue
+
+            if is_add_on:
+                # Calculate how many MORE shares to reach target weight
+                existing = self.portfolio.get_position(sym)
+                if not existing:
+                    continue
+                target_pct = self.config.CONVICTION_SIZE_MAP.get(
+                    signal.conviction, 0.05
+                )
+                target_value = pv * target_pct
+                current_value = existing.current_price * existing.shares
+                additional_value = target_value - current_value
+                qty = int(additional_value / price)
+                if qty <= 0:
+                    logger.info("Add-on for %s: already at target weight — skipping", sym)
+                    continue
+                logger.info(
+                    "Adding to %s: %d more shares (%.1f%% → %.1f%% target)",
+                    sym, qty, current_value / pv * 100, target_pct * 100,
+                )
+            else:
+                qty = self.risk_manager.calculate_position_size(pv, price, signal.conviction)
+                if qty <= 0:
+                    logger.info("Position size 0 for %s — skipping", sym)
+                    continue
 
             # Volatility-adjusted stop-loss
             beta = getattr(signal.thesis, "beta", None)
             stop_loss = self.risk_manager.get_stop_loss_price(price, beta)
-            signal.thesis.stop_loss_price = stop_loss
+            if hasattr(signal.thesis, "stop_loss_price"):
+                signal.thesis.stop_loss_price = stop_loss
 
             # Execute order
             order = await self.executor.place_buy(sym, qty, stop_loss)
@@ -1109,27 +1133,37 @@ class StockAgentScheduler:
 
             # Record position and trade
             now = _now_utc()
-            position = Position(
-                symbol=sym,
-                shares=qty,
-                entry_price=price,
-                entry_date=now,
-                current_price=price,
-                market_value=price * qty,
-                stop_loss=stop_loss,
-                thesis=signal.thesis,
-                sector=company_sector,
-                last_updated=now,
-            )
-            self.portfolio.add_position(position)
+            if is_add_on:
+                # Update existing position shares
+                existing = self.portfolio.get_position(sym)
+                if existing:
+                    existing.shares += qty
+                    existing.market_value = existing.current_price * existing.shares
+                    existing.last_updated = now
+                    self.portfolio._save()
+            else:
+                position = Position(
+                    symbol=sym,
+                    shares=qty,
+                    entry_price=price,
+                    entry_date=now,
+                    current_price=price,
+                    market_value=price * qty,
+                    stop_loss=stop_loss,
+                    thesis=signal.thesis,
+                    sector=company_sector,
+                    last_updated=now,
+                )
+                self.portfolio.add_position(position)
 
+            action_type = "Add-on" if is_add_on else "New thesis"
             trade = Trade(
                 symbol=sym,
                 action="BUY",
                 shares=qty,
                 price=price,
                 timestamp=now,
-                reason=f"New thesis: {signal.thesis.summary[:100]}",
+                reason=f"{action_type}: {signal.thesis.summary[:100]}",
             )
             self.portfolio.log_trade(trade)
 

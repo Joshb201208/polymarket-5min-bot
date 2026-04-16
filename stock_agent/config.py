@@ -44,17 +44,17 @@ class Config:
     MODE = os.environ.get("STOCK_AGENT_MODE", "PAPER")
 
     # Risk limits — conviction-tiered sizing
-    MAX_POSITION_PCT = 0.06      # Absolute cap per position (conviction 10 = 6%)
-    MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "0.50"))  # 50%
+    MAX_POSITION_PCT = 0.10      # Absolute cap per position (conviction 10 = 6%)
+    MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "1.00"))  # 50%
     MAX_POSITIONS = 20           # Max concurrent positions
-    MAX_SECTOR_PCT = 0.30        # 30% max in any sector
+    MAX_SECTOR_PCT = 0.40        # 30% max in any sector
 
     # Conviction-tiered position sizing: conviction score → % of portfolio
     CONVICTION_SIZE_MAP = {
-        7: 0.03,   # 3%
-        8: 0.04,   # 4%
-        9: 0.05,   # 5%
-        10: 0.06,  # 6%
+        7: 0.05,   # 5%
+        8: 0.07,   # 7%
+        9: 0.08,   # 8%
+        10: 0.10,  # 10%
     }
 
     # Stop-loss: volatility-adjusted, clamped to range
