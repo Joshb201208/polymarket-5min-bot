@@ -297,9 +297,17 @@ class OptionsExecutor:
         prices for positions that were manually closed.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/account/activities/FILL"
+        url = f"{_TRADING_BASE}/v2/account/activities"
         try:
-            resp = await client.get(url, headers=self._auth_headers(), params={"page_size": str(limit), "direction": "desc"})
+            resp = await client.get(
+                url,
+                headers=self._auth_headers(),
+                params={
+                    "activity_types": "FILL",
+                    "page_size": str(limit),
+                    "direction": "desc",
+                },
+            )
             resp.raise_for_status()
             acts: list[dict] = resp.json()
             # Filter to option symbols (OCC symbols are length > 5)
