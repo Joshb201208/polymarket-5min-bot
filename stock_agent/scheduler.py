@@ -32,6 +32,17 @@ from stock_agent.tipranks_client import (
     format_tipranks_context,
     format_tipranks_telegram_clause,
 )
+from stock_agent.news_feed import build_news_lookup, format_news_context
+from stock_agent.sentiment import (
+    build_sentiment_lookup,
+    format_sentiment_context,
+    adjust_conviction_with_sentiment,
+)
+from stock_agent.analyst_trends import (
+    build_analyst_lookup,
+    format_analyst_context,
+    adjust_conviction_with_analysts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -843,18 +854,49 @@ class StockAgentScheduler:
         else:
             tipranks_lookup = {}
 
+        # Finnhub enrichment layers — built once per _deep_analyze run.
+        enrichment_symbols = list({s.upper() for s in top_symbols})
+        try:
+            news_lookup, sentiment_lookup, analyst_lookup = await asyncio.gather(
+                build_news_lookup(enrichment_symbols),
+                build_sentiment_lookup(enrichment_symbols),
+                build_analyst_lookup(enrichment_symbols),
+                return_exceptions=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Finnhub enrichment layer failed: %s", exc)
+            news_lookup, sentiment_lookup, analyst_lookup = {}, {}, {}
+        logger.info(
+            "Finnhub enrichment built: news=%d sentiment=%d analyst=%d",
+            len(news_lookup), len(sentiment_lookup), len(analyst_lookup),
+        )
+
         for sym in top_symbols:
             company = next((c for c in companies if c.symbol == sym), None)
             if not company:
                 continue
 
             try:
+                sym_u = sym.upper()
                 # Build TipRanks context for this symbol if available
-                tr_data = tipranks_lookup.get(sym.upper())
+                tr_data = tipranks_lookup.get(sym_u)
                 tipranks_context = format_tipranks_context(sym, tr_data)
 
+                # Finnhub enrichment contexts
+                news_items = news_lookup.get(sym_u)
+                sentiment_data = sentiment_lookup.get(sym_u)
+                analyst_data = analyst_lookup.get(sym_u)
+                news_context = format_news_context(sym, news_items)
+                sentiment_context = format_sentiment_context(sym, sentiment_data)
+                analyst_context = format_analyst_context(sym, analyst_data)
+
                 thesis = await self.analyst.analyze_stock(
-                    sym, company, tipranks_context=tipranks_context
+                    sym,
+                    company,
+                    tipranks_context=tipranks_context,
+                    news_context=news_context,
+                    sentiment_context=sentiment_context,
+                    analyst_context=analyst_context,
                 )
                 if not thesis:
                     continue
@@ -863,6 +905,15 @@ class StockAgentScheduler:
                 if thesis and tr_data:
                     thesis.conviction = adjust_conviction_with_tipranks(
                         thesis.conviction, tr_data
+                    )
+                # Additive nudges from Finnhub (each clamped [1,10] internally).
+                if sentiment_data:
+                    thesis.conviction = adjust_conviction_with_sentiment(
+                        thesis.conviction, sentiment_data
+                    )
+                if analyst_data:
+                    thesis.conviction = adjust_conviction_with_analysts(
+                        thesis.conviction, analyst_data
                     )
 
                 self.portfolio.update_thesis(sym, thesis)

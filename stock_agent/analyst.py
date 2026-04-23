@@ -92,14 +92,27 @@ class Analyst:
         return "\n".join(line for line in lines if line)
 
     async def analyze_stock(
-        self, symbol: str, company_data: CompanyData, tipranks_context: str = ""
+        self,
+        symbol: str,
+        company_data: CompanyData,
+        tipranks_context: str = "",
+        news_context: str = "",
+        sentiment_context: str = "",
+        analyst_context: str = "",
     ) -> Thesis | None:
         """Deep analysis using Perplexity Sonar Pro."""
         financial_str = self._format_financial_data(company_data)
 
+        supplementary_parts = [
+            tipranks_context,
+            analyst_context,
+            sentiment_context,
+            news_context,
+        ]
         supplementary = ""
-        if tipranks_context:
-            supplementary = f"\n{tipranks_context}\n"
+        filled = [p for p in supplementary_parts if p]
+        if filled:
+            supplementary = "\n" + "\n\n".join(filled) + "\n"
 
         prompt = f"""You are a senior equity analyst at a top hedge fund. Analyze {symbol} ({company_data.name}) for a potential investment.
 
