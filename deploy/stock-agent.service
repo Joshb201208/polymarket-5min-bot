@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root/polymarket-bot
+EnvironmentFile=/root/polymarket-bot/.env
 ExecStartPre=/usr/bin/git -C /root/polymarket-bot fetch --all
 ExecStartPre=/usr/bin/git -C /root/polymarket-bot reset --hard origin/master
 ExecStart=/root/polymarket-bot/venv/bin/python -m stock_agent
