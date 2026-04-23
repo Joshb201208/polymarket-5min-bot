@@ -90,9 +90,11 @@ class Config:
             DATA_DIR = _local
 
     # TipRanks
-    TIPRANKS_EMAIL = os.environ.get("TIPRANKS_EMAIL", "")
-    TIPRANKS_PASSWORD = os.environ.get("TIPRANKS_PASSWORD", "")
+    TIPRANKS_API_KEY = os.environ.get("TIPRANKS_API_KEY", "TR_SilverArrow")
+    TIPRANKS_API_TOKEN = os.environ.get("TIPRANKS_API_TOKEN", "f8ed6170-a853-42a6-a76d-a3c244560c17")
     TIPRANKS_ENABLED = os.environ.get("TIPRANKS_ENABLED", "true").lower() == "true"
+    TIPRANKS_MIN_SMART_SCORE = int(os.environ.get("TIPRANKS_MIN_SMART_SCORE", "8"))
+    TIPRANKS_UNIVERSE_LIMIT = int(os.environ.get("TIPRANKS_UNIVERSE_LIMIT", "100"))
 
     # Options trading
     OPTIONS_ENABLED = os.environ.get("OPTIONS_ENABLED", "true").lower() == "true"
