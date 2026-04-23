@@ -294,24 +294,38 @@ class OptionsExecutor:
         """Return recent FILL activities for option contracts only.
 
         Used by :meth:`OptionsPortfolio.sync_from_alpaca` to determine close
-        prices for positions that were manually closed.
+        prices for positions that were manually closed. Alpaca caps page_size
+        at 100, so we paginate using ``page_token`` until we have ``limit``
+        records or the server returns no more.
         """
         client = await self._get_client()
         url = f"{_TRADING_BASE}/v2/account/activities"
+        collected: list[dict] = []
+        page_token: Optional[str] = None
         try:
-            resp = await client.get(
-                url,
-                headers=self._auth_headers(),
-                params={
+            while len(collected) < limit:
+                page_size = min(100, limit - len(collected))
+                params: dict[str, str] = {
                     "activity_types": "FILL",
-                    "page_size": str(limit),
+                    "page_size": str(page_size),
                     "direction": "desc",
-                },
-            )
-            resp.raise_for_status()
-            acts: list[dict] = resp.json()
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                resp = await client.get(url, headers=self._auth_headers(), params=params)
+                resp.raise_for_status()
+                batch: list[dict] = resp.json()
+                if not batch:
+                    break
+                collected.extend(batch)
+                if len(batch) < page_size:
+                    break
+                # Alpaca uses the last row's id as the next page_token
+                page_token = batch[-1].get("id")
+                if not page_token:
+                    break
             # Filter to option symbols (OCC symbols are length > 5)
-            opt_acts = [a for a in acts if len(a.get("symbol", "")) > 5]
+            opt_acts = [a for a in collected if len(a.get("symbol", "")) > 5]
             return opt_acts
         except Exception as exc:
             logger.error("get_option_activities error: %s", exc)
