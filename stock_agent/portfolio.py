@@ -201,7 +201,7 @@ class Portfolio:
                     unrealized_pnl_pct=float(ap.get("unrealized_plpc", 0) or 0),
                     stop_loss=round(avg_entry * 0.95, 2),
                     thesis=placeholder_thesis,
-                    sector="Unknown",
+                    sector=Config.SECTOR_MAP.get(sym, "Unknown"),
                     last_updated=now,
                 )
                 kept.append(imported_pos)

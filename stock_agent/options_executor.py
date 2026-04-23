@@ -290,6 +290,25 @@ class OptionsExecutor:
 
         return []
 
+    async def get_option_activities(self, limit: int = 500) -> list[dict]:
+        """Return recent FILL activities for option contracts only.
+
+        Used by :meth:`OptionsPortfolio.sync_from_alpaca` to determine close
+        prices for positions that were manually closed.
+        """
+        client = await self._get_client()
+        url = f"{_TRADING_BASE}/v2/account/activities/FILL"
+        try:
+            resp = await client.get(url, headers=self._auth_headers(), params={"page_size": str(limit), "direction": "desc"})
+            resp.raise_for_status()
+            acts: list[dict] = resp.json()
+            # Filter to option symbols (OCC symbols are length > 5)
+            opt_acts = [a for a in acts if len(a.get("symbol", "")) > 5]
+            return opt_acts
+        except Exception as exc:
+            logger.error("get_option_activities error: %s", exc)
+            return []
+
     async def get_option_position(self, contract_symbol: str) -> Optional[dict]:
         """Fetch a specific options position by contract symbol.
 

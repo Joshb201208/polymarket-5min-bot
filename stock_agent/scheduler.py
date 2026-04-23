@@ -1357,8 +1357,27 @@ class StockAgentScheduler:
 
             await self.discord.send_system_log("INFO", "Options scan starting")
 
-            # Refresh options portfolio with latest prices
+            # Reconcile options portfolio against Alpaca FIRST — mark expired/
+            # closed legs so we don't double-count them in the "skip underlyings
+            # with existing positions" block below.
             portfolio_value = self.portfolio.get_portfolio_value()
+            try:
+                live_opts = await self.options_executor.get_option_positions()
+                opt_acts = await self.options_executor.get_option_activities()
+                sync_result = await self.options_portfolio.sync_from_alpaca(
+                    alpaca_option_positions=live_opts,
+                    alpaca_option_activities=opt_acts,
+                    portfolio_value=portfolio_value,
+                )
+                if sync_result["closed"]:
+                    logger.info(
+                        "Options reconcile: %d positions closed, $%.0f realized P&L captured",
+                        sync_result["closed"], sync_result["realized_pnl"],
+                    )
+            except Exception as e:
+                logger.warning("Options Alpaca reconcile failed (non-fatal): %s", e)
+
+            # Refresh remaining open options with latest prices
             await self.options_portfolio.refresh_positions(portfolio_value)
 
             # Build inputs for the options engine
@@ -1491,8 +1510,20 @@ class StockAgentScheduler:
             if not self.options_portfolio.state.positions:
                 return
 
-            # Refresh prices
+            # Reconcile with Alpaca first (catch expirations/assignments)
             portfolio_value = self.portfolio.get_portfolio_value()
+            try:
+                live_opts = await self.options_executor.get_option_positions()
+                opt_acts = await self.options_executor.get_option_activities()
+                await self.options_portfolio.sync_from_alpaca(
+                    alpaca_option_positions=live_opts,
+                    alpaca_option_activities=opt_acts,
+                    portfolio_value=portfolio_value,
+                )
+            except Exception as e:
+                logger.warning("Intraday options reconcile failed: %s", e)
+
+            # Refresh prices on remaining open positions
             await self.options_portfolio.refresh_positions(portfolio_value)
 
             # Expiry alerts only (3 DTE warning)
@@ -1884,17 +1915,30 @@ class StockAgentScheduler:
     # ── Sector backfill ──────────────────────────────────────────────
 
     async def _backfill_sectors(self):
-        """One-time backfill: fetch sector for positions marked 'Unknown'."""
+        """Backfill sectors on positions marked 'Unknown'.
+
+        Uses Config.SECTOR_MAP first (fast, deterministic) then falls back to
+        FMP for symbols we haven't hardcoded.
+        """
+        sector_map = getattr(self.config, "SECTOR_MAP", {}) or {}
         updated = 0
         for pos in self.portfolio.state.positions:
             if pos.sector and pos.sector != "Unknown":
                 continue
+            # 1. Hardcoded map (fast path)
+            mapped = sector_map.get(pos.symbol)
+            if mapped:
+                pos.sector = mapped
+                updated += 1
+                logger.info("Backfilled sector for %s from SECTOR_MAP: %s", pos.symbol, mapped)
+                continue
+            # 2. FMP lookup for unknowns
             try:
                 company = await self.data_feed.get_company_fundamentals(pos.symbol)
                 if company and company.sector and company.sector != "Unknown":
                     pos.sector = company.sector
                     updated += 1
-                    logger.info("Backfilled sector for %s: %s", pos.symbol, company.sector)
+                    logger.info("Backfilled sector for %s from FMP: %s", pos.symbol, company.sector)
             except Exception as e:
                 logger.warning("Sector backfill failed for %s: %s", pos.symbol, e)
         if updated:

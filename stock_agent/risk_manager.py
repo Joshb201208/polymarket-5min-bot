@@ -72,15 +72,49 @@ class RiskManager:
         if exposure_pct >= self.config.MAX_TOTAL_EXPOSURE:
             return False, f"Total exposure {exposure_pct:.1%} >= limit {self.config.MAX_TOTAL_EXPOSURE:.0%}"
 
-        # 4. Sector concentration
+        # 4. Sector concentration (uses SECTOR_MAP as fallback if position
+        # sector was not populated, so the rule works even on imported positions).
+        sector_map = getattr(self.config, "SECTOR_MAP", {})
+        def _sec_of(p):
+            s = getattr(p, "sector", None) or "Unknown"
+            if s == "Unknown":
+                s = sector_map.get(p.symbol, "Unknown")
+            return s
+        resolved_sector = sector if sector and sector != "Unknown" else sector_map.get(symbol, "Unknown")
         sector_val = sum(
             p.current_price * p.shares
             for p in state.positions
-            if p.sector == sector
+            if _sec_of(p) == resolved_sector
         )
         sector_pct = sector_val / portfolio_value
-        if sector_pct >= self.config.MAX_SECTOR_PCT:
-            return False, f"Sector '{sector}' at {sector_pct:.1%} >= limit {self.config.MAX_SECTOR_PCT:.0%}"
+        if resolved_sector != "Unknown" and sector_pct + (conviction_target or 0) * 0.5 >= self.config.MAX_SECTOR_PCT:
+            # Block if adding a reasonable new position would push the sector
+            # past the cap. (We check `sector_pct >= cap` AND a soft-block so
+            # a single new full-size buy can't slam into the ceiling.)
+            if sector_pct >= self.config.MAX_SECTOR_PCT:
+                return False, (
+                    f"Sector '{resolved_sector}' at {sector_pct:.1%} >= limit "
+                    f"{self.config.MAX_SECTOR_PCT:.0%}"
+                )
+
+        # 4b. Correlation-cluster concentration. Symbols can belong to multiple
+        # clusters (e.g. NVDA is both Semis and MegaCapTech); we check each.
+        clusters = getattr(self.config, "SYMBOL_CLUSTERS", {}) or {}
+        cluster_cap = getattr(self.config, "MAX_CLUSTER_PCT", 0.45)
+        for cluster_name, members in clusters.items():
+            if symbol not in members:
+                continue
+            cluster_val = sum(
+                p.current_price * p.shares
+                for p in state.positions
+                if p.symbol in members
+            )
+            cluster_pct = cluster_val / portfolio_value
+            if cluster_pct >= cluster_cap:
+                return False, (
+                    f"Cluster '{cluster_name}' at {cluster_pct:.1%} >= limit "
+                    f"{cluster_cap:.0%} (includes {symbol})"
+                )
 
         # 5. Enough cash for minimum order
         if state.cash < price:

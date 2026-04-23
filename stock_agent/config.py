@@ -50,7 +50,87 @@ class Config:
     MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "0.15"))
     MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "1.00"))  # 50%
     MAX_POSITIONS = 20           # Max concurrent positions
-    MAX_SECTOR_PCT = 0.40        # 30% max in any sector
+    MAX_SECTOR_PCT = 0.40        # 40% max in any sector
+    # Cross-sector correlation cap. Caps exposure to groups of symbols that tend
+    # to move together regardless of official sector (e.g. semis, mega-cap tech,
+    # China ADRs). Enforced in risk_manager.can_open_position.
+    MAX_CLUSTER_PCT = float(os.environ.get("MAX_CLUSTER_PCT", "0.45"))
+
+    # Known correlation clusters. A symbol may belong to multiple; all are checked.
+    SYMBOL_CLUSTERS: dict[str, list[str]] = {
+        "Semiconductors": [
+            "NVDA", "AMD", "AVGO", "TSM", "ASML", "MU", "INTC", "AMAT", "LRCX",
+            "KLAC", "MRVL", "QCOM", "TXN", "ON", "ARM", "MCHP", "NXPI", "ADI",
+        ],
+        "MegaCapTech": [
+            "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN", "NVDA", "TSLA",
+            "ORCL", "CRM", "ADBE",
+        ],
+        "ChinaADRs": ["BABA", "PDD", "JD", "BIDU", "NTES", "TCEHY", "NIO", "LI", "XPEV"],
+        "Healthcare": [
+            "LLY", "JNJ", "MRK", "PFE", "ABBV", "AMGN", "UNH", "BMY", "GILD",
+            "ABT", "MDT", "TMO", "DHR", "ISRG", "REGN", "VRTX",
+        ],
+        "Financials": [
+            "JPM", "BAC", "WFC", "GS", "MS", "C", "BRK.B", "V", "MA", "AXP",
+            "BLK", "SCHW", "COF", "USB",
+        ],
+        "ConsumerDiscretionary": [
+            "TJX", "AMZN", "HD", "LOW", "NKE", "SBUX", "MCD", "BKNG", "TSLA",
+            "LULU", "ROST", "MELI",
+        ],
+        "Energy": ["XOM", "CVX", "COP", "OXY", "SLB", "EOG", "PXD", "MPC", "PSX"],
+        "Industrials": [
+            "ETN", "CAT", "DE", "HON", "UNP", "GE", "RTX", "LMT", "BA", "MMM",
+            "EMR", "ITW",
+        ],
+    }
+
+    # Fallback sector map for when FMP profile doesn't return one. Used by
+    # portfolio.sync_from_alpaca and the backfill routine in scheduler.
+    SECTOR_MAP: dict[str, str] = {
+        # Technology / Semiconductors
+        "NVDA": "Technology", "AMD": "Technology", "AVGO": "Technology",
+        "TSM": "Technology", "ASML": "Technology", "MU": "Technology",
+        "INTC": "Technology", "AMAT": "Technology", "LRCX": "Technology",
+        "KLAC": "Technology", "MRVL": "Technology", "QCOM": "Technology",
+        "TXN": "Technology", "ON": "Technology", "ARM": "Technology",
+        # Technology / Software & Platforms
+        "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology",
+        "GOOG": "Technology", "META": "Technology", "ORCL": "Technology",
+        "CRM": "Technology", "ADBE": "Technology",
+        # Consumer discretionary
+        "AMZN": "Consumer Discretionary", "TSLA": "Consumer Discretionary",
+        "TJX": "Consumer Discretionary", "HD": "Consumer Discretionary",
+        "LOW": "Consumer Discretionary", "NKE": "Consumer Discretionary",
+        "SBUX": "Consumer Discretionary", "MCD": "Consumer Discretionary",
+        "BKNG": "Consumer Discretionary", "LULU": "Consumer Discretionary",
+        "ROST": "Consumer Discretionary",
+        # China ADRs
+        "BABA": "Consumer Discretionary", "PDD": "Consumer Discretionary",
+        "JD": "Consumer Discretionary", "MELI": "Consumer Discretionary",
+        "BIDU": "Communication Services", "NTES": "Communication Services",
+        # Healthcare
+        "LLY": "Healthcare", "JNJ": "Healthcare", "MRK": "Healthcare",
+        "PFE": "Healthcare", "ABBV": "Healthcare", "AMGN": "Healthcare",
+        "UNH": "Healthcare", "BMY": "Healthcare", "GILD": "Healthcare",
+        "ABT": "Healthcare", "MDT": "Healthcare", "TMO": "Healthcare",
+        "DHR": "Healthcare", "ISRG": "Healthcare", "REGN": "Healthcare",
+        "VRTX": "Healthcare",
+        # Financials
+        "JPM": "Financials", "BAC": "Financials", "WFC": "Financials",
+        "GS": "Financials", "MS": "Financials", "C": "Financials",
+        "BRK.B": "Financials", "V": "Financials", "MA": "Financials",
+        "AXP": "Financials", "BLK": "Financials", "SCHW": "Financials",
+        # Industrials
+        "ETN": "Industrials", "CAT": "Industrials", "DE": "Industrials",
+        "HON": "Industrials", "UNP": "Industrials", "GE": "Industrials",
+        "RTX": "Industrials", "LMT": "Industrials", "BA": "Industrials",
+        "MMM": "Industrials", "EMR": "Industrials", "ITW": "Industrials",
+        # Energy
+        "XOM": "Energy", "CVX": "Energy", "COP": "Energy", "OXY": "Energy",
+        "SLB": "Energy", "EOG": "Energy",
+    }
 
     # Conviction-tiered position sizing: conviction score → % of portfolio
     CONVICTION_SIZE_MAP = {

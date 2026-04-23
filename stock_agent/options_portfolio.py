@@ -263,6 +263,113 @@ class OptionsPortfolio:
         elif position.entry_cost != 0:
             position.unrealized_pnl_pct = (position.unrealized_pnl / abs(position.entry_cost)) * 100
 
+    # ── Alpaca reconciliation ─────────────────────────────────────────
+
+    async def sync_from_alpaca(
+        self,
+        alpaca_option_positions: list[dict],
+        alpaca_option_activities: list[dict] | None = None,
+        portfolio_value: float = 0.0,
+    ) -> dict:
+        """Reconcile options state against live Alpaca positions.
+
+        For any position in our JSON that is NO LONGER at Alpaca, determine
+        whether it expired worthless, was exercised/assigned, or was closed,
+        then move it to ``closed_positions`` with realized P&L computed.
+
+        Args:
+            alpaca_option_positions: Output of ``GET /v2/positions``, filtered
+                to option legs (symbol length > 5).
+            alpaca_option_activities: Optional ``/v2/account/activities`` of
+                type ``FILL`` for option symbols. Used to find close prices.
+            portfolio_value: Current total portfolio value (for exposure %).
+
+        Returns:
+            ``{"closed": N, "realized_pnl": $X, "still_open": M}``
+        """
+        live_syms: set[str] = {p["symbol"] for p in alpaca_option_positions if p.get("symbol")}
+
+        # Build lookup of close fills: contract_symbol -> list of (side, qty, price, time)
+        closes_by_sym: dict[str, list[dict]] = {}
+        for a in (alpaca_option_activities or []):
+            sym = a.get("symbol")
+            if not sym or len(sym) <= 5:
+                continue
+            closes_by_sym.setdefault(sym, []).append(a)
+
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        closed_count = 0
+        realized_total = 0.0
+        still_open = 0
+
+        remaining: list[OptionsPosition] = []
+        for pos in self.state.positions:
+            sym = pos.contract_symbol
+            if sym in live_syms:
+                still_open += 1
+                remaining.append(pos)
+                continue
+
+            # Position is no longer at Alpaca — figure out why
+            close_price = 0.0
+            close_reason = "unknown"
+
+            exp = pos.expiration_date
+            if exp and exp < today:
+                # Expired. For long legs, if OTM at expiry → worthless (0).
+                # For short legs we kept premium (0 too if OTM).
+                close_price = 0.0
+                close_reason = f"expired {exp.isoformat()}"
+            elif sym in closes_by_sym:
+                # Manually closed — use the last matching fill
+                fills = closes_by_sym[sym]
+                last = fills[-1]
+                try:
+                    close_price = float(last.get("price", 0) or 0)
+                except (TypeError, ValueError):
+                    close_price = 0.0
+                close_reason = f"closed via Alpaca fill {last.get('transaction_time','')[:10]}"
+            else:
+                # Missing with no clear reason — assume expired/assigned to zero
+                close_price = 0.0
+                close_reason = "missing at Alpaca (assumed expired)"
+
+            # Compute realized P&L
+            if pos.side == OptionSide.BUY:
+                realized = (close_price - pos.entry_price) * pos.qty * pos.multiplier
+            else:
+                realized = (pos.entry_price - close_price) * pos.qty * pos.multiplier
+
+            pos.is_open = False
+            pos.closed_at = now
+            pos.close_reason = close_reason
+            pos.current_price = close_price
+            pos.realized_pnl = realized
+            pos.unrealized_pnl = 0.0
+
+            self.state.closed_positions.append(pos)
+            self.state.total_realized_pnl += realized
+            realized_total += realized
+            closed_count += 1
+            logger.info(
+                "Options reconcile: closed %s (%s) realized=$%.0f — %s",
+                sym, pos.strategy.value, realized, close_reason,
+            )
+
+        self.state.positions = remaining
+        self._recalculate_summary(portfolio_value=portfolio_value)
+        self._save()
+        logger.info(
+            "Options sync_from_alpaca: %d closed, $%.0f realized, %d still open",
+            closed_count, realized_total, still_open,
+        )
+        return {
+            "closed": closed_count,
+            "realized_pnl": realized_total,
+            "still_open": still_open,
+        }
+
     # ── Bulk price refresh ─────────────────────────────────────────────
 
     async def refresh_positions(self, portfolio_value: float = 0.0) -> None:
