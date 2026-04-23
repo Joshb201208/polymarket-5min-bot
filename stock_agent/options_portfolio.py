@@ -27,6 +27,7 @@ from stock_agent.config import Config
 from stock_agent.options_data import OptionsDataFeed
 from stock_agent.options_models import (
     OptionSide,
+    OptionType,
     OptionsGreeks,
     OptionsPortfolioState,
     OptionsPosition,
@@ -265,6 +266,126 @@ class OptionsPortfolio:
 
     # ── Alpaca reconciliation ─────────────────────────────────────────
 
+    @staticmethod
+    def _leg_intrinsic_value(
+        underlying_price: float,
+        strike: float,
+        option_type: OptionType | None,
+    ) -> float:
+        """Compute intrinsic value (per-share) of one option leg at expiry.
+
+        Call: max(0, S - K)   Put: max(0, K - S).
+        """
+        if option_type is None or strike is None or underlying_price is None:
+            return 0.0
+        if option_type == OptionType.CALL:
+            return max(0.0, underlying_price - strike)
+        if option_type == OptionType.PUT:
+            return max(0.0, strike - underlying_price)
+        return 0.0
+
+    async def _get_underlying_close_on(
+        self, symbol: str, when: "__import__('datetime').date"
+    ) -> Optional[float]:
+        """Return underlying's closing price on ``when``.
+
+        Falls back to the most recent trading day at or before ``when``
+        (handles weekend/holiday expiries). Uses FMP EOD data via the
+        shared ``OptionsDataFeed`` -> ``DataFeed`` chain if available,
+        else a direct FMP call.
+        """
+        # Try the underlying data feed attached to options_data
+        data_feed = getattr(self.data, "data_feed", None) or getattr(self.data, "_data_feed", None)
+        from_date = (when.toordinal() - 7)
+        import datetime as _dt
+        frm = _dt.date.fromordinal(from_date).isoformat()
+        to = when.isoformat()
+        rows: list[dict] = []
+        try:
+            if data_feed is not None and hasattr(data_feed, "get_historical_prices"):
+                rows = await data_feed.get_historical_prices(symbol, frm, to)
+        except Exception as exc:
+            logger.debug("historical_prices via data_feed failed for %s: %s", symbol, exc)
+            rows = []
+
+        if not rows:
+            # Direct FMP fallback
+            try:
+                import httpx
+                api_key = os.environ.get("FMP_API_KEY") or getattr(self.config, "FMP_API_KEY", "")
+                if api_key:
+                    url = "https://financialmodelingprep.com/stable/historical-price-eod/full"
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        r = await c.get(url, params={"symbol": symbol, "from": frm, "to": to, "apikey": api_key})
+                        if r.status_code == 200:
+                            j = r.json()
+                            rows = j if isinstance(j, list) else j.get("historical", [])
+            except Exception as exc:
+                logger.debug("direct FMP historical fetch failed for %s: %s", symbol, exc)
+                rows = []
+
+        if not rows:
+            return None
+
+        # Find the row on or just before ``when``
+        target = when.isoformat()
+        best: Optional[dict] = None
+        for r in rows:
+            d = r.get("date") or r.get("priceDate") or ""
+            if d and d <= target:
+                if best is None or d > (best.get("date") or best.get("priceDate") or ""):
+                    best = r
+        if not best:
+            return None
+        for key in ("close", "adjClose", "price"):
+            v = best.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def _compute_spread_exit_value(
+        self, pos: OptionsPosition, underlying_price: float
+    ) -> float:
+        """Return the spread's PER-CONTRACT net exit value at expiry.
+
+        For each leg, value = intrinsic(S, K, type). The spread's net
+        exit value = long_leg_value - short_leg_value.
+
+        Returns the per-share value (to be multiplied by qty * multiplier
+        to get total cash). For single-leg positions (e.g. CASH_SECURED_PUT,
+        LONG_CALL, LONG_PUT, COVERED_CALL) only leg 1 is used.
+        """
+        leg1_val = self._leg_intrinsic_value(underlying_price, pos.strike, pos.option_type)
+
+        has_leg2 = bool(
+            pos.leg2_contract_symbol
+            and pos.leg2_strike is not None
+            and pos.leg2_option_type is not None
+        )
+
+        if not has_leg2:
+            # Single-leg: exit value is just the intrinsic value of that leg,
+            # with sign based on whether we're long (BUY) or short (SELL).
+            if pos.side == OptionSide.BUY:
+                return leg1_val
+            else:
+                # Short single-leg: we'd need to pay intrinsic to close.
+                # The caller interprets this correctly via the side math below.
+                return leg1_val
+
+        leg2_val = self._leg_intrinsic_value(underlying_price, pos.leg2_strike, pos.leg2_option_type)
+
+        # Spread net value: long leg - short leg (from our perspective).
+        if pos.side == OptionSide.BUY:
+            # Leg 1 is long, leg 2 is short.
+            return leg1_val - leg2_val
+        else:
+            # Leg 1 is short, leg 2 is long (rare for our strategies).
+            return leg2_val - leg1_val
+
     async def sync_from_alpaca(
         self,
         alpaca_option_positions: list[dict],
@@ -274,8 +395,13 @@ class OptionsPortfolio:
         """Reconcile options state against live Alpaca positions.
 
         For any position in our JSON that is NO LONGER at Alpaca, determine
-        whether it expired worthless, was exercised/assigned, or was closed,
-        then move it to ``closed_positions`` with realized P&L computed.
+        whether it expired worthless, was exercised/assigned ITM, or was
+        closed manually, then move it to ``closed_positions`` with realized
+        P&L computed.
+
+        ITM expirations are computed as intrinsic value at the underlying's
+        close on expiry day (via FMP historical EOD). This correctly captures
+        max-profit scenarios on debit spreads and assignment on short puts.
 
         Args:
             alpaca_option_positions: Output of ``GET /v2/positions``, filtered
@@ -289,7 +415,7 @@ class OptionsPortfolio:
         """
         live_syms: set[str] = {p["symbol"] for p in alpaca_option_positions if p.get("symbol")}
 
-        # Build lookup of close fills: contract_symbol -> list of (side, qty, price, time)
+        # Build lookup of close fills: contract_symbol -> list of fills
         closes_by_sym: dict[str, list[dict]] = {}
         for a in (alpaca_option_activities or []):
             sym = a.get("symbol")
@@ -303,48 +429,101 @@ class OptionsPortfolio:
         realized_total = 0.0
         still_open = 0
 
+        # Cache underlying expiry-day closes to avoid repeat FMP calls
+        close_px_cache: dict[tuple[str, str], Optional[float]] = {}
+
         remaining: list[OptionsPosition] = []
         for pos in self.state.positions:
             sym = pos.contract_symbol
-            if sym in live_syms:
+            # A spread is "still live" only if BOTH legs are still at Alpaca
+            # (when leg 2 exists). This avoids leaving half-closed spreads open.
+            leg1_live = sym in live_syms
+            leg2_live = (
+                pos.leg2_contract_symbol is not None
+                and pos.leg2_contract_symbol in live_syms
+            )
+            if pos.leg2_contract_symbol:
+                fully_live = leg1_live and leg2_live
+            else:
+                fully_live = leg1_live
+
+            if fully_live:
                 still_open += 1
                 remaining.append(pos)
                 continue
 
-            # Position is no longer at Alpaca — figure out why
-            close_price = 0.0
+            # Position is no longer fully at Alpaca — figure out why
             close_reason = "unknown"
+            per_share_exit_value: float = 0.0   # per-share net value of the *spread*
+            underlying_px: Optional[float] = None
 
             exp = pos.expiration_date
-            if exp and exp < today:
-                # Expired. For long legs, if OTM at expiry → worthless (0).
-                # For short legs we kept premium (0 too if OTM).
-                close_price = 0.0
-                close_reason = f"expired {exp.isoformat()}"
+            qty = int(pos.qty or 1)
+
+            if exp and exp <= today:
+                # Expired. Fetch underlying close on expiry day and compute
+                # leg-by-leg intrinsic value.
+                cache_key = (pos.underlying_symbol, exp.isoformat())
+                if cache_key not in close_px_cache:
+                    close_px_cache[cache_key] = await self._get_underlying_close_on(
+                        pos.underlying_symbol, exp
+                    )
+                underlying_px = close_px_cache[cache_key]
+
+                if underlying_px is None:
+                    # Can't confirm — leave safe fallback of 0 (worthless)
+                    per_share_exit_value = 0.0
+                    close_reason = f"expired {exp.isoformat()} (no EOD price — assumed OTM)"
+                else:
+                    per_share_exit_value = await self._compute_spread_exit_value(
+                        pos, underlying_px
+                    )
+                    itm_tag = "ITM" if per_share_exit_value > 0.01 else "OTM"
+                    close_reason = (
+                        f"expired {exp.isoformat()} {itm_tag} @ underlying ${underlying_px:.2f}"
+                    )
             elif sym in closes_by_sym:
-                # Manually closed — use the last matching fill
+                # Manually closed — use the last matching fill price as the
+                # per-share exit price of leg 1. If leg 2 has a fill too, we
+                # net them; else assume leg 2 was held / closed at same time.
                 fills = closes_by_sym[sym]
                 last = fills[-1]
                 try:
-                    close_price = float(last.get("price", 0) or 0)
+                    leg1_exit = float(last.get("price", 0) or 0)
                 except (TypeError, ValueError):
-                    close_price = 0.0
+                    leg1_exit = 0.0
+                leg2_exit = 0.0
+                if pos.leg2_contract_symbol and pos.leg2_contract_symbol in closes_by_sym:
+                    l2_fills = closes_by_sym[pos.leg2_contract_symbol]
+                    try:
+                        leg2_exit = float(l2_fills[-1].get("price", 0) or 0)
+                    except (TypeError, ValueError):
+                        leg2_exit = 0.0
+                if pos.side == OptionSide.BUY:
+                    per_share_exit_value = leg1_exit - leg2_exit
+                else:
+                    per_share_exit_value = leg2_exit - leg1_exit
                 close_reason = f"closed via Alpaca fill {last.get('transaction_time','')[:10]}"
             else:
                 # Missing with no clear reason — assume expired/assigned to zero
-                close_price = 0.0
-                close_reason = "missing at Alpaca (assumed expired)"
+                per_share_exit_value = 0.0
+                close_reason = "missing at Alpaca (assumed expired OTM)"
 
-            # Compute realized P&L
+            # Realized P&L on the full spread = (net_exit - net_entry) * qty * 100
+            # For debit-oriented strategies (bull call, cash-secured put, long call/put):
+            # entry_price is the net debit (for CSP: premium received, side=SELL).
             if pos.side == OptionSide.BUY:
-                realized = (close_price - pos.entry_price) * pos.qty * pos.multiplier
+                realized = (per_share_exit_value - pos.entry_price) * qty * pos.multiplier
             else:
-                realized = (pos.entry_price - close_price) * pos.qty * pos.multiplier
+                # Short single-leg (e.g. CSP): entry_price is premium collected.
+                # If ITM at expiry, we "pay" intrinsic value; if OTM, pay $0.
+                # P&L = premium_kept - intrinsic = entry - per_share_exit_value
+                realized = (pos.entry_price - per_share_exit_value) * qty * pos.multiplier
 
             pos.is_open = False
             pos.closed_at = now
             pos.close_reason = close_reason
-            pos.current_price = close_price
+            pos.current_price = per_share_exit_value
             pos.realized_pnl = realized
             pos.unrealized_pnl = 0.0
 
@@ -353,8 +532,9 @@ class OptionsPortfolio:
             realized_total += realized
             closed_count += 1
             logger.info(
-                "Options reconcile: closed %s (%s) realized=$%.0f — %s",
-                sym, pos.strategy.value, realized, close_reason,
+                "Options reconcile: closed %s %s qty=%d entry=$%.2f exit=$%.2f realized=$%.0f — %s",
+                sym, pos.strategy.value, qty, pos.entry_price, per_share_exit_value,
+                realized, close_reason,
             )
 
         self.state.positions = remaining
