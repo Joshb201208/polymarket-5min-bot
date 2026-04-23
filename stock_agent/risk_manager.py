@@ -21,11 +21,14 @@ class RiskManager:
     ) -> tuple[bool, str]:
         """Check whether a new or additional position is allowed.
 
-        If the symbol is already held, allows adding shares up to the
-        conviction-based target weight. Returns (True, "ADD_TO_EXISTING")
-        when topping up, or (True, "OK") for a new position.
+        Returns (True, "ADD_TO_EXISTING") when topping up an existing
+        position that is still below its effective target weight, or
+        (True, "OK") for a new position.
+
+        A hard per-symbol ceiling (config.MAX_POSITION_PCT) is always
+        enforced — no new shares are acquired once a symbol crosses it,
+        even if conviction is high.
         """
-        # 1. Check if already held — allow add-to-position if below target weight
         existing = None
         for p in state.positions:
             if p.symbol == symbol:
@@ -38,14 +41,25 @@ class RiskManager:
         if portfolio_value <= 0:
             return False, "Portfolio value is zero or negative"
 
+        hard_cap = self.config.MAX_POSITION_PCT
+        conviction_target = self.config.CONVICTION_SIZE_MAP.get(
+            conviction, self.config.CONVICTION_SIZE_MAP.get(7, 0.05)
+        )
+        # Effective target is the smaller of conviction-based size and hard cap.
+        effective_target = min(conviction_target, hard_cap)
+
         if existing:
-            # Calculate current weight vs target weight
             current_weight = (existing.current_price * existing.shares) / portfolio_value
-            target_weight = self.config.CONVICTION_SIZE_MAP.get(
-                conviction, self.config.CONVICTION_SIZE_MAP.get(7, 0.05)
-            )
-            if current_weight >= target_weight * 0.9:  # Within 90% of target = close enough
-                return False, f"Already holding {symbol} at {current_weight:.1%} (target {target_weight:.0%})"
+            # Hard cap check first — blocks additions even if conviction jumps.
+            if current_weight >= hard_cap:
+                return False, (
+                    f"{symbol} at {current_weight:.1%} ≥ hard cap {hard_cap:.0%} — no adds"
+                )
+            if current_weight >= effective_target * 0.9:
+                return False, (
+                    f"Already holding {symbol} at {current_weight:.1%} "
+                    f"(target {effective_target:.0%})"
+                )
             return True, "ADD_TO_EXISTING"
 
         # 2. Position count (only for NEW positions, not add-ons)
@@ -53,12 +67,6 @@ class RiskManager:
             return False, f"Max positions ({self.config.MAX_POSITIONS}) reached"
 
         # 3. Total exposure
-        portfolio_value = state.cash + sum(
-            p.current_price * p.shares for p in state.positions
-        )
-        if portfolio_value <= 0:
-            return False, "Portfolio value is zero or negative"
-
         market_exposure = sum(p.current_price * p.shares for p in state.positions)
         exposure_pct = market_exposure / portfolio_value
         if exposure_pct >= self.config.MAX_TOTAL_EXPOSURE:

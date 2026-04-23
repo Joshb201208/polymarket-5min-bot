@@ -44,7 +44,10 @@ class Config:
     MODE = os.environ.get("STOCK_AGENT_MODE", "PAPER")
 
     # Risk limits — conviction-tiered sizing
-    MAX_POSITION_PCT = 0.10      # Absolute cap per position (conviction 10 = 6%)
+    # Hard ceiling per symbol (new buys AND top-ups are blocked once reached).
+    # Target sizes from CONVICTION_SIZE_MAP go up to 10% — the extra 5pp here
+    # absorbs price appreciation before we force a trim.
+    MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "0.15"))
     MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "1.00"))  # 50%
     MAX_POSITIONS = 20           # Max concurrent positions
     MAX_SECTOR_PCT = 0.40        # 30% max in any sector

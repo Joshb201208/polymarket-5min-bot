@@ -118,34 +118,111 @@ class Portfolio:
         self._save()
 
     def sync_from_alpaca(self, alpaca_positions: list[dict], alpaca_account: dict | None = None):
-        """Sync prices and P&L from Alpaca (source of truth).
+        """Make Alpaca the source of truth for shares, prices, P&L and cash.
 
         alpaca_positions: list from GET /v2/positions
-        alpaca_account: dict from GET /v2/account (optional, for cash sync)
+        alpaca_account:   dict from GET /v2/account
+
+        Options symbols (OCC format, len > 5) are skipped — the equity
+        portfolio only tracks stocks. Options live in options_portfolio.
         """
-        alpaca_by_sym = {p["symbol"]: p for p in alpaca_positions}
+        from stock_agent.models import Thesis  # local import to avoid cycle
 
+        def _is_equity(sym: str) -> bool:
+            # Equity tickers are <=5 uppercase letters (+ optional . suffix).
+            # OCC option symbols ("TSM260424C00375000") are much longer.
+            return bool(sym) and len(sym) <= 5 and sym.replace(".", "").isalpha()
+
+        alpaca_by_sym = {
+            p["symbol"]: p for p in alpaca_positions if _is_equity(p.get("symbol", ""))
+        }
+
+        now = datetime.now(timezone.utc)
+        updated = 0
+        imported = 0
+        dropped = 0
+
+        # 1. Update existing positions with Alpaca truth (shares, price, P&L).
+        kept: list[Position] = []
         for pos in self.state.positions:
-            ap = alpaca_by_sym.get(pos.symbol)
+            ap = alpaca_by_sym.pop(pos.symbol, None)
             if not ap:
+                # Position on our books but not at Alpaca — treat as closed.
+                logger.warning(
+                    "sync_from_alpaca: %s not found at Alpaca, dropping from local state",
+                    pos.symbol,
+                )
+                dropped += 1
                 continue
-
-            cur_price = float(ap.get("current_price", 0))
+            cur_price = float(ap.get("current_price", 0) or 0)
+            shares    = int(float(ap.get("qty", 0) or 0))
+            avg_entry = float(ap.get("avg_entry_price", pos.entry_price) or pos.entry_price)
+            if shares <= 0:
+                dropped += 1
+                continue
+            pos.shares        = shares
+            pos.entry_price   = avg_entry
             if cur_price > 0:
-                pos.current_price = cur_price
-                pos.market_value = float(ap.get("market_value", cur_price * pos.shares))
-                pos.unrealized_pnl = float(ap.get("unrealized_pl", 0))
-                pos.unrealized_pnl_pct = float(ap.get("unrealized_plpc", 0))
-                pos.last_updated = datetime.now(timezone.utc)
+                pos.current_price      = cur_price
+                pos.market_value       = float(ap.get("market_value", cur_price * shares) or 0)
+                pos.unrealized_pnl     = float(ap.get("unrealized_pl", 0) or 0)
+                pos.unrealized_pnl_pct = float(ap.get("unrealized_plpc", 0) or 0)
+            pos.last_updated = now
+            kept.append(pos)
+            updated += 1
 
-        # Sync cash from Alpaca if available
+        # 2. Import Alpaca positions that the bot had no local record of.
+        for sym, ap in alpaca_by_sym.items():
+            try:
+                shares    = int(float(ap.get("qty", 0) or 0))
+                avg_entry = float(ap.get("avg_entry_price", 0) or 0)
+                cur_price = float(ap.get("current_price", 0) or 0)
+                if shares <= 0 or avg_entry <= 0:
+                    continue
+                placeholder_thesis = Thesis(
+                    symbol=sym,
+                    direction="HOLD",
+                    conviction=7,
+                    summary="Imported from Alpaca — awaiting re-analysis.",
+                    bull_case="",
+                    bear_case="",
+                    catalysts=[],
+                    risks=[],
+                    generated_at=now,
+                )
+                imported_pos = Position(
+                    symbol=sym,
+                    shares=shares,
+                    entry_price=avg_entry,
+                    entry_date=now,
+                    current_price=cur_price,
+                    market_value=float(ap.get("market_value", cur_price * shares) or 0),
+                    unrealized_pnl=float(ap.get("unrealized_pl", 0) or 0),
+                    unrealized_pnl_pct=float(ap.get("unrealized_plpc", 0) or 0),
+                    stop_loss=round(avg_entry * 0.95, 2),
+                    thesis=placeholder_thesis,
+                    sector="Unknown",
+                    last_updated=now,
+                )
+                kept.append(imported_pos)
+                imported += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sync_from_alpaca: failed to import %s: %s", sym, exc)
+
+        self.state.positions = kept
+
+        # 3. Sync cash — always, including negative (margin) balances.
         if alpaca_account:
-            alpaca_cash = float(alpaca_account.get("cash", 0))
-            if alpaca_cash > 0:
-                self.state.cash = alpaca_cash
+            try:
+                self.state.cash = float(alpaca_account.get("cash", self.state.cash))
+            except (TypeError, ValueError):
+                pass
 
         self._save()
-        logger.info("Portfolio synced from Alpaca — %d positions updated", len(alpaca_by_sym))
+        logger.info(
+            "Portfolio synced from Alpaca — updated=%d imported=%d dropped=%d cash=$%.0f",
+            updated, imported, dropped, self.state.cash,
+        )
 
     def get_portfolio_value(self) -> float:
         """Total portfolio value: cash + market value of all positions."""

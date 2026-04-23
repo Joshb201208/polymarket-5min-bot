@@ -366,6 +366,9 @@ class StockAgentScheduler:
                 return_exceptions=True,
             )
 
+            # 0a. Reconcile with Alpaca (source of truth) BEFORE any risk decisions.
+            await self._sync_portfolio_from_alpaca()
+
             # 0. Run TipRanks scraper and load data (supplementary — never blocks)
             tipranks_stocks = await self._load_tipranks_data()
             tipranks_lookup = tipranks_stocks if isinstance(tipranks_stocks, dict) else {}
@@ -482,6 +485,9 @@ class StockAgentScheduler:
             self._midweek_analysis_done_this_week = week_key
 
             await self.discord.send_system_log("INFO", "Mid-week analysis starting (Wednesday refresh)")
+
+            # 0a. Reconcile with Alpaca (source of truth) BEFORE any risk decisions.
+            await self._sync_portfolio_from_alpaca()
 
             # 0. Load TipRanks data if available
             tipranks_stocks = await self._load_tipranks_data()
@@ -791,6 +797,23 @@ class StockAgentScheduler:
             await self.discord.send_error(str(e), context="Earnings-reactive scan")
 
     # ── Shared helpers ───────────────────────────────────────────────
+
+    async def _sync_portfolio_from_alpaca(self) -> None:
+        """Pull live positions + account from Alpaca and overwrite local state.
+
+        This makes Alpaca the source of truth for share counts, avg entry
+        prices, and cash (including margin balances). Runs at the top of
+        every weekly / mid-week cycle so risk checks see real weights.
+        """
+        try:
+            account = await self.executor.get_account()
+            positions = await self.executor.get_positions()
+            if account is None and not positions:
+                logger.warning("Alpaca sync: no account + no positions returned — skipping")
+                return
+            self.portfolio.sync_from_alpaca(positions or [], account)
+        except Exception as exc:
+            logger.exception("Alpaca sync failed — continuing with local state: %s", exc)
 
     async def _load_tipranks_data(self) -> dict:
         """Fetch TipRanks Smart Score data via API screener."""
@@ -1180,13 +1203,18 @@ class StockAgentScheduler:
             pv = self.portfolio.get_portfolio_value()
 
             if is_add_on:
-                # Calculate how many MORE shares to reach target weight
+                # Calculate how many MORE shares to reach effective target weight.
+                # Effective target = min(conviction-size, hard cap) — so a single
+                # add can never take us above config.MAX_POSITION_PCT, even if
+                # conviction target is higher.
                 existing = self.portfolio.get_position(sym)
                 if not existing:
                     continue
-                target_pct = self.config.CONVICTION_SIZE_MAP.get(
+                conviction_target = self.config.CONVICTION_SIZE_MAP.get(
                     signal.conviction, 0.05
                 )
+                hard_cap = self.config.MAX_POSITION_PCT
+                target_pct = min(conviction_target, hard_cap)
                 target_value = pv * target_pct
                 current_value = existing.current_price * existing.shares
                 additional_value = target_value - current_value
@@ -1195,8 +1223,8 @@ class StockAgentScheduler:
                     logger.info("Add-on for %s: already at target weight — skipping", sym)
                     continue
                 logger.info(
-                    "Adding to %s: %d more shares (%.1f%% → %.1f%% target)",
-                    sym, qty, current_value / pv * 100, target_pct * 100,
+                    "Adding to %s: %d more shares (%.1f%% → %.1f%% target, cap %.0f%%)",
+                    sym, qty, current_value / pv * 100, target_pct * 100, hard_cap * 100,
                 )
             else:
                 qty = self.risk_manager.calculate_position_size(pv, price, signal.conviction)
