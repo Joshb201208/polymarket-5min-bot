@@ -26,6 +26,12 @@ from stock_agent.options_engine import OptionsEngine
 from stock_agent.options_executor import OptionsExecutor
 from stock_agent.options_portfolio import OptionsPortfolio
 from stock_agent.options_models import OptionSide, OptionOrderType
+from stock_agent.tipranks_client import (
+    build_tipranks_lookup,
+    adjust_conviction_with_tipranks,
+    format_tipranks_context,
+    format_tipranks_telegram_clause,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +357,7 @@ class StockAgentScheduler:
 
             # 0. Run TipRanks scraper and load data (supplementary — never blocks)
             tipranks_stocks = await self._load_tipranks_data()
+            tipranks_lookup = tipranks_stocks if isinstance(tipranks_stocks, dict) else {}
 
             # 1. Screen universe
             symbols = await self.data_feed.screen_universe()
@@ -361,6 +368,21 @@ class StockAgentScheduler:
                     return_exceptions=True,
                 )
                 return
+
+            # Merge TipRanks discovery symbols into candidate universe
+            existing_universe_symbols = {s.upper() for s in symbols}
+            candidate_symbols = list(symbols)
+            tr_new_symbols = [
+                sym for sym in tipranks_lookup
+                if sym not in existing_universe_symbols
+                and self.config.TIPRANKS_MIN_SMART_SCORE <= (tipranks_lookup[sym].get("smart_score") or 0)
+            ]
+            # TipRanks-only symbols still go through full thesis + risk checks
+            candidate_symbols.extend(tr_new_symbols)
+            logger.info(
+                "TipRanks added %d new discovery symbols to universe", len(tr_new_symbols)
+            )
+            symbols = candidate_symbols
 
             self.portfolio.set_universe(symbols)
             logger.info("Universe: %d symbols", len(symbols))
@@ -452,12 +474,29 @@ class StockAgentScheduler:
 
             # 0. Load TipRanks data if available
             tipranks_stocks = await self._load_tipranks_data()
+            tipranks_lookup = tipranks_stocks if isinstance(tipranks_stocks, dict) else {}
 
             # 1. Screen universe (same as weekly)
             symbols = await self.data_feed.screen_universe()
             if not symbols:
                 await self.discord.send_system_log("WARNING", "Mid-week: universe screening returned no symbols")
                 return
+
+            # Merge TipRanks discovery symbols into candidate universe
+            existing_universe_symbols = {s.upper() for s in symbols}
+            candidate_symbols = list(symbols)
+            tr_new_symbols = [
+                sym for sym in tipranks_lookup
+                if sym not in existing_universe_symbols
+                and self.config.TIPRANKS_MIN_SMART_SCORE <= (tipranks_lookup[sym].get("smart_score") or 0)
+            ]
+            # TipRanks-only symbols still go through full thesis + risk checks
+            candidate_symbols.extend(tr_new_symbols)
+            logger.info(
+                "Mid-week: TipRanks added %d new discovery symbols to universe",
+                len(tr_new_symbols),
+            )
+            symbols = candidate_symbols
 
             self.portfolio.set_universe(symbols)
             logger.info("Mid-week universe: %d symbols", len(symbols))
@@ -742,43 +781,20 @@ class StockAgentScheduler:
 
     # ── Shared helpers ───────────────────────────────────────────────
 
-    async def _load_tipranks_data(self):
-        """Load TipRanks data if enabled. Returns list or None."""
-        if not getattr(self.config, "TIPRANKS_ENABLED", False):
-            return None
+    async def _load_tipranks_data(self) -> dict:
+        """Fetch TipRanks Smart Score data via API screener."""
+        if not self.config.TIPRANKS_ENABLED:
+            return {}
         try:
-            from stock_agent.tipranks_scraper import scrape_tipranks
-
-            await scrape_tipranks(self.config)
-
-            from stock_agent.tipranks_data import TipRanksData
-
-            tr = TipRanksData(self.config)
-            tipranks_stocks = tr.load_latest()
-            if tipranks_stocks:
-                logger.info("Loaded %d stocks from TipRanks", len(tipranks_stocks))
-                await self.discord.send_system_log(
-                    "INFO", f"TipRanks data loaded: {len(tipranks_stocks)} stocks"
-                )
-                # Report aligned signals
-                aligned = [
-                    s
-                    for s in tipranks_stocks
-                    if s.smart_score >= 9
-                    and s.analyst_consensus == "Strong Buy"
-                    and s.hedge_fund_signal.lower() == "positive"
-                ]
-                if aligned:
-                    symbols_str = ", ".join(s.symbol for s in aligned[:15])
-                    await self.discord.send_system_log(
-                        "INFO",
-                        f"TipRanks aligned signals: {len(aligned)} stocks "
-                        f"with SS9+, Strong Buy, HF Positive: {symbols_str}",
-                    )
-                return tipranks_stocks
-        except Exception as e:
-            logger.warning("TipRanks scrape failed (non-critical): %s", e)
-        return None
+            lookup = build_tipranks_lookup(
+                min_score=self.config.TIPRANKS_MIN_SMART_SCORE,
+                limit=self.config.TIPRANKS_UNIVERSE_LIMIT,
+            )
+            logger.info("TipRanks lookup built: %d symbols", len(lookup))
+            return lookup
+        except Exception as exc:
+            logger.warning("TipRanks lookup failed: %s \u2014 continuing without", exc)
+            return {}
 
     async def _fetch_fundamentals(self, symbols: list[str]) -> list[CompanyData]:
         """Fetch fundamentals for a list of symbols."""
@@ -801,6 +817,32 @@ class StockAgentScheduler:
     ) -> list[Signal]:
         """Run deep Perplexity Sonar Pro analysis on top symbols. Returns signals."""
         signals: list[Signal] = []
+        # Normalise TipRanks input: accept the new dict[symbol -> data] lookup
+        # or the legacy list of TipRanks objects. Empty/None -> empty dict.
+        if isinstance(tipranks_stocks, dict):
+            tipranks_lookup = tipranks_stocks
+        elif tipranks_stocks:
+            tipranks_lookup = {}
+            for s in tipranks_stocks:
+                sym_key = getattr(s, "symbol", None)
+                if sym_key:
+                    tipranks_lookup[sym_key.upper()] = {
+                        "symbol": sym_key.upper(),
+                        "smart_score": getattr(s, "smart_score", None),
+                        "sector": getattr(s, "sector", None),
+                        "market_cap": getattr(s, "market_cap", None),
+                        "analyst_consensus": getattr(s, "analyst_consensus", None),
+                        "analyst_price_target_upside": getattr(
+                            s, "analyst_target_upside",
+                            getattr(s, "analyst_price_target_upside", None),
+                        ),
+                        "hedge_fund_signal": getattr(s, "hedge_fund_signal", None),
+                        "insider_signal": getattr(s, "insider_signal", None),
+                        "news_sentiment": getattr(s, "news_sentiment", None),
+                    }
+        else:
+            tipranks_lookup = {}
+
         for sym in top_symbols:
             company = next((c for c in companies if c.symbol == sym), None)
             if not company:
@@ -808,28 +850,20 @@ class StockAgentScheduler:
 
             try:
                 # Build TipRanks context for this symbol if available
-                tipranks_context = ""
-                if tipranks_stocks:
-                    tr_stock = next(
-                        (s for s in tipranks_stocks if s.symbol.upper() == sym.upper()),
-                        None,
-                    )
-                    if tr_stock:
-                        tipranks_context = (
-                            f"TIPRANKS DATA:\n"
-                            f"- Smart Score: {tr_stock.smart_score}/10\n"
-                            f"- Analyst Consensus: {tr_stock.analyst_consensus}\n"
-                            f"- Analyst Price Target Upside: {tr_stock.analyst_target_upside:+.1f}%\n"
-                            f"- Hedge Fund Signal: {tr_stock.hedge_fund_signal}\n"
-                            f"- Insider Signal: {tr_stock.insider_signal}\n"
-                            f"- News Sentiment: {tr_stock.news_sentiment}\n"
-                        )
+                tr_data = tipranks_lookup.get(sym.upper())
+                tipranks_context = format_tipranks_context(sym, tr_data)
 
                 thesis = await self.analyst.analyze_stock(
                     sym, company, tipranks_context=tipranks_context
                 )
                 if not thesis:
                     continue
+
+                # Enrich conviction with TipRanks Smart Score (additive, clamped).
+                if thesis and tr_data:
+                    thesis.conviction = adjust_conviction_with_tipranks(
+                        thesis.conviction, tr_data
+                    )
 
                 self.portfolio.update_thesis(sym, thesis)
 
@@ -1210,12 +1244,17 @@ class StockAgentScheduler:
             self.portfolio.remove_position(position.symbol)
             self.portfolio.log_trade(trade)
 
-            await asyncio.gather(
+            tr_clause = format_tipranks_telegram_clause(
+                self._tipranks_lookup.get(position.symbol.upper())
+            )
+            alert_tasks = [
                 self.telegram.send_trade_alert(trade),
                 self.discord.send_trade_alert(trade),
                 self.discord.send_eli5_trade(trade, position.thesis, is_buy=False),
-                return_exceptions=True,
-            )
+            ]
+            if tr_clause:
+                alert_tasks.append(self.telegram.send_message(tr_clause.lstrip(" |").strip()))
+            await asyncio.gather(*alert_tasks, return_exceptions=True)
             logger.info(
                 "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%.1f%%)",
                 position.symbol, position.shares, sell_price, pnl, pnl_pct * 100,
