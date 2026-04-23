@@ -1,5 +1,5 @@
 [Unit]
-Description=Events Trading Agent
+Description=Stock Trading Agent
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,7 @@ User=root
 WorkingDirectory=/root/polymarket-bot
 ExecStartPre=/usr/bin/git -C /root/polymarket-bot fetch --all
 ExecStartPre=/usr/bin/git -C /root/polymarket-bot reset --hard origin/master
-ExecStart=/root/polymarket-bot/venv/bin/python orchestrator.py
+ExecStart=/root/polymarket-bot/venv/bin/python -m stock_agent
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

@@ -1,24 +1,34 @@
-# NBA Polymarket Betting Agent
+# Stock Trading Agent
 
-Automated NBA betting agent for Polymarket. Scans markets, computes edges using NBA stats, and executes trades via paper or live mode.
+Autonomous equities research + paper/live trading agent. Runs a weekly deep-research cycle and a midweek update cycle, combines a multi-source screener (TipRanks Smart Score, Finnhub news/sentiment/analyst trends, macro monitor) with an LLM-driven thesis/analyst layer, and sizes positions with a conviction-based risk manager.
 
 ## Quick Start
 
 ```bash
-cp .env.example .env
+cp .env.example .env     # fill in API keys
 pip install -r requirements.txt
-python -m nba_agent.main
+python -m stock_agent
 ```
 
-## Features
+## Cadence
 
-- **Market Discovery**: Scans Polymarket Gamma API for NBA moneylines, spreads, totals, and futures
-- **NBA Research**: Pulls standings, game logs, H2H, advanced stats, and injury news
-- **Edge Calculation**: Computes fair odds using weighted power ratings
-- **Bankroll Management**: Quarter-Kelly sizing with exposure limits and stop-loss
-- **Paper & Live Trading**: Simulated or real execution via py-clob-client
-- **Telegram Alerts**: Trade notifications, daily/weekly P&L summaries
-- **Early Exit System**: Confidence-tiered profit-taking and loss-cutting
+- **Sunday (WEEKLY_ANALYSIS_DAY=6)** — full discovery + thesis build + portfolio rebalance
+- **Wednesday (MIDWEEK_ANALYSIS_DAY=2)** — midweek check-in, add-to-position, risk review
+- Paper mode is the default; live mode flips a single config flag.
+
+## Inputs
+
+- **TipRanks Smart Score** — API screener, conviction boost for SS 8–10
+- **Finnhub** — company news, news/social sentiment, analyst recommendation trends, insider transactions
+- **Macro monitor** — rates/VIX/USD regime checks
+- **Options data** — IV, skew, flow for the options engine
+- **Perplexity + Anthropic** — thesis research and analyst reasoning
+
+## Outputs
+
+- Telegram trade alerts + weekly/daily summaries
+- Discord channel posts per trade
+- Position ledger persisted under `data/`
 
 ## VPS Deployment
 
@@ -26,24 +36,41 @@ python -m nba_agent.main
 sudo bash deploy/setup.sh
 ```
 
+Installs the `stock-agent` systemd unit and a 10-minute auto-update cron that pulls new commits on `master` and restarts the service.
+
 ## Configuration
 
-All settings via `.env` — see `.env.example` for defaults.
+All knobs live in `stock_agent/config.py` and `.env` — see `.env.example`.
+
+Key flags:
+- `MIN_CONVICTION` — floor for taking a position (default 7)
+- `TIPRANKS_ENABLED`, `TIPRANKS_MIN_SMART_SCORE`, `TIPRANKS_UNIVERSE_LIMIT`
+- `POSITION_SIZE_PCT_BY_CONVICTION` — 5–10% sliding scale
+- Sector caps and hard stop-loss logic live in `risk_manager.py` (do not mutate without a plan)
 
 ## Architecture
 
 ```
-nba_agent/
-├── main.py              # Async scheduler
-├── config.py            # Environment config
-├── models.py            # Data models
-├── polymarket_scanner.py # Market discovery
-├── nba_research.py      # NBA stats engine
-├── edge_calculator.py   # Fair odds & edge
-├── trading_engine.py    # Order execution
-├── bankroll_manager.py  # Position sizing
+stock_agent/
+├── __main__.py          # Entry point
+├── scheduler.py         # Weekly/midweek loop
+├── screener.py          # Universe construction
+├── tipranks_client.py   # TipRanks Smart Score API
+├── news_feed.py         # Finnhub company news
+├── sentiment.py         # Finnhub news + social sentiment
+├── analyst_trends.py    # Finnhub analyst recs + insider txns
+├── macro_monitor.py     # Macro regime checks
+├── data_feed.py         # Price/fundamentals
+├── analyst.py           # LLM thesis + analysis
+├── portfolio.py         # Position ledger
+├── risk_manager.py      # Stops, sector caps, sizing
+├── executor.py          # Equity order execution
+├── options_engine.py    # Options thesis
+├── options_executor.py  # Options order execution
+├── options_portfolio.py # Options ledger
+├── options_data.py      # Options chain data
 ├── telegram_alerts.py   # Notifications
-├── performance_tracker.py # P&L tracking
-├── injury_scanner.py    # Injury news
-└── utils.py             # Helpers
+├── discord_alerts.py    # Channel posts
+├── config.py            # Env + tunables
+└── models.py            # Data models
 ```

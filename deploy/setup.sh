@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
-echo "=== Setting up Polymarket Agent (NBA + Events Orchestrator) ==="
+echo "=== Setting up Stock Trading Agent ==="
 
 # Install system packages
 apt-get update -qq
-apt-get install -y python3 python3-pip python3-venv git nginx
+apt-get install -y python3 python3-pip python3-venv git
 
 # Clone repo if not already present
 cd /root
@@ -33,7 +33,7 @@ mkdir -p data
 # Copy .env.example to .env if .env doesn't exist
 if [ ! -f ".env" ]; then
     cp .env.example .env
-    echo "Created .env from .env.example"
+    echo "Created .env from .env.example (fill in your API keys)."
 fi
 
 # Make auto_update.sh executable
@@ -43,32 +43,13 @@ chmod +x deploy/auto_update.sh
 (crontab -l 2>/dev/null | grep -v auto_update; echo "*/10 * * * * /root/polymarket-bot/deploy/auto_update.sh >> /var/log/auto_update.log 2>&1") | crontab -
 echo "Set up auto-updater cron."
 
-# Set up systemd service for the orchestrator (runs BOTH NBA + NHL)
-cp deploy/agents.service /etc/systemd/system/nba-agent.service
+# Set up systemd service for the stock agent
+cp deploy/stock-agent.service /etc/systemd/system/stock-agent.service
 systemctl daemon-reload
-systemctl enable nba-agent
-systemctl restart nba-agent
-
-# Set up dashboard (nginx + FastAPI)
-# Fix permissions so nginx (www-data) can serve static files from /root/
-chmod 755 /root
-chmod -R 755 /root/polymarket-bot/dashboard/static
-
-cp dashboard/nginx.conf /etc/nginx/sites-available/dashboard
-ln -sf /etc/nginx/sites-available/dashboard /etc/nginx/sites-enabled/dashboard
-rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl restart nginx
-echo "Configured nginx for dashboard."
-
-cp dashboard/dashboard.service /etc/systemd/system/nba-dashboard.service
-systemctl daemon-reload
-systemctl enable nba-dashboard
-systemctl restart nba-dashboard
-echo "Started dashboard API service."
+systemctl enable stock-agent
+systemctl restart stock-agent
 
 echo ""
-echo "=== Setup complete! Orchestrator (NBA + Events) + Dashboard running. ==="
-echo "Check agent:     systemctl status nba-agent"
-echo "Check dashboard:  systemctl status nba-dashboard"
-echo "View agent logs:  journalctl -u nba-agent -f"
-echo "Dashboard URL:    http://139.59.26.34/"
+echo "=== Setup complete! Stock agent running. ==="
+echo "Check agent:      systemctl status stock-agent"
+echo "View agent logs:  journalctl -u stock-agent -f"
