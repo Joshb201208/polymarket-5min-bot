@@ -43,10 +43,11 @@ def _call_screener(params: dict) -> list[dict]:
     """Raw GET against the TipRanks screener endpoint.
 
     Handles multiple response shapes defensively:
-      - {"stocks":   [...]}
-      - {"data":     [...]}
-      - {"results":  [...]}
-      - bare list    [...]
+      - {"stocksScreenerData": [...]}   (current TipRanks shape)
+      - {"stocks":              [...]}
+      - {"data":                [...]}
+      - {"results":             [...]}
+      - bare list               [...]
     Returns an empty list on any error or unrecognised payload.
     """
     try:
@@ -66,7 +67,7 @@ def _call_screener(params: dict) -> list[dict]:
         return [row for row in payload if isinstance(row, dict)]
 
     if isinstance(payload, dict):
-        for key in ("stocks", "data", "results"):
+        for key in ("stocksScreenerData", "stocks", "data", "results"):
             rows = payload.get(key)
             if isinstance(rows, list):
                 return [row for row in rows if isinstance(row, dict)]
@@ -97,64 +98,172 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+# TipRanks nests fields under sub-sections (tradingInformationData,
+# tipRanksEssentialData, etc.). Flatten before lookup so _first() works.
+_NESTED_SECTIONS = (
+    "tradingInformationData",
+    "tipRanksEssentialData",
+    "dividendData",
+    "earningsData",
+    "performanceData",
+    "technicalsData",
+)
+
+
+def _flatten(raw: dict) -> dict:
+    """Flatten nested TipRanks sections into a single dict.
+
+    Top-level keys win over nested keys on conflict. Non-dict sections are
+    kept as-is so future additions don't crash the normaliser.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    flat: dict = {}
+    for section in _NESTED_SECTIONS:
+        sub = raw.get(section)
+        if isinstance(sub, dict):
+            flat.update(sub)
+    for k, v in raw.items():
+        if k in _NESTED_SECTIONS and isinstance(v, dict):
+            continue
+        flat[k] = v
+    return flat
+
+
+# Map TipRanks internal consensus tokens to user-friendly labels.
+_CONSENSUS_LABELS = {
+    "StrongBuy": "Strong Buy",
+    "Buy": "Buy",
+    "ModerateBuy": "Moderate Buy",
+    "Hold": "Hold",
+    "Neutral": "Neutral",
+    "ModerateSell": "Moderate Sell",
+    "Sell": "Sell",
+    "StrongSell": "Strong Sell",
+}
+
+_SIGNAL_LABELS = {
+    "Buy": "Positive",
+    "Sell": "Negative",
+    "Hold": "Neutral",
+    "Neutral": "Neutral",
+    "Bullish": "Positive",
+    "Bearish": "Negative",
+}
+
+
+def _pretty(value: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(value, str) and value in mapping:
+        return mapping[value]
+    return value
+
+
 def _normalise(raw: dict) -> dict:
     """Map a raw screener row to a stable internal shape.
 
     Tries multiple field-name variants so changes in the upstream schema do
-    not silently drop fields.
+    not silently drop fields. Handles both the current nested TipRanks
+    schema and flatter legacy/test shapes.
     """
     if not isinstance(raw, dict):
         return {}
 
-    symbol = _first(raw, "ticker", "symbol", "Ticker", "Symbol", "stockTicker")
+    src = _flatten(raw)
+
+    symbol = _first(
+        src, "stockListingTicker", "ticker", "symbol",
+        "Ticker", "Symbol", "stockTicker",
+    )
     smart_score = _to_int(
-        _first(raw, "smartScore", "smart_score", "SmartScore", "tipranksSmartScore")
-    )
-    sector = _first(raw, "sector", "Sector", "sectorName")
-    market_cap = _to_float(
-        _first(raw, "marketCap", "market_cap", "MarketCap", "marketCapitalization")
-    )
-    analyst_consensus = _first(
-        raw,
-        "analystConsensus",
-        "analyst_consensus",
-        "AnalystConsensus",
-        "stockAnalystConsensus",
-        "consensus",
-    )
-    analyst_price_target_upside = _to_float(
         _first(
-            raw,
-            "analystPriceTargetUpside",
-            "analyst_price_target_upside",
-            "priceTargetUpside",
-            "analystTargetUpside",
-            "priceTargetUpsidePercent",
+            src,
+            "stockTipranksSmartScore",
+            "smartScore",
+            "smart_score",
+            "SmartScore",
+            "tipranksSmartScore",
         )
     )
-    hedge_fund_signal = _first(
-        raw,
-        "hedgeFundSignal",
-        "hedge_fund_signal",
-        "HedgeFundSignal",
-        "hedgeFundTrendAction",
-        "hfSignal",
+    sector = _first(
+        src, "stockSectorName", "sector", "Sector", "sectorName", "industry",
     )
-    insider_signal = _first(
-        raw,
-        "insiderSignal",
-        "insider_signal",
-        "InsiderSignal",
-        "insiderTrendAction",
-        "insidersSignal",
+    market_cap = _to_float(
+        _first(
+            src,
+            "stockListingMarketCapUSD",
+            "stockListingMarketCap",
+            "marketCap",
+            "market_cap",
+            "MarketCap",
+            "marketCapitalization",
+        )
     )
-    news_sentiment = _first(
-        raw,
-        "newsSentiment",
-        "news_sentiment",
-        "NewsSentiment",
-        "newsSentimentLabel",
-        "bloggerSentiment",
+    analyst_consensus = _pretty(
+        _first(
+            src,
+            "stockAnalystConsensus",
+            "stockBestAnalystConsensus",
+            "analystConsensus",
+            "analyst_consensus",
+            "AnalystConsensus",
+            "consensus",
+        ),
+        _CONSENSUS_LABELS,
+    )
+    # TipRanks returns upside as a decimal fraction (0.35 = +35%). Convert
+    # to percent for display consistency.
+    raw_upside = _first(
+        src,
+        "stockUpside",
+        "stockBestUpside",
+        "analystPriceTargetUpside",
+        "analyst_price_target_upside",
+        "priceTargetUpside",
+        "analystTargetUpside",
+        "priceTargetUpsidePercent",
+    )
+    upside_val = _to_float(raw_upside)
+    if upside_val is not None and abs(upside_val) <= 5:
+        # Decimal fraction — scale to percent.
+        upside_val = upside_val * 100.0
+    analyst_price_target_upside = upside_val
+
+    hedge_fund_signal = _pretty(
+        _first(
+            src,
+            "stockHedgeFundSignal",
+            "hedgeFundSignal",
+            "hedge_fund_signal",
+            "HedgeFundSignal",
+            "hedgeFundTrendAction",
+            "hfSignal",
+        ),
+        _SIGNAL_LABELS,
+    )
+    insider_signal = _pretty(
+        _first(
+            src,
+            "stockInsiderSignal",
+            "insiderSignal",
+            "insider_signal",
+            "InsiderSignal",
+            "insiderTrendAction",
+            "insidersSignal",
+        ),
+        _SIGNAL_LABELS,
+    )
+    news_sentiment = _pretty(
+        _first(
+            src,
+            "stockNewsSentiment",
+            "stockBloggerConsensus",
+            "newsSentiment",
+            "news_sentiment",
+            "NewsSentiment",
+            "newsSentimentLabel",
+            "bloggerSentiment",
+        ),
+        _SIGNAL_LABELS,
     )
 
     return {
@@ -188,8 +297,16 @@ def fetch_high_smart_score_us_stocks(
         normalised: list[dict] = []
         for row in rows:
             n = _normalise(row)
-            if n.get("symbol"):
-                normalised.append(n)
+            if not n.get("symbol"):
+                continue
+            # Client-side filter as a safety net — the server sometimes
+            # ignores minSmartScore and returns the full universe.
+            score = n.get("smart_score")
+            if score is not None and score < int(min_score):
+                continue
+            normalised.append(n)
+            if len(normalised) >= int(limit):
+                break
         logger.info(
             "TipRanks fetch: %d rows (min_score=%d, limit=%d)",
             len(normalised), min_score, limit,
@@ -306,6 +423,10 @@ def format_tipranks_context(symbol: str, tipranks_data: dict | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Official TipRanks buckets (per tipranks.com/glossary/s/smart-score):
+#   Outperform  = 8, 9, 10
+#   Neutral     = 4, 5, 6, 7
+#   Underperform = 1, 2, 3
 _SMART_SCORE_LABELS = {
     10: "Outperform",
     9: "Outperform",
@@ -313,7 +434,7 @@ _SMART_SCORE_LABELS = {
     7: "Neutral",
     6: "Neutral",
     5: "Neutral",
-    4: "Underperform",
+    4: "Neutral",
     3: "Underperform",
     2: "Underperform",
     1: "Underperform",
