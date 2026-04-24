@@ -327,7 +327,21 @@ class DataFeed:
             "Screened %d symbols (%d after filtering) across %d sectors",
             len(all_symbols), len(filtered), len(target_sectors),
         )
-        return filtered[: self.config.UNIVERSE_SIZE]
+        truncated = filtered[: self.config.UNIVERSE_SIZE]
+
+        # Always inject priority symbols (curated high-conviction names flagged
+        # by external research). Prepend + dedupe so they survive truncation and
+        # get evaluated by the bot's own thesis process. Does not displace
+        # screener picks — universe may temporarily exceed UNIVERSE_SIZE by the
+        # number of priority symbols not already in the screener output.
+        priority = [s.upper() for s in getattr(self.config, "PRIORITY_SYMBOLS", []) or []]
+        if priority:
+            existing = set(truncated)
+            injected = [s for s in priority if s not in existing]
+            if injected:
+                logger.info("Injected %d priority symbols: %s", len(injected), injected)
+                truncated = injected + truncated
+        return truncated
 
     async def get_company_news(self, symbol: str, limit: int = 10) -> list[dict]:
         """Get recent news for a symbol from FMP."""

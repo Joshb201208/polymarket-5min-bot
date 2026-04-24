@@ -54,7 +54,18 @@ class Config:
     # Cross-sector correlation cap. Caps exposure to groups of symbols that tend
     # to move together regardless of official sector (e.g. semis, mega-cap tech,
     # China ADRs). Enforced in risk_manager.can_open_position.
-    MAX_CLUSTER_PCT = float(os.environ.get("MAX_CLUSTER_PCT", "0.45"))
+    MAX_CLUSTER_PCT = float(os.environ.get("MAX_CLUSTER_PCT", "0.48"))
+
+    # Priority symbols — always injected into the scanned universe regardless
+    # of FMP screener output. Used for curated high-conviction names flagged
+    # by outside research (e.g. Fundstrat Top 5) so the bot's own thesis
+    # process can evaluate them on merit. Env override: comma-separated.
+    _priority_env = os.environ.get("PRIORITY_SYMBOLS", "").strip()
+    PRIORITY_SYMBOLS: list[str] = (
+        [s.strip().upper() for s in _priority_env.split(",") if s.strip()]
+        if _priority_env
+        else ["ANET", "BK", "GS", "JPM"]
+    )
 
     # Known correlation clusters. A symbol may belong to multiple; all are checked.
     SYMBOL_CLUSTERS: dict[str, list[str]] = {
@@ -73,7 +84,7 @@ class Config:
         ],
         "Financials": [
             "JPM", "BAC", "WFC", "GS", "MS", "C", "BRK.B", "V", "MA", "AXP",
-            "BLK", "SCHW", "COF", "USB",
+            "BLK", "SCHW", "COF", "USB", "BK",
         ],
         "ConsumerDiscretionary": [
             "TJX", "AMZN", "HD", "LOW", "NKE", "SBUX", "MCD", "BKNG", "TSLA",
@@ -95,6 +106,7 @@ class Config:
         "INTC": "Technology", "AMAT": "Technology", "LRCX": "Technology",
         "KLAC": "Technology", "MRVL": "Technology", "QCOM": "Technology",
         "TXN": "Technology", "ON": "Technology", "ARM": "Technology",
+        "ANET": "Technology",
         # Technology / Software & Platforms
         "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology",
         "GOOG": "Technology", "META": "Technology", "ORCL": "Technology",
@@ -122,6 +134,7 @@ class Config:
         "GS": "Financials", "MS": "Financials", "C": "Financials",
         "BRK.B": "Financials", "V": "Financials", "MA": "Financials",
         "AXP": "Financials", "BLK": "Financials", "SCHW": "Financials",
+        "BK": "Financials", "COF": "Financials", "USB": "Financials",
         # Industrials
         "ETN": "Industrials", "CAT": "Industrials", "DE": "Industrials",
         "HON": "Industrials", "UNP": "Industrials", "GE": "Industrials",
