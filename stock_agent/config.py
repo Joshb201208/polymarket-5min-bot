@@ -154,9 +154,14 @@ class Config:
     }
 
     # Stop-loss: volatility-adjusted, clamped to range
-    STOP_LOSS_PCT_MIN = 0.05     # 5% minimum stop-loss
-    STOP_LOSS_PCT_MAX = 0.10     # 10% maximum stop-loss
-    STOP_LOSS_PCT = 0.05         # Legacy fallback (used if beta unavailable)
+    # Stop-loss floor widened from 5% -> 7% on 2026-04-25 to reduce whipsaw on
+    # low-beta defensives. The 5% min was firing on ~1% intraday wiggles after
+    # the price had already moved a small amount against us (5 of 5 historical
+    # sells were stop-outs by tiny margins, e.g. PDD $98.06 vs stop $98.70,
+    # all small losses ~$150-230). 7% gives positions room to breathe.
+    STOP_LOSS_PCT_MIN = 0.07     # 7% minimum stop-loss (was 0.05)
+    STOP_LOSS_PCT_MAX = 0.12     # 12% maximum stop-loss for high-beta names (was 0.10)
+    STOP_LOSS_PCT = 0.07         # Legacy fallback (used if beta unavailable)
 
     # Strategy params
     MIN_CONVICTION = 7           # Only trade conviction >= 7
