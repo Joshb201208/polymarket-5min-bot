@@ -43,6 +43,7 @@ from stock_agent.analyst_trends import (
     format_analyst_context,
     adjust_conviction_with_analysts,
 )
+from stock_agent.research_notes import load_notes, format_research_notes_context
 
 logger = logging.getLogger(__name__)
 
@@ -642,7 +643,10 @@ class StockAgentScheduler:
                             company = next((c for c in companies if c.symbol == sym), None)
                             if company:
                                 try:
-                                    thesis = await self.analyst.analyze_stock(sym, company)
+                                    rn = format_research_notes_context(sym, load_notes())
+                                    thesis = await self.analyst.analyze_stock(
+                                        sym, company, research_notes_context=rn,
+                                    )
                                     if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
                                         # High conviction from daily scan — queue signal
                                         pv = self.portfolio.get_portfolio_value()
@@ -758,7 +762,10 @@ class StockAgentScheduler:
 
                         company = await self.data_feed.get_company_fundamentals(sym)
                         if company:
-                            thesis = await self.analyst.analyze_stock(sym, company)
+                            rn = format_research_notes_context(sym, load_notes())
+                            thesis = await self.analyst.analyze_stock(
+                                sym, company, research_notes_context=rn,
+                            )
                             if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
                                 signal = Signal(
                                     symbol=sym,
@@ -894,6 +901,19 @@ class StockAgentScheduler:
             len(news_lookup), len(sentiment_lookup), len(analyst_lookup),
         )
 
+        # Load research notes once per cycle (cheap; reads a small dir)
+        try:
+            research_notes = load_notes()
+            if research_notes:
+                logger.info(
+                    "Loaded %d active research note(s): %s",
+                    len(research_notes),
+                    ", ".join(n.source for n in research_notes),
+                )
+        except Exception as e:
+            logger.warning("Failed to load research notes: %s", e)
+            research_notes = []
+
         for sym in top_symbols:
             company = next((c for c in companies if c.symbol == sym), None)
             if not company:
@@ -912,6 +932,7 @@ class StockAgentScheduler:
                 news_context = format_news_context(sym, news_items)
                 sentiment_context = format_sentiment_context(sym, sentiment_data)
                 analyst_context = format_analyst_context(sym, analyst_data)
+                research_notes_context = format_research_notes_context(sym, research_notes)
 
                 thesis = await self.analyst.analyze_stock(
                     sym,
@@ -920,6 +941,7 @@ class StockAgentScheduler:
                     news_context=news_context,
                     sentiment_context=sentiment_context,
                     analyst_context=analyst_context,
+                    research_notes_context=research_notes_context,
                 )
                 if not thesis:
                     continue

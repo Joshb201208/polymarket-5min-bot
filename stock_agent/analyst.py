@@ -99,6 +99,7 @@ class Analyst:
         news_context: str = "",
         sentiment_context: str = "",
         analyst_context: str = "",
+        research_notes_context: str = "",
     ) -> Thesis | None:
         """Deep analysis using Perplexity Sonar Pro."""
         financial_str = self._format_financial_data(company_data)
@@ -108,6 +109,7 @@ class Analyst:
             analyst_context,
             sentiment_context,
             news_context,
+            research_notes_context,
         ]
         supplementary = ""
         filled = [p for p in supplementary_parts if p]
