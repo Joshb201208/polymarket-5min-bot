@@ -175,6 +175,36 @@ class OptionsDataFeed:
 
     # ── Snapshot (quotes + greeks) ───────────────────────────────────
 
+    async def fetch_stock_price(self, symbol: str) -> Optional[float]:
+        """Fetch the latest trade price for a stock underlying.
+
+        Returns ``None`` on any failure so callers can defensively skip
+        decisions that require a current spot price.
+        """
+        client = await self._get_client()
+        symbol_clean = symbol.replace("-", ".")
+        url = f"{_DATA_BASE}/v2/stocks/{symbol_clean}/snapshot"
+        try:
+            resp = await client.get(url, headers=self._auth_headers())
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("fetch_stock_price failed for %s: %s", symbol, exc)
+            return None
+        # Prefer latest trade, fall back to latest quote midpoint, then bar close.
+        trade = data.get("latestTrade") or {}
+        if isinstance(trade, dict) and trade.get("p"):
+            return float(trade["p"])
+        quote = data.get("latestQuote") or {}
+        bid = quote.get("bp") if isinstance(quote, dict) else None
+        ask = quote.get("ap") if isinstance(quote, dict) else None
+        if bid and ask and bid > 0 and ask > 0:
+            return (float(bid) + float(ask)) / 2.0
+        bar = data.get("dailyBar") or data.get("minuteBar") or {}
+        if isinstance(bar, dict) and bar.get("c"):
+            return float(bar["c"])
+        return None
+
     async def fetch_snapshot(
         self,
         contract_symbols: list[str],

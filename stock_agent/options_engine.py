@@ -151,12 +151,35 @@ class OptionsEngine:
 
         # ── 1. Covered calls on existing positions ────────────────────
         # Only attempt covered calls if we have >= 100 shares (Alpaca requirement)
-        # Our current positions are all < 100 shares so this will be skipped
+        # Build a price lookup so covered calls can target genuinely OTM strikes
+        candidate_prices: dict[str, float] = {
+            sym: price for sym, _conv, price, _tgt in screener_candidates if price > 0
+        }
         for symbol, shares in stock_positions.items():
             if shares >= SHARES_PER_CONTRACT and slots_remaining > 0:
+                # Resolve current underlying price; without it we cannot
+                # safely validate OTM strikes, so skip the position rather
+                # than risk selling a deep-ITM call that gets assigned.
+                current_price = candidate_prices.get(symbol)
+                if not current_price or current_price <= 0:
+                    try:
+                        current_price = await self.data.fetch_stock_price(symbol)
+                    except Exception as exc:
+                        logger.warning(
+                            "_evaluate_covered_call: fetch_stock_price failed for %s: %s",
+                            symbol, exc,
+                        )
+                        current_price = None
+                if not current_price or current_price <= 0:
+                    logger.info(
+                        "_evaluate_covered_call: no current price for %s — skipping (cannot validate OTM)",
+                        symbol,
+                    )
+                    continue
                 cc_signal = await self._evaluate_covered_call(
                     symbol=symbol,
                     shares=shares,
+                    current_price=current_price,
                     portfolio_value=portfolio_value,
                     regime=regime,
                     snap=snap,
@@ -244,18 +267,17 @@ class OptionsEngine:
         self,
         symbol: str,
         shares: int,
+        current_price: float,
         portfolio_value: float,
         regime: str,
         snap: Optional[MacroSnapshot],
     ) -> Optional[OptionsSignal]:
         """Find an optimal covered call to sell on an existing position.
 
-        Targets a strike at or above the thesis target price, 2-4 weeks DTE,
-        with premium >= 1% of underlying per month.
-
-        NOTE: Current portfolio has no positions >= 100 shares.  This method
-        is implemented for when positions grow.  It will return None for any
-        position with fewer than 100 shares.
+        Targets an OTM strike (strictly above current price), 2-5 weeks DTE,
+        with premium >= 0.5% of strike per month. Strike is also capped at
+        a reasonable distance above current price so we do not sell calls
+        with vanishingly small probability of being meaningful.
         """
         contracts_to_sell = shares // SHARES_PER_CONTRACT
         if contracts_to_sell < 1:
@@ -265,13 +287,28 @@ class OptionsEngine:
             )
             return None
 
+        if current_price <= 0:
+            logger.warning(
+                "_evaluate_covered_call: invalid current price %.2f for %s — skipping",
+                current_price, symbol,
+            )
+            return None
+
         min_expiry = date.today() + timedelta(days=CC_MIN_DTE)
         max_expiry = date.today() + timedelta(days=CC_MAX_DTE)
+
+        # Only consider OTM calls: strikes strictly above current price.
+        # Cap at 25% above to avoid worthless far-OTM strikes with no premium.
+        # The slight 1.001× floor avoids round-off edge cases right at the money.
+        min_strike = current_price * 1.001
+        max_strike = current_price * 1.25
 
         # Fetch OTM calls — strikes above current price
         chain_with_quotes = await self.data.fetch_chain_with_quotes(
             underlying=symbol,
             option_type=OptionType.CALL,
+            min_strike=min_strike,
+            max_strike=max_strike,
             min_expiry=min_expiry,
             max_expiry=max_expiry,
             limit=50,
@@ -289,6 +326,10 @@ class OptionsEngine:
             if quote is None:
                 continue
             if quote.fair_value is None or quote.fair_value <= 0:
+                continue
+
+            # Defense in depth — reject any ITM strike even if API ignores filters
+            if contract.strike_price <= current_price:
                 continue
 
             # Premium as monthly percentage of strike (annualise then divide by 12)
@@ -312,7 +353,7 @@ class OptionsEngine:
         return OptionsSignal(
             strategy=OptionsStrategy.COVERED_CALL,
             underlying_symbol=symbol,
-            underlying_price=best_contract.strike_price,  # Approximate
+            underlying_price=current_price,
             contract_symbol=best_contract.symbol,
             option_type=OptionType.CALL,
             side=OptionSide.SELL,
