@@ -1,0 +1,10 @@
+# Minimal on purpose: catch real errors, do not reformat the codebase.
+# py312 because stock_agent/macro_monitor.py uses f-string syntax that only
+# parses on Python 3.12 and later (the droplet runs Ubuntu 24.04).
+# Widen this only as part of an approved plan item.
+target-version = "py312"
+line-length = 120
+extend-exclude = ["data", "venv", ".venv"]
+
+[lint]
+select = ["E9", "F63", "F7", "F82"]
