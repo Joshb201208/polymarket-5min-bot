@@ -42,6 +42,7 @@ docs/revamp/
     PLAYBOOK.md                   How to audit: rules, evidence, formats
     areas/NN-name.md              One brief per audit area
     findings/NN-name.md           One findings file per area (created by the audit)
+    evidence/DATE-name.md         Measurements of the running bot, percentages and counts only
     AUDIT.md                      Synthesis for Josh (created by the audit)
   claude-project/
     SETUP.md                      Click-by-click setup for Josh

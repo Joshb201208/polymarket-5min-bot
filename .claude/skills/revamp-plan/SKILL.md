@@ -17,7 +17,8 @@ Extra direction from Josh, if any: $ARGUMENTS
 2. `docs/revamp/audit/AUDIT.md` must exist, either on `master` (audit pull
    request merged) or on branch `audit/full-dig` (still open). If it is on
    neither, stop and say so.
-3. Read `CLAUDE.md`, `AUDIT.md`, and `docs/revamp/PLAN_TEMPLATE.md`.
+3. Read `CLAUDE.md`, `AUDIT.md`, `docs/revamp/PLAN_TEMPLATE.md`, and every
+   file in `docs/revamp/audit/evidence/`.
 
 ## Steps
 
@@ -39,6 +40,12 @@ Extra direction from Josh, if any: $ARGUMENTS
      mixes a refactor with a behaviour change should be split.
    - Put every verified Critical and High finding either in an item or under
      "Not doing" with a reason. None may be silently dropped.
+   - Do the same for every point under "What the plan has to cover" in the
+     evidence files. Where a point needs a decision from Josh, ask it in
+     step 1.
+   - Include how success will be measured after the build, using the same
+     measures as the evidence files, so the next review can compare like
+     with like.
 4. Commit, push, and open one draft pull request titled
    `docs(plan): revamp plan`. The description lists the items in order with
    one line each.
