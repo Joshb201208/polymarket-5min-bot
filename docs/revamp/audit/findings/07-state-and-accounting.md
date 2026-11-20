@@ -214,6 +214,7 @@ to rebuild trade history, the equity curve, or any options position.
   ```
   Also ran: main missing with a good `.bak` gives fresh state; a subclass of `Thesis` with a required `beta: float` rejects a file written by today's models; one unknown strategy name in `options_portfolio.json` gives zero open option positions.
 - Direction (not a fix): Treat an unreadable state file as a stop-and-alert condition, keep the bad file aside, and rebuild from the broker before any order can be placed. Add a schema version and a migration step before the revamp changes any model.
+- Verification: Confirmed: reproduced independently (both files unreadable, or main file missing even with a good `.bak`, gives 0 positions and cash 100000, and `can_open_position` then returns OK for a symbol already held), and `run()` has no broker sync before the loop, so the event-triggered scan (`scheduler.py:1680`) can buy against the empty book the same day; in practice the exposure window is short because the next weekday 08:15 brief re-imports stock positions before the open, unless the broker list is empty or the brief fails.
 
 ### F-07-02: One failed positions call empties the options ledger for good and books invented P&L
 - Severity: Critical

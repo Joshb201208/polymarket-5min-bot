@@ -148,6 +148,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: With FMP unavailable (expired key, lapsed plan, daily quota used up, outage) the price behind every in-process stop check is the 08:15 pre-market price at best. The broker-side stop order becomes the only protection. Positions imported from Alpaca get a local stop value but no broker order from this code (`portfolio.py:202`), and a failed stop placement is only a log warning (`executor.py:132`); area 03 covers how reliable the broker stops are.
 - How verified: Read the path end to end. Ran `get_batch_quotes` with `_fmp_get` stubbed to return `None`: result `{}`. `update_prices({})` left both test positions' prices and `last_updated` unchanged, and `check_position_health` returned `[]`.
 - Direction (not a fix): Treat an unpriced held position as an event. Track price age, alert when it exceeds a limit, and consider using the broker's own position prices as the monitoring source.
+- Verification: Confirmed: traced `_tick` → `_run_market_monitoring` independently and re-ran `update_prices({})` then `check_position_health` on a made-up position (price unchanged, no alert, while a real 20% drop does alert); no broker sync or price-age check exists on the monitoring path, so the separately placed broker stop order is the only protection during an FMP failure.
 
 ### F-06-02: Buy size and stop price are computed from the analysis-time price, which is never refreshed
 - Severity: High
@@ -167,6 +168,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: Worked example with a 100,000 portfolio and conviction 8 (7% target): stored price 100 gives 70 shares and a stop at 93.00. If the stock opens at 115, the position costs 8,050 (8.05%, not 7%), the stop is 19.1% below the real entry (the intended range is 7-12%), and the ledger records an entry of 100. If it opens at 90, the stop price of 93 is above the market and the in-process check sees a breach at the next cycle.
 - How verified: Read the path. Ran `RiskManager.calculate_position_size(100000, 100.0, 8)` → 70 and `get_stop_loss_price(100.0, None)` → 93.0, then did the arithmetic above.
 - Direction (not a fix): Take a fresh price immediately before sizing, refuse the trade if it has moved beyond a tolerance, and base the stop on the fill.
+- Verification: Confirmed: `_execute_signals` uses `signal.entry_price` whenever it is above zero, with no fresh quote, age limit or tolerance check before sizing and stop calculation, and signals queued on Sunday evening or pre-market reach it at the next open; the worked numbers check out (the recorded entry is later corrected by the next Alpaca sync, the size and the broker stop price are not).
 
 ### F-06-03: A TipRanks API key and token are committed in this public repository, and the `.env` override is not connected
 - Severity: Critical (exposed credential, per the playbook scale; it is a data-vendor credential and cannot place orders)
@@ -177,6 +179,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: Anyone can use the credential. Replacing it requires a code change, and deleting the lines does not remove them from history, so the current values have to be treated as compromised.
 - How verified: Search across the repository. Set both environment variables to test strings, reloaded `config` and `tipranks_client`: `Config` picked them up, `_headers()` did not.
 - Direction (not a fix): Rotate the credential at TipRanks, load it only from the environment with an empty default, and disable the feature when it is absent.
+- Verification: Confirmed: non-empty string literals are assigned to `TIPRANKS_API_KEY` and `TIPRANKS_API_TOKEN` at `stock_agent/tipranks_client.py:18-19` and repeated as the environment defaults at `stock_agent/config.py:194-195`, `_headers()` reads only the module constants, the client is reached from `scheduler.py` through `_load_tipranks_data`, and git history shows the names introduced in the two cited commits (location and names checked only; the values were not used or tested).
 
 ### F-06-04: Sector names come from two different vocabularies, so the 40% sector cap under-counts; a failed lookup skips the cap
 - Severity: High
@@ -202,6 +205,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - How verified: Ran `RiskManager.can_open_position` on a made-up 100,000 portfolio with two holdings labelled "Financials" and two labelled "Financial Services" (56% in total): a further "Financial Services" buy was allowed. With one consistent label it was blocked ("at 56.0% >= limit 40%"). With the sector at 70%, the same buy was blocked when passed "Financial Services" and allowed when passed "Unknown". `sync_from_alpaca` on four made-up rows assigned "Financials", "Consumer Discretionary", "Technology" and "Unknown".
 - How often the fallback map is used: on every position imported by `sync_from_alpaca`, on every start-up for positions marked "Unknown" (map first, FMP second), and inside the risk check for "Unknown" positions. The actual count needs the droplet's ledger.
 - Direction (not a fix): One sector vocabulary, one place that assigns it, and a blocked trade rather than a skipped check when the sector is not known.
+- Verification: Confirmed: reproduced independently with `can_open_position` on made-up holdings (three positions labelled "Financials" at 42% of the portfolio: a new buy passed as "Financial Services" or as "Unknown" was allowed, the same buy passed as "Financials" was blocked), and the cluster cap did not catch it either because it sat below its own 48% limit; the split only arises once a position has been imported from Alpaca or back-filled from the map, which needs the droplet ledger to count.
 
 ### F-06-05: A failed macro quote is scored as zero, which can flip the market regime, change the conviction bar and trigger a full trading cycle
 - Severity: High
@@ -221,6 +225,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: A provider hiccup on one symbol can loosen or tighten the buy threshold and start an unplanned cycle that spends LLM budget and places orders. When the quote returns 30 minutes later the regime flips back, which is a second event.
 - How verified: Ran `_compute_regime` on hand-built snapshots. All zeros: NORMAL, score 0. S&P 6700, VIX 14, TLT 84: CAUTIOUS, score 4, minimum conviction 8; the same with the S&P quote missing: NORMAL, score 2. S&P 6250, drawdown 5.5%, VIX 20, TLT 84: NORMAL, score -2; the same with the TLT quote missing: DIP_OPPORTUNITY, score -3, minimum conviction 6.
 - Direction (not a fix): A snapshot with a missing input should not replace the previous regime or count as a regime change.
+- Verification: Confirmed: re-ran `_compute_regime` with my own inputs (a full set scoring AGGRESSIVE_DEPLOY became NORMAL with the S&P quote missing) and re-checked the auditor's examples, and traced `check_conditions` being called every 30-minute monitoring pass through `_check_for_market_event`, where any regime difference starts the full re-analysis, buy and options cycle with only a 30-minute cooldown; how often a macro quote actually fails is still unknown.
 
 ### F-06-06: The TipRanks clause on the sell path refers to a lookup that does not exist, so every completed sell is announced as a failed sell
 - Severity: Medium (the order and the ledger are correct; the alerts are wrong)
@@ -259,6 +264,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: Either the AI is shown a growth-adjusted ratio under the name "Forward P/E", or it is asked to score "Valuation" and "Analyst Sentiment" (`screener.py:117-119`) with those fields missing. Both shape which stocks reach deep analysis. Missing fields are omitted from the prompt, so the model cannot tell missing from not applicable. The macro brief would show every day-change as +0.0%.
 - How verified: Ran `get_company_fundamentals` with stubbed responses. With old-style field names the screener block showed `P/E: 30.0` and `Forward P/E: 1.8` (the 1.8 was supplied as the PEG value). With the field names I believe `/stable` uses, these were empty: `pe_ratio, forward_pe, pb_ratio, ps_ratio, ev_ebitda, roe, roic, debt_to_equity, analyst_target_price`, and peers was `[]`. With an error object on `/profile` the result was `name='AAA', sector='Unknown', market_cap=0.0, price=0.0`. With `changePercentage: -2.5`, the macro snapshot and `get_stock_quote` reported 0 and `get_batch_quotes` reported -2.5.
 - Direction (not a fix): Capture one real response per endpoint, map fields against it with tests, and drop the calls nothing uses.
+- Verification: Unclear: the code-level claims hold, but only one mislabelled field ("Forward P/E" filled from a PEG ratio) can reach a prompt (`revenue_ttm`, `net_income_ttm`, `fcf_ttm` and `analyst_rating` are never read by `screener.py` or `analyst.py`), and that mislabel and the "valuation fields are empty" claim cannot both be true at once, so which one the bot actually suffers from, and the High rating, depend on real FMP `/stable` response field names that nobody has captured. Suggested severity: Medium until one saved response per endpoint settles it.
 
 ### F-06-09: A failed universe screen is invisible, and the screen never covers all the sectors it asks for
 - Severity: Medium
@@ -304,6 +310,7 @@ During a fundamentals sweep the rate is about 220 FMP calls a minute (measured w
 - Why it matters: In the null case every later valuation raises until a good quote arrives, and a restart in that window (any merge to `master` causes one) starts the bot from an empty ledger with the default 100,000 cash.
 - How verified: Zero: position value 1,000 → 0, portfolio 1,500 → 500, no stop alert. Null: `update_prices` raised `TypeError`; `get_portfolio_value`, `check_position_health` and `can_open_position` then raised too. After two further saves, a fresh `Portfolio` logged "Failed to load portfolio state" and came up with 0 positions and cash 100000.
 - Direction (not a fix): Validate a price before it enters the ledger; reject zero, null and non-numeric values and treat them as a missing quote.
+- Verification: Unclear: every step of the consequence chain reproduces with made-up inputs (zero hides the position from the stop check; null raises in `update_prices`, aborts the monitoring pass with only a log line, and is written to `portfolio.json`), with the correction that the `.bak` copy still loads after the first bad save and the empty-ledger restart needs two saves in the bad state, but nothing shows that FMP `/quote` ever returns a zero or null `price` for a held symbol. Suggested severity: Medium until a real zero or null quote is evidenced.
 
 ### F-06-13: No retries, no cache and no request budget; whole bundles are re-fetched for one field; slow responses stall the single loop
 - Severity: Medium

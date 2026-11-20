@@ -290,6 +290,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
 - How verified: Read the script and scheduler; `git log` on `origin/master`.
 - Direction (not a fix): Deploys at a chosen time, gated on checks, with the
   pending work surviving a restart (area 01).
+- Verification: Confirmed: the updater compares commit hashes only, `_pending_signals` and every "done" marker except the weekly one (which is read from the saved portfolio, `scheduler.py:255-259`) exist only in memory, and `origin/master` has no `.github/` or `tests/`; the count of market-hours commits is understated (about twenty by committer date, not four), and this holds only if the cron updater is really what restarts the bot on the server (see F-09-09).
 
 ### F-09-08: `.env.example` is 88% another bot's settings, and one leftover changes a stock risk limit
 - Severity: Medium
@@ -347,6 +348,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
 - How verified: Read the historic files. Server state not checked.
 - Direction (not a fix): Inspect the server, remove what is left, restore
   `/root` permissions, close port 80.
+- Verification: Unclear: the history is exactly as described (old `setup.sh` lines 7, 47-66, the two self-resetting units, the passkey-protected `set_env` and `deploy` endpoints) and no current script removes any of it, but whether anything is still installed, running or listening on the droplet cannot be told from the repository and decides whether this is Low or Critical; the `system/`, `network/` and `deploy/` sections of a `scripts/vps_snapshot.sh` archive would settle it.
 
 ### F-09-10: API keys are written to the server log on every request
 - Severity: Medium

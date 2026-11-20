@@ -445,6 +445,7 @@ a held position that are skipped with a log line only).
 - Direction (not a fix): Reads that feed money decisions need a distinct
   "failed" result that stops the action and raises an alert. The trading
   consequences belong to areas 03, 04 and 07 (see Handoffs).
+- Verification: Confirmed: re-ran item 1 with a mock transport (account read succeeds, positions read returns 503, every local position is dropped with no alert; when both reads fail the sync is skipped correctly) and read items 2 to 9, which behave as described but were not re-run; item 1 is reachable only from the weekly and midweek cycles, item 2 from every options scan.
 
 ### F-08-07: Things that happen at the broker never produce an alert
 - Severity: Medium
