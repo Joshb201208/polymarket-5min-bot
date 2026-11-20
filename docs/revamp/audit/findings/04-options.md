@@ -229,6 +229,7 @@ expiry.
   supports it; otherwise confirm the first leg is filled before sending the
   second and unwind if the second fails. Judge success per leg, from the
   order's final status.
+- Verification: Confirmed: reachable from `scheduler.py:182-184` and `:1688` with no guard on the way, and an independent run with a rejecting stub returned `(None, None)`, which is truthy, so `if order:` at `scheduler.py:1486` records the spread whatever happened to either leg, and a spread with one live leg is then dropped from the ledger by `sync_from_alpaca` while that leg stays at the broker; whether the broker would accept a lone short leg was not checked.
 
 ### F-04-02: Nothing ever closes an option; positions run to expiry and can become stock positions that no limit covers
 - Severity: Critical

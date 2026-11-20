@@ -190,6 +190,7 @@ through the in-memory `_pending_signals` list when the market opens
 - Direction (not a fix): Before any behaviour change, add tests with a fake
   broker around the five functions named in F-10-15, and decide whether a
   failing check should be able to stop a deploy.
+- Verification: Confirmed: the three test files import only `Config`, three models, `RiskManager` and options constants (136 tests pass, none touches `scheduler.py`, `executor.py`, `portfolio.py` methods or any order path), tests first appear in `ff6fdc7`, and `ci.yml:4-5` states the deploy does not wait for CI; High holds only because the untested sell path already carries a live bug (`scheduler.py:1349` reads an attribute that is never set).
 
 ### F-10-02: Every sell ends in an `AttributeError` after the order is sent; the bot then reports "Sell failed"
 - Severity: Medium
@@ -282,6 +283,7 @@ through the in-memory `_pending_signals` list when the market opens
   (`scheduler.py:182-184`, `1685-1688`).
 - Direction (not a fix): One source of truth for each limit, and a switch
   that is checked where the options scan starts, with a test that proves it.
+- Verification: Confirmed: an independent search finds no reader of any `OPTIONS_*` name outside `config.py` and the tripwire test, `_should_run_options_scan` (`scheduler.py:224-236`) and both call sites (`:182-184`, `:1685-1688`) have no enabled check, and the engine's own constants (`options_engine.py:52-73`) are what apply; the write-up says two settings disagree but its own table correctly shows three (reward-to-risk, spread widths, covered-call maximum DTE).
 
 ### F-10-04: A failed network call returns the same thing as "nothing there", and callers act on it
 - Severity: High
@@ -333,6 +335,7 @@ through the in-memory `_pending_signals` list when the market opens
   all wrappers. Overlaps areas 03 and 04, which own the money consequence.
 - Direction (not a fix): Broker reads need a result that says whether the
   call worked; reconcile must refuse to run on a failed read.
+- Verification: Confirmed: no guard exists between `get_option_positions` returning `[]` on any error (`options_executor.py:283-291`) and `sync_from_alpaca` closing every ledger position (reproduced offline with two made-up positions: both closed, a full loss booked, count and exposure reset to 0), and the equity sync skips only when the account call also failed (`scheduler.py:818`). Suggested severity: Critical, because the options reconcile never re-imports broker positions and the position-count and exposure caps are computed from the wiped ledger (`options_portfolio.py:817-824`, `options_engine.py:128-145`), so later scans can open positions beyond the intended limits; rate consistently with F-03-04 and F-04-04, which describe the same defect.
 
 ### F-10-05: `Config` is read once at import, checks nothing, and its `MODE` setting is only a label
 - Severity: Medium
@@ -596,6 +599,9 @@ through the in-memory `_pending_signals` list when the market opens
   volatility stop (F-10-07), "Minimum conviction is 7" (6 in two macro
   regimes, `macro_monitor.py:337,342`), and reconciling "before risk checks"
   (two of five buy paths, F-10-08).
+- Evidence: the table above; each row cites the line making the claim and
+  the line that contradicts it. No Anthropic, `dotenv`, or rebalancing code
+  is found by searching `stock_agent/`.
 - Why it matters: Josh reads these to understand his bot, and every AI
   session reads them as ground truth before changing code. The ELI5 Discord
   post tells readers a safety net that is not the one in force.

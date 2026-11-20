@@ -298,6 +298,7 @@ Collected in F-05-16.
 - Why it matters: The exit decision for a position worth up to 15% of the account rests on a single sample from a web-searching model whose answer is not repeatable (F-05-08). Asking again and again and acting on the first SELL makes a sale far more likely than any single judgement implies. One odd pass could sell every holding, since nothing counts or limits sells per run.
 - How verified: Read each path end to end. Ran `_parse_thesis` with made-up replies: `"SELL"` and `"Sell"` give SELL; `"STRONG SELL"` does not sell. Listed the monitoring slots that pass the `hour % 2` rule: 10:00, 10:30, 12:00, 12:30, 14:00, 14:30, 16:00.
 - Direction (not a fix): Decide what evidence a thesis-based sale needs (for example agreement of two independent replies, a conviction or `thesis_change` threshold, or Josh's confirmation), remember which events were already judged, and cap sells per run.
+- Verification: Confirmed: all four sell paths are reached from `_tick` and go from `direction == "SELL"` straight to `_execute_sell` with no conviction, `thesis_change`, count or market-hours test in between; the one caveat is that whether Alpaca then accepts the order while the stop is resting is F-03-02's open question, so this finding describes what the bot sends, not what is guaranteed to fill.
 
 ### F-05-02: A sell decided before the market opens is logged as "queued" and then dropped
 - Severity: High
@@ -319,6 +320,7 @@ Collected in F-05-16.
 - Why it matters: The scan exists to react to overnight news, and its only possible reaction is lost. The next event check is the 10:00 monitoring run, half an hour after the open, and a sale then needs both model calls to give the same answers again. Until then only the stop-loss protects the position.
 - How verified: Traced the schedule window against `_is_market_open`; confirmed nothing else stores a pending sell.
 - Direction (not a fix): Either carry the decision to the open or remove the path. Whichever is chosen should follow from the decision on F-05-01.
+- Verification: Confirmed: `now` is fixed at scan start inside the 08:00-09:00 window so `_is_market_open(now)` is always false there, the `else` branch only logs, and nothing else stores a sell; the position can still be sold later only if the 10:00 monitoring check happens to get the same two model answers again.
 
 ### F-05-03: Position size is set by the model's score plus up to five bonus points for data the model already saw
 - Severity: High
@@ -344,6 +346,7 @@ Collected in F-05-16.
 - Why it matters: Conviction sets size (5/7/8/10% of the account). A stock the model rated below the bar can be bought, and one it rated a marginal 7 can be bought at the largest size, on the strength of add-ons that double-count inputs and misread routine insider filings. Downward moves are smaller (at most -3) and TipRanks never contributes to them.
 - How verified: Ran `adjust_conviction_with_tipranks`, `adjust_conviction_with_sentiment`, `adjust_conviction_with_analysts`, `_normalise_insiders`, `build_tipranks_lookup` (with a fake fetch) and `RiskManager.calculate_position_size` on made-up inputs. Not verified against a real Finnhub response.
 - Direction (not a fix): Decide whether outside scores inform the model (in the prompt) or adjust its answer (after it), not both; cap the total adjustment; keep the raw number; make insider rules look at the transaction code.
+- Verification: Confirmed: re-ran the three functions in scheduler order and got the same table (2 to 7, 5 to 10, at most +5), and the adjusted number is the one tested at `scheduler.py:984` and used for sizing; limits on the claim are that the reply must still say BUY, the result stays inside the 5-10% tiers and under the 15% cap, the full +5 needs all three sources to line up, and only the weekly and mid-week paths can get the TipRanks points (the event scan passes no TipRanks data, the daily and earnings paths apply no adjustments).
 
 ### F-05-04: Failed or oddly shaped model replies are read as "nothing to do", and nobody is told
 - Severity: High
@@ -361,6 +364,7 @@ Collected in F-05-16.
 - Why it matters: The research half of the bot can be dead for weeks while the process stays up, positions are held, and reports look normal. During that time no thesis-based exit can happen and no new idea is found. "The call failed" and "the model looked and found nothing" are different facts and the bot cannot tell them apart.
 - How verified: Read the failure paths; replayed the event gate with made-up replies. Whether this has happened on the droplet needs logs (see "Could not verify").
 - Direction (not a fix): Count failures per run and alert when a run could not analyse most of its symbols; do not mark a run complete when research did not happen; make the event check return "unknown" on failure, and parse its fields tolerantly.
+- Verification: Confirmed: every Perplexity failure path returns `None` or `{"material_event": False}`, the callers skip silently, the weekly run still reaches `set_last_weekly_analysis` at `scheduler.py:465`, and the only trace is `logger.error` lines in the service log (`__main__.py` installs no handler that forwards errors to Telegram or Discord).
 
 ### F-05-05: The ranking step trusts the small model's output completely; one malformed element aborts the whole cycle
 - Severity: Medium
