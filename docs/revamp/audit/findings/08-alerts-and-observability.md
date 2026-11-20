@@ -234,6 +234,7 @@ a held position that are skipped with a log line only).
 - Direction (not a fix): Bookkeeping and notification after an accepted
   order must not be able to turn it into a "failed" message. Report the
   order outcome and the notification outcome separately.
+- Verification: Confirmed: `_tipranks_lookup` appears once in the repository (the read at `scheduler.py:1349`) with no assignment and no `__getattr__`, and an independent run of `_execute_sell` with fakes placed the sell, updated the ledger, then sent only the two "Sell failed" messages; all five call sites are live from the tick.
 
 ### F-08-02: Nothing watches the bot, so a dead, stuck, or mis-configured bot is silent
 - Severity: High
@@ -274,6 +275,7 @@ a held position that are skipped with a log line only).
 - Direction (not a fix): A check that lives outside the process and messages
   Josh when the bot stops checking in, plus a startup self-test that refuses
   to run quietly without working broker and alert credentials.
+- Verification: Confirmed: no heartbeat, watchdog or outside check exists in `stock_agent/`, `deploy/` or the unit file, both alert senders return quietly when unconfigured, and the only liveness sign is the "started" message sent after construction; whether an outage has gone unnoticed on the droplet is not checked here.
 
 ### F-08-03: The Telegram bot token and the FMP and Finnhub keys are written to the system log on every request
 - Severity: High
@@ -309,6 +311,7 @@ a held position that are skipped with a log line only).
   (quiet the HTTP library's request lines, do not log exception text that
   embeds the URL), then rotate the three credentials, since they are already
   in the journal.
+- Verification: Confirmed: an independent run with made-up keys and a mock transport, using the same `basicConfig` call, printed the Telegram token in the URL path and the FMP and Finnhub keys in the query string on every `httpx` INFO line and again in the bot's own ERROR lines, and nothing in the code lowers the `httpx` logger; the exposure is the droplet's root-only journal (the snapshot script scrubs these shapes), the broker keys travel in headers and are not logged, and the droplet's `httpx` version and journal contents are not checked.
 
 ### F-08-04: A rejected order or a rejected stop-loss order reaches only the system log, and the buy alert still shows a stop price
 - Severity: High
@@ -359,6 +362,7 @@ a held position that are skipped with a log line only).
   a must-act alert on the channel Josh actually watches, and the buy alert
   states whether the stop is really in place. What the bot should do about
   the position is for area 03.
+- Verification: Confirmed: read independently, `place_buy` returns the buy result whether or not the stop order was accepted, the buy, sell and options call sites only log on a refused order, the buy alert prints the computed stop level regardless, and nothing in the scheduler ever reads open orders to notice a missing stop.
 
 ### F-08-05: The 30-minute stop-loss check can fail or go blind with no alert
 - Severity: High
@@ -395,6 +399,7 @@ a held position that are skipped with a log line only).
 - Direction (not a fix): The monitor should know the difference between
   "checked, all fine" and "could not check", and say so to Josh when it
   could not check.
+- Verification: Confirmed: read independently, the monitoring handler at `scheduler.py:1100-1101` only logs so the main-loop alert is never reached, and a failed quote read returns `None`, leaves prices unchanged, triggers no stop and still logs "Market monitoring complete"; a broker stop order, where one was accepted, still works during such a gap, so the blind spot is the bot's own check and any position without a resting stop.
 
 ### F-08-06: Thirteen catch-alls turn a failed read into "nothing there" and the bot carries on
 - Severity: High

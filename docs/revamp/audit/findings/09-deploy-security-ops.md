@@ -109,6 +109,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
 - Direction (not a fix): Revoke all three first; removing them from the files
   does not un-publish them. Then credentials come only from `.env`, with empty
   placeholders in the example file.
+- Verification: Confirmed: non-placeholder values of the stated shapes sit at all four locations on `origin/master` (the Telegram line matches the bot-token format, the TipRanks pair is identical in both files and is what `tipranks_client.py:25-31` sends regardless of environment, `.mcp.json` is still tracked there), though whether any of them still works was deliberately not tested.
 
 ### F-09-02: Older credentials and server details remain in the public history
 - Severity: Medium
@@ -173,6 +174,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
   `Config`, `Executor._url` and the options constants under each setting.
 - Direction (not a fix): One explicit switch, a refusal to start when the mode,
   address and account type disagree, and one address used by shares and options.
+- Verification: Confirmed: `MODE` has exactly five readers, all log or alert text, share orders follow `ALPACA_BASE_URL` alone (`executor.py:32`), every options trading call uses the hard-coded paper address, and no start-up check compares mode, address and account; nothing can go wrong from this while only paper keys are on the server, as the severity line already says.
 
 ### F-09-04: A deploy is never checked; failures are logged as success and a crash loop is silent
 - Severity: High
@@ -203,6 +205,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
 - Direction (not a fix): One deploy path that stops on the first error,
   confirms the bot is running afterwards, goes back to the last good commit if
   not, and tells Josh either way.
+- Verification: Confirmed: `auto_update.sh` has no `set -e` and checks no exit status after the fetch, so lines 13-19 always run to "Update complete", and a failure at import or in `StockAgentScheduler.__init__` happens before the only start-up alert (`scheduler.py:113-119`) with no `OnFailure`, start limit or health check anywhere in `deploy/` to catch it.
 
 ### F-09-05: The bot cannot start unless GitHub answers at that moment
 - Severity: High
@@ -237,6 +240,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
   remote and the stale lock.
 - Direction (not a fix): Starting the bot should not depend on the network;
   updating the code should be a separate step from starting it.
+- Verification: Confirmed: both `ExecStartPre` lines lack the `-` prefix that would let a failure pass, so a failed fetch or reset blocks `ExecStart` and the 30-second retry never reaches systemd's default start limit, and I reproduced the `rev-parse` quirk that lets the guard at `auto_update.sh:11` pass when `origin/master` does not exist; a plain GitHub outage alone is short and self-healing, so the High rating rests on the stale-lock, renamed-branch and private-repository cases, which need a person to fix.
 
 ### F-09-06: Stopping the bot does not stick, and there is no "no new orders" switch
 - Severity: High
@@ -259,6 +263,7 @@ never imported, so the README Quick Start (`README.md:7-11`, "cp .env.example
   two flags.
 - Direction (not a fix): A documented stop that also holds off the updater, and
   a real pause for new entries that leaves exits running.
+- Verification: Confirmed: `systemctl restart` at `auto_update.sh:18` starts a stopped (or disabled) unit, the cron line is untouched by a stop, the shutdown flag is only checked between ticks around an uninterruptible `asyncio.sleep(60)` (`scheduler.py:127-142`), and `OPTIONS_ENABLED` has no reader outside `config.py:201` and the test fixture list.
 
 ### F-09-07: Every change to `master` restarts the bot as root at an arbitrary moment, unreviewed
 - Severity: High
