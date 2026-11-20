@@ -242,6 +242,7 @@ to rebuild trade history, the equity curve, or any options position.
   print(asyncio.run(op.sync_from_alpaca([{"symbol": "AAA300118C00100000"}], [], 100000)))  # still_open: 0
   ```
 - Direction (not a fix): A failed broker read must be distinguishable from an empty account and must leave the ledger untouched; the options ledger also needs an import path so it can be rebuilt from the broker.
+- Verification: Confirmed: reproduced with made-up positions (an empty list closed both, count and exposure went to 0, a later good list restored nothing, and the only code that adds an open option position is `open_position` at `options_portfolio.py:177`), and no guard exists between `get_option_positions()` returning `[]` on error and the reconcile; additionally, when the fills call succeeds while the positions call fails, the position's own opening fill is read as its closing fill (`options_portfolio.py:485-506`), which booked +300 on my sample instead of -250.
 
 ### F-07-03: The stock sync treats an empty positions list as truth and throws away what only the bot knew
 - Severity: High
@@ -267,6 +268,7 @@ to rebuild trade history, the equity curve, or any options position.
   # 7 Imported from Alpaca — awaiting re-analysis. True 95.0
   ```
 - Direction (not a fix): Make "the request failed" a different result from "the list is empty", and keep local-only facts (thesis, entry date) keyed by symbol so a drop and re-import does not erase them.
+- Verification: Confirmed: reproduced (`sync_from_alpaca([], account)` dropped every position and the re-import came back as HOLD, conviction 7, placeholder summary, entry date now, sector "Unknown"), and the guard at `scheduler.py:818` only skips when the account call also failed; High is right rather than Critical because both syncs that can wipe run at 18:00 with the market closed and the 08:15 brief re-imports before queued buys execute at the open, though a re-imported position whose sector stays "Unknown" is no longer counted toward its sector's 40% cap (`risk_manager.py:78-88`).
 
 ### F-07-04: Queued buy signals and all once-a-day markers exist only in memory
 - Severity: High
@@ -278,6 +280,7 @@ to rebuild trade history, the equity curve, or any options position.
 - Why it matters: A merge on Sunday night or Monday before 09:30 ET silently cancels the week's buying after the research cost has been paid. Duplicate daily summaries put a zero-change point into the equity curve; repeated scans spend API budget and can place further option orders.
 - How verified: Traced every read and write of `_pending_signals` and each flag; confirmed nothing in `PortfolioState` holds them.
 - Direction (not a fix): Persist pending decisions and "done" markers with the rest of the state, with an expiry so stale signals are not executed late.
+- Verification: Confirmed: `_pending_signals` and every once-a-day marker are plain attributes set in `__init__` with no save or load anywhere, the weekly marker alone is persisted, and every push to `master` restarts the service; one overstatement is "never happen", since the Wednesday run repeats the full analysis and the daily pre-scan can queue conviction 8+ names, so lost Sunday buys are delayed by days or partly replaced rather than certainly gone.
 
 ### F-07-05: A null or zero price from the quote source goes straight into the ledger
 - Severity: High
@@ -302,6 +305,7 @@ to rebuild trade history, the equity curve, or any options position.
   ```
   With price `0` on a 100-share, $100 position: portfolio value went from 100000 to 90000.
 - Direction (not a fix): Validate external numbers before they touch state, and never let a pricing error for one symbol stop the checks for the others.
+- Verification: Confirmed: the mechanism reproduced end to end (a null price raised in `update_prices`, left `None` in memory, later positions in the list were not repriced, two ordinary saves wrote the null to both files without error, and a restart then loaded 0 positions and cash 100000; a zero price is skipped by the stop check and cuts portfolio value), but whether the quote source ever returns null or zero for a held symbol could not be tested without calling it, so the High rating holds only if that happens.
 
 ### F-07-06: The trade history is the bot's guess, not what happened at the broker
 - Severity: Medium
