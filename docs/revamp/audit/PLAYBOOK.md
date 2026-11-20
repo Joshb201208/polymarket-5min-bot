@@ -163,7 +163,8 @@ plans; each area runs in its own thread with its own copy of the repository.
 Used in a single cloud session or a local session, where `/audit` and the
 subagents in `.claude/agents/` are available.
 
-1. Create branch `audit/full-dig`.
+1. Create branch `audit/full-dig` from `master`, or from the setup branch
+   if the setup is not merged to `master` yet.
 2. Launch one `auditor` subagent per area brief, in parallel where possible.
    Each writes its own findings file and returns a short summary.
 3. Run the verification and synthesis steps below in the main session.

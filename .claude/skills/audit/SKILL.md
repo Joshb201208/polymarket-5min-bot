@@ -15,8 +15,11 @@ If nothing was given above, treat it as `all`.
    which phase the repo is in.
 2. Read `CLAUDE.md` and `docs/revamp/audit/PLAYBOOK.md` in full. The playbook
    is the authority; this skill only sequences it.
-3. Make sure you are on branch `audit/full-dig`, created from an up-to-date
-   `master`. Never work on `master`.
+3. Make sure you are on branch `audit/full-dig`. Create it from an
+   up-to-date `master` if `docs/revamp/audit/PLAYBOOK.md` exists there. If it
+   does not (the setup pull request is not merged yet), create it from the
+   branch this session started on and remember that branch name: it is the
+   base for the audit pull request. Never work on `master`.
 4. Note the commit being audited (`git rev-parse --short HEAD`) so every
    findings file records it.
 
@@ -47,7 +50,9 @@ If an area number was given:
 5. Commit everything under `docs/revamp/audit/` on `audit/full-dig`, push,
    and open one **draft** pull request titled
    `docs(audit): full audit of the stock agent`. The description is the
-   "Bottom line" and "Decisions for Josh" sections of `AUDIT.md`.
+   "Bottom line" and "Decisions for Josh" sections of `AUDIT.md`. The base
+   is `master`, or the setup branch noted in the checks above if the setup is
+   not merged yet, so the pull request shows only audit documents.
 6. Stop. Tell Josh the audit is ready to read, give him the pull request
    link, and list the decisions that need his answer. Do not start a plan, do
    not change the phase, and do not fix anything.
