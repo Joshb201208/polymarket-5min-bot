@@ -191,6 +191,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: Either exits fail silently, or a stop-out can turn into an unmonitored short position with no stop. Both are outside any limit the bot has.
 - How verified: Read every call path into `place_sell` and searched for callers of the cancel and open-order helpers. Ran `Portfolio.sync_from_alpaca` with a negative-quantity position. The broker's response to each case was not tested (no API calls allowed); that is the untested link.
 - Direction (not a fix): One owner for the stop. Before any bot-initiated sell, read the broker's position and open orders for that symbol, cancel what rests, and sell only what is held.
+- Verification: Confirmed: read independently, all four `_execute_sell` call sites reach `place_sell` for the ledger's full share count with no cancel and no broker read (the cancel and open-order helpers have zero callers), no reconcile runs between a broker stop fill and the next 30-minute pass, and a negative-quantity broker position is skipped by `sync_from_alpaca` (re-ran it); the one untested link is the broker's own response, so which bad branch occurs (exit refused, or sell of shares no longer held) is still unknown, but no branch is safe.
 
 ### F-02-02: Risk checks run on the bot's own ledger, which is not matched to the broker at the moment of the order
 - Severity: High
@@ -207,6 +208,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: A symbol the ledger has lost is treated as new and bought again at full size. That is the mechanism of the past incident; it is narrower now but still open. In the normal schedule the morning brief repairs the ledger before 09:30, so a breach needs a second failure (brief skipped or its account call failing).
 - How verified: Traced all five call sites of `_execute_signals` and all three reconcile sites; ran the wipe case with made-up data.
 - Direction (not a fix): Reconcile inside the buy path, immediately before the checks, and refuse to buy when the broker read fails rather than falling back.
+- Verification: Confirmed: `_execute_signals` has no broker read, the only reconciles are the Sunday/Wednesday start-of-run sync and the conditional one inside the 08:15-08:45 morning brief, the market-event buy path has none, and re-running `sync_from_alpaca([], account)` wiped a two-position ledger so a held symbol passed as new; one detail is overstated (unfilled orders are counted, because the ledger books each buy as soon as the order is accepted), and in the normal schedule the morning brief repairs the ledger before 09:30, so an actual over-buy needs that brief to be skipped or to fail.
 
 ### F-02-03: Sector, cluster and total-exposure caps test the portfolio before the order; the sector "soft block" does nothing
 - Severity: High
@@ -221,6 +223,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: The real ceilings are about 50% per sector and 58% per cluster, not 40% and 48%. The overshoot is bounded at one position per cap for new buys; top-ups add to it (F-02-04).
 - How verified: Ran `can_open_position` and `calculate_position_size` with made-up portfolios either side of each cap.
 - Direction (not a fix): Test the portfolio as it would be after the order, and either shrink the order to fit or reject it.
+- Verification: Confirmed: re-ran `can_open_position` with made-up portfolios and got the same results (sector at 39.6% allowed and 49.6% after a conviction-10 buy, blocked only at 40.0%; semiconductor cluster at 47.5% allowed, blocked at 48.0%), and the outer sector test at `risk_manager.py:90` has no return of its own; the overshoot is limited to one new position per cap because each buy is booked in the ledger before the next signal is checked.
 
 ### F-02-04: Top-ups skip the sector, cluster, exposure and cash checks, and are not deducted from cash in the ledger
 - Severity: High
@@ -235,6 +238,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: Top-ups can push a sector or cluster further over its cap and can be made with no cash. Each one also makes every later order in the batch slightly too large.
 - How verified: Read the path; ran both proofs above.
 - Direction (not a fix): Run the same portfolio-level checks for top-ups, and make the ledger treat a top-up exactly like a new buy for cash.
+- Verification: Confirmed: reproduced both proofs (a top-up is allowed with negative cash and 105% exposure while a new name in the same portfolio is blocked; through the real `_execute_signals` with fakes, an 80-share top-up left cash untouched and the next conviction-10 buy was sized at 108 shares instead of 100); the reach is top-ups from the weekly, midweek and market-event runs only (the pre-market and earnings scans skip held symbols), and each top-up is limited to bringing that one symbol up to its conviction target.
 
 ### F-02-05: There is no working cash or total-exposure limit, so the bot can buy with borrowed money
 - Severity: High
@@ -250,6 +254,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: On a margin account the broker fills these orders with borrowed money, which is leverage nobody chose. On a cash account the broker rejects them instead. Either way the bot does not know its own limit. Once exposure passes 100% new positions stop, but top-ups do not (F-02-04).
 - How verified: Ran the functions with made-up portfolios; read the deploy files; checked git history for the default.
 - Direction (not a fix): Decide the intended maximum invested share and whether borrowing is ever allowed, then check the full order cost against cash (or broker buying power) after the trade.
+- Verification: Confirmed: re-ran the checks (with $150 of cash a 99-share, $9,900 order is allowed; blocked only once cash is zero or below), the 1.00 default and its stale "# 50%" comment are at `config.py:51`, and commit 7d4e34a did move it from 0.50; for new positions the borrowing is limited to roughly one position past 100% before the exposure test starts blocking, and whether the droplet's settings file still carries the old 0.50 line, and whether the account allows margin, remain unknown without a snapshot.
 
 ### F-02-06: Queued buys use the price from analysis time for sizing, for the stop, and as the recorded entry price
 - Severity: High
@@ -264,6 +269,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: After a gap down the bot buys and then tries to sell in the same minute, recording a loss it did not make and a same-day round trip (F-02-13). After a gap up it overspends and the stop is much looser than intended. The earnings-reactive scan is the most exposed, because it picks stocks that have just reported.
 - How verified: Read the path; ran both cases.
 - Direction (not a fix): Re-quote at order time, drop the signal if the price has moved beyond a set tolerance or the signal is too old, and base the stop on the actual fill.
+- Verification: Confirmed: all three signal builders set the price from the fundamentals fetched at analysis time, `_execute_signals` only re-quotes when that price is zero or missing, and re-running it with fakes (signal at $100, market at $91) produced a 50-share order with a $93 stop, a ledger entry price of $100, and a stop-loss alert on the very next price update; nothing in the path checks the signal's age.
 
 ### F-02-07: The macro regime lowers the minimum conviction to 6 during sell-offs
 - Severity: High
@@ -281,6 +287,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: The bar drops exactly when prices are falling, and with no effective exposure limit (F-02-05) the bot can fill up on weaker ideas in one morning. A data outage silently cancels the stricter "cautious" setting.
 - How verified: Ran `_compute_regime` and the getters with made-up snapshots; ran sizing for conviction 6.
 - Direction (not a fix): Josh decides whether 7 is a hard floor. If it is, enforce it in one place the regime cannot override.
+- Verification: Confirmed: re-ran `_compute_regime` (drawdown 8.5% with VIX 26, or the index under the hard-coded 6,200 with VIX 18, both score -3 and set the minimum to 6; all-zero quotes give the normal 7), the only buy gate that uses it is `scheduler.py:984` in the weekly, midweek and market-event analysis (the pre-market and earnings scans keep a fixed 8), and conviction 6 is sized at 5% like a 7; this is deliberate, announced behaviour rather than a defect, so what it needs is a decision from Josh, and every other cap still applies to these buys.
 
 ### F-02-08: Exits decided while the market is closed are either dropped or booked as if already filled
 - Severity: High
@@ -294,6 +301,7 @@ only displayed in the morning brief (`scheduler.py:1867`); the screener uses
 - Why it matters: The exit the bot judged most urgent is missed; the next chance is a fresh pair of AI calls at 10:00 or later that may not agree. For the evening sells, the ledger shows cash the account does not have yet, and the next reconcile re-imports the position as a placeholder.
 - How verified: Read each call site and the schedule windows.
 - Direction (not a fix): A real pending-sell queue that is executed at the open, with the ledger updated from fills, not from intent.
+- Verification: Confirmed: the pre-market scan can only start between 08:00 and 09:00 and tests market hours with the time captured at its start, so the sell branch at `scheduler.py:615` cannot run and the `else` is a log line with no queue and no stored thesis; the earnings (07:00-08:00) and Sunday/Wednesday evening paths call `_execute_sell` with no market-hours test, and it removes the position and credits cash at the last quote as soon as the broker accepts the order; whether the broker accepts or refuses that out-of-hours sell while the stop from F-02-01 is resting was not tested.
 
 ### F-02-09: The stop-loss is never volatility-adjusted; it is always 7%
 - Severity: Medium

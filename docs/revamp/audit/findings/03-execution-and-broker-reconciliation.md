@@ -221,6 +221,7 @@ No network request was made and the agent was not run.
 - Direction (not a fix): Decide on one owner for the stop. Before any sell,
   ask the broker what is held and what orders are open. Treat a negative
   quantity at the broker as an alarm, never as "nothing there".
+- Verification: Confirmed: the bot's side holds end to end (no broker read or sync between a broker stop fill and the 30-minute loop's full-size market sell at `scheduler.py:1047-1053`/`1323`, and a negative broker quantity is silently skipped by both branches of `sync_from_alpaca`, re-run with made-up rows); qualified because whether Alpaca books that second sell as a short or refuses it depends on the account's shorting permission and was not exercised, and it needs the price to still be at or under the software stop at a loop pass before the next 08:15 sync.
 
 ### F-03-02: The bot never cancels its resting stop, so its own sells are expected to be refused while the stop is live
 - Severity: High
@@ -258,6 +259,7 @@ No network request was made and the agent was not run.
   as "insufficient qty available"; the audit could not exercise it.
 - Direction (not a fix): A sell needs to deal with the resting stop first and
   then confirm what happened. The stop's order ID has to be kept somewhere.
+- Verification: Confirmed: for the code path only (no caller of any cancel or open-order function exists outside `executor.py`, the stop's order ID is not kept, and a refused sell ends at one error log with the ledger unchanged); the refusal itself is Alpaca behaviour that was not exercised, and the `config.py:157-161` comment recording past loop stop-out sells as completed is in tension with it, so an Alpaca order-history export is needed to tell whether those sells were refused, accepted alongside a live stop, or accepted after the stop had already filled (F-03-01).
 
 ### F-03-03: Reconciliation with Alpaca does not run before orders are sent
 - Severity: High
@@ -299,6 +301,7 @@ No network request was made and the agent was not run.
   search and read each one.
 - Direction (not a fix): Reconcile immediately before anything that sends an
   order and at startup, and turn "dropped" into a recorded, announced event.
+- Verification: Confirmed: no sync runs at startup, in `_execute_signals`, in `_execute_sell`, in the monitoring loop or in the event-triggered scan, so intraday buys, the software stop and every sell act on an unreconciled ledger; qualified because the summary understates the weekday 08:15-08:45 morning-brief sync (`scheduler.py:1716-1733`), which normally does run between the evening analysis and the 09:30 execution with no trading session in between, and is missed only when the brief is skipped, the account call fails, or Alpaca returns no positions.
 
 ### F-03-04: A failed "list positions" request is treated as "the account is empty" and wipes the ledger
 - Severity: High
@@ -345,6 +348,7 @@ No network request was made and the agent was not run.
 - Direction (not a fix): A failed request must be distinguishable from an
   empty result, and a sync that would remove everything deserves a second
   look before it is applied.
+- Verification: Confirmed: re-run with a mock transport (500, 403, timeout and non-JSON all give `[]`) and `sync_from_alpaca([], account)` emptied a two-position ledger, with the re-import coming back as HOLD / conviction 7 placeholders; it needs the account call to succeed and the positions call straight after it to fail, so it is infrequent, and the over-buying consequence needs the next morning-brief sync to be missed as well.
 
 ### F-03-05: The stop order is sent blind three seconds after the buy, and a failed stop is not reported or recorded
 - Severity: High
@@ -396,6 +400,7 @@ No network request was made and the agent was not run.
 - Direction (not a fix): The stop should follow a confirmed fill and cover the
   filled quantity, and "no stop in place" should be a state the bot records
   and announces.
+- Verification: Confirmed: `place_buy` reads nothing from the buy reply, never calls `get_order`, sends the stop for the full requested quantity after a fixed 3-second sleep, and returns the buy order unchanged when the stop fails, so the scheduler records and announces a stop either way; what Alpaca does with a sell stop that arrives before the fill (refuse it, or accept it as an order for shares not held) was not exercised and decides how bad the unfilled and partial-fill cases are.
 
 ### F-03-06: A timed-out or unreadable broker reply is treated as "the order was not placed", and there is no order ID to check or de-duplicate with
 - Severity: High
@@ -433,6 +438,7 @@ No network request was made and the agent was not run.
   identical buy requests, nothing in the ledger, no alert calls.
 - Direction (not a fix): Give every order an ID the bot chooses, and after an
   uncertain reply look the order up before deciding it failed.
+- Verification: Confirmed: `_request` returns `None` for a timeout, connection error, non-JSON 200 and every HTTP error alike (re-run with a mock transport), no order body carries `client_order_id`, and both callers treat `None` as not placed with no lookup afterwards; the trigger (a reply lost for an order Alpaca did accept) is rare, and the 08:15 sync would import an untracked buy by the next weekday, though without a stop.
 
 ### F-03-07: Share count, stop price and recorded entry all use the price from analysis time, not a current quote or the fill
 - Severity: High
@@ -472,6 +478,7 @@ No network request was made and the agent was not run.
 - Direction (not a fix): Price the order at the moment it is sent, set the
   stop from the actual fill, and decide how much movement since the analysis
   cancels a signal.
+- Verification: Confirmed: all three places that build a signal set `entry_price=company.price` at analysis time, `_execute_signals` fetches a quote only when that is zero or missing, and the same value feeds the risk check, share count, stop price and ledger entry (100 shares and a 93.00 stop reproduced for the example); the same-tick sell after a gap down follows from the tick order (`scheduler.py:196-201`) on the bot's side, but whether Alpaca accepts a stop priced above the market, and then the sell, was not exercised.
 
 ### F-03-08: A sell decided in the pre-market scan is logged as "queued" but nothing is queued
 - Severity: High
@@ -502,6 +509,7 @@ No network request was made and the agent was not run.
   True, market open False in all three.
 - Direction (not a fix): Either hold pending sells the same way pending buys
   are held, or stop logging that it was queued.
+- Verification: Confirmed: the scan only starts between 08:00 and 09:00 ET and tests `_is_market_open` with the timestamp taken at its start, so the sell branch at `scheduler.py:614-617` cannot run, the else branch only logs, and neither a pending sell nor the new SELL thesis is stored anywhere that a later step reads.
 
 ### F-03-09: Orders sent while the exchange is closed are recorded as if they had filled
 - Severity: High
@@ -545,6 +553,7 @@ No network request was made and the agent was not run.
   orders, and how it treats the accompanying stop.
 - Direction (not a fix): Ask the broker whether the market is open before
   sending, and record an order as pending until a fill is seen.
+- Verification: Confirmed: for the bot's side (`_is_market_open` returned True for 26 November, 27 November 14:00 and 25 December 2026; the Sunday/Wednesday evening re-analysis and the 07:00-08:00 earnings scan call `_execute_sell` with no hours check; the event scan tests a timestamp taken before its long analysis; and the ledger is updated as soon as the request is accepted); whether Alpaca queues these orders for the next open or refuses them was not exercised, and a sell sent while a stop is resting may be refused outright as in F-03-02, in which case nothing is booked.
 
 ### F-03-10: Every sell the broker accepts ends with a "Sell failed" alert and no trade alert
 - Severity: Medium

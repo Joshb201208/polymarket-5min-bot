@@ -294,6 +294,7 @@ expiry.
   or accept assignment on purpose). If shares can arrive through options, that
   arrival has to pass the same size limits as a buy, and the equity ledger has
   to handle negative quantities.
+- Verification: Confirmed: no close function has a caller (`_check_options_positions` only reconciles and sends a 3-day alert, and commit `602aa96` removed the closing call), spreads are sized on the debit alone, and the equity import skips non-positive quantities, so the bot's side holds as written; the step that turns this into an oversized or short stock position is the broker's handling at expiry, which is still unchecked and should be confirmed from Alpaca's documentation before the plan relies on the worst-case sizes.
 
 ### F-04-03: The 15% exposure cap measures option prices, not money at risk; put cash is neither checked nor reserved; the equity side is unaware
 - Severity: Critical
@@ -346,6 +347,7 @@ expiry.
   demand (assignment cost for puts, maximum loss for spreads), check it
   including the order being proposed, and make the equity side's cash and
   position checks see that reserved amount.
+- Verification: Confirmed: an independent run of `_recalculate_summary` on a $100,000 portfolio showed a long position at 0.30% falling to 0.15% when a put securing $6,000 was added and ten puts securing $70,000 reading 1.5%, the headroom figure at `options_engine.py:145` is only logged, and neither `buying_power` nor any options reference exists in the risk path; the only remaining backstop is the broker refusing an order for lack of buying power, which was not checked.
 
 ### F-04-04: One failed broker request erases the options ledger, and the reconcile never adds anything back
 - Severity: High
@@ -412,6 +414,7 @@ expiry.
   empty account and must skip the reconcile. The reconcile should run both
   ways, per leg, with quantities, and should flag broker positions the ledger
   does not know.
+- Verification: Confirmed: `get_option_positions` swallows every error and returns `[]`, neither caller can tell that from an empty account, and an independent run of `sync_from_alpaca` with `[]` closed every made-up position as "missing at Alpaca (assumed expired OTM)" with invented P&L and nothing in the module imports broker positions. Suggested severity: Critical, because the wipe happens inside the daily scan just before candidates are chosen, with the position count and the one-per-underlying guard both reset, so the same run can place up to ten more orders on top of the real positions.
 
 ### F-04-05: Covered-call cover is checked once against the local share count, and nothing links the call to the shares afterwards
 - Severity: High
@@ -449,6 +452,7 @@ expiry.
 - Direction (not a fix): Read share count and existing short calls from the
   broker immediately before the order, and make the equity sell and stop
   paths aware of open short calls on the same symbol.
+- Verification: Confirmed: the contract count comes from the local share record, the options scan does not reconcile the equity ledger (that happens only at `scheduler.py:371`, `:491` and `:1733`), and `_execute_sell` and the resting stop from `place_buy` take no account of open short calls; what the broker does is still unknown, but High holds either way, since it either allows an uncovered call or rejects the share sale or stop, which `_execute_sell` only logs, leaving an exit missed.
 
 ### F-04-06: Orders go at market, priced from mid, last trade or yesterday's close, and the fill is never read back
 - Severity: High
@@ -491,6 +495,7 @@ expiry.
 - Direction (not a fix): Use limit orders at the price the checks were made
   on, confirm the fill from the order, record the real fill price, and refuse
   to trade on quotes that are missing, stale or too wide.
+- Verification: Confirmed: both order calls pass `OptionOrderType.MARKET` with no limit, the recorded entry price is the signal's own estimate (`scheduler.py:1488-1489`), no code fetches an order's status or fill, and `fair_value` falls from mid to last trade to previous close with no check of spread width or quote age.
 
 ### F-04-07: `OPTIONS_ENABLED` does not switch options off, and none of the other `OPTIONS_*` settings are read
 - Severity: High
@@ -529,6 +534,7 @@ expiry.
   module in full.
 - Direction (not a fix): One source for each limit, read from config, with
   the enable flag checked before any options work starts.
+- Verification: Confirmed: a fresh search finds `OPTIONS_` only in `config.py`, the tripwire test, `tests/conftest.py` and `scripts/vps_snapshot.sh`, `_should_run_options_scan` tests only weekday, time and the done-today flag, and the engine's constants differ from config on reward-to-risk (1.5 against 2.0) and spread width (10/20 against 5/10).
 
 ### F-04-08: Spread legs are chosen by strike alone and can have different expiry dates; the fixed $5 rounding gives odd strikes on cheap stocks
 - Severity: High
@@ -575,6 +581,7 @@ expiry.
 - Direction (not a fix): Choose an expiry first, then both strikes within it,
   from the strikes that are actually listed, with a width that scales with
   the share price.
+- Verification: Confirmed: an independent run of `_find_closest_contract` on a made-up chain, where the nearer expiry listed 105/110/114 and the later one 105/115, returned the near 105 for the long leg and the later 115 for the short leg, no code compares the two expiry dates, and `_round_to_strike` reproduced the table's values; how often real chains have mismatched strike lists across expiries is still unmeasured.
 
 ### F-04-09: Entry rules are looser than documented: puts are sold on stocks with no thesis, and thesis direction and age are ignored
 - Severity: High
@@ -627,6 +634,7 @@ expiry.
 - Direction (not a fix): Josh decides which strategies and thresholds he
   wants (see Questions). Whatever the rules are, they should require a
   current thesis with the right direction.
+- Verification: Confirmed: `scheduler.py:1436-1441` gives a symbol with no stored thesis conviction 6 and reads only `conviction` and `target_price` from a stored one, `options_engine.py:196` accepts 6 to 8 for a put, and theses are stored for every direction (`scheduler.py:964`, before the BUY test) and never removed; the put is still held to the 7% size rule, so High rather than Critical is right.
 
 ### F-04-10: The options ledger's profit and loss is wrong in several independent ways
 - Severity: Medium
