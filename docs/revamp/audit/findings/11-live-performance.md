@@ -4,25 +4,63 @@ Audited commit: 941f2ca    Date: 2026-11-20
 
 ## Plain-language summary
 
-No droplet snapshot was uploaded, so this file does **not** say how the bot has
-performed. It contains no return, win rate, drawdown, or holdings, because none
-of that can be known from the code, and the brief says not to estimate. What it
-does cover is the bot's own scorekeeping: the numbers it sends in the daily,
-weekly, and morning messages, and whether they can be trusted. The morning
-brief is the only report read straight from the broker. The daily summary and
-the weekly "Performance" block are the bot's own arithmetic on its own
-notebook, and that notebook has gaps. The biggest one: when a stop order fills
-at the broker, the bot records no trade and sends no alert, so the weekly win
-rate and "Total P&L" only count the sells the bot placed itself (F-11-01).
-Second: since 23 April every sell the bot does place is announced as "Sell
-failed" and the real sell alert is never sent, because of a bug that fires
-after the order has already gone through (F-11-02). Third: options results are
-never reported at all, and the options notebook is wrong from the first minute
-(a made-up spread shows a 95% profit at entry) (F-11-07). Fourth: nothing the
-bot stores can answer "did high conviction do better?" or "did we beat an
-index fund?" (F-11-08). The "Could not verify" section lists, question by
-question, what the snapshot will answer, what it will still not answer as the
-script stands today, and how to run it to get more.
+**Updated 2026-11-21 with live evidence.** The first version of this file was
+written without a server snapshot. Two evidence files now sit in
+`docs/revamp/audit/evidence/`, built from a read-only snapshot of the server
+and the broker's order history. This summary and the next section use them;
+the findings below are unchanged except where a note says otherwise.
+
+On paper the bot is up 24.0% since launch (30 March to 19 November 2026),
+against 14.7% for QQQ and 12.9% for SPY. That headline hides three things.
+First, all of the gain came before late July: the bot was up 41.8% by 24 July
+and has lost 12.6% since, twice the fall in QQQ. Second, research has almost
+certainly produced nothing since late July: Perplexity has refused every call
+for lack of quota, the price feed refuses most requests, and the bot kept
+sending normal-looking daily briefs. Third, the bot's own reports say +36.0%,
+about 12 points too high, mainly because two accidental short positions,
+opened when a stop-out was sold twice, are missing from its books. The risk
+limits did not hold in practice: the largest position was above the 15% cap on
+122 of 164 trading days, because shares delivered by option exercise bypass
+every limit. No stock position has a stop order at the broker today. The
+sample is small (38 stock entries, 43 option structures, one strong technology
+rally), so none of this proves the strategy good or bad.
+
+## Answers from the live evidence (added 2026-11-21)
+
+Sources: E1 = `evidence/2026-11-20-live-performance.md`, E2 = `evidence/2026-11-21-answers-to-audit-unknowns.md`. Section numbers refer to those files. Everything
+here is an observation from them; nothing was re-measured in this session.
+
+| # | Question | Answer | Source |
+| --- | --- | --- | --- |
+| 1 | Uptime and restarts | Server up 229 days. Six service restarts in the two-month log window, each back within seconds, no crash loop. 25 "git fetch failed" lines in the update log, in July. The log starts on 20 September, so earlier restarts are unknown. | E1 §7 |
+| 2 | Return and drawdown against an index | +24.0% against QQQ +14.7% and SPY +12.9%. Launch to 24 July: +41.8% against +21.6% and +16.5%. 24 July to 19 November: -12.6% against -5.7% and -3.1%. Largest fall from a peak 15.6% (QQQ 15.1%, SPY 8.1%). Volatility 30.4% a year against 23.9% and 14.6%. Peaked 22 June; 15.3% below that now. | E1 §1 |
+| 3 | Trades, win rate, how closed | 38 thesis stock entries, 21 profitable (55%). Average winner +21.7%, average loser -6.5%. Three entries made 67% of the stock profit. Technology won 11 of 12 and made about 95% of it; Healthcare won 1 of 8. 25 stop exits. Holding periods were not measured. | E1 §6 |
+| 4 | Stops | 25 stop exits: 13 by broker order, 12 by the bot's own check. The price was lower 20 trading days later in only 10 of 25; against holding 20 more days the stops cost about 5 points in total. How close fills were to the stop price was not measured, and the effect of the 5% to 7% widening was not separated out. | E1 §6 |
+| 5 | Did conviction work | Yes, on a small sample. Score 9: 5 winners of 7, average +22.2%. Score 8: 14 of 25, average +8.0%. Score 7: 2 of 6, average -1.5%. | E1 §6 |
+| 6 | Limits in practice | Not held. Largest position above 15% on 122 of 164 days; one stock is 33.6% of equity today. One sector above 40% on 121 days. Long plus short stock above 100% of equity on 49 days, peaking at 154% with one stock at 71.5%. Cash negative on 40 days. Position count stayed inside its limit. Limits held for stock buys and were not applied to shares arriving through options. | E1 §5 |
+| 7 | Orphan, duplicate, rejected orders | 174 orders: 166 filled, 8 cancelled, none recorded as rejected (an order refused at submission leaves no record). Two double sales, each of which opened a short. No stop order is open today, so there are no orphan stops and no position has a broker stop. Six April stops were cancelled, five of them 88 to 90 days after placement. Other duplicates were not checked. | E2 §1, §4; E1 §4 |
+| 8 | Options | 43 structures, 19 profitable, mostly bull call spreads. Those expiring in April made about +15.6 points; everything since lost about 8.0. The scan repeats the same spread on a list frozen at four symbols since April; on one symbol it has lost seven times in a row. Exercise and assignment delivered shares that made +3.6 points and caused the limit breaches in question 6. All 91 option orders were market orders. | E1 §1, §6; E2 §4 |
+| 9 | Ledger against broker | They disagree. Ledger: 6 positions, 56 trades, return +36.0%. Broker: 9 stock positions, 5 open option legs, 166 filled orders, return +24.0%. The two shorts, a fractional remainder and every open option leg are missing from the ledger. | E1 §2 |
+| 10 | Most frequent errors | Two months of log: FMP "payment required" about 12,000 and "too many requests" about 7,900; Perplexity quota exceeded 2,756 with no successful call; "Empty re-analysis response" 235; "Telegram not configured" 77; options "invalid underlying symbols" 51; "0 signals" 36; OpenAI model deprecated 29; TipRanks 401 on 21. | E1 §3 |
+| 11 | API cost | Not measured. | E1 limits |
+
+### Findings in this file seen in production
+
+| Finding | What the evidence shows | Source |
+| --- | --- | --- |
+| F-11-01 | 13 exits were broker stop fills, which the ledger does not record; the ledger holds 56 trades against 166 filled orders. | E1 §2, §6 |
+| F-11-02 | The `_tipranks_lookup` error appears on 1 October, 26 October and 5 November (9 log lines). The sale goes through and the steps after it do not run. | E1 §4 |
+| F-11-04 | The ledger's value is about 12 points too high and leaves out shorts and options. | E1 §2 |
+| F-11-07 | No open option leg is in the local ledger, while the broker holds five. | E1 §2 |
+| F-11-08 | The conviction and index comparisons above had to be rebuilt from broker fills outside the bot; nothing the bot stores could produce them. | E1 intro |
+| F-11-09 | Broker stop orders exist for two April days only. Since then stops have been software-only. | E1 §4 |
+| F-11-12 | The concentration incident is confirmed in outline: one stock reached 71.5% of equity on 22 April after exercised call spreads delivered shares. | E1 §5 |
+
+The first two predictions at the end of this file ("fewer sells in the ledger
+than at the broker", "one error per recorded sell") are borne out. The
+prediction of rejected sells while a stop rests could not be tested: an order
+refused at submission leaves no record, and the log does not reach back to
+the months when stop orders existed.
 
 ## How it actually works
 
@@ -493,6 +531,56 @@ and no cost or API usage figure.
 - Direction (not a fix): Check each against the broker history once the
   snapshot exists.
 
+### F-11-13: Research and price inputs have been failing for months and every report looked normal
+- Severity: High
+- Confidence: Confirmed (observed in production)
+- Where: `docs/revamp/audit/evidence/2026-11-20-live-performance.md` section 3; code causes are in F-05-04, F-06-01, F-08-05 and F-08-11.
+- What happens: Since at least 20 September no Perplexity call has succeeded, most FMP requests are refused, the OpenAI model is reported as deprecated, and TipRanks returns "unauthorized". The last new stock entry was 17 July and the newest stored thesis is from late July.
+- Evidence: 2,756 quota errors, about 12,000 "payment required" and 7,900 "too many requests" responses, 235 empty re-analysis replies and 36 research cycles ending in "0 signals" in two months. Entries per month fell from 24 in April to none after July.
+- Why it matters: The bot has been holding positions for four months with no working research and, because the price feed is refused, a software stop that mostly cannot see prices. Nobody was told. Results since late July say little about the strategy.
+- How verified: Read from the evidence file; not re-measured. Added 2026-11-21.
+- Direction (not a fix): A health check on every input, an alert when one fails, and no new trades while research or prices are down.
+
+### F-11-14: Telegram reports "not configured" although its settings are present on the server
+- Severity: High
+- Confidence: Suspected (cause not traced)
+- Where: `stock_agent/telegram_alerts.py:31-33`, `stock_agent/config.py:17-18`, `deploy/stock-agent.service:10`; evidence file `2026-11-21-answers-to-audit-unknowns.md` section 5.
+- What happens: The log shows "Telegram not configured" 77 times in two months, yet the server's settings file contains both Telegram settings. No Telegram request appears in the log at all.
+- Evidence: The message is logged only when `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is empty in the running process. The unit file loads the settings file, and `config.py` reads those two names. On that reading the values should arrive, so something between the file and the process differs from what the code shows (for example an empty or malformed line). This was not traced.
+- Why it matters: Telegram is very probably delivering nothing. Any alert that goes only to Telegram is lost.
+- How verified: Code read for the three lines above; the observation is from the evidence file. Added 2026-11-21.
+- Direction (not a fix): Find out why the values do not reach the process, and have the bot say at start-up which channels work.
+
+### F-11-15: Broker stop orders were placed on only two days, although the code sends one after every buy
+- Severity: High
+- Confidence: Suspected (cause not traced)
+- Where: `stock_agent/executor.py:104-134`; evidence files, section 4 of each.
+- What happens: The order history holds 19 stop orders, all placed on 23 and 27 April. The code has sent a stop three seconds after every buy since commit `bfe42f0` (6 April), and there were 24 entries in April, 3 in May, 1 in June and 2 in July.
+- Evidence: 13 of the 19 filled and 6 were cancelled, five of them 88 to 90 days after placement. No stop order is open today.
+- Why it matters: Either almost every stop the bot sent was refused at submission, which leaves no record and is what F-03-05 allows, or the April stops were placed by hand and the bot's never worked. Either way no position is protected at the broker, and the six cancelled stops ended without any message.
+- How verified: Evidence files plus `git log` for the stop code. Added 2026-11-21.
+- Direction (not a fix): Read back every stop after sending it, alert when a position has none, and settle who owns the stop.
+
+### F-11-16: The broker's portfolio-history figure has left out one long position since 18 August
+- Severity: Medium
+- Confidence: Confirmed (observed), cause unknown
+- Where: `docs/revamp/audit/evidence/2026-11-20-live-performance.md` section 2.
+- What happens: The broker's portfolio-history endpoint under-reports equity by about 7% from 18 August, while its account and positions endpoints include the position.
+- Evidence: A rebuild from every fill, dividend and fee matches the broker's share counts and cash exactly and is within 0.1% of the corrected equity.
+- Why it matters: Portfolio history cannot be used as the source of truth for equity or drawdown. No code finding explains it; it is on the broker's side.
+- How verified: Read from the evidence file. Added 2026-11-21.
+- Direction (not a fix): Report equity from the live account figures.
+
+### F-11-17: The options scan trades a list frozen in April and retries a renamed ticker
+- Severity: Medium
+- Confidence: Confirmed (observed), code path not traced
+- Where: `docs/revamp/audit/evidence/2026-11-20-live-performance.md` sections 3 and 6.
+- What happens: The last successful TipRanks file is dated 14 April. The options universe has been four symbols since, and the scan repeats the same bull call spread on them about every three weeks. One ticker renamed on 9 June has produced 51 "invalid underlying symbols" errors.
+- Evidence: Seven losses in a row on one symbol since July; a second symbol net negative over eight structures.
+- Why it matters: A stale list keeps trading with no age check. No existing finding covers the age of the saved list.
+- How verified: Read from the evidence file; the code that loads the list was not traced in this pass. Added 2026-11-21.
+- Direction (not a fix): Refuse to trade from a universe older than a set age.
+
 ## Checked and fine
 
 - Win-rate arithmetic and its zero guards are correct for the trades it is
@@ -526,76 +614,28 @@ and no cost or API usage figure.
 
 ## Could not verify
 
-Nothing about actual performance could be verified. No snapshot was uploaded,
-and no other source of account data was used. Item by item:
+Updated 2026-11-21. Most of this section's original table is answered above.
+What is still open:
 
-| # | Question | Status | What the snapshot would supply | Still missing with a default run |
-| --- | --- | --- | --- | --- |
-| 1 | Uptime, restarts, reasons | Not answered | `service/status.txt`, `service/show.txt`, `service/start-stop-history.txt`, `deploy/auto_update.log.tail`, `system/reboots.txt`, `logs/journal.log` | Anything before 120 days (start/stop) or 21 days (reasons); the kernel out-of-memory log; any sign of life outside market hours, because an idle tick logs nothing. In market hours "Running market monitoring" (`scheduler.py:200`) appears every 30 minutes and works as a heartbeat. The dates in `daily_summaries` give a whole-life proxy for "alive at 16:05–16:30 Eastern". |
-| 2 | Return and drawdown against an index fund | Not answered | `alpaca/portfolio_history.json` (one year, daily), `alpaca/account.json`, non-trade rows of `alpaca/activities.json` | Daily closes of the chosen index fund for the same dates (not collected); the date and balance the bot started with; whether the paper account was ever reset. The bot's own daily series must not be used (F-11-04, F-11-05). |
-| 3 | Trade count, win rate, average win and loss, holding periods, how closed | Not answered | `alpaca/orders.json`, fills in `alpaca/activities.json`, reasons in `state/portfolio.json` → `trade_history` | Which orders were placed by hand (F-11-06). The ledger's own trade list is a subset (F-11-01). |
-| 4 | Stop-outs, fill against stop, price afterwards, did widening help | Not answered | Stop orders in `alpaca/orders.json` with stop price, fill price, fill time, and expiry | Daily prices of each stopped-out symbol for the weeks after the exit (not collected); when commit `fc297ce` reached the droplet, if `auto_update.log` no longer reaches back to April. Read with F-11-09. |
-| 5 | Did higher conviction do better | Not answered | `state/portfolio.json`: `positions[].thesis.conviction` and the copies inside `daily_summaries[].positions`, joined to broker round trips | Conviction for positions opened and closed between two daily summaries; the model's score before adjustments; anything real for imported positions, which all read 7 (F-11-08). The sample may be too small to conclude anything. |
-| 6 | Limits exceeded; concentration today | Not answered | `alpaca/positions.json`, `alpaca/account.json`, `env-summary.txt` for the limits in force; sectors and clusters from `config.py:71-146` | History of holdings by day: needs fills plus daily closes per symbol (not collected). The ledger's daily snapshots are an approximation and were wrong during the incident in F-11-12. |
-| 7 | Orphan, duplicate, rejected orders; stops without positions; positions without stops | Not answered | `alpaca/orders.json`, the stop cross-check in `alpaca/summary.md`, `alpaca/positions.json` | Nothing further. |
-| 8 | Options: opened, closed, assigned, expired unmanaged, result | Partly answered from code | Option orders and fills; expiry, assignment, and exercise rows in `alpaca/activities.json`; `state/options_portfolio.json`; option level fields in `alpaca/account.json` | Nothing further. From code alone: every option position has been left to run to expiry since commit `602aa96` (2026-04-08); whether any was assigned or exercised is unknown. |
-| 9 | Ledger against broker now | Not answered | `state/portfolio.json` and `state/options_portfolio.json` against `alpaca/positions.json` and `alpaca/account.json` | Nothing, if the snapshot is taken outside market hours so the two sides describe the same moment. |
-| 10 | Most frequent errors and warnings | Not answered | `logs/digest.txt`, `logs/journal.log` | Anything older than 21 days. The digest counts ERROR and WARNING only; option reconcile closures are INFO and need a search of the journal. |
-| 11 | Monthly API cost | Not answered | Request lines in `logs/journal.log`, counted by host | Token counts are never logged, so money figures need the Perplexity and OpenAI usage pages and the plan prices for FMP, Finnhub, TipRanks, and the droplet. |
-
-**How to run the snapshot for this area.** Run it after the market close or
-at a weekend. Widen the journal window with the supported override, for
-example `LOG_DAYS=240 bash scripts/vps_snapshot.sh` (`vps_snapshot.sh:26`);
-the 250,000-line cap and the 120-day start/stop window are fixed in the
-script. Getting the scripts onto the droplet by merging restarts the bot; the
-queue of Sunday's buy signals exists only in memory until Monday's open
-(`scheduler.py:95`, `437`), so that window is the wrong time to merge.
-
-**What the code predicts the snapshot will show.** These are hypotheses to
-test, not results.
-
-- Fewer sells in `trade_history` than filled sell orders at the broker
-  (F-11-01).
-- One "Sell execution failed" error per recorded sell since 2026-04-23
-  (F-11-02).
-- Stop prices 5% below the signal price for buys before 2026-04-25 and 7%
-  after, with no other widths except hand-placed orders (F-11-09).
-- Days missing from `daily_summaries`, and possibly doubled days (F-11-05).
-- Positions whose thesis summary begins "Imported from Alpaca", all with
-  conviction 7 (F-11-08).
-- Closed option positions with the reason "missing at Alpaca (assumed expired
-  OTM)" dated within a day of opening (F-11-07).
-- Rejected bot sells while a stop order was resting, and possibly stock
-  positions with a negative quantity that are absent from the ledger. Both
-  follow from the first handoff below and are the first thing to look for.
-
-**How API volume can be counted (question 11).** With the bot's logging
-set-up (`__main__.py:9-12`) the HTTP library writes one INFO line per request
-with the full URL. Checked with a mock transport and made-up URLs on httpx
-0.28.1; `requirements.txt` allows 0.24 or later and the droplet's version is
-in `deploy/pip-freeze.txt`. TipRanks uses a different library and shows only
-as "TipRanks fetch:" lines. The code's call pattern, to compare against the
-counts (from reading the code, not measured):
-
-| Unit | Calls |
-| --- | --- |
-| One company's fundamentals (`data_feed.py:107-190`) | 9 FMP + 1 Finnhub |
-| One universe screen (`data_feed.py:281-302`) | 7 FMP |
-| One macro check (`macro_monitor.py:179-184`, `234`) | 7 FMP |
-| Screening n companies (`screener.py:91-96`) | n ÷ 5 OpenAI, rounded up |
-| Deep analysis of k symbols (`scheduler.py:853-1001`) | k Perplexity (larger model) + 4k Finnhub |
-| Each held position, each weekday | 1 Perplexity (smaller model) in the pre-market scan plus 1 in each 30-minute check that falls in an even Eastern hour (`scheduler.py:585`, `1056-1060`, `1103-1108`) |
-| Each held position, Sunday and Wednesday | 1 Perplexity (larger model) (`scheduler.py:1013`) |
-
-The pre-market scan and the options scan each fetch fundamentals for 30
-symbols every weekday (`scheduler.py:634`, `1427-1431`). A restart inside a
-job's time window repeats that job, because the "done today" flags are in
-memory.
+- **Before 20 September 2026.** The service log starts there. Restart history,
+  error counts and the cause of anything earlier cannot be read from logs.
+- **Holding periods** and **how close stop fills were to the stop price.** Not
+  measured. Needs the fills joined to stop prices.
+- **Whether widening the stop floor from 5% to 7% helped.** The evidence gives
+  one total for all 25 stop exits, not a before-and-after.
+- **Rejected orders.** An order refused at submission leaves no record at the
+  broker, and the log covers two months only.
+- **Duplicate orders** other than the two double sales. Not checked.
+- **API cost.** Needs the providers' billing pages.
+- **Why the broker's portfolio-history figure leaves out one long position
+  since 18 August.** Cause unknown; see F-11-16.
+- **Total-return comparison.** Index figures are price change only, without
+  dividends.
 
 ## Questions for Josh
 
-1. Can you run the snapshot as described above and upload it? Every numbered
-   question in this area waits on it.
+1. Answered 2026-11-21: the snapshot was run and summarised in
+   `docs/revamp/audit/evidence/`.
 2. When did the stock agent first trade on this Alpaca account, with what
    starting balance, and has the paper account ever been reset?
 3. Do you place, change, or cancel orders by hand in the Alpaca dashboard?
