@@ -53,7 +53,7 @@ here is an observation from them; nothing was re-measured in this session.
 | F-11-04 | The ledger's value is about 12 points too high and leaves out shorts and options. | E1 §2 |
 | F-11-07 | No open option leg is in the local ledger, while the broker holds five. | E1 §2 |
 | F-11-08 | The conviction and index comparisons above had to be rebuilt from broker fills outside the bot; nothing the bot stores could produce them. | E1 intro |
-| F-11-09 | Broker stop orders exist for two April days only. Since then stops have been software-only. | E1 §4 |
+| F-11-09 | Broker stop orders exist for two April days only: 11 placed by the bot after fast fills and 8 sent together by something outside its normal run. Since then stops have been software-only. | E1 §4; `2026-11-21b-stop-orders-and-telegram.md` §2, §3 |
 | F-11-12 | The concentration incident is confirmed in outline: one stock reached 71.5% of equity on 22 April after exercised call spreads delivered shares. | E1 §5 |
 
 The first two predictions at the end of this file ("fewer sells in the ledger
@@ -540,26 +540,29 @@ and no cost or API usage figure.
 - Why it matters: The bot has been holding positions for four months with no working research and, because the price feed is refused, a software stop that mostly cannot see prices. Nobody was told. Results since late July say little about the strategy.
 - How verified: Read from the evidence file; not re-measured. Added 2026-11-21.
 - Direction (not a fix): A health check on every input, an alert when one fails, and no new trades while research or prices are down.
+- Verification: Confirmed: every count and date matches section 3 of the evidence file and High fits, with three wording caveats: the evidence gives refusal counts but never says "most" FMP requests are refused, the OpenAI deprecation notice starts on 25 October rather than 20 September, and "a software stop that mostly cannot see prices" goes beyond the evidence (section 4 records software stops selling on three days inside the same log window), while the period before 20 September is the evidence file's "most likely reading", not a logged fact.
 
 ### F-11-14: Telegram reports "not configured" although its settings are present on the server
-- Severity: High
-- Confidence: Suspected (cause not traced)
-- Where: `stock_agent/telegram_alerts.py:31-33`, `stock_agent/config.py:17-18`, `deploy/stock-agent.service:10`; evidence file `2026-11-21-answers-to-audit-unknowns.md` section 5.
-- What happens: The log shows "Telegram not configured" 77 times in two months, yet the server's settings file contains both Telegram settings. No Telegram request appears in the log at all.
-- Evidence: The message is logged only when `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is empty in the running process. The unit file loads the settings file, and `config.py` reads those two names. On that reading the values should arrive, so something between the file and the process differs from what the code shows (for example an empty or malformed line). This was not traced.
-- Why it matters: Telegram is very probably delivering nothing. Any alert that goes only to Telegram is lost.
-- How verified: Code read for the three lines above; the observation is from the evidence file. Added 2026-11-21.
-- Direction (not a fix): Find out why the values do not reach the process, and have the bot say at start-up which channels work.
+- Severity: Withdrawn (was High)
+- Confidence: Explained
+- Where: `stock_agent/telegram_alerts.py:31-33`; evidence file `docs/revamp/audit/evidence/2026-11-21b-stop-orders-and-telegram.md` section 1.
+- What happens: **Withdrawn 2026-11-21.** Both Telegram lines exist in the server's settings file and both values are empty. The code skips sending when either is empty and logs "Telegram not configured", so the log line is the code working as written. There is nothing unexplained.
+- Evidence: The earlier evidence file said the settings "are present in the file"; the follow-up corrects that wording.
+- Why it matters: What remains is a fact for Josh, not a defect: no message has gone to Telegram in the two-month log window, and Discord is the only channel that delivers anything. The Telegram value in `.env.example` is not the one in use on the server; it still needs revoking if that bot exists (F-09-01).
+- How verified: Read from the follow-up evidence file and the three code lines. The ID is kept so the numbering does not change.
+- Direction (not a fix): None for this finding. Whether Telegram should be switched back on is decision 26 in `AUDIT.md`.
+- Verification: Confirmed: the withdrawal is justified, because `stock_agent/config.py:17-18` reads both Telegram settings with an empty default, `stock_agent/telegram_alerts.py:31-33` logs "Telegram not configured" and returns when either is empty, and section 1 of the follow-up evidence file says both values on the server are empty, so the 77 log lines are the code working as written.
 
-### F-11-15: Broker stop orders were placed on only two days, although the code sends one after every buy
+### F-11-15: Every buy made at the open has gone without a broker stop order
 - Severity: High
-- Confidence: Suspected (cause not traced)
-- Where: `stock_agent/executor.py:104-134`; evidence files, section 4 of each.
-- What happens: The order history holds 19 stop orders, all placed on 23 and 27 April. The code has sent a stop three seconds after every buy since commit `bfe42f0` (6 April), and there were 24 entries in April, 3 in May, 1 in June and 2 in July.
-- Evidence: 13 of the 19 filled and 6 were cancelled, five of them 88 to 90 days after placement. No stop order is open today.
-- Why it matters: Either almost every stop the bot sent was refused at submission, which leaves no record and is what F-03-05 allows, or the April stops were placed by hand and the bot's never worked. Either way no position is protected at the broker, and the six cancelled stops ended without any message.
-- How verified: Evidence files plus `git log` for the stop code. Added 2026-11-21.
-- Direction (not a fix): Read back every stop after sending it, alert when a position has none, and settle who owns the stop.
+- Confidence: Likely (the pattern is exact; the broker's refusal itself was not captured)
+- Where: `stock_agent/executor.py:113-131`; evidence file `docs/revamp/audit/evidence/2026-11-21b-stop-orders-and-telegram.md` sections 2 and 3; earlier evidence files, section 4 of each.
+- What happens: Updated 2026-11-21 (the title was "Broker stop orders were placed on only two days, although the code sends one after every buy"). The stop is sent three seconds after the buy. Of the 30 stock buys filled since that code arrived on 6 April, the 11 that filled within three seconds all have a stop at the broker, and the 19 that took longer (52 seconds to about ten minutes) have none.
+- Evidence: The 11 fast fills were all on 23 April, sent in the middle of the session. The 19 slow fills were all sent in the first two minutes after the open, on nine different days. The split is exact. The other eight of the 19 stop orders in the history were sent together at 04:01 New York time on 27 April for positions already held, through the API key, with no buy before them. Nothing in the code places a stop except straight after a buy, so those eight came from outside the bot's normal run, most likely a one-off script. Six stops were later cancelled, five of them 88 to 90 days after placement, most likely expired by the broker.
+- Why it matters: This is F-03-05 seen in production. The bot normally buys at the open, which is exactly when the fill is slow, so in normal running a new position gets no broker stop, and the buy alert still shows a stop price. No stop order is open today.
+- How verified: Read from the evidence files, plus `git log` for the stop code (commit `bfe42f0`). The likeliest cause, that the broker refuses a stop sent before the buy has filled and keeps no record of it, is not confirmed: the log window holds no buys, so the "Stop-loss order FAILED" line could not be counted.
+- Direction (not a fix): Send the stop only after the fill is confirmed, read it back, and alert when a position has none. One saved broker response to an early stop would confirm the cause.
+- Verification: Confirmed: every number matches sections 2 and 3 of the follow-up evidence file, and the code agrees (`stock_agent/executor.py:113-132` sends the stop after a fixed three-second sleep with no fill check and only logs a warning if it fails, it is the only place a stop order is built, its only caller is `stock_agent/scheduler.py:1264`, and queued buys are released as soon as the market opens at `scheduler.py:194-196`); the broker refusing an early stop remains the likeliest cause and is still unproven, so "Likely" and High are both right.
 
 ### F-11-16: The broker's portfolio-history figure has left out one long position since 18 August
 - Severity: Medium
@@ -570,6 +573,7 @@ and no cost or API usage figure.
 - Why it matters: Portfolio history cannot be used as the source of truth for equity or drawdown. No code finding explains it; it is on the broker's side.
 - How verified: Read from the evidence file. Added 2026-11-21.
 - Direction (not a fix): Report equity from the live account figures.
+- Verification: Confirmed: the statement matches section 2 of the evidence file, but nothing in `stock_agent/` calls the portfolio-history endpoint (the only caller is the read-only report script, `scripts/alpaca_readonly_report.py:106`), so this affects how performance is measured and not what the bot does or reports. Suggested severity: Note
 
 ### F-11-17: The options scan trades a list frozen in April and retries a renamed ticker
 - Severity: Medium
@@ -580,6 +584,7 @@ and no cost or API usage figure.
 - Why it matters: A stale list keeps trading with no age check. No existing finding covers the age of the saved list.
 - How verified: Read from the evidence file; the code that loads the list was not traced in this pass. Added 2026-11-21.
 - Direction (not a fix): Refuse to trade from a universe older than a set age.
+- Verification: Unclear: the observations match sections 3 and 6 of the evidence file, but the traced code contradicts the explanation: no code reads a saved TipRanks file (`scheduler.py:825-838` calls the API each time and saves nothing, and that client only arrived on 23 April), the options scan takes its symbols from the first 30 of the universe saved in `portfolio.json` (`scheduler.py:1426-1427`), that list is rewritten by every weekly, midweek and event screen (`scheduler.py:402`, `519`, `1672`), and when the FMP screener is refused `screen_universe` returns exactly the four hard-coded priority symbols (`data_feed.py:337-344`, `config.py:63-68`, run here with a failing fake, already F-06-09), so the list is most likely re-saved fresh each week rather than frozen and an age check on it would not fire; no age check exists anywhere (`last_universe_refresh` is written at `portfolio.py:365` and never read, and the conviction that triggers a bull call spread comes from a stored thesis of any age at `scheduler.py:1435-1440`, already F-04-09); still unknown are whether the server's four symbols are that priority list and why the evidence dates the freeze to 14 April, ten days before priority symbols were added. Suggested severity: High
 
 ## Checked and fine
 
@@ -638,8 +643,11 @@ What is still open:
    `docs/revamp/audit/evidence/`.
 2. When did the stock agent first trade on this Alpaca account, with what
    starting balance, and has the paper account ever been reset?
-3. Do you place, change, or cancel orders by hand in the Alpaca dashboard?
-   The commit history says stops were added by hand at least once.
+3. Mostly answered 2026-11-21: of 174 orders, 170 came through the API key,
+   3 were placed by the broker to close expiring spreads, and 1 (a
+   fractional-share buy on 16 April) did not come through the API key. Still
+   open: do you remember what sent the eight stop orders at 04:01 on
+   27 April, and did you place the fractional buy?
 4. Which yardstick do you want: the S&P 500, the total US market, or the
    Nasdaq-100?
 5. Have you been receiving "Sell failed for …" messages on Telegram? If so,

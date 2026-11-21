@@ -9,12 +9,14 @@ finding was refuted; three are marked "Unclear" because they depend on facts
 only the server or a data provider can supply.
 
 **Updated 2026-11-21 with live evidence.** The audit was first written
-without server data. Two evidence files are now in
+without server data. Three evidence files are now in
 [`evidence/`](evidence/), built from a read-only server snapshot and the
 Alpaca order history: **E1** =
 [`2026-11-20-live-performance.md`](evidence/2026-11-20-live-performance.md)
-and **E2** =
-[`2026-11-21-answers-to-audit-unknowns.md`](evidence/2026-11-21-answers-to-audit-unknowns.md).
+**E2** =
+[`2026-11-21-answers-to-audit-unknowns.md`](evidence/2026-11-21-answers-to-audit-unknowns.md)
+and **E3** =
+[`2026-11-21b-stop-orders-and-telegram.md`](evidence/2026-11-21b-stop-orders-and-telegram.md).
 "Seen in production" below means the evidence shows it happened, with the
 file and section. No area was re-audited; the code findings are unchanged.
 Figures are percentages and counts only.
@@ -98,7 +100,7 @@ not be tested.
 | --- | --- | --- |
 | [F-03-01](findings/03-execution-and-broker-reconciliation.md) (also F-02-01) | Critical | After Alpaca's stop fills, the bot's 30-minute check can sell the same shares again from its stale ledger. That may open a short position, which the bot's sync silently ignores. **Seen in production twice**, 1 and 27 May; both shorts are still open (E2 §1, E1 §2). |
 | [F-03-02](findings/03-execution-and-broker-reconciliation.md) | High | The bot never cancels its resting stop, so its own "thesis broken" sells are probably refused by Alpaca, with a log line and no alert. Bot's side. |
-| [F-03-05](findings/03-execution-and-broker-reconciliation.md) (also F-08-04) | High | The stop order is sent blind 3 seconds after the buy. If it is rejected, the position has no stop, yet the alert and ledger still show one. **Consistent with production:** no position has a broker stop today, and stops were placed on only two April days (E1 §4, E2 §4; see F-11-15). |
+| [F-03-05](findings/03-execution-and-broker-reconciliation.md) (also F-08-04) | High | The stop order is sent blind 3 seconds after the buy. If it is rejected, the position has no stop, yet the alert and ledger still show one. **Seen in production:** of 30 buys since the stop code arrived, the 11 that filled within three seconds all got a stop and the 19 that took longer got none. Every buy made at the open, which is when the bot normally buys, has gone without a broker stop (E3 §2; see F-11-15). The broker's refusal itself was not captured. |
 | [F-06-01](findings/06-data-sources.md) (also F-08-05) | High | When price quotes fail, the bot's stop check runs on old prices, reports success and alerts nobody. **Seen in production:** the feed refused about 12,000 requests in two months, including quotes for held symbols (E1 §3). |
 | [F-05-01](findings/05-research-and-llm.md) | High | One model reply of "SELL" sells a whole position, and the same news is put to the model up to six times a day. |
 | [F-01-02](findings/01-scheduler-and-lifecycle.md) (also F-03-08, F-05-02) | High | A sell decided in the 08:00 scan is logged as "queued" and then forgotten. |
@@ -130,7 +132,7 @@ not be tested.
 | ID | Sev. | What it means for the account |
 | --- | --- | --- |
 | [F-04-01](findings/04-options.md) | Critical | A spread is two separate market orders and is recorded as opened even if one or both fail. One live leg can be left at the broker untracked. |
-| [F-04-02](findings/04-options.md) | Critical | Nothing ever closes an option. Positions run to expiry and can turn into stock positions, long or short, that no limit covers. **Seen in production:** exercised spreads delivered shares that took one stock to 71.5% of equity and total exposure to 154% (E1 §5). |
+| [F-04-02](findings/04-options.md) | Critical | Nothing ever closes an option. Positions run to expiry and can turn into stock positions, long or short, that no limit covers. **Seen in production:** exercised spreads delivered shares that took one stock to 71.5% of equity and total exposure to 154% (E1 §5). On three expiry days the broker itself closed a spread at 15:30; it does not do so reliably (E3 §4). |
 | [F-04-03](findings/04-options.md) | Critical | The 15% options cap measures premium. Ten puts that could oblige $70,000 read as 1.5%. Cash behind a put is neither checked nor reserved. **Seen in production** in its effect: exposure above 100% on 49 days (E1 §5). |
 | [F-04-04](findings/04-options.md) (also F-07-02, F-10-04) | High, two verifiers suggest Critical | One failed positions request closes every option in the ledger with invented losses and never restores them. The limits then read zero and the same run can open more. **Consistent with production:** the broker holds five option legs and the ledger holds none (E1 §2). |
 | [F-04-05](findings/04-options.md) | High | Covered calls are checked once against the local share count. The shares can later be sold or stopped out, leaving the call uncovered. |
@@ -205,9 +207,9 @@ is recorded as a new finding in area 11 so the plan can pick it up.
 
 | ID | Observation |
 | --- | --- |
-| [F-11-14](findings/11-live-performance.md) | The log says "Telegram not configured" 77 times although both Telegram settings are in the server's file (E2 §5). The code reads those names and the service loads that file, so the cause is not visible in the repository. Telegram is probably delivering nothing. |
-| [F-11-15](findings/11-live-performance.md) | Broker stop orders were placed on only two days in April, though the code has sent one after every buy since 6 April (E1 §4). Either nearly every stop the bot sent was refused without a record, or the April stops were placed by hand. |
-| [F-11-15](findings/11-live-performance.md) | Six of those stops were cancelled, five of them 88 to 90 days after placement. The bot never cancels a stop, so the broker most likely expired them. Nothing reported it (E2 §4). |
+| [F-11-14](findings/11-live-performance.md) | **Explained and withdrawn.** Both Telegram lines are in the server's settings file with empty values, so "Telegram not configured" is the code working as written. Nothing has gone to Telegram in two months; Discord is the only working channel (E3 §1). |
+| [F-11-15](findings/11-live-performance.md) | **Mostly explained.** The stop is sent three seconds after the buy. Fast fills (11, all on 23 April, mid-session) got a stop; slow fills (19, all at the open) got none. This is F-03-05 in production (E3 §2). Still unexplained: eight stops sent together at 04:01 on 27 April for positions already held, through the API key, by something outside the bot's normal run (E3 §3). |
+| [F-11-15](findings/11-live-performance.md) | Six stops were cancelled, five of them 88 to 90 days after placement. The bot never cancels a stop, so the broker most likely expired them. Nothing reported it (E2 §4). |
 | [F-11-16](findings/11-live-performance.md) | The broker's portfolio-history figure has left out one long position, about 7% of equity, since 18 August. Cause unknown, on the broker's side (E1 §2). |
 | [F-11-17](findings/11-live-performance.md) | The options scan has traded a list frozen at four symbols since the last good TipRanks file on 14 April, and retries a ticker that was renamed in June. No finding covers the age of that list (E1 §3, §6). |
 | none | Covered calls were sold far below the market price on 11 May. Commit `e92e1cd` fixed the strike rule, but no test covers it (E1 §4). |
@@ -273,7 +275,9 @@ Still unknown:
 | Anything before 20 September 2026 in the logs | Nothing; the log does not reach back. Longer retention is a plan item. |
 | Holding periods, stop fill quality, whether widening the stop to 7% helped | The fills joined to stop prices (not measured) |
 | Rejected orders, and duplicates other than the two double sales | Not recorded by the broker; not checked |
-| Why Telegram reports "not configured", why stops exist for two days only, why portfolio history omits a position | See "What no existing finding explains" |
+| What the broker answers to a stop sent before the buy has filled | One saved response (E3 §5) |
+| What sent eight stop orders at 04:01 on 27 April | Josh may remember (E3 §3) |
+| Why portfolio history omits a position | Broker side; see F-11-16 |
 | API cost per month | Provider billing pages |
 
 ## 7. Decisions for Josh
@@ -304,12 +308,16 @@ Still unknown:
     track shorts. Recommended: (a), then switch short selling off at Alpaca
     (decision 6). They have cost about 1.3 points so far and nothing manages
     them.
-23. **No position has a stop order at the broker.** The April stops filled
-    or expired after about 90 days, and the bot's own check cannot see prices
-    while its feed is refused. Options: (a) place stops by hand now, knowing
-    they expire again; (b) accept no stops while on paper; (c) stop the bot
-    until decision 5 is built. Recommended: decide it knowingly. On paper (b)
-    costs nothing real, but the record it produces says little.
+23. **No position has a stop order at the broker.** The cause is now
+    known: a stop sent three seconds after a buy at the open is too early,
+    and every such buy has gone without one (E3 §2). The April stops that
+    did exist filled or expired after about 90 days, and the bot's own check
+    cannot see prices while its feed is refused. Options: (a) place stops by
+    hand now, knowing they expire again; (b) accept no stops while on paper;
+    (c) stop the bot until decision 5 is built. Recommended: decide it
+    knowingly. On paper (b) costs nothing real, but the record it produces
+    says little. Whichever you choose, the bot's buy alerts have been showing
+    a stop price that did not exist at the broker.
 24. **Should the bot keep running with no working research?** Options:
     (a) restore the Perplexity, FMP, OpenAI and TipRanks accounts now;
     (b) stop the service until the revamp has input health checks;
@@ -319,8 +327,13 @@ Still unknown:
 25. **One stock is 33.6% of equity.** Trim it by hand to the 15% cap, or
     leave it? The bot has no code that trims. Recommended: your call; the
     plan needs to know whether the cap applies to holding or only to buying.
-26. **Do you receive anything on Telegram?** The log says it is not
-    configured. If nothing arrives, Discord is your only channel today.
+26. **Telegram is switched off on the server.** Both settings are empty
+    there, so nothing has been sent for at least two months and Discord is
+    your only channel (E3 §1). Options: (a) leave it off and make Discord the
+    one must-act channel; (b) switch Telegram back on with a new token.
+    Recommended: (a) unless you watch Telegram more closely than Discord;
+    this folds into decision 16. Either way, revoke the token in
+    `.env.example` if that bot still exists.
 27. **Entry bar.** Score 7 entries lost money on average, on six trades.
     Recommended: no change on so small a sample, but it strengthens the case
     in decision 7 for never dropping to 6.
@@ -376,10 +389,13 @@ Still unknown:
     Alpaca?** Recommended: yes.
 20. **Make the repository private?** Recommended: yes, after a read-only
     deploy key is on the droplet.
-21. **Partly answered.** The "Sell failed" error is in the log on three
-    dates and two short positions exist (E1 §4, E2 §1). Still needed from
-    you: did you place the April stop orders, or any other order, by hand?
-    That decides how to read F-11-15.
+21. **Mostly answered.** The "Sell failed" error is in the log on three
+    dates and two short positions exist (E1 §4, E2 §1). Of 174 orders, 170
+    came through the bot's API key, 3 were placed by the broker to close
+    expiring spreads, and 1 did not come through the API key: a
+    fractional-share buy on 16 April (E3 §4). Still needed from you: do you
+    remember what sent eight stop orders at 04:01 on 27 April (a one-off
+    script?), and did you place the fractional buy?
 
 ## 8. Suggested order of work
 
@@ -425,8 +441,8 @@ A suggestion for the plan phase, not the plan.
 | 08 | Alerts and observability | 0 | 6 | 5 | 2 | 1 | [findings](findings/08-alerts-and-observability.md) |
 | 09 | Deploy, security, operations | 2 | 5 | 5 | 1 | 0 | [findings](findings/09-deploy-security-ops.md) |
 | 10 | Code health and testability | 0 | 3 | 8 | 2 | 2 | [findings](findings/10-code-health-and-testability.md) |
-| 11 | Live performance (code, then live evidence) | 0 | 3 | 10 | 1 | 3 | [findings](findings/11-live-performance.md) |
-| | **Total** | **10** | **57** | **75** | **19** | **9** | 170 findings |
+| 11 | Live performance (code, then live evidence) | 0 | 2 | 10 | 1 | 3 | [findings](findings/11-live-performance.md) |
+| | **Total** | **10** | **56** | **75** | **19** | **9** | 169 findings, plus F-11-14 withdrawn |
 
 Counts are as rated by each area's auditor. Many findings describe the same
 defect from different areas; the tables in section 3 merge them into about

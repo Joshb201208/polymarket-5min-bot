@@ -295,6 +295,7 @@ expiry.
   arrival has to pass the same size limits as a buy, and the equity ledger has
   to handle negative quantities.
 - Verification: Confirmed: no close function has a caller (`_check_options_positions` only reconciles and sends a 3-day alert, and commit `602aa96` removed the closing call), spreads are sized on the debit alone, and the equity import skips non-positive quantities, so the bot's side holds as written; the step that turns this into an oversized or short stock position is the broker's handling at expiry, which is still unchecked and should be confirmed from Alpaca's documentation before the plan relies on the worst-case sizes.
+- Seen in production (added 2026-11-21): the broker itself closed both legs of an option spread at 15:30 New York time on expiry day three times (24 April, 21 August, 11 September). Other positions expired worthless or ended in exercise or assignment, and delivered shares took one stock to 71.5% of equity. So the broker sometimes steps in, but not reliably. Sources: `docs/revamp/audit/evidence/2026-11-21b-stop-orders-and-telegram.md` section 4; `2026-11-20-live-performance.md` section 5.
 
 ### F-04-03: The 15% exposure cap measures option prices, not money at risk; put cash is neither checked nor reserved; the equity side is unaware
 - Severity: Critical

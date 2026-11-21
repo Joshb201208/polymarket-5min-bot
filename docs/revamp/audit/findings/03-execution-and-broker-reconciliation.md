@@ -401,6 +401,7 @@ No network request was made and the agent was not run.
   filled quantity, and "no stop in place" should be a state the bot records
   and announces.
 - Verification: Confirmed: `place_buy` reads nothing from the buy reply, never calls `get_order`, sends the stop for the full requested quantity after a fixed 3-second sleep, and returns the buy order unchanged when the stop fails, so the scheduler records and announces a stop either way; what Alpaca does with a sell stop that arrives before the fill (refuse it, or accept it as an order for shares not held) was not exercised and decides how bad the unfilled and partial-fill cases are.
+- Seen in production (added 2026-11-21): of 30 stock buys filled since the stop code arrived, the 11 that filled within three seconds all have a broker stop and the 19 that took longer have none. Every buy made at the open has gone without a broker stop. The broker's refusal itself was not captured. Source: `docs/revamp/audit/evidence/2026-11-21b-stop-orders-and-telegram.md` section 2; see F-11-15.
 
 ### F-03-06: A timed-out or unreadable broker reply is treated as "the order was not placed", and there is no order ID to check or de-duplicate with
 - Severity: High
