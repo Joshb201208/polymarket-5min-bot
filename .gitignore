@@ -7,3 +7,11 @@ __pycache__/
 venv/
 *.log
 dashboard/data/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Server snapshots contain private account data. Never commit them.
+stock-agent-snapshot-*
+snapshot/
