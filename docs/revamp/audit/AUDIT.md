@@ -34,8 +34,8 @@ short positions have been open for about six months without the bot knowing;
 its own reports overstate the return by about 12 points. The risk limits did
 not hold: the largest position was above the 15% cap on 122 of 164 trading
 days, because shares delivered by options bypass every limit. No position
-has a stop order at the broker today, and the bot's own stop check is mostly
-blind because its price feed is refused. Credentials for Telegram, TipRanks
+has a stop order at the broker today, and the bot's own stop check depends on a
+price feed that is partly refused. Credentials for Telegram, TipRanks
 and a Perplexity proxy are committed in this public repository and need
 rotating. My recommendation is unchanged: revamp in place, safety first, with
 options switched off and rebuilt only if Josh still wants them. What should
@@ -211,7 +211,7 @@ is recorded as a new finding in area 11 so the plan can pick it up.
 | [F-11-15](findings/11-live-performance.md) | **Mostly explained.** The stop is sent three seconds after the buy. Fast fills (11, all on 23 April, mid-session) got a stop; slow fills (19, all at the open) got none. This is F-03-05 in production (E3 §2). Still unexplained: eight stops sent together at 04:01 on 27 April for positions already held, through the API key, by something outside the bot's normal run (E3 §3). |
 | [F-11-15](findings/11-live-performance.md) | Six stops were cancelled, five of them 88 to 90 days after placement. The bot never cancels a stop, so the broker most likely expired them. Nothing reported it (E2 §4). |
 | [F-11-16](findings/11-live-performance.md) | The broker's portfolio-history figure has left out one long position, about 7% of equity, since 18 August. Cause unknown, on the broker's side (E1 §2). |
-| [F-11-17](findings/11-live-performance.md) | The options scan has traded a list frozen at four symbols since the last good TipRanks file on 14 April, and retries a ticker that was renamed in June. No finding covers the age of that list (E1 §3, §6). |
+| [F-11-17](findings/11-live-performance.md) | The options scan has traded the same four symbols since April and retries a ticker renamed in June (E1 §3, §6). The verifier traced the likely cause to two existing findings acting together: a refused screen falls back to four hard-coded symbols (F-06-09), and stored theses of any age trigger the spreads (F-04-09). Not confirmed against the server, and it does not explain the April date. |
 | none | Covered calls were sold far below the market price on 11 May. Commit `e92e1cd` fixed the strike rule, but no test covers it (E1 §4). |
 
 ## 4. Themes
@@ -312,7 +312,7 @@ Still unknown:
     known: a stop sent three seconds after a buy at the open is too early,
     and every such buy has gone without one (E3 §2). The April stops that
     did exist filled or expired after about 90 days, and the bot's own check
-    cannot see prices while its feed is refused. Options: (a) place stops by
+    depends on a price feed that is partly refused. Options: (a) place stops by
     hand now, knowing they expire again; (b) accept no stops while on paper;
     (c) stop the bot until decision 5 is built. Recommended: decide it
     knowingly. On paper (b) costs nothing real, but the record it produces
@@ -449,6 +449,8 @@ defect from different areas; the tables in section 3 merge them into about
 forty distinct problems. Verifiers suggested three severity changes that are
 left for Josh and the plan to settle: F-04-04 up to Critical, F-01-05 down to
 Medium, and F-06-08 and F-06-12 down to Medium. Five findings (F-11-13 to
-F-11-17) were added on 2026-11-21 from the live evidence and have not been
-through a second reviewer. The evidence also suggests F-09-09 down to Medium
+F-11-17) were added on 2026-11-21 from the live evidence and then checked by
+a second reviewer: F-11-13 and F-11-15 confirmed, F-11-14 withdrawn, F-11-16
+confirmed with Note suggested, and F-11-17 unclear with High suggested, its
+cause corrected to F-06-09 plus F-04-09. The evidence also suggests F-09-09 down to Medium
 and F-07-14 up from Low.

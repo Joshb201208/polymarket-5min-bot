@@ -15,13 +15,14 @@ against 14.7% for QQQ and 12.9% for SPY. That headline hides three things.
 First, all of the gain came before late July: the bot was up 41.8% by 24 July
 and has lost 12.6% since, twice the fall in QQQ. Second, research has almost
 certainly produced nothing since late July: Perplexity has refused every call
-for lack of quota, the price feed refuses most requests, and the bot kept
+for lack of quota, the price feed refuses many requests, and the bot kept
 sending normal-looking daily briefs. Third, the bot's own reports say +36.0%,
 about 12 points too high, mainly because two accidental short positions,
 opened when a stop-out was sold twice, are missing from its books. The risk
 limits did not hold in practice: the largest position was above the 15% cap on
 122 of 164 trading days, because shares delivered by option exercise bypass
-every limit. No stock position has a stop order at the broker today. The
+every limit. No stock position has a stop order at the broker today, and the
+bot's own stop check depends on a price feed that is partly refused. The
 sample is small (38 stock entries, 43 option structures, one strong technology
 rally), so none of this proves the strategy good or bad.
 
@@ -535,9 +536,9 @@ and no cost or API usage figure.
 - Severity: High
 - Confidence: Confirmed (observed in production)
 - Where: `docs/revamp/audit/evidence/2026-11-20-live-performance.md` section 3; code causes are in F-05-04, F-06-01, F-08-05 and F-08-11.
-- What happens: Since at least 20 September no Perplexity call has succeeded, most FMP requests are refused, the OpenAI model is reported as deprecated, and TipRanks returns "unauthorized". The last new stock entry was 17 July and the newest stored thesis is from late July.
+- What happens: Since at least 20 September no Perplexity call has succeeded, FMP has refused about 20,000 requests, the OpenAI model has been reported as deprecated since 25 October, and TipRanks returns "unauthorized". The last new stock entry was 17 July and the newest stored thesis is from late July. That research stopped in late July, before the log begins, is the evidence file's most likely reading, not a logged fact.
 - Evidence: 2,756 quota errors, about 12,000 "payment required" and 7,900 "too many requests" responses, 235 empty re-analysis replies and 36 research cycles ending in "0 signals" in two months. Entries per month fell from 24 in April to none after July.
-- Why it matters: The bot has been holding positions for four months with no working research and, because the price feed is refused, a software stop that mostly cannot see prices. Nobody was told. Results since late July say little about the strategy.
+- Why it matters: The bot has been holding positions for four months with no working research, and its software stop depends on a price feed that is partly refused (software stops did still sell on three days in the log window). Nobody was told. Results since late July say little about the strategy.
 - How verified: Read from the evidence file; not re-measured. Added 2026-11-21.
 - Direction (not a fix): A health check on every input, an alert when one fails, and no new trades while research or prices are down.
 - Verification: Confirmed: every count and date matches section 3 of the evidence file and High fits, with three wording caveats: the evidence gives refusal counts but never says "most" FMP requests are refused, the OpenAI deprecation notice starts on 25 October rather than 20 September, and "a software stop that mostly cannot see prices" goes beyond the evidence (section 4 records software stops selling on three days inside the same log window), while the period before 20 September is the evidence file's "most likely reading", not a logged fact.
@@ -579,11 +580,11 @@ and no cost or API usage figure.
 - Severity: Medium
 - Confidence: Confirmed (observed), code path not traced
 - Where: `docs/revamp/audit/evidence/2026-11-20-live-performance.md` sections 3 and 6.
-- What happens: The last successful TipRanks file is dated 14 April. The options universe has been four symbols since, and the scan repeats the same bull call spread on them about every three weeks. One ticker renamed on 9 June has produced 51 "invalid underlying symbols" errors.
+- What happens: Corrected 2026-11-21 after verification. The evidence says the last successful TipRanks file is dated 14 April, the options universe has been four symbols since, and the scan repeats the same bull call spread on them about every three weeks. The cause first written here (a saved list with no age check) does not match the code. The scan takes its symbols from the universe saved in `portfolio.json` (`scheduler.py:1426-1427`), which is rewritten at every screen. When the FMP screener is refused, the screen returns exactly the four hard-coded priority symbols (`data_feed.py:337-344`, `config.py:63-68`), which is F-06-09. The spreads are then triggered by stored theses of any age, which is F-04-09. Whether the server's four symbols are that priority list is not confirmed, and it does not explain the 14 April date. One ticker renamed on 9 June has produced 51 "invalid underlying symbols" errors.
 - Evidence: Seven losses in a row on one symbol since July; a second symbol net negative over eight structures.
-- Why it matters: A stale list keeps trading with no age check. No existing finding covers the age of the saved list.
+- Why it matters: A failed screen quietly shrinks the universe to four names, and months-old theses keep triggering real option orders on them. F-06-09 and F-04-09 cover the two halves; this finding records that together they have been trading in production.
 - How verified: Read from the evidence file; the code that loads the list was not traced in this pass. Added 2026-11-21.
-- Direction (not a fix): Refuse to trade from a universe older than a set age.
+- Direction (not a fix): Treat a failed screen as a failure, not as a four-symbol universe, and refuse to open options on a thesis older than a set age. An age check on the universe alone would not fire, because the list is re-saved each week.
 - Verification: Unclear: the observations match sections 3 and 6 of the evidence file, but the traced code contradicts the explanation: no code reads a saved TipRanks file (`scheduler.py:825-838` calls the API each time and saves nothing, and that client only arrived on 23 April), the options scan takes its symbols from the first 30 of the universe saved in `portfolio.json` (`scheduler.py:1426-1427`), that list is rewritten by every weekly, midweek and event screen (`scheduler.py:402`, `519`, `1672`), and when the FMP screener is refused `screen_universe` returns exactly the four hard-coded priority symbols (`data_feed.py:337-344`, `config.py:63-68`, run here with a failing fake, already F-06-09), so the list is most likely re-saved fresh each week rather than frozen and an age check on it would not fire; no age check exists anywhere (`last_universe_refresh` is written at `portfolio.py:365` and never read, and the conviction that triggers a bull call spread comes from a stored thesis of any age at `scheduler.py:1435-1440`, already F-04-09); still unknown are whether the server's four symbols are that priority list and why the evidence dates the freeze to 14 April, ten days before priority symbols were added. Suggested severity: High
 
 ## Checked and fine
