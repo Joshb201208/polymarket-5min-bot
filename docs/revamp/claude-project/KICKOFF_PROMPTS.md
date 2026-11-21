@@ -51,6 +51,33 @@ To audit one area on its own, for example before committing to the full run:
 /audit 02
 ```
 
+### If the audit stopped part-way
+
+A session stops when a usage limit is reached. Open the same session again
+once the limit has reset (do not start a new one, or unsaved work is lost)
+and send:
+
+```
+The audit was interrupted. Continue it, do not start again.
+
+1. Show me which findings files already exist in
+   docs/revamp/audit/findings/ and whether each one is complete.
+2. Commit and push the complete ones to audit/full-dig now, before doing
+   anything else.
+3. Read every file in docs/revamp/audit/evidence/. If that folder is missing
+   on this branch, bring it in with:
+   git fetch origin
+   git checkout origin/master -- docs/revamp/audit/evidence
+   (if it is not on master yet, tell me and I will paste the evidence.)
+4. Run the remaining areas at most two at a time, money-critical first.
+   Commit and push each findings file as soon as it is done.
+5. Then verify the Critical and High findings, write AUDIT.md, open the
+   draft pull request, and stop.
+
+If the usage limit gets close again, stop starting new work, push what is
+finished, and tell me which areas are left.
+```
+
 ## 2. From audit to plan
 
 Use this after you have read `docs/revamp/audit/AUDIT.md`. Replace the

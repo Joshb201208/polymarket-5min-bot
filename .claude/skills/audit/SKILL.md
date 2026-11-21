@@ -22,6 +22,24 @@ If nothing was given above, treat it as `all`.
    base for the audit pull request. Never work on `master`.
 4. Note the commit being audited (`git rev-parse --short HEAD`) so every
    findings file records it.
+5. List `docs/revamp/audit/evidence/`. If it has files, read them. They are
+   measurements of the running bot (see "Evidence on file" in the playbook).
+6. List `docs/revamp/audit/findings/`. If the branch exists on GitHub, fetch
+   it first so you see what an earlier session pushed. An area that already
+   has a complete findings file is done: do not run it again unless Josh
+   asked for that area by number.
+
+## Save as you go
+
+A session can stop without warning when a usage limit is reached. Nothing
+that exists only in the session survives that.
+
+- Commit and push each findings file as soon as its auditor returns and the
+  file passes your format check. One commit per area:
+  `docs(audit): findings for area NN`.
+- Never hold more than one finished, unpushed findings file.
+- If you are told the usage limit is close, stop launching work, commit and
+  push what is complete, and tell Josh which areas remain.
 
 ## One area
 
@@ -36,17 +54,22 @@ If an area number was given:
 
 ## All areas
 
-1. Launch one `auditor` subagent per brief in `docs/revamp/audit/areas/`, all
-   eleven, in parallel. Each gets only its brief's path.
+1. Launch one `auditor` subagent per brief in `docs/revamp/audit/areas/`
+   that is not already done, at most four at a time, in the playbook's
+   money-critical order (02, 03, 01, 07, 04, 09, 06, 05, 08, 10, 11). Each
+   gets only its brief's path. Start the next one as each finishes.
 2. As they return, check that each wrote exactly one findings file in the
    playbook's format. If one is thin or missed questions from its brief, send
-   it back once with the specific gaps.
+   it back once with the specific gaps. Then commit and push that file (see
+   "Save as you go").
 3. Launch `finding-verifier` subagents on every findings file that has
    Critical or High findings. These can run in parallel, one per file.
-4. Read all eleven findings files yourself and write
+4. Read all eleven findings files and the evidence files yourself and write
    `docs/revamp/audit/AUDIT.md` with the sections the playbook lists under
    "Synthesis". Leave refuted findings out of the top-findings table. Remove
-   duplicates across areas by pointing to one finding ID.
+   duplicates across areas by pointing to one finding ID. Every observation
+   in the evidence files must appear under the finding that explains it or
+   under "Unknowns".
 5. Commit everything under `docs/revamp/audit/` on `audit/full-dig`, push,
    and open one **draft** pull request titled
    `docs(audit): full audit of the stock agent`. The description is the
@@ -61,4 +84,5 @@ If an area number was given:
 
 Tell the area 03, 07, 08, 09, and 11 auditors where the unpacked snapshot is.
 It is evidence only. It must never be committed, and its raw contents must
-not be pasted into findings.
+not be pasted into findings. A snapshot adds to the evidence on file; it does
+not replace it.

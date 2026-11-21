@@ -164,11 +164,19 @@ Used in a single cloud session or a local session, where `/audit` and the
 subagents in `.claude/agents/` are available.
 
 1. Create branch `audit/full-dig` from `master`, or from the setup branch
-   if the setup is not merged to `master` yet.
-2. Launch one `auditor` subagent per area brief, in parallel where possible.
-   Each writes its own findings file and returns a short summary.
-3. Run the verification and synthesis steps below in the main session.
-4. Commit, push, open one draft pull request, then stop.
+   if the setup is not merged to `master` yet. If the branch already exists,
+   continue on it.
+2. Launch one `auditor` subagent per area brief that does not have a findings
+   file yet, at most four at a time. Each writes its own findings file and
+   returns a short summary.
+3. Commit and push each findings file as soon as it is complete. A session
+   can stop at any moment (usage limit, closed tab); work that is only in
+   the session is lost with it.
+4. Run the verification and synthesis steps below in the main session.
+5. Commit, push, open one draft pull request, then stop.
+
+To resume an interrupted audit, run it again. Areas that already have a
+findings file on `audit/full-dig` are not repeated.
 
 If parallel work is not available at all, do the areas one at a time in the
 order 02, 03, 01, 07, 04, 09, 06, 05, 08, 10, 11 (money-critical first).
@@ -220,3 +228,23 @@ uploading the resulting archive to the session.
   log lines containing them into findings.
 - If no snapshot is available, write area 11 as far as the code allows, list
   exactly what is missing under "Could not verify", and carry on.
+
+## Evidence on file
+
+`docs/revamp/audit/evidence/` holds measurements of the running bot that were
+taken outside a Claude Code session and written to the privacy rules above.
+They are committed so that every session has them, even when no snapshot can
+be uploaded.
+
+- Every auditor reads the files there before starting. Each file says which
+  areas its observations belong to.
+- An observation is a fact about what happened, at **Confirmed** confidence
+  for the observation itself. It is not a diagnosis. A finding built on one
+  still needs the code path, with file and line, that produces the behaviour.
+  Cite the evidence file and section alongside the code reference.
+- If the code cannot explain an observation, record that as a finding in its
+  own right rather than dropping it.
+- `AUDIT.md` lists each observation from the evidence files under the finding
+  that explains it, or under "Unknowns" if none does.
+- Do not edit evidence files during an audit. New measurements go in a new
+  dated file.
