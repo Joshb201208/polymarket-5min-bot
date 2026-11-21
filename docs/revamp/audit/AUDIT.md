@@ -322,8 +322,8 @@ Still unknown:
     (a) restore the Perplexity, FMP, OpenAI and TipRanks accounts now;
     (b) stop the service until the revamp has input health checks;
     (c) leave it. Recommended: (b), or (a) if you want the paper record to
-    continue. Under (c) the options scan keeps repeating losing spreads on a
-    list frozen in April.
+    continue. Under (c) the options scan keeps repeating losing spreads on
+    the same four symbols.
 25. **One stock is 33.6% of equity.** Trim it by hand to the 15% cap, or
     leave it? The bot has no code that trims. Recommended: your call; the
     plan needs to know whether the cap applies to holding or only to buying.
