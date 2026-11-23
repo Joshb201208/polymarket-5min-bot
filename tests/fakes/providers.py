@@ -97,6 +97,8 @@ class _LLM(CannedService):
     """Replies are taken from `replies` in order, then `default_reply`.
 
     `reply("text")`, `reply({"json": 1})` or `reply(LLMReply(...))`.
+    `respond_with(fn)`: fn(request_body: dict) -> reply, used when the queue is
+    empty (pick the answer from the prompt, e.g. by model or evidence id).
     `prompts` keeps every request body for assertions.
     """
 
@@ -105,15 +107,24 @@ class _LLM(CannedService):
     def __init__(self, clock=None):
         self.replies: list[LLMReply] = []
         self.prompts: list[Any] = []
+        self.responder = None
         super().__init__(clock)
+
+    def respond_with(self, fn) -> None:
+        self.responder = fn
 
     def reply(self, *items) -> None:
         for t in items:
             self.replies.append(_as_reply(t))
 
     def _next(self, request: httpx.Request) -> LLMReply:
-        self.prompts.append(request_json(request))
-        return self.replies.pop(0) if self.replies else LLMReply(text=self.default_reply)
+        body = request_json(request)
+        self.prompts.append(body)
+        if self.replies:
+            return self.replies.pop(0)
+        if self.responder is not None:
+            return _as_reply(self.responder(body or {}))
+        return LLMReply(text=self.default_reply)
 
     def _model(self, request, default: str) -> str:
         return (request_json(request) or {}).get("model", default)
