@@ -286,7 +286,10 @@ def _renames(ledger: Ledger) -> dict[str, str]:
         g = groups.setdefault(str(a.get("group_id") or a.get("id")), {})
         q = _dec(a.get("qty")) or ZERO
         g["new" if q > 0 else "old"] = a.get("symbol")
-    return {g["old"]: g["new"] for g in groups.values() if g.get("old") and g.get("new")}
+    out = {g["old"]: g["new"] for g in groups.values() if g.get("old") and g.get("new")}
+    for old, a in (ledger.store.kv_get("symbol_aliases", {}) or {}).items():
+        out.setdefault(old, a["new"])
+    return out
 
 
 def _own_intent_for(ledger: Ledger, open_activity_id: str | None) -> dict | None:
@@ -393,13 +396,18 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
 
     with store.transaction() as c:
         # metadata follows a name change before anything else
+        aliases = ledger.store.kv_get("symbol_aliases", {}) or {}
+        broker_qty = {str(_g(p, "symbol")): _dec(_g(p, "qty")) for p in positions}
         for old, new in renames.items():
+            if old in aliases and old in prev_qty and broker_qty.get(new) != Decimal(str(prev_qty[old])):
+                continue        # a registered alias moves metadata only when the quantity carried over exactly
             if old in open_meta and new in broker_syms and new not in open_meta and old not in broker_syms:
                 m = open_meta.pop(old)
                 c.execute("UPDATE positions_meta SET symbol=? WHERE position_id=?", (new, m.position_id))
                 open_meta[new] = PositionMeta(**{**m.__dict__, "symbol": new})
                 diffs.append(Diff(DiffKind.RENAMED, new, Severity.INFO, ledger=old, broker=new,
-                                  explanation="NC/SC activity", action="metadata moved"))
+                                  explanation=("verified corporate action" if old in aliases else "NC/SC activity"),
+                                  action="metadata moved"))
 
         for p in positions:
             sym = str(_g(p, "symbol"))
