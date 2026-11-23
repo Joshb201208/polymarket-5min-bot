@@ -283,3 +283,20 @@ def test_concentration_exact_cap_alerts_without_buy_or_trim_veto(risk):
 def test_options_cannot_cross_gross_via_existing_leverage(risk):
     book = snapshot(*(stock(f"NAME{i}", 101, "Industrials") for i in range(10)))
     assert risk.evaluate_trade(book, option()).reasons == ("gross_cap",)
+
+
+def test_fee_and_unfavorable_fill_do_not_overshoot_stop_budget(risk):
+    trade = buy(qty="100", stop_distance=D(".10"), mark_price=D(99), fee=D(1))
+    assert risk.evaluate_trade(snapshot(), trade).reasons == ("stop_risk_budget",)
+    assert risk.propose_equity_qty(snapshot(), trade) == 99
+
+
+def test_option_entry_requires_fresh_thesis(risk):
+    assert risk.evaluate_trade(snapshot(), option(signal_at=None)).reasons == ("stale_signal",)
+
+
+def test_two_share_classes_count_as_two_positions_but_one_exposure_bucket(risk):
+    holdings = (stock("GOOG", 1, "Communication Services"), stock("GOOGL", 1, "Communication Services"))
+    verdict = risk.evaluate_trade(snapshot(*holdings), buy())
+    assert verdict.after.positions == 3
+    assert verdict.after.issuer_values["GOOGL"] == D(200)

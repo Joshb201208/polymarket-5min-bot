@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import StrEnum
 from typing import Protocol
@@ -11,6 +11,8 @@ from stock_agent.ledger import BookSnapshot
 from stock_agent.models import PortfolioState, Trade
 
 logger = logging.getLogger(__name__)
+
+DRAWDOWN_STATE_KEY = "drawdown"
 
 
 class TradeKind(StrEnum):
@@ -96,6 +98,33 @@ class DrawdownState:
     def alert(self) -> bool:
         return self.drawdown >= _decimal(Config.DRAWDOWN_ALERT_PCT)
 
+    def to_record(self) -> dict[str, str | bool | int | None]:
+        return {
+            "version": 1,
+            "high_water": str(self.high_water),
+            "drawdown": str(self.drawdown),
+            "paused": self.paused,
+            "recovery_closes": self.recovery_closes,
+            "last_session": self.last_session,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping | None) -> "DrawdownState":
+        if record is None:
+            return cls()
+        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] != 1:
+            raise ValueError("unrecognized drawdown record")
+        high, loss = _decimal(record.get("high_water")), _decimal(record.get("drawdown"))
+        paused, closes = record.get("paused"), record.get("recovery_closes")
+        session = record.get("last_session")
+        if (high < 0 or not 0 <= loss < 1 or type(paused) is not bool or type(closes) is not int
+                or not 0 <= closes < Config.DRAWDOWN_RECOVERY_SESSIONS
+                or (not paused and (closes or loss >= _decimal(Config.DRAWDOWN_PAUSE_PCT)))
+                or (session is None and (high or loss or paused or closes))
+                or (session is not None and (high <= 0 or _session_id(session) != session))):
+            raise ValueError("invalid drawdown record")
+        return cls(high, loss, paused, closes, session)
+
 
 @dataclass(frozen=True)
 class RiskControls:
@@ -175,9 +204,11 @@ class _Projection:
             by_sector[c.sector] = by_sector.get(c.sector, Decimal(0)) + value
             for cluster in c.clusters:
                 by_cluster[cluster] = by_cluster.get(cluster, Decimal(0)) + value
+        symbols = {stock.symbol for stock in self.stocks.values() if stock.qty > 0}
+        symbols.update(self.pending_values)
         return PortfolioTotals(
             self.equity, self.cash, sum(by_issuer.values(), Decimal(0)),
-            by_issuer, by_sector, by_cluster, len(by_issuer),
+            by_issuer, by_sector, by_cluster, len(symbols),
             self.option_loss, self.option_count,
         )
 
@@ -306,6 +337,11 @@ def update_drawdown(
     previous_session: str | None = None,
 ) -> DrawdownState:
     """Apply one trusted (flow-adjusted when applicable) close, once."""
+    session = _session_id(session)
+    if previous_session is not None:
+        previous_session = _session_id(previous_session)
+        if previous_session >= session:
+            raise ValueError("expected previous close must precede the new close")
     if not session or (state.last_session is not None and session <= state.last_session):
         return state
     close_equity = _decimal(close_equity)
@@ -321,6 +357,14 @@ def update_drawdown(
     if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
     return DrawdownState(high_water, drawdown, paused, closes, session)
+
+
+def _session_id(day: str) -> str:
+    try:
+        parsed = date.fromisoformat(day)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid drawdown session label") from exc
+    return parsed.isoformat()
 
 
 class RiskManager:
@@ -386,6 +430,13 @@ class RiskManager:
             projection.equity -= fee + qty * max(Decimal(0), price - mark)
             if projection.equity <= 0:
                 return RiskVerdict(False, ("nonpositive_projected_equity",))
+            stop_distance = _decimal(self.config.STOP_LOSS_PCT if intent.stop_distance is None
+                                     else intent.stop_distance)
+            loss_budget = projection.equity * self._ratio("MAX_INITIAL_STOP_RISK_PCT")
+            if controls.drawdown.throttled:
+                loss_budget *= self._ratio("DRAWDOWN_THROTTLE_SCALE")
+            if (held + qty * price) * stop_distance > loss_budget:
+                return RiskVerdict(False, ("stop_risk_budget",), projection.totals())
             breaches = self._breaches(projection)
             unchanged = self._unchanged_breaches(before, breaches, equity_before, projection.equity)
             reasons = tuple(dict.fromkeys(b.kind for b in breaches
@@ -457,14 +508,11 @@ class RiskManager:
             buffer = _decimal(self.config.RISK_DRIFT_BUFFER_PCT)
             for breach in breaches:
                 if breach.kind == "position_count" and broker_action:
-                    # Count only falls when the last class of the issuer is closed.
                     # Prefer the newly delivered name if fully saleable.
                     candidates = [
                         stock for stock in book.stocks.values()
                         if stock.qty > 0 and stock.qty == stock.qty.to_integral_value()
                         and self._covered_shares(snapshot, stock.symbol) == 0
-                        and sum(s.classification.issuer == stock.classification.issuer
-                                for s in book.stocks.values() if s.qty > 0) == 1
                     ]
                     candidates.sort(key=lambda s: (s.symbol != broker_symbol, s.qty * s.mark, s.symbol))
                     if candidates:
@@ -669,6 +717,9 @@ class RiskManager:
                 or any(snapshot.account_flags.get(x) is True for x in
                        ("account_blocked", "trading_blocked", "trade_suspended_by_user"))):
             reasons.append("broker_book_blocked")
+        status = snapshot.account_flags.get("status")
+        if status and str(status).lower() != "active":
+            reasons.append("broker_account_inactive")
         raw, effective = intent.raw_conviction, intent.effective_conviction
         floor = self.config.MIN_CONVICTION
         effective_floor = max(8 if option else floor, intent.minimum_conviction)
@@ -680,9 +731,10 @@ class RiskManager:
         now = now or snapshot.as_of
         if not 0 <= (now - snapshot.as_of).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
             reasons.append("stale_broker_book")
-        if not option or intent.signal_at is not None:
-            if intent.signal_at is None or not 0 <= (now - intent.signal_at).total_seconds() <= self.config.MAX_ENTRY_SIGNAL_HOURS * 3600:
-                reasons.append("stale_signal")
+        if intent.signal_at is None or not (
+            0 <= (now - intent.signal_at).total_seconds() <= self.config.MAX_ENTRY_SIGNAL_HOURS * 3600
+        ):
+            reasons.append("stale_signal")
         if not option:
             if intent.quote_at is None or not 0 <= (now - intent.quote_at).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
                 reasons.append("stale_quote")
