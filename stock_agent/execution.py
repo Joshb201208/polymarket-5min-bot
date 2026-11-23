@@ -140,6 +140,7 @@ class ExecutionEngine:
         controls: Callable[[], Any] | None = None,
         market_gate: Callable[..., Awaitable[Any]] | None = None,
         capital_lock: Any = None,
+        research_gate: Any = None,
         config: Any = Config,
         settings: ExecSettings | None = None,
         now: Callable[[], datetime] | None = None,
@@ -154,6 +155,7 @@ class ExecutionEngine:
         self.controls = controls
         self._market_gate = market_gate
         self._capital_lock = capital_lock
+        self._research_gate = research_gate
         self.config = config
         self.s = settings or ExecSettings()
         self._alert_fn = alert
@@ -537,6 +539,9 @@ class ExecutionEngine:
         h = snap.holding(intent.symbol)
         if h is not None and h.qty < 0:
             return self._skip(intent, "account is short this symbol; cover first")
+        why = await self._research_recheck(intent, h)
+        if why:
+            return self._skip(intent, why)
         dist = await self._stop_distance(intent.symbol, ask)
         ti = self._trade_intent(intent, snap, limit, q, dist, add=h is not None and h.qty > 0)
         controls = self._risk_controls()
@@ -588,6 +593,29 @@ class ExecutionEngine:
                 e._exec_reprotect = intent.symbol  # re-protected by buy(), outside the capital lock
             raise
         return claimed, order, released
+
+    RESEARCH_ORIGINS = frozenset({"weekly", "midweek", "prescan", "earnings", "news"})
+
+    async def _research_recheck(self, intent: OrderIntent, holding: Any) -> str | None:
+        """At submission, not just at proposal: the research gate must still say BUY
+        for this intent's thesis, and a top-up must target the position it was proven for."""
+        if holding is not None and holding.qty > 0 and intent.position_id:
+            meta = self.ledger.open_position_meta(intent.symbol)
+            if meta is None or meta.position_id != intent.position_id:
+                return "top-up was approved for a position that has since closed or reopened"
+        if self._research_gate is None or intent.origin not in self.RESEARCH_ORIGINS:
+            return None
+        try:
+            g = self._research_gate.is_entry_eligible(intent.symbol, self.now())
+            if hasattr(g, "__await__"):
+                g = await g
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        if not g or getattr(g, "direction", None) != "BUY":
+            return "research gate no longer has a BUY for this symbol"
+        if getattr(g, "thesis_id", None) not in set(intent.thesis_ids or ()):
+            return "research gate's current thesis is not the one this intent was made from"
+        return None
 
     async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None) -> ExecResult:
         nxt = until or (self.now() + timedelta(minutes=5))

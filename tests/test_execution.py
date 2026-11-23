@@ -591,3 +591,26 @@ def test_capital_lock_serialises_opening_buys_but_not_protection(world, tmp_path
 
     res = run(go())
     assert res.status == IntentStatus.FILLED and len(_stops(world.alpaca, "AAA")) == 1
+
+
+def test_research_gate_rechecked_at_submission(world, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+
+    class Gate:
+        def is_entry_eligible(self, symbol, now):
+            return SimpleNamespace(direction="BUY", thesis_id="th-newer")
+
+    eng._research_gate = Gate()
+    ids = eng.ledger.enqueue_intents([NewIntent(
+        symbol="AAA", side="buy", dedupe_key="news:AAA", reference_price=Decimal("50"), origin="news",
+        thesis_ids=("th-old",), meta={"effective_conviction": 8, "raw_conviction": 8, "sector": "Technology"})])
+    res = run(eng.execute_intent(eng.ledger.get_intent(ids[0])))
+    assert res.status == IntentStatus.SKIPPED and "thesis" in res.reason
+    world.assert_no_orders()
