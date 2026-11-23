@@ -52,6 +52,8 @@ from stock_agent.options_policy import (
     ExitInputs,
     ExitReason,
     Proposal,
+    estimate_trading_days,
+    is_probable_session,
     mark_problem,
     Rejection,
     apply_result,
@@ -71,6 +73,8 @@ from stock_agent.risk_manager import OptionCommitment, RiskControls, TradeIntent
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
+# estimated counts are trusted only this many sessions past the exit threshold
+_FALLBACK_MARGIN = 5
 _EXPIRY_DRIVEN = frozenset({ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND})
 OPTION_ACTIVITY_TYPES = ("FILL", "OPEXC", "OPXRC", "OPASN", "OPEXP", "OPTRD")
 _FILLED = "filled"
@@ -352,9 +356,17 @@ class OptionsManager:
 
     def _trading_days(self, a: date, b: date) -> int | None:
         try:
-            return self.calendar.trading_days_between(a, b)
+            n = self.calendar.trading_days_between(a, b)
         except Exception:
-            return None
+            n = None
+        if n is not None or b < a:
+            return n
+        # Beyond the broker calendar's window: use the weekday/holiday estimate, but only
+        # for clearly distant dates. Near expiry an unknown count stays None (close).
+        est = estimate_trading_days(a, b)
+        if est is not None and est > self.settings.exit_trading_days_before_expiry + _FALLBACK_MARGIN:
+            return est
+        return None
 
     def _add_trading_days(self, d: date, n: int) -> date:
         cur = d
@@ -365,9 +377,9 @@ class OptionsManager:
             except Exception:
                 nxt = None
             if nxt is None:
-                # calendar not covered that far: count weekdays (only ever lengthens the wait slightly)
+                # calendar not covered that far: weekdays minus rule-based NYSE holidays
                 cur = cur + timedelta(days=1)
-                while cur.weekday() >= 5:
+                while not is_probable_session(cur):
                     cur += timedelta(days=1)
             else:
                 cur = getattr(nxt, "date", None) or getattr(nxt, "day")

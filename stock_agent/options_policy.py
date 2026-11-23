@@ -11,7 +11,7 @@ import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 
 from stock_agent.options_settings import OptionsSettings
@@ -415,3 +415,69 @@ def close_limit(value_bid: float, value_mid: float, frac: float) -> float:
     """Limit for a closing credit per share: from mid towards the natural price, never negative."""
     px = value_mid - max(value_mid - value_bid, 0.0) * frac
     return max(math.floor(round(px * 100, 6)) / 100, 0.0)
+
+
+# ---------------------------------------------------------------- calendar fallback
+# Used only beyond the broker calendar's window. Rule-based NYSE full-day closures
+# (https://www.nyse.com/markets/hours-calendars); special closures are not known here,
+# so near-expiry decisions always rely on the broker calendar instead.
+
+def _easter(y: int) -> date:
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    m = (32 + 2 * e + 2 * i - h - k) % 7
+    n = (a + 11 * h + 22 * m) // 451
+    month = (h + m - 7 * n + 114) // 31
+    day = (h + m - 7 * n + 114) % 31 + 1
+    return date(y, month, day)
+
+
+def _nth_weekday(y: int, month: int, weekday: int, n: int) -> date:
+    d = date(y, month, 1)
+    d += timedelta(days=(weekday - d.weekday()) % 7)
+    return d + timedelta(weeks=n - 1)
+
+
+def _last_weekday(y: int, month: int, weekday: int) -> date:
+    d = date(y + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def nyse_holidays(y: int) -> frozenset[date]:
+    days = {
+        _nth_weekday(y, 1, 0, 3), _nth_weekday(y, 2, 0, 3), _easter(y) - timedelta(days=2),
+        _last_weekday(y, 5, 0), _observed(date(y, 7, 4)), _nth_weekday(y, 9, 0, 1),
+        _nth_weekday(y, 11, 3, 4), _observed(date(y, 12, 25)),
+    }
+    if date(y, 1, 1).weekday() != 5:  # NYSE does not observe a Saturday New Year on Dec 31
+        days.add(_observed(date(y, 1, 1)))
+    if y >= 2022:
+        days.add(_observed(date(y, 6, 19)))
+    return frozenset(days)
+
+
+def is_probable_session(d: date) -> bool:
+    return d.weekday() < 5 and d not in nyse_holidays(d.year)
+
+
+def estimate_trading_days(a: date, b: date) -> int | None:
+    """Sessions after ``a`` through ``b`` by weekday and holiday rules."""
+    if b < a:
+        return None
+    n, cur = 0, a
+    while cur < b:
+        cur += timedelta(days=1)
+        n += is_probable_session(cur)
+    return n
