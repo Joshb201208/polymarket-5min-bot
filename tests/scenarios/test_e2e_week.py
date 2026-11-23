@@ -248,10 +248,6 @@ def test_own_fills_are_not_reported_as_imports(week):
     assert not noisy, noisy
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "R-03: after a lost order reply + restart, startup reconciles (scheduler.py:333-334 order, "
-    "mirrored by WeekAgent.startup) before engine.resume() acks the intent with its broker "
-    "order id, so the bot's own DDD fill is booked as an 'imported' position with a warning"))
 def test_own_fill_recovered_after_restart_is_not_an_import(week):
     world, *_ = week
     noisy = [a for a in world.e2e_shared["alerts"] if a[1] == "Books: imported DDD"]
