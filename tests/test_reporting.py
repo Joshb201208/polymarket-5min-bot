@@ -28,6 +28,7 @@ from stock_agent.ledger import (
 from stock_agent.options_book import Leg as OptBookLeg, OptionsStore, Structure
 from stock_agent.price_service import DailyBar, PriceBatchResult, Quote
 from stock_agent.reporting import ReportBuilder, describe_drawdown_tier, format_input_health_table
+from stock_agent.scheduler import StockAgentScheduler
 from tests.fakes.world import FakeWorld
 from tests.ledger_helpers import make_ledger
 
@@ -553,5 +554,32 @@ def test_daily_summary_separates_options_pnl_and_ignores_last_equity(
         assert "+21.20%" in flat  # QQQ cumulative since launch ($500 -> $606 = +21.20%)
         assert "sector headroom exceeded" in flat
         ledger.store.close()
+
+    asyncio.run(_run())
+
+
+def test_scheduler_morning_brief_and_friday_summary_emit_weekly_scorecard(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    async def _run() -> None:
+        # Friday Nov 27, 2026 at 16:10 ET -> _send_morning_brief + _send_daily_summary post daily + weekly scorecard
+        world.clock.set_et(2026, 11, 27, 16, 10)
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path
+        cfg.DISCORD_BOT_TOKEN = "test-discord"
+        cfg.TELEGRAM_BOT_TOKEN = ""
+        cfg.TELEGRAM_CHAT_ID = ""
+        sched = StockAgentScheduler(cfg)
+        sched.store.open()
+        try:
+            await sched._send_morning_brief()
+            await sched._send_daily_summary()
+            texts = "\n".join(world.discord.texts())
+            assert "Morning Brief" in texts
+            assert "Daily Close Summary" in texts
+            assert "Weekly Paper-Test Scorecard" in texts
+        finally:
+            await sched.http.aclose()
+            sched.store.close()
 
     asyncio.run(_run())

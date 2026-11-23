@@ -1059,63 +1059,80 @@ class StockAgentScheduler:
     # ── Daily summary ────────────────────────────────────────────────
 
     async def _send_daily_summary(self):
-        """End-of-day summary."""
+        """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""
         try:
+            from stock_agent.reporting import ReportBuilder
+
             now = _now_et()
             self._daily_summary_sent_today = now.strftime("%Y-%m-%d")
+            snap = self.ledger.last_snapshot() if self.ledger is not None else None
+            if snap is None and self.ledger is not None:
+                try:
+                    snap = await self.ledger.refresh("daily_summary")
+                except Exception as exc:
+                    logger.warning("Daily summary refresh fallback failed: %s", exc)
 
-            pv = self.portfolio.get_portfolio_value()
-            exposure = self.portfolio.get_exposure()
-
-            # Calculate day P&L (compare to previous summary or starting capital)
-            prev_value = self.portfolio.state.starting_capital
-            if self.portfolio.state.daily_summaries:
-                prev_value = self.portfolio.state.daily_summaries[-1].portfolio_value
-
-            day_pnl = pv - prev_value
-            day_pnl_pct = day_pnl / prev_value if prev_value > 0 else 0
-            total_pnl = pv - self.portfolio.state.starting_capital
-            total_pnl_pct = total_pnl / self.portfolio.state.starting_capital if self.portfolio.state.starting_capital > 0 else 0
-
-            # Trades executed today
-            today_str = now.strftime("%Y-%m-%d")
-            trades_today = [
-                t for t in self.portfolio.state.trade_history
-                if t.timestamp.strftime("%Y-%m-%d") == today_str
-            ]
-
-            summary = DailySummary(
-                date=now.strftime("%b %d, %Y (%a)"),
-                portfolio_value=pv,
-                cash=self.portfolio.state.cash,
-                total_exposure=sum(p.current_price * p.shares for p in self.portfolio.state.positions),
-                exposure_pct=exposure,
-                num_positions=len(self.portfolio.state.positions),
-                day_pnl=day_pnl,
-                day_pnl_pct=day_pnl_pct,
-                total_pnl=total_pnl,
-                total_pnl_pct=total_pnl_pct,
-                trades_today=trades_today,
-                positions=list(self.portfolio.state.positions),
-                signals=[],
+            builder = ReportBuilder(
+                self.config,
+                ledger=self.ledger,
+                price_service=getattr(self, "prices", None),
+                health_registry=getattr(self, "health", None),
+                options_store=getattr(self, "options_store", None),
+                calendar=getattr(self, "calendar", None),
+                research_store=getattr(self, "research_store", None),
+                clock=_now_utc,
+            )
+            embeds = await builder.build_daily_summary(
+                snapshot=snap,
+                close_report=getattr(self, "_last_close_report", None),
+                as_of=now,
             )
 
-            self.portfolio.add_daily_summary(summary)
-            await asyncio.gather(
-                self.telegram.send_daily_summary(summary),
-                self.discord.send_daily_summary(summary),
-                self.discord.send_eli5_daily(summary),
-                return_exceptions=True,
-            )
-            logger.info("Daily summary sent — PV=$%.0f, Day P&L=$%+.0f", pv, day_pnl)
+            if self.alerts is not None:
+                self.alerts.alert(
+                    "info",
+                    f"Daily Summary — {now.strftime('%Y-%m-%d')}",
+                    "",
+                    key=f"daily_summary:{now.strftime('%Y-%m-%d')}",
+                    channel_key="daily_summary",
+                    embeds=embeds,
+                )
+            elif self.discord is not None:
+                ch = self.discord.channels.get("daily_summary") or self.discord.channels.get("announcements", "")
+                if ch:
+                    await self.discord._send_multi_embed(ch, embeds)
 
+            # Emit the weekly paper-test scorecard on Friday (or if Friday is a holiday, Thursday)
+            is_week_end = now.weekday() == 4
+            if not is_week_end and now.weekday() == 3 and getattr(self, "calendar", None) is not None:
+                try:
+                    is_week_end = self.calendar.session_on(now.date() + timedelta(days=1)) is None
+                except Exception:
+                    is_week_end = False
+            if is_week_end:
+                wk_embeds, _ = await builder.build_weekly_scorecard(snapshot=snap, as_of=now)
+                if self.alerts is not None:
+                    self.alerts.alert(
+                        "info",
+                        f"Weekly Scorecard — {now.strftime('%Y-%m-%d')}",
+                        "",
+                        key=f"weekly_scorecard:{now.strftime('%Y-%W')}",
+                        channel_key="daily_summary",
+                        embeds=wk_embeds,
+                    )
+                elif self.discord is not None:
+                    ch = self.discord.channels.get("daily_summary") or self.discord.channels.get("announcements", "")
+                    if ch:
+                        await self.discord._send_multi_embed(ch, wk_embeds)
+
+            if self.alerts is not None:
+                await self.alerts.flush()
+            logger.info("Daily summary sent (%d embeds)", len(embeds))
         except Exception as e:
             logger.exception("Daily summary failed: %s", e)
-            await asyncio.gather(
-                self.telegram.send_error_alert(f"Daily summary failed: {e}"),
-                self.discord.send_error(str(e), context="Daily summary"),
-                return_exceptions=True,
-            )
+            if self.alerts is not None:
+                self.alerts.alert_unhandled_exception("daily_summary", e)
+                await self.alerts.flush()
 
     async def _run_options_scan(self):
         """Once-per-session options entry scan via OptionsManager.
@@ -1160,225 +1177,69 @@ class StockAgentScheduler:
     # ── Morning Brief ────────────────────────────────────────────────
 
     async def _send_morning_brief(self):
-        """Comprehensive morning brief posted to #announcements.
-
-        Includes: portfolio status, market regime, yesterday's activity,
-        today's outlook, key levels, and what the bot plans to do.
-        """
+        """Honest morning brief posted to #announcements from reconciled state."""
         try:
+            from stock_agent.reporting import ReportBuilder
+
             now = _now_et()
             self._morning_brief_done_today = now.strftime("%Y-%m-%d")
-            today_str = now.strftime("%A, %B %d, %Y")
-            sgt_str = datetime.now(SGT).strftime("%I:%M %p SGT")
-
-            embeds: list[dict] = []
-
-            # ── 1. PORTFOLIO STATUS ──────────────────────────────
-            book = self.ledger.last_snapshot()
-            if book:
-                equity, cash = float(book.equity), float(book.cash)
-                marks = [mark for mark in self.ledger.equity_marks("close") if mark.session_date < now.date()]
-                last_equity = float(marks[-1].equity) if marks else equity
-                alpaca_positions = [{
-                    "symbol": h.symbol, "unrealized_pl": (h.price - h.avg_cost) * h.qty if h.price else 0,
-                    "unrealized_plpc": h.price / h.avg_cost - 1 if h.price and h.avg_cost else 0,
-                    "current_price": h.price or 0, "market_value": h.market_value,
-                } for h in book.holdings]
-                day_pnl = equity - last_equity
-                day_pnl_pct = (day_pnl / last_equity * 100) if last_equity > 0 else 0
-                starting = self.portfolio.state.starting_capital
-                total_pnl = equity - starting
-                total_pnl_pct = (total_pnl / starting * 100) if starting > 0 else 0
-                invested = equity - cash
-                exposure_pct = (invested / equity * 100) if equity > 0 else 0
-
-                pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
-                day_emoji = "\u2705" if day_pnl >= 0 else "\u274c"
-
-                portfolio_fields = [
-                    {"name": "Portfolio Value", "value": f"**${equity:,.2f}**", "inline": True},
-                    {"name": "Cash Available", "value": f"${cash:,.0f}", "inline": True},
-                    {"name": "Exposure", "value": f"{exposure_pct:.1f}% (${invested:,.0f})", "inline": True},
-                    {"name": f"{day_emoji} Yesterday P&L", "value": f"${day_pnl:+,.2f} ({day_pnl_pct:+.2f}%)", "inline": True},
-                    {"name": f"{pnl_emoji} Total P&L", "value": f"${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)", "inline": True},
-                    {"name": "Positions", "value": f"{len(alpaca_positions)} / {self.config.MAX_POSITIONS} slots", "inline": True},
-                ]
-
-                # Position table
-                if alpaca_positions:
-                    # Sort by unrealized P&L descending
-                    sorted_pos = sorted(
-                        alpaca_positions,
-                        key=lambda p: float(p.get("unrealized_pl", 0)),
-                        reverse=True,
-                    )
-                    pos_lines = []
-                    for p in sorted_pos:
-                        sym = p.get("symbol", "?")
-                        upnl = float(p.get("unrealized_pl", 0))
-                        upnl_pct = float(p.get("unrealized_plpc", 0)) * 100
-                        cur = float(p.get("current_price", 0))
-                        mv = float(p.get("market_value", 0))
-                        emoji = "\u2705" if upnl >= 0 else "\u274c"
-                        pos_lines.append(
-                            f"{emoji} **{sym}** ${cur:,.2f} | ${upnl:+,.0f} ({upnl_pct:+.1f}%) | ${mv:,.0f}"
-                        )
-                    pos_text = "\n".join(pos_lines)
-                    if len(pos_text) <= 1024:
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Open Positions", "value": pos_text, "inline": False}
-                        )
-                    else:
-                        # Split into two fields
-                        mid = len(pos_lines) // 2
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Positions (1/2)", "value": "\n".join(pos_lines[:mid]), "inline": False}
-                        )
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Positions (2/2)", "value": "\n".join(pos_lines[mid:]), "inline": False}
-                        )
-
-                embeds.append({
-                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
-                    "description": f"Good {'morning' if now.hour < 12 else 'evening'}. Here's your daily update. ({sgt_str})",
-                    "color": 0x3B82F6,
-                    "fields": portfolio_fields,
-                })
-            else:
-                embeds.append({
-                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
-                    "description": "Could not fetch Alpaca account data.",
-                    "color": 0xEF4444,
-                })
-
-            # ── 2. MARKET REGIME ─────────────────────────────────
-            macro_snap = self.macro.get_last_snapshot()
-            if macro_snap:
-                regime_embed = self.macro.format_discord_brief(macro_snap)
-                regime_embed["title"] = "\U0001f30d Market Conditions"
-                embeds.append(regime_embed)
-            else:
-                # Run a fresh check if none exists
+            snap = self.ledger.last_snapshot() if self.ledger is not None else None
+            if snap is None and self.ledger is not None:
                 try:
-                    macro_snap = await self.macro.check_conditions()
-                    regime_embed = self.macro.format_discord_brief(macro_snap)
-                    regime_embed["title"] = "\U0001f30d Market Conditions"
-                    embeds.append(regime_embed)
-                except Exception as e:
-                    logger.warning("Could not fetch macro data for morning brief: %s", e)
+                    snap = await self.ledger.refresh("morning_brief")
+                except Exception as exc:
+                    logger.warning("Morning brief refresh fallback failed: %s", exc)
 
-            # ── 3. YESTERDAY RECAP ───────────────────────────────
-            yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-            yesterday_trades = [
-                t for t in self.portfolio.state.trade_history
-                if t.timestamp.strftime("%Y-%m-%d") == yesterday_str
-            ]
+            macro_embed: dict | None = None
+            macro_svc = getattr(self, "macro", None)
+            if macro_svc is not None:
+                try:
+                    macro_snap = macro_svc.get_last_snapshot()
+                    if macro_snap is None:
+                        macro_snap = await macro_svc.check_conditions()
+                    if macro_snap is not None:
+                        macro_embed = macro_svc.format_discord_brief(macro_snap)
+                        macro_embed["title"] = "\U0001f30d Market Conditions"
+                except Exception as exc:
+                    logger.warning("Could not fetch macro data for morning brief: %s", exc)
 
-            recap_lines = []
-            if yesterday_trades:
-                for t in yesterday_trades:
-                    pnl_str = ""
-                    if t.pnl is not None:
-                        pnl_str = f" \u2192 ${t.pnl:+,.0f}"
-                    recap_lines.append(f"\u2022 **{t.action}** {t.symbol} x{t.shares} @ ${t.price:.2f}{pnl_str}")
-            else:
-                recap_lines.append("No trades executed yesterday. The bot held steady.")
+            builder = ReportBuilder(
+                self.config,
+                ledger=self.ledger,
+                price_service=getattr(self, "prices", None),
+                health_registry=getattr(self, "health", None),
+                options_store=getattr(self, "options_store", None),
+                calendar=getattr(self, "calendar", None),
+                research_store=getattr(self, "research_store", None),
+                clock=_now_utc,
+            )
+            embeds = await builder.build_morning_brief(
+                snapshot=snap,
+                as_of=now,
+                macro_embed=macro_embed,
+            )
 
-            # What scans ran
-            scan_info = []
-            day_of_week = now.weekday()
-            yesterday_dow = (now - timedelta(days=1)).weekday()
-            if yesterday_dow == 6:  # Sunday
-                scan_info.append("\u2022 Weekly full analysis ran (Sunday cycle)")
-            if yesterday_dow == 2:  # Wednesday
-                scan_info.append("\u2022 Mid-week analysis ran (Wednesday refresh)")
-            if yesterday_dow < 5:  # Weekday
-                scan_info.append("\u2022 Daily pre-market scan completed")
-                scan_info.append("\u2022 Market monitoring ran every 30 min during market hours")
-
-            recap_text = "**Trades:**\n" + "\n".join(recap_lines)
-            if scan_info:
-                recap_text += "\n\n**Bot Activity:**\n" + "\n".join(scan_info)
-
-            embeds.append({
-                "title": "\U0001f4cb Yesterday's Recap",
-                "description": recap_text,
-                "color": 0x6B7280,
-            })
-
-            # ── 4. TODAY'S OUTLOOK ───────────────────────────────
-            outlook_lines = []
-
-            # What's scheduled today
-            if day_of_week < 5:  # Weekday
-                outlook_lines.append("\u2022 **6:30 AM ET** \u2014 Macro conditions check")
-                outlook_lines.append("\u2022 **7:00 AM ET** \u2014 Earnings-reactive scan")
-                outlook_lines.append("\u2022 **8:00 AM ET** \u2014 Daily pre-market scan")
-                outlook_lines.append("\u2022 **9:30 AM - 4:00 PM ET** \u2014 Market monitoring (every 30 min)")
-                outlook_lines.append("\u2022 **4:05 PM ET** \u2014 Daily summary")
-            if day_of_week == 2:  # Wednesday
-                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Mid-week full analysis (Wednesday refresh)")
-            if day_of_week == 6:  # Sunday
-                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Weekly full analysis")
-
-            # Regime-driven behavior
-            regime = self.macro.get_current_regime()
-            min_conv = self.macro.get_effective_min_conviction()
-            scan_depth = self.macro.get_effective_universe_size()
-            analysis_depth = self.macro.get_effective_analysis_depth()
-
-            outlook_lines.append("")
-            outlook_lines.append(f"**Active Regime:** {regime.replace('_', ' ').title()}")
-            outlook_lines.append(f"**Conviction Threshold:** {min_conv}/10")
-            outlook_lines.append(f"**Scan Depth:** {scan_depth} stocks \u2192 analyze top {analysis_depth}")
-
-            # Available slots and firepower
-            open_slots = self.config.MAX_POSITIONS - len(self.portfolio.state.positions)
-            if open_slots > 0 and book:
-                outlook_lines.append(f"**Open Slots:** {open_slots} positions available")
-                outlook_lines.append(f"**Buying Power:** ${cash:,.0f} ready to deploy")
-            elif open_slots <= 0:
-                outlook_lines.append("**Slots:** Fully invested \u2014 no new positions unless one is sold")
-
-            # Pending signals
-            if self._pending_signals:
-                outlook_lines.append(f"\n**\U0001f4e1 {len(self._pending_signals)} signal(s) queued** for market open")
-                for sig in self._pending_signals[:5]:
-                    outlook_lines.append(f"  \u2022 {sig.action} {sig.symbol} (conviction {sig.conviction})")
-
-            embeds.append({
-                "title": "\U0001f3af Today's Plan",
-                "description": "\n".join(outlook_lines),
-                "color": 0x8B5CF6,
-            })
-
-            # ── 5. KEY LEVELS ────────────────────────────────────
-            levels = macro_snap.key_levels if macro_snap else {}
-            fields = (("close", "Last close"), ("sma50", "50-day average"), ("sma200", "200-day average"),
-                      ("high90", "90-day high"))
-            levels_text = "\n".join(
-                f"**{symbol}**: " + " | ".join(f"{label} ${value:,.2f}" for key, label in fields
-                                                if (value := levels.get(symbol, {}).get(key)) is not None)
-                for symbol in ("SPY", "QQQ") if any(levels.get(symbol, {}).values())
-            ) or "Completed market bars unavailable."
-
-            embeds.append({
-                "title": "\U0001f4ca Key Levels to Watch",
-                "description": levels_text,
-                "color": 0xF59E0B,
-            })
-
-            # ── POST TO DISCORD ──────────────────────────────────
-            # Post to announcements channel as multi-embed message
-            ch = self.discord.channels.get("announcements", "")
-            if ch:
-                # Discord allows max 10 embeds — we should have 5
-                await self.discord._send_multi_embed(ch, embeds)
+            if self.alerts is not None:
+                self.alerts.alert(
+                    "info",
+                    f"Morning Brief — {now.strftime('%Y-%m-%d')}",
+                    "",
+                    key=f"morning_brief:{now.strftime('%Y-%m-%d')}",
+                    channel_key="announcements",
+                    embeds=embeds,
+                )
+                await self.alerts.flush()
+            elif self.discord is not None:
+                ch = self.discord.channels.get("announcements", "")
+                if ch:
+                    await self.discord._send_multi_embed(ch, embeds)
 
             logger.info("Morning brief sent — %d embeds", len(embeds))
-
         except Exception as e:
             logger.exception("Morning brief failed: %s", e)
+            if self.alerts is not None:
+                self.alerts.alert_unhandled_exception("morning_brief", e)
+                await self.alerts.flush()
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
