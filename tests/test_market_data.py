@@ -119,6 +119,48 @@ async def test_daily_history_never_bridges_gap_or_mixes_split_basis(world, tmp_p
 
 
 @run_async
+async def test_daily_history_retries_full_window_when_overlap_is_missing(world, tmp_path, monkeypatch):
+    world.alpaca.seed_daily_bars("ALFA", [100] * 20)
+    store = StateStore(tmp_path / "bars.db")
+    store.open()
+    prices = PriceService(store=store, now=world.clock.now)
+    bars = (await prices.get_daily_bars(["ALFA"], sessions=20))["ALFA"]
+    assert bars[-1].close == 100
+
+    history = world.alpaca.trades_history["ALFA"]
+    world.alpaca.trades_history["ALFA"] = [(t, p / 2, v * 2) for t, p, v in history]
+    world.clock.advance(days=1)
+    world.alpaca.seed_daily_bars("ALFA", [50])
+    original = world.alpaca._bars
+
+    def missing_anchor(symbol, params):
+        rows = original(symbol, params)
+        return ([row for row in rows if not row["t"].startswith("2026-11-20")]
+                if str(params.get("start", "")).startswith("2026-11-20") else rows)
+
+    monkeypatch.setattr(world.alpaca, "_bars", missing_anchor)
+    adjusted = (await prices.get_daily_bars(["ALFA"], sessions=20))["ALFA"]
+    assert len(adjusted) == 20 and {bar.close for bar in adjusted} == {Decimal(50)}
+    assert len(world.net.requests(service="alpaca", path="/v2/stocks/bars")) == 3
+    store.close()
+
+
+@run_async
+async def test_daily_history_revalidates_premarket_cache_at_open(world, tmp_path):
+    world.alpaca.seed_daily_bars("ALFA", [100] * 20)
+    store = StateStore(tmp_path / "bars.db")
+    store.open()
+    prices = PriceService(store=store, now=world.clock.now)
+    assert (await prices.get_daily_bars(["ALFA"], sessions=20))["ALFA"][-1].close == 100
+    history = world.alpaca.trades_history["ALFA"]
+    world.alpaca.trades_history["ALFA"] = [(t, p / 2, v * 2) for t, p, v in history]
+    world.clock.advance_to_open()
+    adjusted = (await prices.get_daily_bars(["ALFA"], sessions=20))["ALFA"]
+    assert len(adjusted) == 20 and {bar.close for bar in adjusted} == {Decimal(50)}
+    store.close()
+
+
+@run_async
 async def test_registry_defers_state_until_scheduler_opens_store(world, tmp_path, monkeypatch):
     world.alpaca.add_asset("ALFA")
     world.alpaca.add_asset("BETA", tradable=False)
