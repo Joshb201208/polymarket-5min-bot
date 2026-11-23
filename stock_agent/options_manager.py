@@ -21,6 +21,7 @@ Mechanics this module guarantees:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import logging
@@ -160,6 +161,7 @@ class OptionsManager:
         cover_short: Callable[..., Awaitable[Any]] | None = None,
         universe: Callable[[], Iterable[str]] | None = None,
         risk_controls: Callable[[], RiskControls] | None = None,
+        capital_lock: asyncio.Lock | None = None,
         ex_dividend: Callable[[str], Any] | None = None,
         journal: Any = None,
         alerts: Any = None,
@@ -179,6 +181,7 @@ class OptionsManager:
         self._universe = universe or (lambda: ())
         self._risk_controls = risk_controls or (lambda: RiskControls())
         self._bad_marks: set[str] = set()
+        self._capital_lock = capital_lock
         self._ex_dividend = ex_dividend
         self.journal = journal
         self.alerts = alerts
@@ -214,19 +217,34 @@ class OptionsManager:
     def get(self, structure_id: str) -> Structure | None:
         return next((s for s in self.structures if s.id == structure_id), None)
 
+    @contextlib.asynccontextmanager
+    async def _capital_lock_cm(self):
+        if self._capital_lock is None:
+            yield
+        else:
+            async with self._capital_lock:
+                yield
+
+    def risk_commitments(self) -> tuple[OptionCommitment, ...]:
+        """Public alias for the equity lane's projection: every open and pending structure."""
+        return self.commitments()
+
     def commitments(self) -> tuple[OptionCommitment, ...]:
-        """Open and pending structures for risk (max loss; pending debit by order id)."""
+        """Open and pending structures for risk: max loss for all; for pending ones the
+        debit is also reserved as cash (identified by order ids) until the fill shows
+        up in the broker's cash."""
         out = []
         for s in self.live():
             ml = s.max_loss if s.max_loss is not None else 0.0
             ids = tuple(i for i in (s.open_order_id, s.open_client_id) if i) if s.st is StructState.PENDING else ()
+            cash = Decimal(str(round(ml, 2))) if s.st is StructState.PENDING else Decimal(0)
             kw: dict[str, Any] = {}
             if ids:
                 kw["order_ids"] = ids
             try:
-                out.append(OptionCommitment(s.id, Decimal(str(round(ml, 2))), Decimal(0), **kw))
+                out.append(OptionCommitment(s.id, Decimal(str(round(ml, 2))), cash, **kw))
             except TypeError:  # older risk interface without order_ids
-                out.append(OptionCommitment(s.id, Decimal(str(round(ml, 2))), Decimal(0)))
+                out.append(OptionCommitment(s.id, Decimal(str(round(ml, 2))), cash))
         return tuple(out)
 
     def open_max_loss(self) -> float:
@@ -496,30 +514,36 @@ class OptionsManager:
             option_max_loss=Decimal(str(sizing.max_loss)), option_cash_debit=Decimal(str(sizing.debit_cash)),
             structure_id=sid, signal_at=el.generated_at, quote_at=now, analysis_price=Decimal(str(spot)),
         )
-        full_controls = RiskControls(
-            pause_new_buys=getattr(controls, "pause_new_buys", False),
-            drawdown=getattr(controls, "drawdown", RiskControls().drawdown),
-            option_commitments=self.commitments(),
-        )
-        try:
-            snap = await _maybe(self._snapshot())
-            verdict = self.risk.evaluate_trade(snap, intent, now=now, controls=full_controls)
-        except BrokerError:
-            raise
-        except Exception as e:  # risk unavailable -> no entry
-            return ScanOutcome(sym, None, f"risk check unavailable: {e}", final=False)
-        if not verdict.ok:
-            return ScanOutcome(sym, None, "risk: " + "; ".join(verdict.reasons))
-        existing = getattr(verdict, "allowed_existing_breaches", ()) or ()
-        if existing:
-            self._j("options.risk_existing_breaches", symbol=sym, structure_id=sid,
-                    breaches=[{"kind": getattr(b, "kind", None), "key": getattr(b, "key", None),
-                               "value": str(getattr(b, "value", "")), "cap": str(getattr(b, "cap", ""))}
-                              for b in existing])
-        ok, why = await self._gate("entry")
-        if not ok:
-            return ScanOutcome(sym, None, f"market gate: {why}", final=False)
-        st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
+        # final risk recheck -> write-ahead reservation under the shared capital lock, so an
+        # equity lane can't size from the same free cash at the same moment
+        async with self._capital_lock_cm():
+            full_controls = RiskControls(
+                pause_new_buys=getattr(controls, "pause_new_buys", False),
+                drawdown=getattr(controls, "drawdown", RiskControls().drawdown),
+                option_commitments=self.commitments(),
+            )
+            try:
+                snap = await _maybe(self._snapshot())
+                verdict = self.risk.evaluate_trade(snap, intent, now=now, controls=full_controls)
+            except BrokerError:
+                raise
+            except Exception as e:  # risk unavailable -> no entry
+                return ScanOutcome(sym, None, f"risk check unavailable: {e}", final=False)
+            if not verdict.ok:
+                return ScanOutcome(sym, None, "risk: " + "; ".join(verdict.reasons))
+            existing = getattr(verdict, "allowed_existing_breaches", ()) or ()
+            if existing:
+                self._j("options.risk_existing_breaches", symbol=sym, structure_id=sid,
+                        breaches=[{"kind": getattr(b, "kind", None), "key": getattr(b, "key", None),
+                                   "value": str(getattr(b, "value", "")), "cap": str(getattr(b, "cap", ""))}
+                                  for b in existing])
+            ok, why = await self._gate("entry")
+            if not ok:
+                return ScanOutcome(sym, None, f"market gate: {why}", final=False)
+            st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
+            st.open_client_id = _cid("open", st.id)
+            self.structures.append(st)
+            self._save()  # write-ahead: from here the commitment is visible to every lane
         return await self._submit_open(st, prop, now)
 
     def _new_structure(self, sid, prop: Proposal, qty, max_loss, c: OptionCandidate, el, now) -> Structure:
@@ -566,9 +590,7 @@ class OptionsManager:
         return out
 
     async def _submit_open(self, st: Structure, prop: Proposal, now: datetime) -> ScanOutcome:
-        st.open_client_id = _cid("open", st.id)
-        self.structures.append(st)
-        self._save()  # write-ahead
+        """Send the open ladder for a structure already reserved (write-ahead) in the book."""
         self._j("options.open_submitted", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                 direction=st.direction, qty=st.qty, expiry=st.expiry, legs=[lg.symbol for lg in st.legs],
                 limit_debit=prop.limit_debit, max_loss=st.max_loss, thesis_id=st.thesis_id,

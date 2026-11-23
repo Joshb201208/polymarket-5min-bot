@@ -220,3 +220,37 @@ def test_rejected_open_alerts(world, tmp_path):
     assert out[0].opened is None and "rejected" in out[0].reason
     assert any("rejected" in title for _, title, _ in m.alerts.sent)
     assert m.structures[0].st is StructState.VOID
+
+
+def test_capital_lock_guards_the_reservation(world, tmp_path):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA")
+    m = make_manager(world, tmp_path, gate=gate)
+
+    async def go():
+        lock = asyncio.Lock()
+        m._capital_lock = lock
+        await lock.acquire()
+        task = asyncio.create_task(m.scan())
+        await asyncio.sleep(0.5)
+        assert world.orders_sent() == [] and m.structures == []  # waits for the equity lane
+        lock.release()
+        out = await task
+        return out
+    out = run(go())
+    assert out[0].opened
+    c = m.risk_commitments()
+    assert len(c) == 1 and c[0].cash_reserved == 0  # filled: cash already at the broker
+
+
+def test_pending_structure_reserves_cash(world, tmp_path):
+    from stock_agent.options_book import Leg, Structure
+    m = make_manager(world, tmp_path)
+    st = Structure(id="os-x", underlying="AAA", strategy="bull_call_spread", direction="bullish", qty=2,
+                   expiry=EXP.isoformat(), legs=[Leg(C100, "buy", "call", 100, EXP.isoformat())],
+                   state=StructState.PENDING.value, source="scan", max_loss=140.0, open_client_id="sa-opt-open-x")
+    m.structures.append(st)
+    (c,) = m.risk_commitments()
+    assert float(c.max_loss) == 140.0 and float(c.cash_reserved) == 140.0 and "sa-opt-open-x" in c.order_ids
