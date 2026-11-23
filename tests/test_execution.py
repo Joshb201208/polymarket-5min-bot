@@ -738,3 +738,28 @@ def test_no_shorting_retried_after_failed_cleanup(world, tmp_path, monkeypatch):
     world.clock.advance(minutes=31)
     run(eng.monitor_tick())
     assert a.configurations["no_shorting"] is True
+
+
+def test_normalise_plan_and_result_go_to_the_notifier(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.price("PPP", 100, spread=0.02)
+    a.seed_position("PPP", -10, 100)
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    sent = []
+
+    class Notifier:
+        def send_normalise_plan(self, steps):
+            sent.append(("plan", list(steps)))
+            return True
+
+        async def send_normalise_result(self, results, *, all_clean=True):
+            sent.append(("result", all_clean))
+            return True
+
+    eng._notifier = Notifier()
+    assert run(eng.normalise_step()).state == "planned"
+    assert sent[0][0] == "plan" and any("PPP" in s for s in sent[0][1])
+    assert not any(t == "Account clean-up plan" for _, t, _ in eng.alerts)
+    world.clock.set_et(2026, 11, 23, 9, 36)
+    assert run(eng.normalise_step()).state == "done"
+    assert sent[-1] == ("result", True)
