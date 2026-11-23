@@ -4,7 +4,6 @@ import asyncio
 
 import httpx
 import pytest
-import requests
 
 from tests.fakes import FakeAlpaca, FakeInternet, SimClock
 from tests.fakes.providers import FakeDiscord, FakeFMP, FakeOpenAI, FakeTelegram, FakeTipRanks
@@ -85,7 +84,7 @@ def test_unknown_host_fails_loudly_and_is_recorded(net):
     assert net.unexpected and net.unexpected[0].host == "example.com"
 
 
-def test_install_patches_async_and_sync_httpx_and_requests(net, monkeypatch):
+def test_install_patches_async_and_sync_httpx(net, monkeypatch):
     net.install(monkeypatch)
 
     async def go():
@@ -94,12 +93,19 @@ def test_install_patches_async_and_sync_httpx_and_requests(net, monkeypatch):
 
     assert asyncio.run(go()) == 200
     assert httpx.Client().get(f"{BASE}/v2/clock").status_code == 200
+    assert [r.service for r in net.recorded] == ["alpaca", "alpaca"]
+
+
+def test_install_also_patches_requests_when_installed(net, monkeypatch):
+    """Only while some code still uses `requests`; skipped once it is uninstalled."""
+    requests = pytest.importorskip("requests")
+    net.install(monkeypatch)
     r = requests.get("https://api.tipranks.com/api/stocks/screener", params={"x": "1"}, timeout=5)
     assert r.status_code == 200 and r.json() == {"data": []}
     net.service("tipranks").fail("/api/stocks/screener", "timeout")
     with pytest.raises(requests.exceptions.Timeout):
         requests.get("https://api.tipranks.com/api/stocks/screener", timeout=5)
-    assert [r.service for r in net.recorded] == ["alpaca", "alpaca", "tipranks", "tipranks"]
+    assert [r.service for r in net.recorded] == ["tipranks", "tipranks"]
 
 
 def test_recorder_redacts_credentials(net):
