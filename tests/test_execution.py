@@ -280,3 +280,116 @@ def test_gate_closed_outside_session_for_exit(world, tmp_path, monkeypatch):
     assert res.status == IntentStatus.QUEUED
     assert a.position("AAA").qty == 10
     _ = timedelta
+
+
+def test_top_up_releases_stop_then_reprotects_whole_position(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    a.behaviour.wash_trade_check = True
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    run(eng.ensure_protection())
+
+    class AddThree:  # sizing for adds is risk_limits' rule; here only the mechanics matter
+        def propose_equity_qty(self, *a, **k):
+            return 3
+
+        def evaluate_trade(self, *a, **k):
+            from stock_agent.risk_manager import RiskVerdict
+            return RiskVerdict(True)
+
+    eng.risk = AddThree()
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.FILLED, res
+    pos = a.position("AAA")
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == pos.qty > 10
+
+
+def test_failed_exit_puts_the_stop_back(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    run(eng.ensure_protection())
+    a.fail("/v2/orders", "status", method="POST", status=403, times=1)
+    run(eng.execute_intent(enqueue(eng, "AAA", "sell", rule="model")))
+    assert a.position("AAA").qty == 10
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == 10
+
+
+def test_resume_counts_market_fallback_fills_and_does_not_resell(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    it = enqueue(eng, "AAA", "sell", rule="risk_limit", qty=4)
+    claimed = eng.ledger.claim_intent(it.intent_id, check_thesis=False)
+    # crash after the fallback market order went out
+    a.submit({"symbol": "AAA", "qty": "4", "side": "sell", "type": "market", "time_in_force": "day",
+              "client_order_id": claimed.client_order_id + "-m"})
+    world.clock.advance(minutes=1)
+    assert a.position("AAA").qty == 6
+    run(eng.resume())
+    got = eng.ledger.get_intent(it.intent_id)
+    assert got.status == IntentStatus.FILLED
+    run(eng.execute_due())
+    assert a.position("AAA").qty == 6
+    assert len(_stops(a, "AAA")) == 1
+
+
+def test_cover_refused_when_it_would_need_borrowing(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("PPP", 100, spread=0.02)
+    a.seed_position("PPP", -85, 100)
+    eng = make_engine(world, tmp_path, monkeypatch)
+
+    class NoCash:
+        def evaluate_trade(self, *a, **k):
+            from stock_agent.risk_manager import RiskVerdict
+            return RiskVerdict(False, ("insufficient_cash",))
+
+    eng.risk = NoCash()
+    try:
+        run(eng.cover_short("PPP"))
+    except Exception:
+        pass
+    assert a.position("PPP").qty == -85
+    assert any(sev == "critical" for sev, _, _ in eng.alerts)
+
+
+def test_clean_account_unlocks_entries_without_waiting(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    a.configurations["no_shorting"] = True
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    st = run(eng.normalise_step())
+    assert st.state == "done", st
+    assert len(_stops(a, "AAA")) == 1
+
+
+def test_normalise_rerun_after_cancelled_fraction_sale_finishes_the_job(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 9, 36)
+    world.price("MMM", 500, spread=0.02)
+    a.seed_position("MMM", 3.5, 500)
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    eng._kv_set(eng.NORMALISE_KEY, {"state": "planned", "planned_at": "2026-11-20T12:00:00+00:00"})
+    a.fail("/v2/orders", "status", method="POST", status=403, times=1)
+    st = run(eng.normalise_step())
+    assert st.state == "failed"
+    assert len(_stops(a, "MMM")) == 1  # the whole shares stay protected
+    st = run(eng.normalise_step())
+    assert st.state == "done", st
+    assert a.position("MMM").qty == 3
+    assert len(_stops(a, "MMM")) == 1

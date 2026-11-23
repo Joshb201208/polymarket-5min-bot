@@ -81,3 +81,15 @@ def enqueue(eng, symbol, side, *, ref=None, key=None, **meta):
         kind="cover" if meta.pop("cover", False) else "equity",
         meta={"effective_conviction": 8, "raw_conviction": 8, "sector": "Technology", **meta})])
     return eng.ledger.get_intent(ids[0])
+
+
+def wired_scheduler(world, tmp_path, monkeypatch, **kw):
+    """Today's StockAgentScheduler with the new services injected (engine, ledger, ...)."""
+    from types import SimpleNamespace
+
+    from stock_agent.scheduler import StockAgentScheduler
+
+    eng = make_engine(world, tmp_path, monkeypatch, **kw)
+    services = SimpleNamespace(broker=eng.broker, ledger=eng.ledger, risk=eng.risk, calendar=eng.calendar,
+                               prices=eng.prices, engine=eng)
+    return StockAgentScheduler(services=services), eng
