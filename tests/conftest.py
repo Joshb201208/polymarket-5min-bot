@@ -57,15 +57,17 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture
-def world(monkeypatch, tmp_path):
+def world(request, monkeypatch, tmp_path):
     """The simulated outside world (clock, broker, providers), installed.
 
-    Starts Monday 23 Nov 2026 09:00 ET. Every HTTP request the code makes is
+    Starts Monday 23 Nov 2026 09:00 ET, or at the aware datetime given by
+    `@pytest.mark.world_start(dt)`. Every HTTP request the code makes is
     answered by a fake; state files go to this test's own tmp_path.
     """
     from tests.fakes.world import FakeWorld
 
-    w = FakeWorld()
+    mark = request.node.get_closest_marker("world_start")
+    w = FakeWorld(start=mark.args[0]) if mark else FakeWorld()
     w.install(monkeypatch, data_dir=tmp_path)
     yield w
     w.assert_no_unexpected_hosts()
