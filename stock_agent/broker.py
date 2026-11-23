@@ -122,8 +122,15 @@ class _Model(BaseModel):
 
 
 def _num(v: Any) -> Any:
+    """Empty -> None; anything else must be a finite number (NaN/inf are refused)."""
     if v is None or v == "":
         return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"not a number: {v!r}") from None
+    if not math.isfinite(f):
+        raise ValueError(f"non-finite number: {v!r}")
     return v
 
 
@@ -377,6 +384,11 @@ def resolve_base_url(config: type[Config] | Any = Config) -> str:
     An explicit ALPACA_BASE_URL wins; otherwise STOCK_AGENT_MODE=LIVE selects
     the live host and anything else selects paper.
     """
+    settings = getattr(config, "settings", None)  # security_config's settings object, when present
+    for name in ("trading_base_url", "alpaca_base_url"):
+        url = getattr(settings, name, None) if settings is not None else None
+        if isinstance(url, str) and url:
+            return url.rstrip("/")
     explicit = (getattr(config, "ALPACA_BASE_URL", "") or "").rstrip("/")
     if explicit:
         return explicit

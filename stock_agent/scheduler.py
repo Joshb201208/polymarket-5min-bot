@@ -689,35 +689,15 @@ class StockAgentScheduler:
     # ── Market monitoring ────────────────────────────────────────────
 
     async def _run_market_monitoring(self):
-        """Broker safety and queued orders, then the held-position news hook.
-
-        Order of work: engine.monitor_tick (clean-up, cover any short, one
-        broker stop per long, queued exits then entries), then the research
-        hook, whose intents are persisted and dispatched in the same cycle.
-        There is no software stop sell: the broker stop is the only one.
-        """
+        """Broker safety and queued orders: engine.monitor_tick only (clean-up,
+        resolve accepted orders, cover any short, one broker stop per long,
+        queued exits then entries). No software stop sell, no legacy APIs; the
+        research hook is dispatched separately by the execution cycle."""
         self._last_monitor_time = _now_et()
         if self.engine is None:
             logger.error("Execution engine not wired; no monitoring")
             return None
-        report = await self.engine.monitor_tick()
-        hook = getattr(self, "_run_held_news_check", None)
-        if hook is None or self.ledger is None:
-            return report
-        try:
-            try:
-                snapshot = self.ledger.snapshot()
-            except Exception:
-                snapshot = await self.ledger.refresh("held news check")
-            outcome = await hook(snapshot)
-            intents = list(getattr(outcome, "intents", outcome) or [])
-            if intents:
-                self.ledger.enqueue_intents(intents, job="held_news")
-                report.executed.extend(await self.engine.execute_due())
-        except Exception as e:
-            logger.exception("Held news check failed: %s", e)
-            report.errors.append(f"held news: {e}")
-        return report
+        return await self.engine.monitor_tick()
 
     def _should_check_events(self) -> bool:
         now = _now_et()
