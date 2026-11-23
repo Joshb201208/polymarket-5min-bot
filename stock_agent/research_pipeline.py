@@ -356,16 +356,21 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
+            elif kind == "news" and self.clock() >= session.closes_at:
+                self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "live_session_closed"})
             elif not exit_pending:
                 current = self.clock()
                 expiration = current + timedelta(minutes=30)
                 if story and story.evidence.published_at:
                     expiration = min(expiration, story.evidence.published_at + timedelta(hours=24))
+                if kind == "news":
+                    expiration = min(expiration, session.closes_at)
                 self.store.schedule_confirmation(
                     key, symbol, position_id, current, expiration, {
                         "thesis_id": thesis_id, "inputs": result.inputs, "provider": result.result.route.provider,
                         "model": result.result.route.model, "evidence_ids": evidence_ids, "kind": kind,
                         "story_id": story.story_id if story else None,
+                        "session_date": session.date.isoformat(),
                     },
                 )
                 confirmation_requested = True
@@ -422,7 +427,12 @@ class ResearchPipeline:
                 decision_id=key, generated_at=confirmation.result.completed_at,
             )
             execution_session = self._session(self.clock())
+            same_session = request["kind"] != "news" or (
+                execution_session is not None and execution_session.date.isoformat()
+                == (request.get("session_date") or data.as_of.astimezone(NY).date().isoformat())
+            )
             if (confirmation.approved and execution_session
+                    and same_session
                     and self.store.reserve_exit(execution_session.date.isoformat(), position_id)):
                 ids = tuple(dict.fromkeys((*request["evidence_ids"], *confirmation.result.value.evidence_ids)))
                 price = Decimal(str(data.price)) if data.price is not None else None
@@ -430,7 +440,10 @@ class ResearchPipeline:
                                       price, ids, request["kind"], execution_session)
                 self.store.record_proposal(key, thesis_id, intent)
             else:
-                self.store.finish_work(key, "no_action", thesis_id=thesis_id)
+                self.store.finish_work(
+                    key, "no_action", thesis_id=thesis_id,
+                    detail={} if same_session else {"reason": "live_session_closed"},
+                )
             self.store.finish_confirmation(key, "complete")
         if request["story_id"]:
             self.ledger.journal.append(

@@ -212,8 +212,9 @@ def test_research_budget_and_claims_survive_restart(tmp_path):
     other.close()
 
 
-@pytest.mark.parametrize("held", [False, True])
-def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, tmp_path, held):
+@pytest.mark.parametrize(("held", "closes_during_confirmation"), [(False, False), (True, False), (True, True)])
+def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, tmp_path, held,
+                                                               closes_during_confirmation):
     config = settings(PERPLEXITY_API_KEY="")
     journal = Journal(tmp_path / "journal", clock=lambda: NOW)
     state = StateStore(tmp_path / "s.db", journal, clock=lambda: NOW)
@@ -228,11 +229,14 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
     security = SecurityInputs("ABC", "Example", "Technology", Decimal("100"), NOW, True)
     event = NewsEvent("ABC", "abc-material-1", evidence, 8)
     session = Session(NOW.date(), NOW - timedelta(minutes=30), NOW + timedelta(hours=5))
-    calendar = SimpleNamespace(session_on=lambda _: session, next_session=lambda _: None)
+    tomorrow = timedelta(days=1)
+    next_session = Session(session.date + tomorrow, session.opens_at + tomorrow, session.closes_at + tomorrow)
+    calendar = SimpleNamespace(session_on=lambda _: session, next_session=lambda _: next_session)
     holding = Holding("ABC", Decimal("1"), Decimal("1"), Decimal("100"), Decimal("100"), True,
                       Decimal("100"), Decimal("100"), meta=PositionMeta("p-1", "ABC", opened_at=NOW))
     snapshot = SimpleNamespace(holdings=(holding,) if held else ())
     calls = []
+    now = NOW
 
     class Sources:
         async def universe(self, now):
@@ -246,10 +250,13 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
             return {"ABC": security} if symbols else {}
 
     def endpoint(request):
+        nonlocal now
         body = json.loads(request.content)
         calls.append(body)
         if body["model"] == "gpt-5.6-luna":
             assert "first model reasoning" not in body["input"]
+            if closes_during_confirmation:
+                now = session.closes_at + timedelta(seconds=1)
             value = {"symbol": "ABC", "verdict": "CONFIRM_BREAK", "conviction": 8,
                      "reason": "Independent", "evidence_ids": ["filing"]}
             tools = []
@@ -271,9 +278,9 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
-            analyst = Analyst(LLMClient(config, client=http, spend=spend, now=lambda: NOW))
+            analyst = Analyst(LLMClient(config, client=http, spend=spend, now=lambda: now))
             pipe = ResearchPipeline(config, ledger, calendar, analyst, spend, Sources(), gate,
-                                    focus=lambda **_: ("FOCS",))
+                                    clock=lambda: now, focus=lambda **_: ("FOCS",))
             # Held symbols lead focus names, which lead the rest of the universe.
             if not held:
                 async def for_unheld(symbols, now):
@@ -282,6 +289,12 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
 
                 monkeypatch.setattr(pipe.sources, "news", for_unheld)
             first = await pipe.run("news", snapshot)
+            if closes_during_confirmation:
+                assert first.status is JobStatus.DONE and not first.intents
+                assert len(calls) == 2
+                assert spend.work_state(pipe._story_key(event))["status"] == "no_action"
+                assert not (await pipe.run("news", snapshot)).intents
+                return
             assert first.status is JobStatus.DONE and len(first.intents) == 1
             intent = first.intents[0]
             assert intent.side == ("sell" if held else "buy")
