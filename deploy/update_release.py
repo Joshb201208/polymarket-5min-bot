@@ -102,11 +102,18 @@ class Updater:
     def pid(self) -> int:
         return int(self.systemctl("show", UNIT, "--property=MainPID", "--value") or "0")
 
-    def eligible(self) -> None:
+    def unit_needs_reload(self) -> bool:
+        return self.systemctl("show", UNIT, "--property=NeedDaemonReload", "--value") == "yes"
+
+    def eligible(self, expected_state: str | None = None) -> str:
         if self.hold.exists():
             raise Deferred("deploy hold file present")
-        if self.active_state() != "active":
-            raise Deferred("service not active; not starting it")
+        state = self.active_state()
+        if state not in {"active", "failed"}:
+            raise Deferred("service not active or failed; not starting it")
+        if expected_state is not None and state != expected_state:
+            raise Deferred("service state changed during preparation; not starting it")
+        return state
 
     def commit(self, ref: str) -> str:
         value = self.git("rev-parse", "--verify", f"{ref}^{{commit}}").strip()
@@ -114,19 +121,20 @@ class Updater:
             raise Deferred("invalid commit identity")
         return value
 
-    def clock_closed(self) -> None:
-        record = read_json(self.heartbeat)
-        if record.get("pid") == self.pid() and record.get("market_source") == "live":
-            clock = {
-                "timestamp": record.get("market_observed_at"),
-                "is_open": record.get("market_open"),
-                "next_open": record.get("market_next_open"),
-            }
-            try:
-                self.verify_closed(clock)
-                return
-            except (KeyError, ValueError, TypeError):
-                pass
+    def clock_closed(self, *, use_heartbeat: bool = True) -> None:
+        if use_heartbeat:
+            record = read_json(self.heartbeat)
+            if record.get("pid") == self.pid() and record.get("market_source") == "live":
+                clock = {
+                    "timestamp": record.get("market_observed_at"),
+                    "is_open": record.get("market_open"),
+                    "next_open": record.get("market_next_open"),
+                }
+                try:
+                    self.verify_closed(clock)
+                    return
+                except (KeyError, ValueError, TypeError):
+                    pass
         try:
             reply = self.run(
                 "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
@@ -251,52 +259,87 @@ class Updater:
         self.run(str(self.root / "venv/bin/pip"), "install", "-r", "requirements.txt", "--quiet", timeout=480)
 
     def update(self) -> None:
-        self.eligible()
+        initial_state = self.eligible()
+        recovering = initial_state == "failed"
         old = self.commit("HEAD")
         self.git("fetch", "--no-tags", "origin", f"refs/heads/master:{REMOTE_REF}")
         new = self.commit(REMOTE_REF)
-        if old == new:
-            raise Deferred("already current")
-        self.run("git", "merge-base", "--is-ancestor", old, new)
-        paths = self.git("diff", "--no-renames", "--name-only", "-z", old, new).split("\0")
-        paths = [path for path in paths if path]
+        checkout_changed = old != new
+        if recovering and not checkout_changed:
+            raise Deferred("failed service requires a newer release")
+        candidate_path = self.root / "deploy/stock-agent.service"
+        paths = []
+        if checkout_changed:
+            self.run("git", "merge-base", "--is-ancestor", old, new)
+            changed = self.git("diff", "--no-renames", "--name-only", "-z", old, new)
+            paths = [path for path in changed.split("\0") if path]
         self.check_paths(paths)
         self.ensure_clean(paths)
+        old_unit = None
+        needs_reload = False
+        if not checkout_changed:
+            # The old cron can advance HEAD on the first cutover without
+            # replacing its systemd unit. Unit drift is an activation, not a
+            # documentation update, even though the checkout needs no reset.
+            old_unit = self.unit_path.read_bytes()
+            needs_reload = self.unit_needs_reload()
+            if old_unit == candidate_path.read_bytes() and not needs_reload:
+                raise Deferred("already current")
         state = read_json(self.state)
         if state.get("failed_sha") == new:
             raise Deferred("candidate quarantined following earlier failure")
-        self.clock_closed()
+        self.clock_closed(use_heartbeat=not recovering)
         self.ci(new, state)
-        self.eligible()
-        self.clock_closed()
-        if not paths or self.docs_only(paths):
+        self.eligible(initial_state)
+        self.clock_closed(use_heartbeat=not recovering)
+        if not recovering and checkout_changed and (not paths or self.docs_only(paths)):
             self.git("reset", "--hard", new)
             say(f"advanced to {new[:12]} (documentation-only; no restart)")
             return
 
         old_pid = self.pid()
-        old_unit = self.unit_path.read_bytes()
+        if old_unit is None:
+            old_unit = self.unit_path.read_bytes()
         changed_deps = bool({"requirements.txt", "requirements.lock"} & set(paths))
         changed_unit = False
         activation_attempted = False
         try:
-            self.git("reset", "--hard", new)
+            if checkout_changed:
+                self.git("reset", "--hard", new)
             self.dependencies()
-            self.eligible()
-            self.clock_closed()
-            candidate_unit = (self.root / "deploy/stock-agent.service").read_bytes()
+            self.eligible(initial_state)
+            self.clock_closed(use_heartbeat=not recovering)
+            candidate_unit = candidate_path.read_bytes()
             if candidate_unit != old_unit:
                 changed_unit = True
                 self.install_unit(candidate_unit)
-            self.eligible()
-            activation_attempted = True
-            self.systemctl("try-restart", UNIT, timeout=210)
+            elif needs_reload:
+                self.systemctl("daemon-reload")
+            self.eligible(initial_state)
+            if recovering:
+                self.systemctl("reset-failed", UNIT)
+                activation_attempted = True
+                # Refuse a conflicting stop already queued by an operator.
+                self.systemctl("start", "--job-mode=fail", UNIT, timeout=210)
+            else:
+                activation_attempted = True
+                self.systemctl("try-restart", UNIT, timeout=210)
             if not self.wait_healthy(new, old_pid):
                 raise RuntimeError("candidate did not reconcile and report healthy")
         except (Deferred, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            if recovering and activation_attempted:
+                state["failed_sha"] = new
+                state["last_event"] = {
+                    "event": "recovery_failed", "active_sha": new, "candidate_sha": new,
+                    "at": datetime.now(timezone.utc).isoformat(), "reason": error_kind(exc),
+                }
+                save_json(self.state, state)
+                # Do not restart, stop or restore the previously failed release.
+                raise RuntimeError("failed-service recovery did not become healthy; candidate quarantined") from exc
             say(f"candidate {new[:12]} did not activate ({error_kind(exc)}); restoring {old[:12]}")
             try:
-                self.git("reset", "--hard", old)
+                if checkout_changed:
+                    self.git("reset", "--hard", old)
                 if changed_unit:
                     self.install_unit(old_unit)
                 if changed_deps:
@@ -304,15 +347,17 @@ class Updater:
                 # If stopped concurrently, restore disk but do not resurrect the unit.
                 unit_state = self.active_state()
                 failing_pid = self.pid()
-                if unit_state == "active" and failing_pid != old_pid:
+                can_recover_prior = not recovering and (checkout_changed or changed_unit)
+                if can_recover_prior and unit_state == "active" and failing_pid != old_pid:
                     self.systemctl("try-restart", UNIT, timeout=210)
                     if not self.wait_healthy(old, failing_pid):
                         raise RuntimeError("previous release did not become healthy")
-                elif activation_attempted and unit_state == "activating":
+                elif can_recover_prior and activation_attempted and unit_state == "activating":
                     # Restart=on-failure may already be launching the restored code.
                     if not self.wait_healthy(old, failing_pid):
                         raise RuntimeError("previous release did not recover")
-                elif activation_attempted and unit_state == "failed" and self.active_state() == "failed":
+                elif (can_recover_prior and activation_attempted and unit_state == "failed"
+                      and self.active_state() == "failed"):
                     # Only recover a failed candidate, never an inactive or stopping unit.
                     self.systemctl("restart", "--job-mode=fail", UNIT, timeout=210)
                     if not self.wait_healthy(old, failing_pid):
@@ -328,16 +373,20 @@ class Updater:
                     save_json(self.state, state)
             if isinstance(exc, Deferred):
                 raise
-            raise RuntimeError("activation failed; prior checkout restored") from exc
+            raise RuntimeError("activation failed; checkout and unit on disk restored") from exc
         state["last_event"] = {
             "event": "deployed", "active_sha": new, "candidate_sha": new,
-            "at": datetime.now(timezone.utc).isoformat(), "reason": "startup health passed",
+            "at": datetime.now(timezone.utc).isoformat(),
+            "reason": "failed service recovered" if recovering else "startup health passed",
         }
         try:
             save_json(self.state, state)
         except OSError:
             say("deployment succeeded, but status event could not be written")
-        say(f"update successful: {old[:12]} -> {new[:12]}")
+        if checkout_changed:
+            say(f"update successful: {old[:12]} -> {new[:12]}")
+        else:
+            say(f"repaired installed unit for {new[:12]}")
 
     def locked_update(self) -> int:
         self.data.mkdir(parents=True, exist_ok=True)
