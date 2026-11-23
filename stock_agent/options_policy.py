@@ -229,8 +229,9 @@ def build_proposal(
     *, underlying: str, direction: Direction, conviction: int, spot: float,
     chain: Sequence[ContractQuote], today: date, now: datetime, s: OptionsSettings,
     trading_days: Callable[[date, date], int | None],
+    shapes: Sequence[str] = ("single", "spread"),
 ) -> Proposal | Rejection:
-    """Choose a structure for a view. Conviction >= single_option_min_conviction
+    """Choose a structure for a view. `shapes` limits what the account level allows. Conviction >= single_option_min_conviction
     prefers a single long option; otherwise a vertical debit spread. If the
     preferred shape cannot be built from good quotes the other is tried."""
     if spot <= 0:
@@ -243,6 +244,7 @@ def build_proposal(
     if not legs:
         return Rejection(underlying, "empty chain")
     order = ("single", "spread") if conviction >= s.single_option_min_conviction else ("spread", "single")
+    order = tuple(x for x in order if x in shapes)
     reasons = []
     for shape in order:
         out = (_spread(underlying, direction, spot, legs, now, s) if shape == "spread"
