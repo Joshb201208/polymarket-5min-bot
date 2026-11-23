@@ -2,12 +2,14 @@
 
 import asyncio
 from datetime import datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 from stock_agent import scheduler as module
 from stock_agent.config import Config
 from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
+from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
 
 
 class CalendarStub:
@@ -26,6 +28,13 @@ class CalendarStub:
         session = self.state.session
         if session and session.date > day:
             return session
+        return None
+
+    def previous_session(self, day):
+        session = self.state.session
+        if session:
+            return Session(day - timedelta(days=2), session.opens_at - timedelta(days=2),
+                           session.closes_at - timedelta(days=2))
         return None
 
     def is_open(self, now):
@@ -77,6 +86,7 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
     async def check():
         now = datetime(2026, 11, 27, 10, tzinfo=ET)
         sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
         assert not (await sched.market_gate("entry")).allowed
         assert (await sched.market_gate("exit")).allowed
         sched._normalised = sched._reconciled = True
@@ -87,6 +97,7 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
         sched.shutdown()
         assert not (await sched.market_gate("exit")).allowed
         assert (await sched.market_gate("protection")).allowed
+        await sched._cleanup()
 
     asyncio.run(check())
 
@@ -195,3 +206,34 @@ def test_half_day_summary_uses_calendar_close(tmp_path, monkeypatch):
     sched, _ = build(tmp_path, monkeypatch, now)
     assert not sched._should_send_daily_summary(now)
     assert sched._should_send_daily_summary(now + timedelta(minutes=1))
+
+
+def test_drawdown_uses_only_trusted_close_and_persists_once(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 13, 5, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        old = DrawdownState(high_water=Decimal(1000), last_session="2026-11-25")
+        sched.ledger.risk_state_set(DRAWDOWN_STATE_KEY, old.to_record())
+        snapshot = SimpleNamespace(quality="indicative", equity=Decimal(790), as_of=now)
+
+        async def refresh(reason):
+            return snapshot
+
+        monkeypatch.setattr(sched.ledger, "refresh", refresh)
+        assert (await sched._close_drawdown()).detail == {"reason": "close_clock_unverified"}
+        sess = sched.calendar.state.session
+        sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, sess)
+        assert (await sched._close_drawdown()).detail == {"reason": "close_equity_unverified"}
+        assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == old.to_record()
+        snapshot.quality = "live"
+        await sched._close_drawdown()
+        state = DrawdownState.from_record(sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
+        assert state.last_session == "2026-11-27"
+        assert state.paused and state.drawdown == Decimal("0.21")
+        snapshot.equity = Decimal(1000)
+        await sched._close_drawdown()
+        assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == state.to_record()
+        await sched._cleanup()
+
+    asyncio.run(check())
