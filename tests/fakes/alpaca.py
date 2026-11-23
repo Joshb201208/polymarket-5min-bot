@@ -146,6 +146,10 @@ class AlpacaBehaviour:
     covered_call_locks_shares: bool = True
     # Buying power multiplier applied to short sales (docs: 102%-103% margin).
     short_sale_bp_factor: float = 1.03
+    # A quote set by the test keeps being re-quoted during the regular session:
+    # its timestamp reads as "now" while the market is open (a live market
+    # quotes continuously). Off: the timestamp is when the test set it.
+    quotes_stay_fresh_in_session: bool = True
 
 
 @dataclass
@@ -1523,18 +1527,23 @@ class FakeAlpaca(FakeService):
         return {"option_contracts": page, "next_page_token": nxt}
 
     # ------------------------------------------------------------ market data
+    def _quote_time(self, q) -> datetime:
+        if self.behaviour.quotes_stay_fresh_in_session and self.calendar.is_open(self.now()):
+            return max(q.at, self.now())
+        return q.at
+
     def _quote_json(self, sym: str) -> dict | None:
         q = self.quotes.get(sym)
         if not q:
             return None
-        return {"t": _iso(q.at), "ax": "V", "ap": q.ask, "as": q.ask_size, "bx": "V", "bp": q.bid, "bs": q.bid_size,
+        return {"t": _iso(self._quote_time(q)), "ax": "V", "ap": q.ask, "as": q.ask_size, "bx": "V", "bp": q.bid, "bs": q.bid_size,
                 "c": ["R"], "z": "C"}
 
     def _trade_json(self, sym: str) -> dict | None:
         q = self.quotes.get(sym)
         if not q:
             return None
-        return {"t": _iso(q.at), "x": "V", "p": q.last, "s": 100, "c": ["@"], "i": 1, "z": "C"}
+        return {"t": _iso(self._quote_time(q)), "x": "V", "p": q.last, "s": 100, "c": ["@"], "i": 1, "z": "C"}
 
     def _bars(self, sym: str, params: dict) -> list[dict]:
         hist = self.trades_history.get(sym, [])

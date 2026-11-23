@@ -139,19 +139,29 @@ class ScenarioRunner:
         self._watchers.append((predicate, fn, label or getattr(fn, "__name__", "watch"), once))
         return self
 
-    def restart_after_lost_order(self) -> "ScenarioRunner":
+    def restart_after_lost_order(self, *, lookup_down: bool = False) -> "ScenarioRunner":
         """Restart the agent right after the next order whose broker reply is lost.
 
         Arms a one-shot `lost_response` fault on POST /v2/orders (the order is
         accepted by the fake broker, the client sees a timeout), then rebuilds
-        the agent at the end of that step: a crash mid-order.
+        the agent at the end of that step: a crash mid-order. With
+        `lookup_down=True` the by-client-order-id lookup also fails (5xx) until
+        the restart, so the old process cannot learn the outcome and the new
+        one must recover it.
         """
-        self.world.alpaca.fail("/v2/orders", "lost_response", method="POST", times=1)
+        a = self.world.alpaca
+        a.fail("/v2/orders", "lost_response", method="POST", times=1)
+        lookup = a.fail("/v2/orders:by_client_order_id", "5xx", method="GET", times=None) if lookup_down else None
 
         def lost(w, r):
             return any(q.fault == "lost_response" for q in w.net.requests("alpaca", "POST", "/v2/orders"))
 
-        return self.when(lost, self.restart, "restart after lost order reply")
+        def restart(w, r):
+            if lookup is not None and lookup in a.faults:
+                a.faults.remove(lookup)
+            r.restart()
+
+        return self.when(lost, restart, "restart after lost order reply")
 
     def note(self, kind: str, detail: str) -> None:
         self.timeline.append(TimelineEntry(self.clock.now_et(), kind, detail))

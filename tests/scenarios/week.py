@@ -18,7 +18,8 @@ Script (ET):
              T-1: a spread opened Mon/Tue must be closed by Wed's close.
   Thu        holiday: the broker accepts orders but nothing fills.
   Fri 09:50  positive news for DDD; the next order's reply is lost and the
-             agent restarts at the end of that step (restart mid-order).
+             agent restarts at the end of that step (restart mid-order); the
+             order lookup is down until then, so recovery is the new process's job.
 
 LLM replies are NOT scripted here: set them with `world.openai.reply(...)`,
 `world.perplexity.reply(...)`, `world.anthropic.reply(...)` in the shape the
@@ -93,7 +94,8 @@ class E2EWeek:
         runner.at(t["aaa_confirm"], self._story("AAA", "Second report confirms AAA accounting probe", "reuters"))
         runner.at(t["ccc_t_minus_2_close"], lambda w, r: None, "CCC T-2 close (checkpoint)")
         runner.at(t["ddd_news"], self._story("DDD", "DDD wins multi-year government contract"))
-        runner.at(t["ddd_news"], lambda w, r: r.restart_after_lost_order(), "arm lost order reply + restart")
+        runner.at(t["ddd_news"], lambda w, r: r.restart_after_lost_order(lookup_down=True),
+                    "arm lost order reply (lookup down) + restart")
         return self
 
     def run(self, runner) -> None:

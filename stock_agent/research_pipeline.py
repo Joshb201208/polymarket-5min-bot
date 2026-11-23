@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
@@ -19,6 +20,10 @@ from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
 _PRE_INFERENCE = {"auth", "quota", "model_unavailable", "rate_limit", "budget"}
+
+
+class SourceUnavailable(RuntimeError):
+    """A required data request failed rather than returning a healthy empty result."""
 
 @dataclass(frozen=True)
 class NewsEvent:
@@ -50,6 +55,8 @@ class Sources(Protocol):
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]: ...
 
     async def market(self, now: datetime) -> tuple[SecurityInputs, ...]: ...
+
+    async def background(self, symbols: tuple[str, ...]) -> dict[str, tuple[Evidence, ...]]: ...
 
 
 @dataclass(frozen=True)
@@ -108,7 +115,7 @@ def _reconstitute(payload: dict) -> NewIntent:
 
 class ResearchPipeline:
     def __init__(self, config, ledger, calendar, analyst: Analyst, store: ResearchStore, sources: Sources, gate,
-                 *, clock=None, context=None, focus=focus_symbols):
+                 *, clock=None, context=None, focus=focus_symbols, alerts=None):
         self.config = config
         self.ledger = ledger
         self.calendar = calendar
@@ -119,8 +126,20 @@ class ResearchPipeline:
         self.clock = clock or ledger.now
         self.context = context or (lambda: {})
         self.focus = focus
+        self.alerts = alerts
+        self._analysis_lock = asyncio.Lock()
 
     async def run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
+        # Avoid overlapping scheduled/news windows superseding a thesis
+        # during its independent review. Broker protection has its own lane.
+        async with self._analysis_lock:
+            try:
+                return await self._run(kind, snapshot)
+            except SourceUnavailable:
+                intents, ideas = self._recover()
+                return JobOutcome(JobStatus.FAILED, intents, {"reason": "required_source_unavailable"}, ideas)
+
+    async def _run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
         now = self.clock()
         session = self._session(now)
         if session is None:
@@ -129,7 +148,6 @@ class ResearchPipeline:
         focus = tuple(self.focus(now=now))
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
-        collected = []
         if kind in {"news", "earnings"}:
             gathered = await (self.sources.news(symbols, now) if kind == "news" else self.sources.releases(symbols, now))
             as_of = self.clock()
@@ -153,13 +171,23 @@ class ResearchPipeline:
                 for row in securities.values()
             ])
             chosen = tuple(dict.fromkeys((*held, *focus, *(r["symbol"] for r in ranked[:8]))))
+            background = getattr(self.sources, "background", None)
+            if background is not None:
+                stories = await background(chosen)
+                for symbol in chosen:
+                    if symbol in securities:
+                        row = securities[symbol]
+                        securities[symbol] = replace(row, evidence=(*stories.get(symbol, ()), *row.evidence))
             work = [(sym, f"{kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
-        failed = attempted = 0
+        failed = attempted = deferred = 0
         for symbol, key, story in work:
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
             if not self.store.claim_work(key, symbol, as_of):
+                state = self.store.work_state(key)
+                if state is not None and state["status"] == "retry":
+                    deferred += 1
                 continue
             attempted += 1
             try:
@@ -167,23 +195,33 @@ class ResearchPipeline:
             except ProviderUnavailable as exc:
                 failed += 1
                 pre_inference = all(err.kind in _PRE_INFERENCE for err in exc.attempts)
+                if pre_inference:
+                    deferred += 1
                 self.store.finish_work(
                     key, "retry" if pre_inference else "unavailable",
                     detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
-                    retry_at=self.clock() + timedelta(minutes=15) if pre_inference else None,
+                    retry_at=self.clock() + timedelta(minutes=15 if kind == "news" else 5)
+                    if pre_inference else None,
                 )
+        collected, ideas = self._recover()
+        incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
+        status = JobStatus.FAILED if incomplete else JobStatus.DONE
+        return JobOutcome(status, collected, {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
+
+    def _recover(self) -> tuple[tuple[NewIntent, ...], tuple[OptionIdea, ...]]:
+        collected = []
+        now = self.clock()
         for proposal in self.store.unqueued_proposals():
             intent = _reconstitute(proposal)
-            if intent.expires_at and intent.expires_at > self.clock():
+            if intent.expires_at and intent.expires_at > now:
                 collected.append(intent)
             else:
                 # Record the expired opportunity as a refused intent so recovery
                 # never rescans the same expired proposal forever.
                 collected.append(NewIntent(intent.symbol, intent.side, intent.dedupe_key,
                                            status=IntentStatus.SKIPPED, last_error="research_proposal_expired"))
-        status = JobStatus.FAILED if attempted and failed == attempted and not collected else JobStatus.DONE
-        ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(self.clock()))
-        return JobOutcome(status, tuple(collected), {"reviewed": attempted, "unavailable": failed}, ideas)
+        ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(now))
+        return tuple(collected), ideas
 
     def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
         """Scheduler calls after the options manager has durably handled each story."""
@@ -196,7 +234,8 @@ class ResearchPipeline:
         changes = {}
         for row in rows:
             change = row.metrics.get("session_return")
-            if (row.symbol in {"SPY", "QQQ"} and _fresh_quote(row, now) and type(change) in (int, float)
+            if (row.symbol in {"SPY", "QQQ"} and _fresh_quote(row, now, max_age=timedelta(seconds=90))
+                    and type(change) in (int, float)
                     and math.isfinite(change)):
                 changes[row.symbol] = change
         if changes.keys() != {"SPY", "QQQ"}:
@@ -260,14 +299,15 @@ class ResearchPipeline:
         role = ThesisRole.HELD_REVIEW if holding else ThesisRole.ENTRY_CANDIDATE
         payload = record.model_dump(mode="json") | {"inputs": result.inputs, "job": kind}
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
+        entry_blockers = ()
         with self.store.store.transaction():
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=fresh_quote or direction not in {Direction.BUY, Direction.BEARISH},
+                activate=not self.store.has_unqueued_exit(symbol, now),
             )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
-                self._record_entry(
+                entry_blockers = self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
                     thesis_id, record, fresh_quote, price, evidence_ids, context,
                 )
@@ -277,7 +317,13 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
-                return
+        if direction is not Direction.EXIT_PROPOSED or not position_id:
+            if entry_blockers and self.alerts is not None:
+                await self.alerts.alert(
+                    "WARN", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
+                    key=f"research_entry_inputs:{symbol}:{':'.join(entry_blockers)}",
+                )
+            return
         try:
             confirmation = await self.analyst.confirm_exit(data, result.result.route)
         except ProviderUnavailable as exc:
@@ -335,6 +381,14 @@ class ResearchPipeline:
             idea = OptionIdea(symbol, direction, story.story_id, thesis_id, record.raw_conviction,
                               record.effective_conviction, record.generated_at, evidence_ids)
             self.store.record_option_idea(story.story_id, idea, session.closes_at)
+        if not qualifies and direction in {Direction.BUY, Direction.BEARISH} and record.effective_conviction >= floor:
+            health_reasons = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
+                              "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
+            if not fresh_quote:
+                return ("quote_stale_or_unavailable",) if session.opens_at <= self.clock() < session.closes_at else ()
+            if gate is not None:
+                return tuple(reason for reason in gate.reasons if reason in health_reasons)
+        return ()
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):
@@ -345,9 +399,9 @@ class ResearchPipeline:
         )
 
 
-def _fresh_quote(row: SecurityInputs, now: datetime) -> bool:
+def _fresh_quote(row: SecurityInputs, now: datetime, *, max_age: timedelta = timedelta(minutes=20)) -> bool:
     price, quoted = row.price, row.quote_at
     return (
         price is not None and math.isfinite(price) and price > 0 and quoted is not None
-        and quoted.utcoffset() is not None and now - timedelta(minutes=20) <= quoted <= now
+        and quoted.utcoffset() is not None and now - max_age <= quoted <= now
     )
