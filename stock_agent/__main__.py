@@ -3,11 +3,11 @@ import fcntl
 import logging
 import signal
 
-from stock_agent.config import Config
+from stock_agent.config import Settings, SettingsError, load_settings
 from stock_agent.scheduler import StockAgentScheduler
 
 
-async def _serve(config: Config) -> None:
+async def _serve(config: Settings) -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with (config.DATA_DIR / "agent.lock").open("a") as lock:
         try:
@@ -27,9 +27,13 @@ async def _serve(config: Config) -> None:
 
 
 def main() -> None:
+    try:
+        settings = load_settings(load_dotenv_file=True, require_runtime_secrets=True)
+    except SettingsError as exc:
+        raise SystemExit(str(exc)) from None
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(_serve(Config()))
+    asyncio.run(_serve(settings))
 
 
 if __name__ == "__main__":

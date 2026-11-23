@@ -14,6 +14,7 @@ import pytest
 from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
 from stock_agent.asset_registry import SymbolRenameEvent
+from stock_agent.broker import OrderRequest
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
@@ -228,6 +229,35 @@ def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
     asyncio.run(check())
 
 
+def test_startup_binds_unacknowledged_fill_before_reconciling(world):
+    async def check():
+        world.clock.set_et(2026, 11, 23, 10, 20)
+        world.price("ALFA", 100)
+        first = world.scheduler()
+        first.store.open()
+        intent = enqueue(first.engine, "ALFA", "buy", ref=100)
+        claimed = first.ledger.claim_intent(intent.intent_id, check_thesis=False)
+        order = await first.broker.submit_order(OrderRequest(
+            symbol="ALFA", side="buy", type="limit", time_in_force="day", qty=5, limit_price=101,
+            client_order_id=claimed.client_order_id, position_intent="buy_to_open",
+        ))
+        await first._cleanup()  # process stopped before it linked the broker reply
+
+        restarted = world.scheduler()
+        try:
+            await restarted.startup()
+            holding = restarted.ledger.snapshot().holding("ALFA")
+            assert holding.meta.opened_source == "bot"
+            assert holding.meta.entry_intent_id == intent.intent_id
+            persisted = restarted.ledger.get_intent(intent.intent_id)
+            assert persisted.broker_order_id == order.id and persisted.status.value == "filled"
+            assert not any("imported ALFA" in str(row) for row in restarted.ledger.journal.read(kinds={"alert"}))
+        finally:
+            await restarted._cleanup()
+
+    asyncio.run(check())
+
+
 def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
     async def check():
         sched = world.scheduler()
@@ -336,7 +366,7 @@ def test_readiness_follows_reconcile_and_shutdown_wakes_idle_loop(tmp_path, monk
         monkeypatch.setattr(sched, "_tick", tick)
         task = asyncio.create_task(sched.run())
         await asyncio.wait_for(ready.wait(), timeout=1)
-        assert events[:3] == ["startup", "resume", "READY=1"]
+        assert events[:3] == ["resume", "startup", "READY=1"]
         sched.shutdown()
         await asyncio.wait_for(task, timeout=2)
         assert events[-2:] == ["STOPPING=1", "drain"]
