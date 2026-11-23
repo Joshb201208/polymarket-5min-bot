@@ -36,7 +36,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from stock_agent.journal import Journal
 from stock_agent.state_store import StateStore, StateUnavailable
@@ -442,6 +442,7 @@ class Ledger:
         self._refresh_lock: asyncio.Lock | None = None
         self._refresh_starts = 0
         self._alert_tasks: set = set()
+        self._listeners: list[Callable[[BookSnapshot], Any]] = []
         self._snapshot_start_seq = -1
 
     def now(self) -> datetime:
@@ -465,7 +466,17 @@ class Ledger:
             snap = await reconcile(self, reason=reason, rebuild=rebuild)
             self._snapshot = snap
             self._snapshot_start_seq = seq
+            for fn in list(self._listeners):
+                try:
+                    fn(snap)
+                except Exception as e:  # a view must never break the books
+                    logger.error("snapshot listener failed: %s", e)
             return snap
+
+    def add_snapshot_listener(self, fn: Callable[[BookSnapshot], Any]) -> None:
+        """Call ``fn(snapshot)`` after every successful refresh (e.g. the legacy
+        ``Portfolio.sync_from_snapshot`` view). Exceptions are logged, not raised."""
+        self._listeners.append(fn)
 
     def snapshot(self, max_age_s: int | None = None) -> BookSnapshot:
         """The last reconciled snapshot, if fresh enough. Raises ``StaleBook``."""

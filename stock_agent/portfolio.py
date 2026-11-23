@@ -20,6 +20,7 @@ class Portfolio:
     def __init__(self, config: Config):
         self.config = config
         self._state_path = config.DATA_DIR / "portfolio.json"
+        self._load_failed = False
         self.state: PortfolioState = self._load()
 
     def _load(self) -> PortfolioState:
@@ -30,6 +31,7 @@ class Portfolio:
                 return PortfolioState.model_validate_json(raw)
             except Exception as e:
                 logger.error("Failed to load portfolio state: %s", e)
+                self._load_failed = True
                 # Try backup
                 backup = self._state_path.with_suffix(".json.bak")
                 if backup.exists():
@@ -44,6 +46,16 @@ class Portfolio:
     def _save(self):
         """Atomic write: write to temp file then rename."""
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._load_failed and self._state_path.exists():
+            # never overwrite a file we could not read: keep it for diagnosis
+            aside = self._state_path.with_name(
+                f"portfolio.json.unreadable-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+            try:
+                os.replace(self._state_path, aside)
+                logger.error("Unreadable portfolio.json moved to %s", aside.name)
+            except OSError as e:
+                logger.error("Could not move unreadable portfolio.json aside: %s", e)
+            self._load_failed = False
         data = self.state.model_dump_json(indent=2)
 
         # Write to temp file in same directory, then rename
@@ -223,6 +235,47 @@ class Portfolio:
             "Portfolio synced from Alpaca — updated=%d imported=%d dropped=%d cash=$%.0f",
             updated, imported, dropped, self.state.cash,
         )
+
+    def sync_from_snapshot(self, snapshot) -> None:
+        """Mirror a reconciled ledger ``BookSnapshot`` into this legacy view.
+
+        The ledger is the source of truth; this keeps older callers that read
+        ``portfolio.state.positions`` / ``cash`` consistent with it. Long stock
+        only (shorts are blocked and covered by execution; options live in the
+        ledger's legs). Fractional quantities are floored for this int-share
+        view; the ledger keeps the exact quantity.
+        """
+        from stock_agent.models import Thesis  # local import to avoid cycle
+
+        now = datetime.now(timezone.utc)
+        old = {p.symbol: p for p in self.state.positions}
+        kept: list[Position] = []
+        for h in snapshot.holdings:
+            shares = int(h.qty)
+            if shares <= 0:
+                continue
+            meta = h.meta
+            prev = old.get(h.symbol)
+            price = float(h.price) if h.price is not None else (prev.current_price if prev else float(h.avg_cost))
+            thesis = prev.thesis if prev else Thesis(
+                symbol=h.symbol, direction="HOLD", conviction=0,
+                summary="Imported from Alpaca — awaiting re-analysis.", bull_case="", bear_case="",
+                catalysts=[], risks=[], generated_at=now)
+            stop = float(meta.stop_price) if meta and meta.stop_price is not None else (
+                prev.stop_loss if prev else round(float(h.avg_cost) * 0.95, 2))
+            sector = (meta.sector if meta and meta.sector else None) or (prev.sector if prev else None) or \
+                Config.SECTOR_MAP.get(h.symbol, "Unknown")
+            entry_date = (meta.opened_at if meta and meta.opened_at else None) or (prev.entry_date if prev else now)
+            mv = float(h.market_value) if h.market_value is not None else price * shares
+            cost = float(h.avg_cost) * shares
+            kept.append(Position(
+                symbol=h.symbol, shares=shares, entry_price=float(h.avg_cost), entry_date=entry_date,
+                current_price=price, market_value=mv, unrealized_pnl=mv - cost,
+                unrealized_pnl_pct=((mv - cost) / cost) if cost else 0.0, stop_loss=stop, thesis=thesis,
+                sector=sector, last_updated=now))
+        self.state.positions = kept
+        self.state.cash = float(snapshot.cash)
+        self._save()
 
     def get_portfolio_value(self) -> float:
         """Total portfolio value: cash + market value of all positions."""
