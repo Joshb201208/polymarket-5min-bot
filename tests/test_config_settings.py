@@ -339,6 +339,7 @@ def test_requirements_files_are_exact_pinned_and_lightweight() -> None:
         "numpy",
         "pandas",
         "playwright",
+        "requests",
         "uvicorn",
         "yfinance",
     }
@@ -359,7 +360,7 @@ def test_requirements_files_are_exact_pinned_and_lightweight() -> None:
 
         if filename == "requirements.txt":
             assert not (pkgs & forbidden_runtime)
-            assert {"httpx", "pydantic", "python-dotenv", "requests"} <= pkgs
+            assert {"httpx", "pydantic", "python-dotenv"} <= pkgs
         else:
             assert {"pytest", "ruff"} <= pkgs
 
@@ -390,6 +391,5 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "OPTIONS_MODE",
     ):
         assert required_readme in readme, f"README.md missing {required_readme}"
-
 
 

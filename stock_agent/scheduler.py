@@ -14,20 +14,12 @@ from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
-from stock_agent.data_feed import DataFeed
 from stock_agent.execution import ExecutionEngine
 from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsService
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
-from stock_agent.models import (
-    CompanyData,
-    DailySummary,
-    Position,
-    Signal,
-    Thesis,
-    Trade,
-)
+from stock_agent.models import DailySummary, Signal
 from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.llm_client import LLMClient
@@ -47,30 +39,11 @@ from stock_agent.risk_manager import (
     DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, TradeKind, update_drawdown,
 )
 from stock_agent.runtime_status import RuntimeStatus, notify_systemd
-from stock_agent.screener import Screener
 from stock_agent.state_boot import build_ledger, prepare_ledger
 from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
-from stock_agent.tipranks_client import (
-    build_tipranks_lookup,
-    adjust_conviction_with_tipranks,
-    format_tipranks_context,
-    format_tipranks_telegram_clause,
-)
-from stock_agent.news_feed import build_news_lookup, format_news_context
-from stock_agent.sentiment import (
-    build_sentiment_lookup,
-    format_sentiment_context,
-    adjust_conviction_with_sentiment,
-)
-from stock_agent.analyst_trends import (
-    build_analyst_lookup,
-    format_analyst_context,
-    adjust_conviction_with_analysts,
-)
-from stock_agent.research_notes import load_notes, format_research_notes_context
 
 logger = logging.getLogger(__name__)
 
@@ -202,9 +175,7 @@ class StockAgentScheduler:
         self._telemetry_task: asyncio.Task | None = None
         self._last_issue: dict[str, datetime] = {}
         self._pending_ledger_alerts: set[asyncio.Task] = set()
-        # Legacy read interfaces temporarily remain for report/research callbacks.
-        self.data_feed = DataFeed(self.config)
-        self.screener = Screener(self.config)
+        # Legacy read view temporarily retained for the two reporting callbacks.
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
         self.macro = service("macro", lambda: MacroMonitor(
@@ -1064,56 +1035,6 @@ class StockAgentScheduler:
             return JobOutcome(JobStatus.SKIPPED, detail={"reason": "research_not_configured"})
         return await research.run(kind, snapshot)
 
-    # ── Shared helpers ───────────────────────────────────────────────
-
-    async def _sync_portfolio_from_alpaca(self) -> None:
-        """Reconcile the ledger with the broker and mirror it into the legacy view.
-
-        The ledger is the source of truth. A failed or malformed broker read
-        raises inside ``refresh`` and leaves both the ledger and the legacy
-        ``portfolio`` view untouched (never read as "no positions").
-        """
-        if self.ledger is None:
-            logger.error("Broker sync: ledger not wired; legacy view left unchanged")
-            return
-        try:
-            snapshot = await self.ledger.refresh("portfolio sync")
-        except Exception as exc:
-            logger.error("Broker sync failed; ledger and legacy view unchanged: %s", exc)
-            return
-        try:
-            self.portfolio.sync_from_snapshot(snapshot)
-        except Exception as exc:
-            logger.error("Legacy portfolio view update failed: %s", exc)
-
-    async def _load_tipranks_data(self) -> dict:
-        """Fetch TipRanks Smart Score data via API screener."""
-        if not self.config.TIPRANKS_ENABLED:
-            return {}
-        try:
-            lookup = build_tipranks_lookup(
-                min_score=self.config.TIPRANKS_MIN_SMART_SCORE,
-                limit=self.config.TIPRANKS_UNIVERSE_LIMIT,
-            )
-            logger.info("TipRanks lookup built: %d symbols", len(lookup))
-            return lookup
-        except Exception as exc:
-            logger.warning("TipRanks lookup failed: %s \u2014 continuing without", exc)
-            return {}
-
-    async def _fetch_fundamentals(self, symbols: list[str]) -> list[CompanyData]:
-        """Fetch fundamentals for a list of symbols."""
-        companies: list[CompanyData] = []
-        for sym in symbols:
-            try:
-                data = await self.data_feed.get_company_fundamentals(sym)
-                if data:
-                    companies.append(data)
-            except Exception as e:
-                logger.warning("Failed to fetch fundamentals for %s: %s", sym, e)
-        logger.info("Fetched fundamentals for %d companies", len(companies))
-        return companies
-
     # ── Market monitoring ────────────────────────────────────────────
 
     async def _run_market_monitoring(self):
@@ -1193,81 +1114,6 @@ class StockAgentScheduler:
                 self.discord.send_error(str(e), context="Daily summary"),
                 return_exceptions=True,
             )
-
-    # ── Trade execution ──────────────────────────────────────────────
-
-    async def _execute_signals(self, signals: list[Signal]) -> list[Signal]:
-        """Queue BUY signals as order intents and let the execution engine run them.
-
-        Sizing, risk limits, market hours and the protective stop are all
-        decided by the engine at execution time from fresh broker state.
-        Returns the signals whose buy filled.
-        """
-        if self.engine is None or self.ledger is None:
-            logger.error("Execution engine not wired; %d signals not executed", len(signals))
-            return []
-        from decimal import Decimal
-
-        from stock_agent.ledger import NewIntent
-
-        session = _now_et().date()
-        buys = [s for s in signals if s.action == "BUY"]
-        missing = [s.symbol.upper() for s in buys if not s.entry_price]
-        marks: dict = {}
-        if missing and self.prices is not None:
-            try:
-                marks = (await self.prices.get_quotes(missing, purpose="order_sizing")).quotes
-            except Exception as e:
-                logger.warning("Quotes for signal reference prices failed: %s", e)
-        by_symbol: dict[str, Signal] = {}
-        items: list[NewIntent] = []
-        for signal in buys:
-            sym = signal.symbol.upper()
-            by_symbol[sym] = signal
-            ref = signal.entry_price or getattr(marks.get(sym), "price", None)
-            items.append(NewIntent(
-                symbol=sym, side="buy", dedupe_key=f"signal:{sym}:{session.isoformat()}",
-                reference_price=None if not ref else Decimal(str(ref)),
-                origin="scheduled", sleeve="CORE_EQUITY", session_date=session,
-                meta={"conviction": signal.conviction, "effective_conviction": signal.conviction,
-                      "raw_conviction": signal.conviction, "signal_at": signal.generated_at.isoformat()},
-            ))
-        if not items:
-            return []
-        ids = set(self.ledger.enqueue_intents(items, job="signals"))
-        executed: list[Signal] = []
-        for res in await self.engine.execute_due():
-            if res.intent_id in ids and res.filled_qty > 0 and res.symbol in by_symbol:
-                executed.append(by_symbol[res.symbol])
-        return executed
-
-    async def _execute_sell(self, position: Position, reason: str):
-        """Queue an exit for a held position and run it through the engine.
-
-        Never sells directly: the engine cancels and confirms the broker stop
-        first and sells at most the free shares the broker reports.
-        """
-        return await self._submit_exit(position.symbol, reason=reason)
-
-    async def _submit_exit(self, symbol: str, *, reason: str, rule: str = "model", qty: float | None = None):
-        if self.engine is None or self.ledger is None:
-            logger.error("Execution engine not wired; exit for %s not sent", symbol)
-            return None
-        from stock_agent.ledger import NewIntent
-
-        meta = self.ledger.open_position_meta(symbol)
-        session = _now_et().date()
-        m: dict = {"rule": rule, "reason": reason}
-        if qty is not None:
-            m["qty"] = qty
-        ids = self.ledger.enqueue_intents([NewIntent(
-            symbol=symbol, side="sell", dedupe_key=f"exit:{symbol}:{rule}:{session.isoformat()}",
-            position_id=getattr(meta, "position_id", None), origin="scheduled", session_date=session, meta=m,
-        )], job="exit")
-        intent = self.ledger.get_intent(ids[0])
-        if intent is None or intent.terminal:
-            return None
-        return await self.engine.execute_intent(intent)
 
     async def _run_options_scan(self):
         """Once-per-session options entry scan via OptionsManager.
@@ -1532,39 +1378,6 @@ class StockAgentScheduler:
         except Exception as e:
             logger.exception("Morning brief failed: %s", e)
 
-    # ── Sector backfill ──────────────────────────────────────────────
-
-    async def _backfill_sectors(self):
-        """Fill a missing or unrecognised sector on open ledger positions.
-
-        Order: risk_limits' issuer overrides / SECTOR_MAP, then FMP. Stored in
-        the ledger (canonical names), so sector caps see the same value.
-        """
-        if self.ledger is None:
-            return
-        from stock_agent.risk_manager import CanonicalSector, classify_symbol
-
-        sector_map = getattr(self.config, "SECTOR_MAP", {}) or {}
-        updated = 0
-        for meta in self.ledger.all_open_meta():
-            if meta.asset_class != "us_equity":
-                continue
-            if classify_symbol(meta.symbol, meta.sector).sector != CanonicalSector.UNKNOWN:
-                continue
-            found = classify_symbol(meta.symbol, sector_map.get(meta.symbol)).sector
-            if found == CanonicalSector.UNKNOWN:
-                try:
-                    company = await self.data_feed.get_company_fundamentals(meta.symbol)
-                    found = classify_symbol(meta.symbol, getattr(company, "sector", None)).sector
-                except Exception as e:
-                    logger.warning("Sector backfill failed for %s: %s", meta.symbol, e)
-                    continue
-            if found != CanonicalSector.UNKNOWN:
-                self.ledger.set_sector(meta.position_id, found.value)
-                updated += 1
-        if updated:
-            logger.info("Backfilled sectors for %d positions", updated)
-
     # ── Cleanup ──────────────────────────────────────────────────────
 
     async def _cleanup(self):
@@ -1603,8 +1416,7 @@ class StockAgentScheduler:
                 task.cancel()
 
         seen = set()
-        dynamic = ("data_feed", "screener", "telegram", "discord", "macro",
-                   "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
+        dynamic = ("telegram", "discord", "macro", "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:

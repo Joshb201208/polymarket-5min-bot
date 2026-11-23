@@ -15,7 +15,6 @@ from decimal import Decimal
 
 import pytest
 
-from stock_agent import options_engine, options_portfolio
 from stock_agent.config import Config
 from stock_agent.risk_manager import (
     CanonicalSector, DrawdownState, ShadowDailyBar, ShadowEntryAnchor, StopDistance,
@@ -73,19 +72,6 @@ def test_options_limit_values_in_config():
     assert Config.OPTIONS_MAX_DTE == 45
     assert Config.OPTIONS_AUTO_CLOSE_PROFIT_PCT == 0.50
     assert Config.OPTIONS_AUTO_CLOSE_DTE == 3
-
-
-def test_options_limit_values_in_the_options_modules():
-    # The options code carries its own copies of these limits.
-    assert options_engine.MAX_OPTIONS_POSITIONS == 10
-    assert options_engine.MAX_SINGLE_TRADE_PCT == 0.07
-    assert options_engine.MAX_TOTAL_OPTIONS_EXPOSURE_PCT == 0.15
-    assert options_engine.MIN_REWARD_TO_RISK == 1.5
-    assert options_engine.SHARES_PER_CONTRACT == 100
-    assert (options_engine.CC_MIN_DTE, options_engine.CC_MAX_DTE) == (14, 35)
-    assert (options_engine.SPREAD_MIN_DTE, options_engine.SPREAD_MAX_DTE) == (14, 45)
-    assert options_portfolio.EXPIRY_ALERT_DTE == 3
-    assert options_portfolio.PROFIT_TAKE_PCT == 50.0
 
 
 @pytest.mark.parametrize(("name", "expected"), [

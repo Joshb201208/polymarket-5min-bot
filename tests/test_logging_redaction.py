@@ -10,7 +10,6 @@ import httpx
 import pytest
 
 from stock_agent import __main__ as entrypoint
-from stock_agent import tipranks_client
 from stock_agent.config import LIVE_ALPACA_BASE_URL, load_settings
 from stock_agent.logging_setup import configure_logging, redact_text
 
@@ -121,9 +120,7 @@ def test_main_fails_fast_when_mode_and_broker_disagree(monkeypatch: pytest.Monke
     assert "ALPACA_BASE_URL" in str(exc_info.value)
 
 
-def test_no_hardcoded_tipranks_or_mcp_secrets_in_tracked_code() -> None:
+def test_legacy_secrets_surfaces_are_absent() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     assert not (repo_root / ".mcp.json").exists()
-    assert tipranks_client._headers(load_settings({}))["X-APIKey"] == ""
-    assert tipranks_client._headers(load_settings({}))["X-APIToken"] == ""
-    assert tipranks_client._call_screener({"limit": 5}) == []
+    assert not (repo_root / "stock_agent" / "tipranks_client.py").exists()
