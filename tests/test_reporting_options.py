@@ -109,3 +109,42 @@ def test_unknown_max_loss_is_never_summed_as_zero(world, tmp_path):
     assert sc["account"]["open_option_unknown_risk_count"] == 1
     assert sc["account"]["breach_count"] >= 1
     assert "unknown max loss" in str(embeds)
+
+
+def _repair_only():
+    return Structure("r1", "XYZ", "unknown", None, 1, "2026-12-18", [Leg(C100, "sell", "call", 100, "2026-12-18")],
+                     state="repair", source="adopted", entry_debit=-1.5, max_loss=None)
+
+
+def test_all_unknown_risk_has_no_leading_zero(world, tmp_path):
+    rb = builder(tmp_path, world, [_repair_only()])
+    daily = str(run(rb.build_daily_summary(snapshot=snapshot([leg(C100, 100, -1, "1")]))))
+    assert "unknown (1 structure(s); no known maximum)" in daily
+    assert "$0 known" not in daily
+
+
+def test_broker_legs_with_failed_or_empty_book_are_unknown_risk(world, tmp_path):
+    snap = snapshot([leg(C100, 100, -2, "1"), leg(C105, 105, 2, "0.5")], option_value="-100")
+
+    def boom():
+        raise OSError("store down")
+
+    for store in (NS(load=boom), NS(load=lambda: [])):
+        rb = ReportBuilder(Config(), ledger=make_ledger(tmp_path / str(id(store)), world),
+                           options_store=store, clock=lambda: NOW)
+        daily = str(run(rb.build_daily_summary(snapshot=snap)))
+        assert "Open Max Risk $0 " not in daily and "no known maximum" in daily
+        brief = str(run(rb.build_morning_brief(snapshot=snap)))
+        assert "no known maximum" in brief
+        _, sc = run(rb.build_weekly_scorecard(snapshot=snap))
+        assert sc["account"]["open_option_unknown_risk_count"] == 1
+
+
+def test_pnl_is_unknown_when_broker_quantity_differs_from_book(world, tmp_path):
+    rb = builder(tmp_path, world, [debit_spread()])  # book expects +2 / -2
+    snap = snapshot([leg(C100, 100, 2, "4"), leg(C105, 105, -1, "1")])  # short leg partly gone
+    sleeves, _, _, _ = rb._compile_sleeves_and_orders(snap)
+    assert sleeves["OPTIONS"]["unrealized_pnl"] == 0.0
+    assert sleeves["OPTIONS"]["unrealized_unknown_count"] == 1
+    daily = str(run(rb.build_daily_summary(snapshot=snap)))
+    assert "unknown max loss" in daily  # the unexplained leg is uncovered risk
