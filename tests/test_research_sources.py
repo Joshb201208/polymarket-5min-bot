@@ -6,8 +6,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from stock_agent.fundamentals_service import FundamentalsService
+from stock_agent.research_pipeline import SourceUnavailable
 from stock_agent.research_sources import ResearchSources
 
 NOW = datetime(2026, 11, 23, 15, tzinfo=UTC)
@@ -64,6 +66,32 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
         assert sources.quote_ok("AAA", NOW) and not sources.quote_ok("BBB", NOW)
         assert sources.news_ok("AAA", NOW) and not sources.news_ok("BBB", NOW)
         assert not sources.news_ok("AAA", NOW + timedelta(minutes=21))
+
+    asyncio.run(run())
+
+
+def test_global_feed_health_cannot_substitute_for_symbol_coverage():
+    class News:
+        fails = False
+
+        async def poll_news(self, symbols, **_):
+            return SimpleNamespace(ok=not self.fails, degraded=True, as_of=NOW, covered_symbols={"AAA"}, items=[])
+
+    async def universe():
+        return ["AAA", "BBB"]
+
+    async def run():
+        service = News()
+        health = SimpleNamespace(research_entry_blockers=lambda *_args, **_kwargs: ())
+        sources = ResearchSources(None, service, list_universe=universe, health=health)
+        assert await sources.news(("AAA", "BBB"), NOW) == ()
+        assert sources.news_ok("AAA", NOW)
+        assert not sources.news_ok("BBB", NOW)
+        assert not sources.news_ok("AAA", NOW - timedelta(seconds=1))
+        service.fails = True
+        with pytest.raises(SourceUnavailable):
+            await sources.news(("AAA", "BBB"), NOW)
+        assert not sources.news_ok("AAA", NOW)
 
     asyncio.run(run())
 
