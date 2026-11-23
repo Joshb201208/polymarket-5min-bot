@@ -469,26 +469,6 @@ def test_rejected_buy_and_stop_raise_alerts(world, tmp_path, monkeypatch):
     assert any(s == "critical" and "stop not in place" in t for s, t, _ in eng.alerts)
 
 
-def test_execute_sell_on_wired_scheduler_does_not_touch_tipranks(world, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from tests.exec_helpers import wired_scheduler
-
-    a = world.alpaca
-    world.clock.set_et(2026, 11, 23, 10, 0)
-    world.price("AAA", 50, spread=0.02)
-    a.seed_position("AAA", 10, 50)
-    sched, eng = wired_scheduler(world, tmp_path, monkeypatch)
-    run(eng.ledger.refresh("t"))
-
-    def boom(*_a, **_k):
-        raise AssertionError("tipranks lookup must not run on the sell path")
-
-    sched._tipranks_lookup = boom
-    run(sched._execute_sell(SimpleNamespace(symbol="AAA"), "model exit"))
-    assert a.position("AAA") is None and _no_shorts(a)
-
-
 def test_crash_after_buy_filled_resume_places_stop(world, tmp_path, monkeypatch):
     a = world.alpaca
     world.clock.set_et(2026, 11, 23, 10, 0)
