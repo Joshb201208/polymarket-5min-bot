@@ -170,8 +170,18 @@ CREATE TABLE IF NOT EXISTS legacy_archive (name TEXT PRIMARY KEY, archived_at TE
 """
 
 
+def run_script(conn: sqlite3.Connection, script: str) -> None:
+    """Run several ``;``-separated DDL statements inside the current transaction.
+
+    (``executescript`` would COMMIT first, breaking migration atomicity.)
+    """
+    for stmt in script.split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+
+
 def _core_v1(conn: sqlite3.Connection) -> None:
-    conn.executescript(_CORE_V1)
+    run_script(conn, _CORE_V1)
 
 
 class StateStore:
@@ -384,6 +394,7 @@ class StateStore:
             dst = sqlite3.connect(str(tmp))
             try:
                 self.conn.backup(dst)
+                dst.execute("PRAGMA journal_mode=DELETE")  # self-contained single file
             finally:
                 dst.close()
         tmp.replace(target)
