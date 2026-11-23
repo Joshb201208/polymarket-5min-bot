@@ -1,6 +1,6 @@
 """Tests of the simulated Alpaca itself (no bot code involved)."""
 
-from datetime import date, time
+from datetime import date, time, timedelta
 
 import httpx
 import pytest
@@ -470,3 +470,59 @@ def test_require_auth_switch():
     c = httpx.Client(transport=FakeInternet([alpaca]).transport)
     assert c.get(f"{BASE}/v2/account").status_code == 401
     assert c.get(f"{BASE}/v2/account", headers={"APCA-API-KEY-ID": "k"}).status_code == 200
+
+
+# ------------------------------------------------- covered calls, assignment
+def test_covered_call_locks_shares_and_blocks_stock_sale(opt_env):
+    _, alpaca, _, c, exp = opt_env
+    order(c, qty="150")
+    call = occ_symbol("AAA", exp, "call", 105)
+    r = order(c, symbol=call, side="sell", qty="1", type="limit", limit_price="1.2")
+    assert r.status_code == 200 and r.json()["position_intent"] == "sell_to_open"
+    assert c.get(f"{BASE}/v2/positions/AAA").json()["qty_available"] == "50"
+    r = order(c, side="sell", qty="100")
+    assert r.status_code == 403 and r.json()["held_for_options"] == "100" and r.json()["available"] == "50"
+    r = order(c, symbol=call, side="sell", qty="1", type="limit", limit_price="1.2")
+    assert r.status_code == 403
+    assert r.json()["message"] == "insufficient underlying qty available for covered call (required: 100, available: 50)"
+
+
+def test_early_assignment_of_short_call_can_leave_short_stock(opt_env):
+    _, alpaca, _, c, exp = opt_env
+    call = occ_symbol("AAA", exp, "call", 100)
+    alpaca.seed_position(call, -1, 3.0)
+    acts = alpaca.assign_early(call)
+    assert [a["activity_type"] for a in acts] == ["OPASN", "OPTRD"]
+    assert alpaca.position(call) is None and alpaca.position("AAA").qty == -100
+
+
+def test_option_greeks_in_snapshots(opt_env):
+    _, alpaca, _, c, exp = opt_env
+    sym = occ_symbol("AAA", exp, "call", 100)
+    alpaca.set_option_greeks(sym, delta=0.52, iv=0.31)
+    snap = c.get(f"{DATA}/v1beta1/options/snapshots", params={"symbols": sym}).json()["snapshots"][sym]
+    assert snap["greeks"]["delta"] == 0.52 and snap["impliedVolatility"] == 0.31
+
+
+def test_corporate_action_cancel(env):
+    _, alpaca, _, c = env
+    order(c)
+    s = order(c, side="sell", type="stop", stop_price="90", time_in_force="gtc").json()
+    assert alpaca.corporate_action_cancel("AAA") == [s["id"]]
+    assert c.get(f"{BASE}/v2/orders/{s['id']}").json()["status"] == "canceled"
+
+
+def test_news_appears_when_clock_reaches_it(env):
+    clock, alpaca, _, c = env
+    alpaca.add_news(["AAA"], "later story", created_at=clock.now() + timedelta(minutes=10))
+    assert c.get(f"{DATA}/v1beta1/news", params={"symbols": "AAA"}).json()["news"] == []
+    clock.advance(minutes=10)
+    assert len(c.get(f"{DATA}/v1beta1/news", params={"symbols": "AAA"}).json()["news"]) == 1
+
+
+def test_seeded_daily_bars(env):
+    _, alpaca, _, c = env
+    alpaca.seed_daily_bars("BBB", [10, 11, 12, 13, 14])
+    bars = c.get(f"{DATA}/v2/stocks/BBB/bars", params={"timeframe": "1Day"}).json()["bars"]
+    assert [b["c"] for b in bars] == [10, 11, 12, 13, 14]
+    assert bars[0]["h"] == pytest.approx(10.1) and bars[-1]["t"].startswith("2026-11-20")

@@ -10,6 +10,7 @@ Hosts (taken from the constants in stock_agent/*.py):
 - OpenAI      api.openai.com/v1/chat/completions            (screener.py)
 - Perplexity  api.perplexity.ai/chat/completions            (analyst.py)
 - Anthropic   api.anthropic.com/v1/messages                 (not used by the code today)
+- OpenAI Responses /v1/responses and Perplexity Agent /v1/agent for the new research client
 - FMP         financialmodelingprep.com/stable/...          (data_feed.py, options_portfolio.py)
 - Finnhub     finnhub.io/api/v1/...                         (data_feed, news_feed, sentiment, analyst_trends)
 - SEC EDGAR   data.sec.gov / www.sec.gov                    (data_feed)
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
@@ -60,58 +62,187 @@ class CannedService(FakeService):
 
 
 # --------------------------------------------------------------------- LLMs
+@dataclass
+class LLMReply:
+    """One scripted model answer, rendered in each provider's own shape.
+
+    text      the model's text (a JSON string when the caller asked for a schema)
+    sources   web results the provider's search tool returned: dicts with
+              url, title and optionally date / snippet
+    status    "completed" or "incomplete" (with incomplete_reason, e.g.
+              "max_output_tokens"); incomplete output may break the schema
+    refusal   a refusal string instead of text (OpenAI refusal content part)
+    tool_error  Anthropic: web_search_tool_result_error code inside HTTP 200
+              (e.g. "max_uses_exceeded", "unavailable")
+    """
+
+    text: str = "{}"
+    sources: list[dict] = field(default_factory=list)
+    status: str = "completed"
+    incomplete_reason: str | None = None
+    refusal: str | None = None
+    tool_error: str | None = None
+    input_tokens: int = 1000
+    output_tokens: int = 300
+    cost_usd: float | None = None
+
+
+def _as_reply(x) -> LLMReply:
+    if isinstance(x, LLMReply):
+        return x
+    return LLMReply(text=x if isinstance(x, str) else json.dumps(x))
+
+
 class _LLM(CannedService):
-    """Replies are taken from `replies` in order, then `default_reply`."""
+    """Replies are taken from `replies` in order, then `default_reply`.
+
+    `reply("text")`, `reply({"json": 1})` or `reply(LLMReply(...))`.
+    `prompts` keeps every request body for assertions.
+    """
 
     default_reply: str = "{}"
 
     def __init__(self, clock=None):
-        self.replies: list[str] = []
+        self.replies: list[LLMReply] = []
         self.prompts: list[Any] = []
         super().__init__(clock)
 
-    def reply(self, *texts: str | dict | list) -> None:
-        for t in texts:
-            self.replies.append(t if isinstance(t, str) else json.dumps(t))
+    def reply(self, *items) -> None:
+        for t in items:
+            self.replies.append(_as_reply(t))
 
-    def _next(self, request: httpx.Request) -> str:
+    def _next(self, request: httpx.Request) -> LLMReply:
         self.prompts.append(request_json(request))
-        return self.replies.pop(0) if self.replies else self.default_reply
+        return self.replies.pop(0) if self.replies else LLMReply(text=self.default_reply)
+
+    def _model(self, request, default: str) -> str:
+        return (request_json(request) or {}).get("model", default)
+
+    def _created(self) -> int:
+        return int(self.now().timestamp()) if self.now() else 0
+
+
+def _cite_annotations(text: str, sources: list[dict], kind: str = "url_citation") -> list[dict]:
+    return [{"type": kind, "start_index": 0, "end_index": len(text), "url": s["url"], "title": s.get("title", "")}
+            for s in sources]
 
 
 class FakeOpenAI(_LLM):
+    """Chat Completions (today's screener) and the Responses API.
+
+    Responses (https://developers.openai.com/api/docs/guides/tools-web-search):
+    output = [web_search_call (action.sources)] + [message with output_text +
+    url_citation annotations | refusal]; status completed | incomplete.
+    """
+
     name = "openai"
     hosts = ("api.openai.com",)
 
     def defaults(self):
         self.on("POST", "/v1/chat/completions", self._chat)
+        self.on("POST", "/v1/responses", self._responses)
 
     def _chat(self, request):
-        text = self._next(request)
+        r = self._next(request)
         return {
-            "id": "chatcmpl-fake", "object": "chat.completion", "model": (request_json(request) or {}).get("model", "fake"),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "id": "chatcmpl-fake", "object": "chat.completion", "created": self._created(),
+            "model": self._model(request, "fake"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r.text, "refusal": r.refusal},
+                         "finish_reason": "length" if r.status == "incomplete" else "stop"}],
+            "usage": {"prompt_tokens": r.input_tokens, "completion_tokens": r.output_tokens,
+                      "total_tokens": r.input_tokens + r.output_tokens},
+        }
+
+    def _responses(self, request):
+        r = self._next(request)
+        body = request_json(request) or {}
+        searched = any(t.get("type", "").startswith("web_search") for t in body.get("tools") or [])
+        output: list[dict] = []
+        if searched or r.sources:
+            output.append({"type": "web_search_call", "id": "ws_fake", "status": "completed",
+                           "action": {"type": "search", "query": "fake query",
+                                      "sources": [{"type": "url", "url": s["url"]} for s in r.sources]}})
+        if r.refusal is not None:
+            content = [{"type": "refusal", "refusal": r.refusal}]
+        else:
+            content = [{"type": "output_text", "text": r.text, "annotations": _cite_annotations(r.text, r.sources)}]
+        output.append({"type": "message", "id": "msg_fake", "status": r.status, "role": "assistant",
+                       "content": content})
+        return {
+            "id": f"resp_fake_{len(self.prompts)}", "object": "response", "created_at": self._created(),
+            "status": r.status,
+            "incomplete_details": {"reason": r.incomplete_reason or "max_output_tokens"} if r.status == "incomplete" else None,
+            "error": None, "model": self._model(request, "fake"), "output": output,
+            "usage": {"input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                      "total_tokens": r.input_tokens + r.output_tokens,
+                      "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
         }
 
 
 class FakePerplexity(_LLM):
+    """Agent API `POST /v1/agent` (alias `/v1/responses`) and legacy
+    `/chat/completions` (used by today's analyst.py).
+
+    Agent shape (https://docs.perplexity.ai/docs/agent-api/quickstart and the
+    Create Agent Response reference): output = [search_results {queries,
+    results[{id,title,url,snippet,date,source}]}] + [message output_text];
+    usage.cost.total_cost. `legacy_chat_status` can make /chat/completions
+    fail (Sonar Chat Completions support ended 27 Sep 2026; behaviour today
+    unverified, default still answers).
+    """
+
     name = "perplexity"
     hosts = ("api.perplexity.ai",)
+    legacy_chat_status: int = 200
 
     def defaults(self):
         self.on("POST", "/chat/completions", self._chat)
+        self.on("POST", "/v1/agent", self._agent)
+        self.on("POST", "/v1/responses", self._agent)
 
     def _chat(self, request):
-        text = self._next(request)
+        if self.legacy_chat_status != 200:
+            return json_response({"error": {"message": "fake: legacy endpoint unavailable"}}, self.legacy_chat_status)
+        r = self._next(request)
         return {
-            "id": "pplx-fake", "model": (request_json(request) or {}).get("model", "sonar"),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "citations": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "id": "pplx-fake", "model": self._model(request, "sonar"), "created": self._created(),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": r.text}, "finish_reason": "stop"}],
+            "citations": [s["url"] for s in r.sources],
+            "search_results": [{"title": s.get("title", ""), "url": s["url"], "date": s.get("date")} for s in r.sources],
+            "usage": {"prompt_tokens": r.input_tokens, "completion_tokens": r.output_tokens,
+                      "total_tokens": r.input_tokens + r.output_tokens},
+        }
+
+    def _agent(self, request):
+        r = self._next(request)
+        output: list[dict] = []
+        if r.sources:
+            output.append({"type": "search_results", "queries": ["fake query"], "results": [
+                {"id": i + 1, "title": s.get("title", ""), "url": s["url"], "snippet": s.get("snippet", ""),
+                 "date": s.get("date"), "last_updated": s.get("last_updated"), "source": "web"}
+                for i, s in enumerate(r.sources)]})
+        output.append({"type": "message", "id": "msg_fake", "status": r.status, "role": "assistant",
+                       "content": [{"type": "output_text", "text": r.text,
+                                    "annotations": _cite_annotations(r.text, r.sources)}]})
+        return {
+            "id": f"resp_fake_{len(self.prompts)}", "object": "response", "created_at": self._created(),
+            "status": r.status, "model": self._model(request, "perplexity/sonar"), "output": output,
+            "usage": {"input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                      "total_tokens": r.input_tokens + r.output_tokens,
+                      "cost": {"currency": "USD", "total_cost": r.cost_usd if r.cost_usd is not None else 0.001}},
         }
 
 
 class FakeAnthropic(_LLM):
+    """Messages API `POST /v1/messages`.
+
+    With a web_search tool in the request (or sources on the reply) the
+    content is server_tool_use + web_search_tool_result + text blocks with
+    web_search_result_location citations; `tool_error` puts a
+    web_search_tool_result_error inside an HTTP 200
+    (https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool).
+    """
+
     name = "anthropic"
     hosts = ("api.anthropic.com",)
 
@@ -119,12 +250,33 @@ class FakeAnthropic(_LLM):
         self.on("POST", "/v1/messages", self._messages)
 
     def _messages(self, request):
-        text = self._next(request)
+        r = self._next(request)
+        body = request_json(request) or {}
+        searched = any(str(t.get("type", "")).startswith("web_search") for t in body.get("tools") or [])
+        content: list[dict] = []
+        n_search = 0
+        if searched or r.sources or r.tool_error:
+            n_search = 1
+            content.append({"type": "server_tool_use", "id": "srvtoolu_fake", "name": "web_search",
+                            "input": {"query": "fake query"}})
+            if r.tool_error:
+                result = {"type": "web_search_tool_result_error", "error_code": r.tool_error}
+            else:
+                result = [{"type": "web_search_result", "url": s["url"], "title": s.get("title", ""),
+                           "page_age": s.get("page_age"), "encrypted_content": "fake"} for s in r.sources]
+            content.append({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_fake", "content": result})
+        citations = [{"type": "web_search_result_location", "url": s["url"], "title": s.get("title", ""),
+                      "cited_text": r.text[:150], "encrypted_index": "fake"} for s in r.sources]
+        block = {"type": "text", "text": r.text}
+        if citations:
+            block["citations"] = citations
+        content.append(block)
         return {
-            "id": "msg_fake", "type": "message", "role": "assistant",
-            "model": (request_json(request) or {}).get("model", "fake"),
-            "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "id": "msg_fake", "type": "message", "role": "assistant", "model": self._model(request, "fake"),
+            "content": content,
+            "stop_reason": "max_tokens" if r.status == "incomplete" else ("refusal" if r.refusal else "end_turn"),
+            "usage": {"input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                      "server_tool_use": {"web_search_requests": n_search}},
         }
 
 
@@ -190,11 +342,33 @@ class FakeFMP(CannedService):
 
 
 class FakeFinnhub(CannedService):
+    """`/company-news` serves stories added with `add_news`, only once the
+    simulated clock has reached their time (needs a clock)."""
+
     name = "finnhub"
     hosts = ("finnhub.io",)
 
+    def __init__(self, clock=None):
+        self.news: list[dict] = []
+        super().__init__(clock)
+
+    def add_news(self, symbol: str, headline: str, *, at=None, summary: str = "", source: str = "Reuters") -> dict:
+        at = at or self.now()
+        n = {"category": "company", "datetime": int(at.timestamp()), "headline": headline, "id": len(self.news) + 1,
+             "image": "", "related": symbol, "source": source, "summary": summary,
+             "url": f"https://example.invalid/finnhub/{len(self.news) + 1}"}
+        self.news.append(n)
+        return n
+
+    def _company_news(self, request):
+        sym = request.url.params.get("symbol", "")
+        now = self.now().timestamp() if self.now() else float("inf")
+        rows = [n for n in self.news if n["related"] == sym and n["datetime"] <= now]
+        return sorted(rows, key=lambda n: n["datetime"], reverse=True)
+
     def defaults(self):
         self.on("GET", "/api/v1/*", [])
+        self.on("GET", "/api/v1/company-news", self._company_news)
         self.on("GET", "/api/v1/calendar/earnings", {"earningsCalendar": []})
         self.on("GET", "/api/v1/news-sentiment", {})
         self.on("GET", "/api/v1/stock/insider-transactions", {"data": []})
