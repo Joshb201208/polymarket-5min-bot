@@ -354,6 +354,10 @@ class OptionsManager:
         if isinstance(r, tuple):
             px, at = r
         else:
+            actual = getattr(r, "symbol", None)
+            if isinstance(actual, str) and actual and actual.upper() != symbol.upper():
+                # the market-data layer resolved a rename: never trade options on a stale symbol
+                return None, f"symbol now trades as {actual}"
             px, at = getattr(r, "price", None), getattr(r, "at", None) or getattr(r, "as_of", None)
         px = _f(px)
         at = _parse_ts(at) if not isinstance(at, datetime) else at

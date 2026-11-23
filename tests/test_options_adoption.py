@@ -279,3 +279,15 @@ def test_deferred_load(world, tmp_path):
     kv.ready = True
     m.load_state()
     assert m.commitments() == () and m.open_blocker() is None
+
+
+def test_renamed_underlying_is_not_traded(world, tmp_path):
+    from types import SimpleNamespace
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA")
+    m = make_manager(world, tmp_path, gate=gate)
+    m._spot = lambda sym: SimpleNamespace(symbol="AAAN", price=100.0, as_of=world.clock.now())
+    out = run(m.scan())
+    assert out[0].opened is None and "AAAN" in out[0].reason and world.orders_sent() == []
