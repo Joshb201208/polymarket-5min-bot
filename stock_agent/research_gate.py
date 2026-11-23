@@ -44,6 +44,11 @@ class ResearchGate:
         if utc_now is None:
             return Eligibility(False, ("invalid_clock",))
         reasons = list(self.health.research_entry_blockers(symbol, utc_now))
+        pending = getattr(self.ledger, "list_intents", None)
+        if pending is not None and any(
+            intent.side == "sell" and not intent.terminal for intent in pending(symbol=symbol)
+        ):
+            reasons.append("pending_exit")
         record = self.ledger.current_thesis(symbol)
         if record is None:
             return Eligibility(False, (*reasons, "missing_thesis"))

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -49,7 +50,7 @@ class ModelRoute:
 
     @property
     def underlying(self) -> str:
-        return self.model.rsplit("/", 1)[-1]
+        return re.sub(r"-20\d\d(?:-\d\d-\d\d|\d{4})$", "", self.model.rsplit("/", 1)[-1])
 
 
 @dataclass(frozen=True)
@@ -155,10 +156,13 @@ class LLMClient:
         return any(self._available(route, self.now()) for route in self._routes())
 
     def _available(self, route: ModelRoute, now: datetime) -> bool:
+        resolver = getattr(self.spend, "get_cooldown", None)
+        persisted = resolver(route) if resolver is not None else None
         return (
             route.underlying in _RATES
             and self._health.provider_until.get(route.provider, now) <= now
             and self._health.route_until.get(route, now) <= now
+            and (persisted is None or persisted <= now)
         )
 
     async def close(self) -> None:
@@ -202,13 +206,21 @@ class LLMClient:
         raise ProviderUnavailable(tuple(attempts))
 
     async def _failed(self, route: ModelRoute, error: ProviderError, now: datetime) -> None:
+        until = None
+        provider_wide = error.kind in {"auth", "quota"}
         if error.kind in {"auth", "quota"}:
-            self._health.provider_until[route.provider] = now + timedelta(hours=24)
+            until = now + timedelta(hours=24)
+            self._health.provider_until[route.provider] = until
         elif error.kind == "model_unavailable":
-            self._health.route_until[route] = now + timedelta(hours=24)
+            until = now + timedelta(hours=24)
+            self._health.route_until[route] = until
         elif error.kind in {"rate_limit", "transport", "upstream"}:
             delay = 60 if error.retry_after is None else max(30, min(3_600, error.retry_after))
-            self._health.route_until[route] = now + timedelta(seconds=delay)
+            until = now + timedelta(seconds=delay)
+            self._health.route_until[route] = until
+        persist = getattr(self.spend, "set_cooldown", None)
+        if until is not None and persist is not None:
+            persist(route, until, provider_wide=provider_wide)
         logger.warning("Research %s route failed (%s, %s)", route.provider, error.kind, error.status)
         if self.on_failure is not None:
             try:
@@ -350,6 +362,18 @@ class LLMClient:
                 val = usage.get(key, 0)
                 if type(val) is int and val >= 0:
                     in_tokens += val * scale
+        if route.provider == "perplexity":
+            provided = (usage.get("cost") or {}).get("total_cost")
+            if type(provided) in {int, float} and 0 < provided < 100:
+                return round(provided * 1_000_000)
+        if route.provider == "openai":
+            actual = ((data.get("tool_usage") or {}).get("web_search") or {}).get("num_requests")
+            if type(actual) is int and actual >= 0:
+                searches = actual
+        if route.provider == "anthropic":
+            actual = (usage.get("server_tool_use") or {}).get("web_search_requests")
+            if type(actual) is int and actual >= 0:
+                searches = actual
         in_rate, out_rate = _RATES[route.underlying]
         return int(in_tokens * in_rate + out_tokens * out_rate + searches * _FEES[route.provider]) + 1
 
