@@ -17,8 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class Portfolio:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, persist: bool = True):
+        """``persist=False``: in-memory compatibility view (the scheduler's, fed by
+        the ledger). It reads ``portfolio.json`` if readable but never writes,
+        moves or replaces it; the SQLite ledger owns state and migration."""
         self.config = config
+        self.persist = persist
         self._state_path = config.DATA_DIR / "portfolio.json"
         self._load_failed = False
         self.state: PortfolioState = self._load()
@@ -44,7 +48,9 @@ class Portfolio:
         return PortfolioState()
 
     def _save(self):
-        """Atomic write: write to temp file then rename."""
+        """Atomic write: write to temp file then rename. No-op when ``persist=False``."""
+        if not self.persist:
+            return
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         if self._load_failed and self._state_path.exists():
             # never overwrite a file we could not read: keep it for diagnosis
