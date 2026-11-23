@@ -226,6 +226,10 @@ class ExecutionEngine:
         q = res.quotes.get(symbol)
         if q is None:
             raise ExecutionError(f"no fresh quote for {symbol}: {res.missing.get(symbol, 'missing')}")
+        actual = str(getattr(q, "symbol", "") or symbol).upper()
+        if actual != symbol.upper():
+            # renamed ticker: never size an order for the old symbol from the new one's quote
+            raise ExecutionError(f"symbol changed: {symbol} now trades as {actual}; fresh thesis required")
         return q
 
     async def _stop_distance(self, symbol: str, price: float):
@@ -463,14 +467,28 @@ class ExecutionEngine:
         if cur is not None and cur.status in (IntentStatus.SUBMITTED, IntentStatus.PARTIALLY_FILLED):
             # The broker accepted the order; a later poll/cancel failed. Shares may be
             # held. Protect what is confirmed now and resolve the remainder each tick.
+            # A stop cannot rest beside our own working buy (Alpaca's wash-trade
+            # check), so first retry cancelling the remainder, then resolve and protect.
+            try:
+                await self._resolve(cur)
+                cur2 = self.ledger.get_intent(intent.intent_id)
+                if cur2 is not None and cur2.status not in (IntentStatus.SUBMITTED, IntentStatus.PARTIALLY_FILLED):
+                    meta = cur2.meta or {}
+                    await self.alert("warning", f"{intent.symbol}: order recovered after a broker error",
+                                     f"{e}; the remainder was cancelled on retry and the filled shares "
+                                     "are protected.", key=f"accepted-{intent.intent_id}")
+                    return ExecResult(intent.intent_id, intent.symbol, cur2.status,
+                                      _f(meta.get("filled_qty")), meta.get("avg_price"), reason=str(e))
+            except BrokerError as re:
+                logger.warning("retry resolve for %s failed: %s", intent.symbol, re)
             try:
                 await self._protect_symbol(intent.symbol)
             except Exception as pe:
                 logger.warning("protect after failure for %s: %s", intent.symbol, pe)
-            await self.alert("critical", f"{intent.symbol}: order accepted, follow-up failed",
-                             f"{intent.side} {intent.symbol}: {e}. Order {intent.client_order_id} is being "
-                             "resolved on every monitoring tick; no new order for this intent.",
-                             key=f"accepted-{intent.intent_id}")
+            await self.alert("critical", f"{intent.symbol}: filled shares may be unprotected",
+                             f"{intent.side} {intent.symbol}: {e}. The broker would not cancel the rest of order "
+                             f"{intent.client_order_id}, and a stop cannot rest beside it. Retrying the cancel "
+                             "and the stop on every monitoring tick.", key=f"accepted-{intent.intent_id}")
             return ExecResult(intent.intent_id, intent.symbol, cur.status, reason=str(e))
         if e.uncertain:
             if cur is not None and cur.status == IntentStatus.SUBMITTING:
