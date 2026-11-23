@@ -60,6 +60,7 @@ CASH_FLOW_TYPES = ("JNLC", "CSD", "CSW", "JNL")
 
 # a run that would close at least this share of >= 2 open positions re-reads once
 MASS_CLOSE_FRACTION = 0.5
+REOPEN_TOLERANCE = timedelta(seconds=120)   # bot-recorded open time vs broker fill time
 
 
 
@@ -368,6 +369,36 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
                                   ledger=None, broker=str(qty),
                                   explanation=_explain_close(ledger, sym, None) or "no matching activity",
                                   action=f"imported ({source})"))
+            elif meta.opened_at is not None and meta.opened_source not in ("v0",):
+                # sold to flat and bought again between refreshes: a new position, not the old one
+                reopened, how = _opened_from_history(ledger, sym, qty)
+                if reopened is not None and reopened > meta.opened_at + REOPEN_TOLERANCE:
+                    c.execute("UPDATE positions_meta SET closed_at=?, close_cause=? WHERE position_id=?",
+                              (reopened.isoformat(), "flat_then_reopened", meta.position_id))
+                    diffs.append(Diff(DiffKind.CLOSED, sym, Severity.INFO, ledger=meta.position_id, broker=str(qty),
+                                      explanation="went flat and was reopened between refreshes",
+                                      action="old position closed; new position opened"))
+                    source = {"fill": "import", "assignment_or_exercise": "assignment"}.get(how, "import")
+                    pid = _new_meta(c, sym, meta.asset_class, reopened, source)
+                    meta = PositionMeta(position_id=pid, symbol=sym, asset_class=meta.asset_class,
+                                        opened_at=reopened, opened_source=source)
+                    open_meta[sym] = meta
+                    diffs.append(Diff(DiffKind.IMPORTED, sym, Severity.WARNING, broker=str(qty),
+                                      explanation=f"reopened by {how}", action=f"imported ({source})"))
+            elif meta.opened_at is None or meta.opened_source == "v0":
+                # migrated (or unknown) entry date: broker fills are the truth (F-07-03)
+                opened, how = _opened_from_history(ledger, sym, qty)
+                if opened is not None:
+                    src = "v0_verified" if meta.opened_source == "v0" else meta.opened_source
+                    c.execute("UPDATE positions_meta SET opened_at=?, opened_source=? WHERE position_id=?",
+                              (opened.isoformat(), src, meta.position_id))
+                    if meta.opened_at is None or meta.opened_at.date() != opened.date():
+                        diffs.append(Diff(DiffKind.ENTRY_DATE_CORRECTED, sym, Severity.INFO,
+                                          ledger=meta.opened_at.isoformat() if meta.opened_at else None,
+                                          broker=opened.isoformat(), explanation=f"first {how} after flat",
+                                          action="entry date taken from broker fills"))
+                    meta = PositionMeta(**{**meta.__dict__, "opened_at": opened, "opened_source": src})
+                    open_meta[sym] = meta
             seen_meta.add(sym)
             pq = prev_qty.get(sym)
             if pq is not None and Decimal(str(pq)) != qty:
@@ -478,7 +509,13 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
                                 key=f"reconcile:{d.kind.value}:{d.symbol}")
     journal.append("reconcile", ok=True, run_id=run_id, reason=reason, n_diffs=len(diffs), quality=quality,
                    equity=str(equity), cash=str(cash), n_holdings=len(holdings), n_legs=len(legs))
-    if store.trading_block():
+    # B1: resume only after a CLEAN reconcile. Shorts are blocked per symbol, not here.
+    blocking = [d for d in diffs if d.severity == Severity.CRITICAL and d.kind != DiffKind.SHORT_STOCK]
+    if store.trading_block() and blocking:
+        ledger._raise_alert(Severity.CRITICAL, "Books not clean; trading stays blocked",
+                            "; ".join(f"{d.kind.value} {d.symbol or ''}".strip() for d in blocking[:10]),
+                            key="state:still_blocked")
+    elif store.trading_block():
         old = store.trading_block()
         store.clear_trading_block(by=f"reconcile {run_id}")
         ledger._raise_alert(Severity.WARNING, "Books rebuilt from broker",

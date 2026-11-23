@@ -260,3 +260,65 @@ def test_snapshot_age(tmp_path):
     snap = run(led.refresh("x"))
     clock.t += timedelta(seconds=30)
     assert snap.age_seconds(clock.t) == 30
+
+
+def test_concurrent_refreshes_are_serialised_and_coalesced(tmp_path):
+    import asyncio
+
+    b = StubBroker()
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    b.calls.clear()
+
+    async def three():
+        return await asyncio.gather(led.refresh("a"), led.refresh("b"), led.refresh("c"))
+
+    s1, s2, s3 = run(three())
+    # first runs; the two that queued behind it share the next run started after they asked
+    assert b.calls.count("get_account") == 2
+    assert s2 is s3 and s1.run_id != s2.run_id
+
+
+def test_critical_diff_keeps_trading_block(tmp_path):
+    b = StubBroker()
+    for s in ("AAA", "BBB", "CCC"):
+        b.pos(s, 10, 50)
+    alerts = []
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first"))
+    led.store.set_trading_block("test block")
+    del b.positions["AAA"]                                  # unexplained disappearance -> critical
+    run(led.refresh("again"))
+    assert led.trading_block() == "test block"
+    assert any(a[3] == "state:still_blocked" for a in alerts)
+    run(led.refresh("clean now"))                           # nothing new and critical
+    assert led.trading_block() is None
+
+
+def test_short_alone_does_not_keep_global_block(tmp_path):
+    b = StubBroker()
+    b.pos("PPP", -5, 10)
+    led = make_ledger(tmp_path, broker=b)
+    led.store.set_trading_block("rebuild")
+    snap = run(led.refresh("rebuild", rebuild=True))
+    assert led.trading_block() is None and "PPP" in snap.blocked_symbols
+
+
+def test_flat_and_reopened_between_refreshes_gets_new_position(tmp_path):
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-02T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first", rebuild=True))
+    old = led.open_position_meta("AAA")
+    led.set_stop(old.position_id, 90, "stop-old")
+    b.fill("AAA", "sell", 10, 95, ts="2026-11-03T15:00:00Z")
+    b.fill("AAA", "buy", 8, 97, ts="2026-11-04T15:00:00Z")
+    b.pos("AAA", 8, 97)
+    snap = run(led.refresh("later"))
+    new = led.open_position_meta("AAA")
+    assert new.position_id != old.position_id and new.stop_order_id is None
+    assert new.opened_at.date().isoformat() == "2026-11-04"
+    assert led.store.query("SELECT closed_at FROM positions_meta WHERE position_id=?", (old.position_id,))[0][0]
+    assert snap.holding("AAA").meta.position_id == new.position_id

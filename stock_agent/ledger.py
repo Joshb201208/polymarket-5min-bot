@@ -26,6 +26,7 @@ Consumers:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -77,6 +78,7 @@ class DiffKind(StrEnum):
     PRICE_INVALID = "price_invalid"
     UNEXPLAINED = "unexplained"
     MASS_CLOSE = "mass_close"
+    ENTRY_DATE_CORRECTED = "entry_date_corrected"   # migrated/unknown entry date replaced from broker fills
 
 
 @dataclass(frozen=True)
@@ -436,6 +438,9 @@ class Ledger:
         self._clock = clock or _now
         self._alert = alert              # callable(severity, title, body, key=None)
         self._snapshot: BookSnapshot | None = None
+        self._refresh_lock: asyncio.Lock | None = None
+        self._refresh_starts = 0
+        self._snapshot_start_seq = -1
 
     def now(self) -> datetime:
         return self._clock()
@@ -446,9 +451,19 @@ class Ledger:
         (the ledger is left untouched); never treats a failure as empty."""
         from stock_agent.reconcile import reconcile
 
-        snap = await reconcile(self, reason=reason, rebuild=rebuild)
-        self._snapshot = snap
-        return snap
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        arrival = self._refresh_starts
+        async with self._refresh_lock:
+            # coalesce: a refresh that STARTED after we asked and succeeded is as fresh as ours
+            if not rebuild and self._snapshot is not None and self._snapshot_start_seq >= arrival:
+                return self._snapshot
+            seq = self._refresh_starts
+            self._refresh_starts += 1
+            snap = await reconcile(self, reason=reason, rebuild=rebuild)
+            self._snapshot = snap
+            self._snapshot_start_seq = seq
+            return snap
 
     def snapshot(self, max_age_s: int | None = None) -> BookSnapshot:
         """The last reconciled snapshot, if fresh enough. Raises ``StaleBook``."""
