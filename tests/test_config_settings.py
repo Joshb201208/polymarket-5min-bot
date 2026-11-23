@@ -327,3 +327,40 @@ def test_gitignore_and_gitleaks_hygiene() -> None:
     assert commits
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in commits)
 
+
+def test_requirements_files_are_exact_pinned_and_lightweight() -> None:
+    import re
+
+    repo_root = Path(__file__).resolve().parent.parent
+    pin_re = re.compile(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+-]+)$")
+    forbidden_runtime = {
+        "aiohttp",
+        "fastapi",
+        "numpy",
+        "pandas",
+        "playwright",
+        "uvicorn",
+        "yfinance",
+    }
+
+    for filename in ("requirements.txt", "requirements-dev.txt"):
+        lines = [
+            line.strip()
+            for line in (repo_root / filename).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert lines, f"{filename} should not be empty"
+        pkgs: set[str] = set()
+        for line in lines:
+            assert "--hash" not in line, f"{filename} must work with plain pip install -r"
+            match = pin_re.match(line)
+            assert match is not None, f"Unpinned line in {filename}: {line!r}"
+            pkgs.add(match.group(1).lower().replace("_", "-"))
+
+        if filename == "requirements.txt":
+            assert not (pkgs & forbidden_runtime)
+            assert {"httpx", "pydantic", "python-dotenv", "requests"} <= pkgs
+        else:
+            assert {"pytest", "ruff"} <= pkgs
+
+
