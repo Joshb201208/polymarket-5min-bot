@@ -322,3 +322,34 @@ def test_flat_and_reopened_between_refreshes_gets_new_position(tmp_path):
     assert new.opened_at.date().isoformat() == "2026-11-04"
     assert led.store.query("SELECT closed_at FROM positions_meta WHERE position_id=?", (old.position_id,))[0][0]
     assert snap.holding("AAA").meta.position_id == new.position_id
+
+
+def test_exit_intent_for_replaced_position_is_cancelled(tmp_path):
+    from stock_agent.ledger import IntentStatus, LedgerError, NewIntent
+
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-02T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first", rebuild=True))
+    pid = led.open_position_meta("AAA").position_id
+    [iid] = led.enqueue_intents([NewIntent(symbol="AAA", side="sell", dedupe_key="exit:AAA", position_id=pid)])
+    b.fill("AAA", "sell", 10, 95, ts="2026-11-03T15:00:00Z")
+    b.fill("AAA", "buy", 10, 97, ts="2026-11-04T15:00:00Z")
+    run(led.refresh("later"))
+    with pytest.raises(LedgerError):
+        led.claim_intent(iid)
+    assert led.get_intent(iid).status == IntentStatus.CANCELLED
+
+
+def test_same_second_round_trip_detected_by_activity_id(tmp_path):
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-02T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first", rebuild=True))
+    old = led.open_position_meta("AAA").position_id
+    b.fill("AAA", "sell", 10, 100, ts="2026-11-02T15:00:30Z")
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-02T15:00:40Z")
+    run(led.refresh("later"))
+    assert led.open_position_meta("AAA").position_id != old

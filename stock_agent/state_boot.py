@@ -2,8 +2,9 @@
 
 Usage (scheduler startup)::
 
-    boot = open_ledger(config.DATA_DIR, broker=self.broker, alert=self.alerts.alert)
-    self.ledger = boot.ledger
+    self.ledger = build_ledger(config.DATA_DIR, broker=self.broker, alert=self.alerts.alert)
+    # ... other areas register migrations on self.ledger.store here ...
+    boot = prepare_ledger(self.ledger, config.DATA_DIR)
     boot.ledger.mark_submitting_ambiguous()
     await boot.ledger.refresh("startup", rebuild=boot.needs_rebuild)
 
@@ -46,19 +47,34 @@ class Boot:
         return bool(self.health.created or self.health.quarantined or self.ledger.trading_block())
 
 
-def open_ledger(data_dir: Path, *, broker: Any = None, alert: Callable[..., Any] | None = None,
-                options_importer: Any = None, clock: Callable | None = None) -> Boot:
+def build_ledger(data_dir: Path, *, broker: Any = None, alert: Callable[..., Any] | None = None,
+                 clock: Callable | None = None) -> Ledger:
+    """Construct journal, store and ledger WITHOUT opening the store, so other
+    areas can ``ledger.store.register_migration(...)`` first. Then call
+    ``prepare_ledger``."""
     data_dir = Path(data_dir)
     journal = Journal(Path(os.getenv("JOURNAL_DIR") or data_dir / "journal"),
                       max_mb=_env_int("JOURNAL_MAX_MB", 500), clock=clock)
     store = StateStore(Path(os.getenv("STATE_DB_PATH") or data_dir / "state.db"), journal,
                        backup_keep=_env_int("STATE_BACKUP_KEEP", 14), clock=clock)
-    health = store.open()
+    return Ledger(store, journal, broker=broker, max_age_s=_env_int("RECONCILE_MAX_AGE_SEC", 120),
+                  clock=clock, alert=alert)
+
+
+def prepare_ledger(ledger: Ledger, data_dir: Path, *, options_importer: Any = None) -> Boot:
+    """Open the injected ledger's store (runs every registered migration) and
+    import legacy v0 JSON state if the store is new. Does not call the broker."""
+    health = ledger.store.open()
     migration = None
-    if health.created and not health.quarantined and has_legacy_state(data_dir):
-        migration = migrate_v0(data_dir, store, options_importer=options_importer)
+    if health.created and not health.quarantined and has_legacy_state(Path(data_dir)):
+        migration = migrate_v0(Path(data_dir), ledger.store, options_importer=options_importer)
         health.migrated_v0 = migration.ran
         health.notes.append(migration.summary())
-    ledger = Ledger(store, journal, broker=broker, max_age_s=_env_int("RECONCILE_MAX_AGE_SEC", 120),
-                    clock=clock, alert=alert)
     return Boot(ledger=ledger, health=health, migration=migration)
+
+
+def open_ledger(data_dir: Path, *, broker: Any = None, alert: Callable[..., Any] | None = None,
+                options_importer: Any = None, clock: Callable | None = None) -> Boot:
+    """build_ledger + prepare_ledger, for standalone tools."""
+    return prepare_ledger(build_ledger(data_dir, broker=broker, alert=alert, clock=clock), data_dir,
+                          options_importer=options_importer)
