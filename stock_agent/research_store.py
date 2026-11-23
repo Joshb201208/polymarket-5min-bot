@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -40,11 +40,20 @@ def _migrate(conn) -> None:
     )""")
 
 
+def _migrate_retry(conn) -> None:
+    conn.execute("ALTER TABLE research_work ADD COLUMN retry_after_s INTEGER")
+    conn.execute("""CREATE TABLE research_option_ideas (
+        story_id TEXT PRIMARY KEY, expires_at_s INTEGER NOT NULL, payload_json TEXT NOT NULL,
+        handled INTEGER NOT NULL DEFAULT 0
+    )""")
+
+
 class ResearchStore:
     def __init__(self, store: StateStore, config):
         self.store = store
         self.config = config
         store.register_migration(1, "research", _migrate)
+        store.register_migration(2, "research", _migrate_retry)
 
     def available_budget(self, now: datetime) -> dict:
         rows = self.store.query(
@@ -99,28 +108,37 @@ class ResearchStore:
             conn.execute(
                 """INSERT INTO research_cooldowns VALUES(?,?,?)
                 ON CONFLICT(provider,model) DO UPDATE SET until_at=max(until_at,excluded.until_at)""",
-                (route.provider, "" if provider_wide else route.model, until.isoformat()),
+                (route.provider, "" if provider_wide else route.model, until.astimezone(UTC).isoformat()),
             )
 
     def claim_work(self, work_key: str, symbol: str, now: datetime) -> bool:
-        # Exactly once per stable input, including crashes during a paid call.
-        # The status remains 'started' after an ambiguous crash; don't redraw.
+        # Only a known pre-inference rejection permits reopening work. An
+        # ambiguous crash leaves the status 'started' and is never redrawn.
         with self.store.transaction() as conn:
             return bool(conn.execute(
-                """INSERT OR IGNORE INTO research_work(work_key,symbol,claimed_at,status)
-                VALUES(?,?,?,'started')""",
-                (work_key, symbol, now.isoformat()),
+                """INSERT INTO research_work(work_key,symbol,claimed_at,status)
+                VALUES(?,?,?,'started') ON CONFLICT(work_key) DO UPDATE SET
+                    claimed_at=excluded.claimed_at,status='started',retry_after_s=NULL
+                WHERE status='retry' AND retry_after_s<=?""",
+                (work_key, symbol, now.isoformat(), int(now.timestamp())),
             ).rowcount)
+
+    def ready(self, work_key: str, now: datetime) -> bool:
+        row = self.work_state(work_key)
+        return row is None or (row["status"] == "retry" and row["retry_after_s"] <= int(now.timestamp()))
 
     def work_state(self, work_key: str):
         rows = self.store.query("SELECT * FROM research_work WHERE work_key=?", (work_key,))
         return rows[0] if rows else None
 
-    def finish_work(self, work_key: str, status: str, *, thesis_id: str | None = None, detail: dict | None = None) -> None:
+    def finish_work(self, work_key: str, status: str, *, thesis_id: str | None = None, detail: dict | None = None,
+                    retry_at: datetime | None = None) -> None:
         with self.store.transaction() as conn:
             conn.execute(
-                "UPDATE research_work SET status=?, thesis_id=?, details_json=? WHERE work_key=? AND status='started'",
-                (status, thesis_id, json.dumps(detail or {}, default=str), work_key),
+                """UPDATE research_work SET status=?, thesis_id=?, details_json=?, retry_after_s=?
+                WHERE work_key=? AND status='started'""",
+                (status, thesis_id, json.dumps(detail or {}, default=str),
+                 int(retry_at.timestamp()) if retry_at is not None else None, work_key),
             )
 
     def unqueued_proposals(self) -> list[dict]:
@@ -147,3 +165,22 @@ class ResearchStore:
 
     def record_proposal(self, work_key: str, thesis_id: str, intent) -> None:
         self.finish_work(work_key, "proposed", thesis_id=thesis_id, detail={"intent": asdict(intent)})
+
+    def record_option_idea(self, story_id: str, idea, expires_at: datetime) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO research_option_ideas(story_id,expires_at_s,payload_json) VALUES (?,?,?)""",
+                (story_id, int(expires_at.timestamp()), json.dumps(asdict(idea), default=str)),
+            )
+
+    def pending_option_ideas(self, now: datetime) -> list[dict]:
+        return [json.loads(row[0]) for row in self.store.query(
+            """SELECT payload_json FROM research_option_ideas
+            WHERE handled=0 AND expires_at_s>? ORDER BY rowid LIMIT 20""",
+            (int(now.timestamp()),),
+        )]
+
+    def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
+        with self.store.transaction() as conn:
+            conn.executemany("UPDATE research_option_ideas SET handled=1 WHERE story_id=?",
+                             ((story_id,) for story_id in story_ids))

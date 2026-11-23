@@ -192,12 +192,16 @@ def test_research_budget_and_claims_survive_restart(tmp_path):
     assert research.reserve("c", NOW, 3_000_000, exit_work=True)
     assert research.claim_work("story", "ABC", NOW)
     assert not research.claim_work("story", "ABC", NOW)
+    assert research.claim_work("rejected", "ABC", NOW)
+    research.finish_work("rejected", "retry", retry_at=NOW + timedelta(minutes=15))
     store.close()
 
     other = StateStore(path)
     research = ResearchStore(other, settings())
     other.open()
     assert not research.claim_work("story", "ABC", NOW)
+    assert not research.claim_work("rejected", "ABC", NOW)
+    assert research.claim_work("rejected", "ABC", NOW + timedelta(minutes=15))
     assert not research.reserve("d", NOW, 1_100_000, exit_work=True)
     research.settle("a", 2_000_000)
     assert research.available_budget(NOW)["billed_or_reserved_microusd"] == 5_000_000
@@ -285,8 +289,13 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
             assert intent.expires_at == session.closes_at
             replayed = await pipe.run("news", snapshot)
             assert replayed.intents == first.intents
+            assert replayed.option_candidates == first.option_candidates
+            if not held:
+                assert first.option_candidates[0].direction is Direction.BUY
+                pipe.acknowledge_options((first.option_candidates[0].story_id,))
             ledger.enqueue_intents(replayed.intents)
-            assert not (await pipe.run("news", snapshot)).intents
+            after_ack = await pipe.run("news", snapshot)
+            assert not after_ack.intents and not after_ack.option_candidates
             assert len(calls) == (2 if held else 1)
             if held:
                 confirmation = ledger.get_thesis(intent.thesis_ids[1])

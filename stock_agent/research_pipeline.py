@@ -18,6 +18,8 @@ from stock_agent.research_schemas import Direction, Evidence, ResearchTask
 from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
+_PRE_INFERENCE = {"auth", "quota", "model_unavailable", "rate_limit", "budget"}
+
 @dataclass(frozen=True)
 class NewsEvent:
     symbol: str
@@ -60,6 +62,14 @@ class OptionIdea:
     effective_conviction: int
     generated_at: datetime
     evidence_ids: tuple[str, ...]
+
+    @classmethod
+    def from_payload(cls, payload: dict):
+        return cls(
+            payload["symbol"], Direction(payload["direction"]), payload["story_id"], payload["thesis_id"],
+            payload["raw_conviction"], payload["effective_conviction"],
+            datetime.fromisoformat(payload["generated_at"]), tuple(payload["evidence_ids"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -133,7 +143,7 @@ class ResearchPipeline:
                 seen.add(item.story_id)
                 stories.append(item)
             # A live pass must remain bounded even with an exceptionally busy tape.
-            stories = [item for item in stories if self.store.work_state(self._story_key(item)) is None][:4]
+            stories = [item for item in stories if self.store.ready(self._story_key(item), as_of)][:4]
             securities = await self.sources.securities(tuple(dict.fromkeys(item.symbol for item in stories)), now)
             work = [(item.symbol, self._story_key(item), item) for item in stories]
         else:
@@ -146,7 +156,6 @@ class ResearchPipeline:
             work = [(sym, f"{kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
         failed = attempted = 0
-        ideas = []
         for symbol, key, story in work:
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
@@ -154,14 +163,15 @@ class ResearchPipeline:
                 continue
             attempted += 1
             try:
-                idea = await self._review(kind, key, item, held.get(symbol), story, session, as_of)
-                if idea is not None:
-                    ideas.append(idea)
+                await self._review(kind, key, item, held.get(symbol), story, session, as_of)
             except ProviderUnavailable as exc:
                 failed += 1
-                self.store.finish_work(key, "unavailable", detail={"failures": [
-                    f"{err.provider}:{err.kind}" for err in exc.attempts
-                ]})
+                pre_inference = all(err.kind in _PRE_INFERENCE for err in exc.attempts)
+                self.store.finish_work(
+                    key, "retry" if pre_inference else "unavailable",
+                    detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
+                    retry_at=self.clock() + timedelta(minutes=15) if pre_inference else None,
+                )
         for proposal in self.store.unqueued_proposals():
             intent = _reconstitute(proposal)
             if intent.expires_at and intent.expires_at > self.clock():
@@ -172,7 +182,12 @@ class ResearchPipeline:
                 collected.append(NewIntent(intent.symbol, intent.side, intent.dedupe_key,
                                            status=IntentStatus.SKIPPED, last_error="research_proposal_expired"))
         status = JobStatus.FAILED if attempted and failed == attempted and not collected else JobStatus.DONE
-        return JobOutcome(status, tuple(collected), {"reviewed": attempted, "unavailable": failed}, tuple(ideas))
+        ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(self.clock()))
+        return JobOutcome(status, tuple(collected), {"reviewed": attempted, "unavailable": failed}, ideas)
+
+    def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
+        """Scheduler calls after the options manager has durably handled each story."""
+        self.store.acknowledge_options(story_ids)
 
     async def observe_regime(self) -> tuple[str, str] | None:
         """Quote-only posture calculation; no model, candidate scan, or intent."""
@@ -209,7 +224,7 @@ class ResearchPipeline:
             return today
         return self.calendar.next_session(day)
 
-    async def _review(self, kind, key, security, holding, story, session, now) -> OptionIdea | None:
+    async def _review(self, kind, key, security, holding, story, session, now) -> None:
         symbol = security.symbol
         position_id = holding.meta.position_id if holding and holding.meta else None
         entry = self.ledger.entry_thesis(position_id) if position_id else None
@@ -252,7 +267,7 @@ class ResearchPipeline:
                 activate=fresh_quote or direction not in {Direction.BUY, Direction.BEARISH},
             )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
-                idea = self._record_entry(
+                self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
                     thesis_id, record, fresh_quote, price, evidence_ids, context,
                 )
@@ -262,14 +277,14 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
-                return idea
+                return
         try:
             confirmation = await self.analyst.confirm_exit(data, result.result.route)
         except ProviderUnavailable as exc:
             self.store.finish_work(key, "confirmation_unavailable", thesis_id=thesis_id, detail={
                 "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts],
             })
-            return None
+            return
 
         with self.store.store.transaction():
             conf_id = self.ledger.record_thesis(
@@ -296,7 +311,6 @@ class ResearchPipeline:
                 thesis_id=thesis_id, confirmation_thesis_id=conf_id, direction=direction,
                 confirmed=confirmation.approved, degraded=confirmation.result.degraded_confirmation,
             )
-        return None
 
     def _record_entry(self, key, symbol, kind, security, holding, position_id, baseline, story, session,
                       thesis_id, record, fresh_quote, price, evidence_ids, context):
@@ -318,9 +332,9 @@ class ResearchPipeline:
         else:
             self.store.finish_work(key, "no_action", thesis_id=thesis_id)
         if qualifies and story and direction in {Direction.BEARISH, Direction.BUY}:
-            return OptionIdea(symbol, direction, story.story_id, thesis_id, record.raw_conviction,
+            idea = OptionIdea(symbol, direction, story.story_id, thesis_id, record.raw_conviction,
                               record.effective_conviction, record.generated_at, evidence_ids)
-        return None
+            self.store.record_option_idea(story.story_id, idea, session.closes_at)
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):
