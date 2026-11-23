@@ -549,6 +549,7 @@ class FakeAlpaca(FakeService):
             "status": "executed", "description": "", **{k: (_f(v) if isinstance(v, float) else v) for k, v in fields.items()},
         }
         a["_at"] = at
+        a["_seq"] = len(self.activities)
         self.activities.append(a)
         return a
 
@@ -558,7 +559,7 @@ class FakeAlpaca(FakeService):
             "type": "fill" if o.remaining <= 1e-9 else "partial_fill",
             "price": _f(price), "qty": _f(qty), "side": o.side, "symbol": o.symbol,
             "leaves_qty": _f(o.remaining), "order_id": o.id, "cum_qty": _f(o.filled_qty),
-            "order_status": o.status, "_at": at,
+            "order_status": o.status, "_at": at, "_seq": len(self.activities),
         }
         self.activities.append(a)
 
@@ -682,20 +683,18 @@ class FakeAlpaca(FakeService):
             return
         if o.qty is None and o.notional:
             o.qty = round(o.notional / px, 9)
-        if o.fill_plan:
-            if o.next_chunk_at is not None and at < o.next_chunk_at:
-                return
-            chunk = min(o.fill_plan.pop(0), o.remaining)
-            o.next_chunk_at = at + timedelta(minutes=1)
-            if not o.fill_plan:
-                chunk = o.remaining if chunk >= o.remaining else chunk
-        else:
-            chunk = o.remaining
-        self._execute(o, chunk, px, at)
-        if o.fill_plan and o.is_open:
-            # later chunks are due one minute apart; evaluate again if time allows
-            if o.next_chunk_at is not None and o.next_chunk_at <= self.now():
-                self._try_fill(o, o.next_chunk_at)
+        now = self.now()
+        while o.is_open:
+            if o.next_chunk_at is not None:
+                if o.next_chunk_at > now:
+                    return
+                at = max(at, o.next_chunk_at)
+            if o.fill_plan:
+                chunk = min(o.fill_plan.pop(0), o.remaining)
+                o.next_chunk_at = at + timedelta(minutes=1)
+            else:
+                chunk = o.remaining
+            self._execute(o, chunk, px, at)
 
     def _execute(self, o: Order, qty: float, px: float, at: datetime) -> None:
         if qty <= 0:
@@ -1031,6 +1030,7 @@ class FakeAlpaca(FakeService):
         if (qty is None) == (notional is None):
             return _err(422, 40010001, "qty or notional is required (exactly one)"), info
         qty_f = float(qty) if qty is not None else None
+        notional = float(notional) if notional is not None else None
         if qty_f is not None and qty_f <= 0:
             return _err(422, 40010001, "qty must be > 0"), info
         if typ in ("limit", "stop_limit") and body.get("limit_price") is None:
@@ -1324,13 +1324,13 @@ class FakeAlpaca(FakeService):
             acts = [a for a in acts if _iso(a["_at"]) > params["after"]]
         if params.get("until"):
             acts = [a for a in acts if _iso(a["_at"]) < params["until"]]
-        acts.sort(key=lambda a: a["_at"], reverse=params.get("direction", "desc") == "desc")
+        acts.sort(key=lambda a: (a["_at"], a["_seq"]), reverse=params.get("direction", "desc") == "desc")
         if params.get("page_token"):
             ids = [a["id"] for a in acts]
             if params["page_token"] in ids:
                 acts = acts[ids.index(params["page_token"]) + 1:]
         size = min(int(params.get("page_size", 100)), 100)
-        return [{k: v for k, v in a.items() if k != "_at"} for a in acts[:size]]
+        return [{k: v for k, v in a.items() if not k.startswith("_")} for a in acts[:size]]
 
     def _portfolio_history(self, params: dict) -> dict:
         pts = list(self.equity_history) + [(self.now(), self.equity())]
