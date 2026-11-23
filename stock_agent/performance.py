@@ -197,6 +197,9 @@ def _bar(b: Any):
     return ShadowDailyBar(session_date=sd, open=vals[0], high=vals[1], low=vals[2], close=vals[3])
 
 
+SHADOW_BASIS_MARGIN = Decimal("0.02")
+
+
 async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars,
                        warnings: list[str]) -> int:
     """Journal one ``shadow.stop`` row per anchor per completed session (idempotent)."""
@@ -234,6 +237,20 @@ async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars
             if not bars or bars[-1].session_date != end:
                 # the provider has not published the bar for ``end`` yet: retry at a later close
                 warnings.append(f"shadow stop {anchor.symbol}: no completed bar for {end.isoformat()} yet")
+                continue
+            entry_bar = next((b for b in bars if b.session_date == anchor.session_date), None)
+            if entry_bar is None:
+                warnings.append(f"shadow stop {anchor.symbol}: no entry-day bar; price basis unchecked")
+            elif not (Decimal(str(entry_bar.low)) * (1 - SHADOW_BASIS_MARGIN) <= anchor.fill_price
+                      <= Decimal(str(entry_bar.high)) * (1 + SHADOW_BASIS_MARGIN)):
+                # split-adjusted bars on a different basis from the raw fill (e.g. a later split):
+                # a replay would write false exits, so record why and stop replaying this anchor
+                ledger.journal.append("shadow.stop.skipped", anchor=key, position_id=pid, symbol=anchor.symbol,
+                                      entry_session=anchor.session_date, reason="price_basis_mismatch",
+                                      fill_price=anchor.fill_price, entry_low=entry_bar.low,
+                                      entry_high=entry_bar.high)
+                warnings.append(f"shadow stop {anchor.symbol}: fill outside entry-day adjusted range; skipped")
+                done[key] = "9999-12-31"
                 continue
             results = shadow_stop_results(anchor, bars)
         except Exception as e:  # never let analysis break the close job

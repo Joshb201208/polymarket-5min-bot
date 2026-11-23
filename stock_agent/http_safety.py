@@ -2,19 +2,21 @@
 
 Guarantees:
 - API keys, tokens, and secrets are passed in HTTP headers (`APCA-API-KEY-ID`,
-  `X-Finnhub-Token`, `apikey`, `User-Agent`) rather than URL query strings.
+  `X-Finnhub-Token`, `apikey`, `User-Agent`) selected strictly by verified parsed
+  HTTPS hostname — never by URL substring and never in URL query strings.
 - `httpx` and `httpcore` INFO-level request URL logs are suppressed to WARNING.
-- `RedactingLogFilter` scrubs query-string and header-style credentials from all
-  log messages, format args, and URL/Request objects before any handler sees them.
-- `DataHttpClient` provides a lightweight shared async HTTP client (`await http.get(...)`)
-  for `PriceService`, `AssetRegistry`, `NewsService`, `FundamentalsService`, and `MacroMonitor`.
+- `RedactingLogFilter` scrubs query-string credentials, header credentials (including
+  `Bearer`, `Bot`, `Basic`, `APCA-API-KEY-ID`, `APCA-API-SECRET-KEY`, `X-Finnhub-Token`),
+  and exception tracebacks (`record.exc_info` / `record.exc_text`) before formatting.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import traceback
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -23,8 +25,13 @@ from stock_agent.config import Config
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:apikey|api_key|token|access_token|secret|password|auth|key)=)([^&\s'\"<>]+)"
 )
+_AUTH_SCHEME_RE = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|bot|basic|token)\s+)([^\s,'\"<>};]+)"
+)
 _KV_SECRET_RE = re.compile(
-    r"(?i)(\b(?:apikey|api_key|x-finnhub-token|apca-api-secret-key|authorization)\s*[:=]\s*)(?:bearer\s+)?([^\s,'\"<>};]+)"
+    r"(?i)(\b(?:apikey|api_key|x-finnhub-token|apca-api-key-id|apca-api-secret-key|"
+    r"authorization|discord_bot_token|telegram_bot_token|bot_token|secret|password)\s*[:=]\s*)"
+    r"([^\s,'\"<>};]+)"
 )
 
 
@@ -33,6 +40,7 @@ def scrub_secrets(text: str) -> str:
     if not text:
         return text
     cleaned = _QUERY_SECRET_RE.sub(r"\1REDACTED", text)
+    cleaned = _AUTH_SCHEME_RE.sub(r"\1REDACTED", cleaned)
     cleaned = _KV_SECRET_RE.sub(r"\1REDACTED", cleaned)
     return cleaned
 
@@ -52,13 +60,14 @@ def _scrub_arg(value: Any) -> Any:
 
 
 class RedactingLogFilter(logging.Filter):
-    """Logging filter that scrubs secrets from log format strings, args, and URLs."""
+    """Logging filter that scrubs secrets from messages, args, and exception tracebacks."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
             record.msg = scrub_secrets(record.msg)
         elif record.msg is not None:
             record.msg = scrub_secrets(str(record.msg))
+
         if record.args:
             if isinstance(record.args, dict):
                 record.args = {k: _scrub_arg(v) for k, v in record.args.items()}
@@ -66,6 +75,17 @@ class RedactingLogFilter(logging.Filter):
                 record.args = tuple(_scrub_arg(a) for a in record.args)
             else:
                 record.args = (_scrub_arg(record.args),)
+
+        if record.exc_info:
+            formatted = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
+            record.exc_text = scrub_secrets(formatted)
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = scrub_secrets(record.exc_text)
+
+        if record.stack_info:
+            record.stack_info = scrub_secrets(record.stack_info)
+
         return True
 
 
@@ -131,13 +151,12 @@ def sec_headers(config: Any = Config) -> dict[str, str]:
     }
 
 
-class DataHttpClient:
-    """Shared async HTTP transport for market-data, news, fundamentals, and macro services.
+def _host_matches(hostname: str, domain: str) -> bool:
+    return hostname == domain or hostname.endswith(f".{domain}")
 
-    Compatible with raw `httpx.AsyncClient` injection (`await http.get(url, params=..., headers=...)`)
-    while automatically attaching provider headers by host when omitted and installing
-    log-redaction safeguards.
-    """
+
+class DataHttpClient:
+    """Shared async HTTP transport for market-data, news, fundamentals, and macro services."""
 
     def __init__(
         self,
@@ -160,14 +179,20 @@ class DataHttpClient:
         return self._owned_client
 
     def default_headers_for_url(self, url: str) -> dict[str, str]:
-        lowered = url.lower()
-        if "alpaca.markets" in lowered:
+        """Select auth headers strictly from verified parsed HTTPS hostname."""
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "https":
+            return {}
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return {}
+        if _host_matches(host, "alpaca.markets"):
             return alpaca_headers(self.config)
-        if "finnhub.io" in lowered:
+        if _host_matches(host, "finnhub.io"):
             return finnhub_headers(self.config)
-        if "financialmodelingprep.com" in lowered:
+        if _host_matches(host, "financialmodelingprep.com"):
             return fmp_headers(self.config)
-        if "sec.gov" in lowered:
+        if _host_matches(host, "sec.gov"):
             return sec_headers(self.config)
         return {}
 

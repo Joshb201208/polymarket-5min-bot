@@ -122,3 +122,28 @@ def test_calendar_contract_with_shared_broker_fake(world, tmp_path):
             await broker.close()
 
     asyncio.run(check())
+
+
+def test_calendar_refresh_replaces_short_cache_and_covers_options_expiry(world, tmp_path):
+    async def check():
+        broker = AlpacaClient()
+        try:
+            now = world.clock.now_et()
+            today = now.date()
+            expiry = today + timedelta(days=32)
+            cache = tmp_path / "calendar.json"
+            initial = MarketCalendar(broker, cache, now=world.clock.now)
+            initial._calendar_at = world.clock.now()
+            initial._coverage = (today - timedelta(days=7), today + timedelta(days=14))
+            session = world.clock.calendar.session(today)
+            initial._sessions = {today: initial._session(today, session.open.time(), session.close.time())}
+            initial._save_cache()
+            calendar = MarketCalendar(broker, cache, now=world.clock.now)
+            assert calendar.trading_days_between(today, expiry) is None
+            await calendar.refresh()
+            expected = len(world.clock.calendar.sessions(today + timedelta(days=1), expiry))
+            assert calendar.trading_days_between(today, expiry) == expected > 14
+        finally:
+            await broker.close()
+
+    asyncio.run(check())

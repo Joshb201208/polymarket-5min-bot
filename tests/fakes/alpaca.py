@@ -150,6 +150,10 @@ class AlpacaBehaviour:
     # its timestamp reads as "now" while the market is open (a live market
     # quotes continuously). Off: the timestamp is when the test set it.
     quotes_stay_fresh_in_session: bool = True
+    # Screener `top` above the documented maximum (most-actives 100, movers 50;
+    # market-data-api.json). Real response unverified: "reject" = 400,
+    # "clamp" = return at most the maximum.
+    screener_top_over_max: str = "reject"
 
 
 @dataclass
@@ -317,6 +321,8 @@ class FakeAlpaca(FakeService):
         self.activities: list[dict] = []
         self.equity_history: list[tuple[datetime, float]] = []
         self.news: list[dict] = []
+        self.most_actives: list[dict] = []
+        self.movers: dict[str, list[dict]] = {"gainers": [], "losers": []}
         self.fill_scripts: dict[str, list[list[float]]] = {}
         self.greeks: dict[str, dict] = {}
         self._processed_until: datetime = clock.now()
@@ -455,6 +461,50 @@ class FakeAlpaca(FakeService):
         }
         self.news.append(n)
         return n
+
+    def set_most_actives(self, rows: list[str | tuple[str, int] | tuple[str, int, int] | dict]) -> None:
+        """Screener /v1beta1/screener/stocks/most-actives. Rows are a symbol, a
+        (symbol, volume[, trade_count]) tuple, or a dict; the route ranks them by
+        `by=volume|trades` (default volume) and returns the first `top` (default 10)."""
+        out = []
+        for i, r in enumerate(rows):
+            if isinstance(r, dict):
+                d = {"symbol": r["symbol"], "volume": int(r.get("volume", 0)), "trade_count": int(r.get("trade_count", 0))}
+            elif isinstance(r, str):
+                d = {"symbol": r, "volume": (len(rows) - i) * 1_000_000, "trade_count": (len(rows) - i) * 1_000}
+            else:
+                vol = int(r[1])
+                d = {"symbol": r[0], "volume": vol, "trade_count": int(r[2]) if len(r) > 2 else vol // 100}
+            out.append(d)
+        self.most_actives = out
+
+    def set_movers(self, gainers: list[str | tuple | dict] = (), losers: list[str | tuple | dict] = ()) -> None:
+        """Screener /v1beta1/screener/stocks/movers. Rows are a symbol (price and
+        change from the fake's quotes), a (symbol, price, percent_change) tuple, or a
+        dict with symbol/price/change/percent_change. Order is kept; `top` truncates."""
+        def row(r, sign: float) -> dict:
+            if isinstance(r, dict):
+                return {"symbol": r["symbol"], "price": float(r["price"]), "change": float(r.get("change", 0.0)),
+                        "percent_change": float(r.get("percent_change", 0.0))}
+            if isinstance(r, str):
+                q = self.quotes.get(r)
+                px = q.last if q else 10.0
+                pct = 10.0 * sign
+            else:
+                _, px, pct = r
+            prev = px / (1 + pct / 100) if pct != -100 else 0.0
+            sym = r if isinstance(r, str) else r[0]
+            return {"symbol": sym, "price": float(px), "change": round(px - prev, 4), "percent_change": float(pct)}
+        self.movers = {"gainers": [row(r, 1) for r in gainers], "losers": [row(r, -1) for r in losers]}
+
+    def _screener_top(self, params: dict, maximum: int) -> int | httpx.Response:
+        try:
+            top = int(params.get("top", 10))
+        except ValueError:
+            return _err(400, 40010001, "invalid top")
+        if top < 1 or (top > maximum and self.behaviour.screener_top_over_max == "reject"):
+            return _err(400, 40010001, f"top must be between 1 and {maximum}")
+        return min(top, maximum)
 
     def pay_dividend(self, symbol: str, per_share: float) -> dict | None:
         """Credit a cash dividend (the real paper API does NOT do this; docs)."""
@@ -1631,6 +1681,24 @@ class FakeAlpaca(FakeService):
             page = out[start:start + limit]
             nxt = str(start + limit) if start + limit < len(out) else None
             return json_response({"news": page, "next_page_token": nxt})
+        if parts[:2] == ["v1beta1", "screener"]:
+            if parts[2:] == ["stocks", "most-actives"]:
+                by = params.get("by", "volume")
+                if by not in ("volume", "trades"):
+                    return _err(400, 40010001, "by must be volume or trades")
+                top = self._screener_top(params, 100)
+                if isinstance(top, httpx.Response):
+                    return top
+                key = "volume" if by == "volume" else "trade_count"
+                rows = sorted(self.most_actives, key=lambda r: -r[key])[:top]
+                return json_response({"most_actives": rows, "last_updated": _iso(self.now())})
+            if len(parts) == 4 and parts[3] == "movers" and parts[2] in ("stocks", "crypto"):
+                top = self._screener_top(params, 50)
+                if isinstance(top, httpx.Response):
+                    return top
+                movers = self.movers if parts[2] == "stocks" else {"gainers": [], "losers": []}
+                return json_response({"gainers": movers["gainers"][:top], "losers": movers["losers"][:top],
+                                      "market_type": parts[2], "last_updated": _iso(self.now())})
         if parts[:2] == ["v1beta1", "options"]:
             if parts[2:4] == ["quotes", "latest"]:
                 return json_response({"quotes": {s: self._quote_json(s) for s in syms if s in self.quotes}})

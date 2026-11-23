@@ -445,3 +445,102 @@ def test_registered_alias_ignored_on_qty_mismatch(tmp_path):
     b.pos("NEW", 40, 100)
     run(led.refresh("rename"))
     assert led.open_position_meta("NEW").position_id != pid
+
+
+def test_own_fill_linked_by_client_order_id_before_ack(tmp_path):
+    """R-03: lost submit reply + restart; reconcile runs before the engine re-acks."""
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    b = StubBroker()
+    orders = {}
+
+    async def get_order(oid):
+        return orders[oid]
+    b.get_order = get_order
+    alerts = []
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first"))
+    tid = led.record_thesis("DDD", {"c": 8}, ThesisRole.ENTRY_CANDIDATE, activate=True)
+    [iid] = led.enqueue_intents([NewIntent(symbol="DDD", side="buy", dedupe_key="buy:DDD", thesis_ids=(tid,))])
+    led.claim_intent(iid)                                   # submit sent, reply lost; no broker_order_id
+    a = b.fill("DDD", "buy", 5, 40, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "ord-lost"
+    orders["ord-lost"] = SimpleNamespace(id="ord-lost", client_order_id=led.get_intent(iid).client_order_id)
+    b.pos("DDD", 5, 40)
+    snap = run(led.refresh("restart"))
+    m = led.open_position_meta("DDD")
+    assert m.opened_source == "bot" and m.entry_intent_id == iid and m.entry_thesis_id == tid
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs) and alerts == []
+
+
+def test_foreign_fill_still_imported_when_client_id_differs(tmp_path):
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    b = StubBroker()
+
+    async def get_order(oid):
+        return SimpleNamespace(id=oid, client_order_id="someone-else")
+    b.get_order = get_order
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    [iid] = led.enqueue_intents([NewIntent(symbol="DDD", side="buy", dedupe_key="buy:DDD")])
+    led.claim_intent(iid)
+    b.fill("DDD", "buy", 5, 40, ts="2026-11-23T15:00:00Z")
+    b.pos("DDD", 5, 40)
+    snap = run(led.refresh("x"))
+    assert led.open_position_meta("DDD").opened_source != "bot"
+    assert any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
+
+
+def _split_setup(tmp_path):
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-16T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first", rebuild=True))
+    m = led.open_position_meta("AAA")
+    led.set_stop(m.position_id, 93, "stop-1")
+    return b, led, m
+
+
+def test_forward_split_keeps_entry_date_explains_qty_and_rescales_stop(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="-10", group_id="g1")
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="20", group_id="g1")
+    b.pos("AAA", 20, 50)
+    snap = run(led.refresh("after split"))
+    after = led.open_position_meta("AAA")
+    assert after.position_id == m.position_id and after.opened_at == m.opened_at
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
+    assert any(d.kind == DiffKind.QTY_CHANGED and "split" in (d.explanation or "") for d in snap.diffs)
+    assert float(after.stop_price) == pytest.approx(46.5)
+    # an entry-date check after the split replays fills + split to the broker qty
+    from stock_agent.reconcile import _open_event
+    opened, how, _ = _open_event(led, "AAA", Decimal("20"))
+    assert how == "fill" and opened is not None
+    run(led.refresh("again", rebuild=True))
+    assert float(led.open_position_meta("AAA").stop_price) == pytest.approx(46.5)   # applied once
+
+
+def test_split_leaves_stop_to_execution_when_it_keeps_a_basis(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    led.store.kv_set("exec.stop_basis.AAA", {"qty": "10", "avg": "100"})
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="-10", group_id="g1")
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="20", group_id="g1")
+    b.pos("AAA", 20, 50)
+    run(led.refresh("after split"))
+    assert float(led.open_position_meta("AAA").stop_price) == 93
+
+
+def test_legacy_ssp_unknown_ratio_clears_recorded_stop(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    b.act("SSP", "AAA", ts="2026-11-20T13:00:00Z", qty="10")
+    b.pos("AAA", 20, 50)
+    snap = run(led.refresh("after split"))
+    assert led.open_position_meta("AAA").stop_price is None
+    assert led.open_position_meta("AAA").position_id == m.position_id
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs)

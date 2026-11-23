@@ -271,3 +271,96 @@ def test_dotenv_file_loaded_without_overriding_explicit_env(tmp_path: Path) -> N
     assert s.ALPACA_API_KEY == "from-process-env"
     assert s.ALPACA_SECRET_KEY == "secret-from-dotenv"
     assert s.PRIORITY_SYMBOLS == ["NVDA", "MSFT"]
+
+
+def test_env_example_matches_settings_and_contains_no_secrets() -> None:
+    from dotenv import dotenv_values
+
+    from stock_agent.config import _ENV_ALIASES, _SECRET_EXTRA_NAMES, _SECRET_SUFFIXES
+
+    repo_root = Path(__file__).resolve().parent.parent
+    env_example = repo_root / ".env.example"
+    assert env_example.is_file()
+
+    parsed = dotenv_values(env_example)
+    assert parsed, ".env.example should define key settings"
+
+    supported_env_names = set(Settings.model_fields) | set(_ENV_ALIASES.values())
+    unknown_keys = set(parsed) - supported_env_names
+    assert not unknown_keys, f".env.example contains unknown settings: {sorted(unknown_keys)}"
+
+    for key, val in parsed.items():
+        if key.endswith(_SECRET_SUFFIXES) or key in _SECRET_EXTRA_NAMES:
+            assert (val or "") == "", f".env.example must keep {key} empty"
+
+    clean_env = {k: (v or "") for k, v in parsed.items()}
+    s = load_settings(clean_env)
+    assert s.MODE == "PAPER"
+    assert s.OPTIONS_MODE == "defined_risk"
+    assert s.trading_base_url == PAPER_ALPACA_BASE_URL
+
+    with pytest.raises(SettingsError, match="ALPACA_API_KEY"):
+        load_settings(clean_env, require_runtime_secrets=True)
+
+
+def test_gitignore_and_gitleaks_hygiene() -> None:
+    import re
+    import tomllib
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assert not (repo_root / ".mcp.json").exists()
+
+    gitignore_lines = {
+        line.strip()
+        for line in (repo_root / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert ".env" in gitignore_lines
+    assert ".mcp.json" in gitignore_lines
+    assert "dashboard/data/" not in gitignore_lines
+
+    gitleaks_cfg = tomllib.loads((repo_root / ".gitleaks.toml").read_text(encoding="utf-8"))
+    assert gitleaks_cfg.get("extend", {}).get("useDefault") is True
+    allowlist = gitleaks_cfg.get("allowlist", {})
+    assert "paths" not in allowlist
+    commits = allowlist.get("commits", [])
+    assert commits
+    assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in commits)
+
+
+def test_requirements_files_are_exact_pinned_and_lightweight() -> None:
+    import re
+
+    repo_root = Path(__file__).resolve().parent.parent
+    pin_re = re.compile(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+-]+)$")
+    forbidden_runtime = {
+        "aiohttp",
+        "fastapi",
+        "numpy",
+        "pandas",
+        "playwright",
+        "uvicorn",
+        "yfinance",
+    }
+
+    for filename in ("requirements.txt", "requirements-dev.txt"):
+        lines = [
+            line.strip()
+            for line in (repo_root / filename).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert lines, f"{filename} should not be empty"
+        pkgs: set[str] = set()
+        for line in lines:
+            assert "--hash" not in line, f"{filename} must work with plain pip install -r"
+            match = pin_re.match(line)
+            assert match is not None, f"Unpinned line in {filename}: {line!r}"
+            pkgs.add(match.group(1).lower().replace("_", "-"))
+
+        if filename == "requirements.txt":
+            assert not (pkgs & forbidden_runtime)
+            assert {"httpx", "pydantic", "python-dotenv", "requests"} <= pkgs
+        else:
+            assert {"pytest", "ruff"} <= pkgs
+
+

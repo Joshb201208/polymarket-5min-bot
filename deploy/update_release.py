@@ -317,6 +317,11 @@ class Updater:
                     self.systemctl("restart", "--job-mode=fail", UNIT, timeout=210)
                     if not self.wait_healthy(old, failing_pid):
                         raise RuntimeError("previous release did not recover")
+                if not isinstance(exc, Deferred):
+                    state["last_event"] = {
+                        "event": "rollback", "active_sha": old, "candidate_sha": new,
+                        "at": datetime.now(timezone.utc).isoformat(), "reason": error_kind(exc),
+                    }
             finally:
                 if not isinstance(exc, Deferred):
                     state["failed_sha"] = new
@@ -324,6 +329,14 @@ class Updater:
             if isinstance(exc, Deferred):
                 raise
             raise RuntimeError("activation failed; prior checkout restored") from exc
+        state["last_event"] = {
+            "event": "deployed", "active_sha": new, "candidate_sha": new,
+            "at": datetime.now(timezone.utc).isoformat(), "reason": "startup health passed",
+        }
+        try:
+            save_json(self.state, state)
+        except OSError:
+            say("deployment succeeded, but status event could not be written")
         say(f"update successful: {old[:12]} -> {new[:12]}")
 
     def locked_update(self) -> int:

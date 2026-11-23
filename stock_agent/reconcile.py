@@ -55,8 +55,12 @@ class BrokerReader(Protocol):
 # Activity types ingested into broker_activities (OPXRC is the documented
 # spelling of exercise; OPEXC is what the live account returns).
 ACTIVITY_TYPES = ("FILL", "DIV", "FEE", "OPEXP", "OPASN", "OPEXC", "OPXRC", "OPTRD", "NC", "SC",
-                  "SSP", "SSO", "MA", "REORG", "JNLC", "JNLS", "JNL", "CSD", "CSW", "INT")
+                  "SSP", "SPLIT", "SSO", "MA", "REORG", "JNLC", "JNLS", "JNL", "CSD", "CSW", "INT")
 CASH_FLOW_TYPES = ("JNLC", "CSD", "CSW", "JNL")
+# Stock splits: "SPLIT" (current; a remove entry with negative qty and an add entry
+# with the new qty, same group_id) and "SSP" (former code). Per
+# https://docs.alpaca.markets/us/docs/sse-events and trading-api.json ActivityType.
+SPLIT_TYPES = ("SPLIT", "SSP")
 
 # a run that would close at least this share of >= 2 open positions re-reads once
 MASS_CLOSE_FRACTION = 0.5
@@ -187,8 +191,8 @@ async def _read_broker(broker: Any, after: datetime | None) -> tuple[Any, list, 
     return account, list(positions), list(orders), list(acts)
 
 
-def _ingest_activities(ledger: Ledger, acts: list[dict]) -> int:
-    n = 0
+def _ingest_activities(ledger: Ledger, acts: list[dict]) -> list[dict]:
+    new: list[dict] = []
     with ledger.store.transaction() as c:
         for a in acts:
             aid = a.get("id")
@@ -203,7 +207,7 @@ def _ingest_activities(ledger: Ledger, acts: list[dict]) -> int:
                  float(_dec(a.get("net_amount")) or 0) if a.get("net_amount") is not None else None,
                  json.dumps(a, default=str)))
             if cur.rowcount:
-                n += 1
+                new.append(a)
                 ledger.journal.append("fill" if a.get("activity_type") == "FILL" else "broker_activity",
                                       activity_id=aid, activity_type=a.get("activity_type"),
                                       symbol=a.get("symbol"), qty=a.get("qty"), price=a.get("price"),
@@ -213,7 +217,42 @@ def _ingest_activities(ledger: Ledger, acts: list[dict]) -> int:
                 c.execute("INSERT OR IGNORE INTO cash_flows(activity_id, date, amount, kind) VALUES (?,?,?,?)",
                           (aid, _activity_ts(a)[:10], float(_dec(a.get("net_amount")) or 0),
                            a.get("activity_type")))
-    return n
+    return new
+
+
+def _rescale_stops_for_splits(ledger: Ledger, new_acts: list[dict]) -> list[Diff]:
+    """Recorded stops are in pre-split dollars after a split. Rescale them for
+    newly seen split activity, unless the execution engine keeps its own basis
+    (``exec.stop_basis.<sym>``; it rescales on re-placement). Unknown ratio ->
+    clear the recorded stop so it is never read as a breach."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for a in new_acts:
+        if a.get("activity_type") in SPLIT_TYPES and a.get("symbol"):
+            key = (str(a["symbol"]), str(a.get("group_id") or a.get("id")))
+            groups.setdefault(key, []).append(a)
+    diffs: list[Diff] = []
+    for (sym, gid), rows in groups.items():
+        meta = ledger.open_position_meta(sym)
+        if meta is None or meta.stop_price is None or ledger.store.kv_get(f"exec.stop_basis.{sym}") is not None:
+            continue
+        when = _dt(_activity_ts(rows[0]))
+        if meta.opened_at and when and when < meta.opened_at:
+            continue
+        removed = sum((-q for q in (_dec(r.get("qty")) or ZERO for r in rows) if q < 0), ZERO)
+        added = sum((q for q in (_dec(r.get("qty")) or ZERO for r in rows) if q > 0), ZERO)
+        old_stop = Decimal(str(meta.stop_price))
+        new_stop = (old_stop * removed / added).quantize(Decimal("0.0001")) if removed > 0 and added > 0 else None
+        with ledger.store.transaction() as c:
+            c.execute("UPDATE positions_meta SET stop_price=? WHERE position_id=?",
+                      (float(new_stop) if new_stop is not None else None, meta.position_id))
+        ledger.journal.append("stop.split_adjusted", symbol=sym, group_id=gid, source="reconcile",
+                              old_stop=old_stop, new_stop=new_stop,
+                              factor=(added / removed) if removed > 0 and added > 0 else None)
+        diffs.append(Diff(DiffKind.QTY_CHANGED, sym, Severity.INFO, ledger=str(old_stop),
+                          broker=str(new_stop) if new_stop is not None else None,
+                          explanation="stock split", action=("recorded stop rescaled" if new_stop is not None
+                                                             else "recorded stop cleared: split ratio unknown")))
+    return diffs
 
 
 def _symbol_activities(ledger: Ledger, symbol: str, since: str | None = None) -> list[dict]:
@@ -236,6 +275,9 @@ def _open_event(ledger: Ledger, symbol: str, qty: Decimal) -> tuple[datetime | N
     aid: str | None = None
     for a in _symbol_activities(ledger, symbol):
         t = a.get("activity_type")
+        if t in SPLIT_TYPES:
+            running += _signed_qty(a)   # a split changes the count, never the opening date
+            continue
         if t not in ("FILL", "OPTRD"):
             continue
         before = running
@@ -273,6 +315,8 @@ def _explain_close(ledger: Ledger, symbol: str, since: datetime | None) -> str:
             return f"expired on {when}"
         if t in ("NC", "SC"):
             return f"name/symbol change on {when}"
+        if t in SPLIT_TYPES:
+            return f"stock split on {when}"
         if t in ("MA", "REORG", "SSO"):
             return f"corporate action {t} on {when}"
     return ""
@@ -290,6 +334,46 @@ def _renames(ledger: Ledger) -> dict[str, str]:
     for old, a in (ledger.store.kv_get("symbol_aliases", {}) or {}).items():
         out.setdefault(old, a["new"])
     return out
+
+
+async def _link_own_orders(ledger: Ledger, broker: Any, acts: list[dict]) -> int:
+    """Attach broker order ids to our intents by ``client_order_id`` (R-03).
+
+    After a lost submit reply and a restart, reconcile can run before the
+    execution engine re-acks the intent, so the fill's ``order_id`` is unknown.
+    For each FILL whose order is unknown while an un-acked intent exists for the
+    same symbol, ask the broker for that order and match its client_order_id.
+    Read-only at the broker; failures are ignored (the next run retries)."""
+    pending = {}
+    for r in ledger.store.query("SELECT intent_id, client_order_id, symbol, status FROM order_intents"
+                                " WHERE broker_order_id IS NULL"):
+        if r["status"] in ("submitting", "submitted", "ambiguous", "partially_filled", "filled"):
+            pending.setdefault(str(r["symbol"]), {})[str(r["client_order_id"])] = r["intent_id"]
+    if not pending:
+        return 0
+    seen: set[str] = set()
+    linked = 0
+    for a in acts:
+        oid, sym = a.get("order_id"), a.get("symbol")
+        if a.get("activity_type") != "FILL" or not oid or oid in seen or sym not in pending:
+            continue
+        seen.add(oid)
+        if ledger.store.query("SELECT 1 FROM order_intents WHERE broker_order_id=?", (oid,)):
+            continue
+        try:
+            order = await broker.get_order(oid)
+        except Exception:
+            continue
+        intent_id = pending[sym].get(str(_g(order, "client_order_id") or ""))
+        if not intent_id:
+            continue
+        with ledger.store.transaction() as c:
+            c.execute("UPDATE order_intents SET broker_order_id=? WHERE intent_id=? AND broker_order_id IS NULL",
+                      (oid, intent_id))
+        ledger.journal.append("state_event", event="intent_linked", intent_id=intent_id, broker_order_id=oid,
+                              via="client_order_id")
+        linked += 1
+    return linked
 
 
 def _own_intent_for(ledger: Ledger, open_activity_id: str | None) -> dict | None:
@@ -360,7 +444,9 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     to_close = [s for s in open_meta if s not in broker_syms]
     diffs: list[Diff] = []
     # broker activity is fact even if the rest of this run aborts; ingest first so closes can be explained
-    _ingest_activities(ledger, acts)
+    new_acts = _ingest_activities(ledger, acts)
+    diffs.extend(_rescale_stops_for_splits(ledger, new_acts))
+    await _link_own_orders(ledger, broker, acts)
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())

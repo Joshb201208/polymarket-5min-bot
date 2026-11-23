@@ -13,12 +13,16 @@ import pytest
 
 from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
+from stock_agent.asset_registry import SymbolRenameEvent
+from stock_agent.broker import OrderRequest
 from stock_agent.config import Config
-from stock_agent.ledger import BookSnapshot, JobStatus, NewIntent
+from stock_agent.ledger import BookSnapshot, CashFlow, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
+from stock_agent.news_service import NewsService
 from stock_agent.research_pipeline import OptionIdea
 from stock_agent.research_schemas import Direction
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from stock_agent.state_store import StateStore
 from tests.exec_helpers import FakePrices, enqueue
 
 
@@ -227,9 +231,43 @@ def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
     asyncio.run(check())
 
 
-def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
+def test_startup_binds_unacknowledged_fill_before_reconciling(world):
     async def check():
-        sched = world.scheduler()
+        world.clock.set_et(2026, 11, 23, 10, 20)
+        world.price("ALFA", 100)
+        first = world.scheduler()
+        first.store.open()
+        intent = enqueue(first.engine, "ALFA", "buy", ref=100)
+        claimed = first.ledger.claim_intent(intent.intent_id, check_thesis=False)
+        order = await first.broker.submit_order(OrderRequest(
+            symbol="ALFA", side="buy", type="limit", time_in_force="day", qty=5, limit_price=101,
+            client_order_id=claimed.client_order_id, position_intent="buy_to_open",
+        ))
+        await first._cleanup()  # process stopped before it linked the broker reply
+
+        restarted = world.scheduler()
+        try:
+            await restarted.startup()
+            holding = restarted.ledger.snapshot().holding("ALFA")
+            assert holding.meta.opened_source == "bot"
+            assert holding.meta.entry_intent_id == intent.intent_id
+            persisted = restarted.ledger.get_intent(intent.intent_id)
+            assert persisted.broker_order_id == order.id and persisted.status.value == "filled"
+            assert not any("imported ALFA" in str(row) for row in restarted.ledger.journal.read(kinds={"alert"}))
+        finally:
+            await restarted._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world, monkeypatch):
+    async def check():
+        def unexpected_read(*args, **kwargs):
+            pytest.fail("a production service tried to read the unopened state store")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(StateStore, "kv_get", unexpected_read)
+            sched = world.scheduler()
         assert sched.ledger.broker is sched.calendar.broker is sched.broker
         assert sched.engine.broker is sched.options.broker is sched.broker
         assert sched.engine.ledger is sched.ledger
@@ -239,6 +277,15 @@ def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
         assert sched.engine._capital_lock is sched.options._capital_lock is sched.capital_lock
         assert sched.engine._research_gate is sched.options.gate is sched.research_gate
         assert sched.options_store.store is sched.ledger.store is sched.research_store.store
+        assert isinstance(sched.news, NewsService)
+        assert sched.news.http is sched.http
+        assert sched.news.assets is sched.assets
+        assert sched.news.store is sched.health.store is sched.macro.store is sched.store
+        assert sched.news.health is sched.llm.health is sched.research_sources.health is sched.health
+        assert sched.news is sched.research_sources.news_service
+        assert sched.prices is sched.macro.prices is sched.research_sources.prices
+        assert sched.research.sources is sched.research_sources
+        assert sched.research.gate is sched.research_gate
         await sched._cleanup()
 
     asyncio.run(check())
@@ -335,7 +382,7 @@ def test_readiness_follows_reconcile_and_shutdown_wakes_idle_loop(tmp_path, monk
         monkeypatch.setattr(sched, "_tick", tick)
         task = asyncio.create_task(sched.run())
         await asyncio.wait_for(ready.wait(), timeout=1)
-        assert events[:3] == ["startup", "resume", "READY=1"]
+        assert events[:3] == ["resume", "startup", "READY=1"]
         sched.shutdown()
         await asyncio.wait_for(task, timeout=2)
         assert events[-2:] == ["STOPPING=1", "drain"]
@@ -385,6 +432,158 @@ def test_close_performance_and_drawdown_share_trusted_mark_persisted_once(tmp_pa
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == state.to_record()
         assert sched.ledger.equity_marks("close")[0].equity == Decimal(790)
         await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_close_drawdown_adjusts_only_external_flows_since_last_close(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 25, 13, 5, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        flows = [
+            CashFlow("prior-deposit", now.date(), Decimal(1000), "CSD"),
+            CashFlow("withdrawal", now.date() + timedelta(days=1), Decimal(-320), "CSW"),
+            CashFlow("deposit", now.date() + timedelta(days=2), Decimal(100), "CSD"),
+            CashFlow("dividend", now.date() + timedelta(days=2), Decimal(12), "DIV"),
+            CashFlow("future-deposit", now.date() + timedelta(days=3), Decimal(500), "CSD"),
+        ]
+        monkeypatch.setattr(sched.ledger, "cash_flows", lambda: flows)
+        equity = Decimal(1000)
+
+        async def refresh(reason):
+            return BookSnapshot(
+                as_of=now, run_id="flow-fixture", equity=equity, cash=equity,
+                long_mv=Decimal(0), short_mv=Decimal(0), options_mv=Decimal(0),
+                last_equity=Decimal(1), buying_power=equity,
+                holdings=(), legs=(), open_orders=(), diffs=(), quality="live",
+            )
+
+        monkeypatch.setattr(sched.ledger, "refresh", refresh)
+        try:
+            first = sched.calendar.state.session
+            sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, first)
+            assert await sched._close_drawdown() is None
+            initial = sched._drawdown_state()
+            assert initial.high_water == Decimal(1000)
+
+            now += timedelta(days=2)
+            monkeypatch.setattr(module, "_now_et", lambda: now)
+            monkeypatch.setattr(module, "_now_utc", lambda: now)
+            next_session = Session(now.date(), first.opens_at + timedelta(days=2),
+                                   first.closes_at + timedelta(days=2))
+            sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, next_session)
+            equity = Decimal(730)  # $220 net withdrawn and $50 of investment loss.
+            assert await sched._close_drawdown() is None
+            final = sched._drawdown_state()
+            assert final.high_water == Decimal(1000)
+            assert final.drawdown == Decimal("0.05") and not final.paused
+            assert sched.ledger.equity_marks("close")[-1].equity == Decimal(730)
+            assert await sched._close_drawdown() is None
+            assert sched._drawdown_state() == final
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_two_trusted_closes_execute_one_next_session_trim(world):
+    async def check():
+        sched = module.StockAgentScheduler(services=SimpleNamespace(prices=FakePrices(world)))
+        sched.store.open()
+        sched.options.load_state()
+        world.alpaca.cash = 80_000
+        world.price("ALFA", 100)
+        world.alpaca.seed_position("ALFA", 200, 100)
+
+        async def close(day):
+            world.clock.set_et(2026, 11, day, 16, 5)
+            key = world.clock.now_et().date().isoformat()
+            sched._schedule_job("drawdown_close", key, sched._close_drawdown, timeout=5)
+            if task := sched._job_tasks.get("drawdown_close"):
+                await task
+                await sched._collect_finished_jobs()
+            assert sched.ledger.job_status("drawdown_close", key).status is JobStatus.DONE
+
+        try:
+            await close(23)
+            await close(23)
+            assert sched.ledger.risk_state_get("a6.close_drift")["counts"] == [["issuer_cap", "ALFA", 1]]
+            assert not sched.ledger.list_intents()
+            await close(24)
+            (trim,) = sched.ledger.list_intents()
+            assert trim.kind == "trim" and trim.origin == "limit_drift" and trim.meta["qty"] == "70"
+            assert not await sched.engine.execute_due()
+            world.clock.set_et(2026, 11, 25, 9, 34)
+            assert not await sched.engine.execute_due()
+            world.clock.advance(minutes=1)
+            (result,) = await sched.engine.execute_due()
+            assert result.filled_qty == 70
+            assert world.alpaca.position("ALFA").qty == 130
+            (stop,) = [order for order in world.alpaca.open_orders("ALFA") if order.type == "stop"]
+            assert stop.qty == 130 and stop.time_in_force == "gtc"
+            assert not await sched.engine.execute_due()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_option_delivery_trims_next_session_without_waiting_two_closes(world):
+    async def check():
+        sched = module.StockAgentScheduler(services=SimpleNamespace(prices=FakePrices(world)))
+        sched.store.open()
+        sched.options.load_state()
+        world.clock.set_et(2026, 11, 23, 16, 20)
+        world.alpaca.cash = 90_000
+        world.price("ALFA", 100)
+        world.alpaca.seed_position("ALFA", 100, 100)
+        expiry = world.clock.now_et().date() + timedelta(days=18)
+        contract = world.alpaca.add_option_contract("ALFA", expiry, "put", 100)
+        world.alpaca.seed_position(contract.symbol, -1, 2)
+        world.alpaca.assign_early(contract.symbol)
+        try:
+            await sched.calendar.refresh()
+            await sched.ledger.refresh("after option delivery")
+            await sched._queue_delivery_trims(world.clock.now_et())
+            assert not sched.ledger.list_intents()
+            world.clock.set_et(2026, 11, 24, 9, 35)
+            await sched.calendar.refresh()
+            await sched._queue_delivery_trims(world.clock.now_et())
+            await sched._queue_delivery_trims(world.clock.now_et())
+            (trim,) = sched.ledger.list_intents()
+            assert trim.kind == "trim" and trim.origin == "option_delivery"
+            assert trim.meta["qty"] == "50"
+            (result,) = await sched.engine.execute_due()
+            assert result.filled_qty == 50
+            assert world.alpaca.position("ALFA").qty == 150
+            assert sched.ledger.risk_state_get("a6.close_drift") is None
+            assert not await sched.engine.execute_due()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_asset_refresh_tracks_focus_and_drops_dead_poll_symbols(world, monkeypatch):
+    async def check():
+        sched = world.scheduler()
+        sched.store.open()
+        monkeypatch.setattr(module, "focus_symbols", lambda **kw: ("DEAD", "FORMER", "ALFA"))
+        world.price("ALFA", 100)
+        world.price("CURRENT", 100)
+        try:
+            await sched._refresh_assets()
+            assert "ALFA" in sched._option_universe()
+            assert "DEAD" not in sched._option_universe()
+            assert "FORMER" not in sched._option_universe()
+            assert "CURRENT" in sched._option_universe()
+            day = world.clock.now_et().date()
+            await sched._on_asset_rename(SymbolRenameEvent("FORMER", "CURRENT", None, day))
+            alias = sched.store.kv_get("symbol_aliases")["FORMER"]
+            assert alias["new"] == "CURRENT" and alias["effective"] == day.isoformat()
+        finally:
+            await sched._cleanup()
 
     asyncio.run(check())
 
