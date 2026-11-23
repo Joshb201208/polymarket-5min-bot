@@ -425,7 +425,16 @@ class ExecutionEngine:
         for it in due:
             if it.kind == "option_structure":
                 continue  # the options module executes its own structures
-            out.append(await self.execute_intent(it))
+            try:
+                out.append(await self.execute_intent(it))
+            except Exception as e:  # one lane's bug must not stop the other intents or protection
+                logger.exception("intent %s crashed", it.intent_id)
+                await self.alert("critical", f"{it.symbol}: order step crashed",
+                                 f"{it.side} {it.symbol}: {type(e).__name__}: {e}", key=f"crash-{it.intent_id}")
+                try:
+                    await self._protect_symbol(it.symbol)
+                except Exception:
+                    logger.exception("protect after crash failed")
         return out
 
     async def execute_intent(self, intent: OrderIntent) -> ExecResult:
@@ -684,6 +693,40 @@ class ExecutionEngine:
     def _model_exit_key(self) -> str:
         return f"exec.model_exits.{self.session_date().isoformat()}"
 
+    async def _replan_trim(self, intent: OrderIntent) -> float | str:
+        """A queued risk trim is re-planned from a fresh, trusted book right before it
+        sells: still the recommended symbol, and never more than the fresh quantity."""
+        from stock_agent.risk_manager import TradeKind
+
+        m = intent.meta or {}
+        counters: dict[tuple[str, str], int] = {}
+        for row in m.get("consecutive_closes") or []:
+            try:
+                kind, key, n = row
+                counters[(str(kind), str(key))] = int(n)
+            except (TypeError, ValueError):
+                continue
+        snap = await self._snapshot(f"trim replan {intent.symbol}")
+        if not counters and intent.origin == "limit_drift":
+            # Drift was confirmed at the close that queued this trim; re-check only that
+            # the breach is still beyond its band on today's fresh book.
+            need = int(getattr(self.risk.config, "RISK_DRIFT_CONFIRM_SESSIONS", 2))
+            counters = {(b.kind, b.key): need
+                        for b in self.risk.evaluate_portfolio(snap, controls=self._risk_controls())}
+        delivery = intent.origin == "option_delivery"
+        plan = self.risk.plan_remediation(snap, consecutive_closes=counters, broker_action=delivery,
+                                          broker_symbol=m.get("delivery_symbol") if delivery else None,
+                                          controls=self._risk_controls())
+        if not plan:
+            return "risk trim no longer needed on the fresh book"
+        rec = plan[0]
+        if rec.kind != TradeKind.SELL or str(rec.symbol).upper() != intent.symbol.upper():
+            return f"fresh risk plan now recommends {rec.kind} {rec.symbol}, not this trim"
+        qty = float(rec.qty)
+        if qty <= 0:
+            return "fresh risk plan sells nothing"
+        return qty
+
     async def exit(self, intent: OrderIntent) -> ExecResult:
         """Sell (part of) a long. Cancel our stop, confirm, sell, re-protect any rest."""
         rule = str((intent.meta or {}).get("rule") or "model")
@@ -704,6 +747,14 @@ class ExecutionEngine:
         want = (intent.meta or {}).get("qty")
         want_qty = float(want) if want is not None else pos.qty
         want_qty = min(want_qty, pos.qty)
+        if intent.kind == "trim" and intent.origin in ("limit_drift", "option_delivery"):
+            block = self.ledger.trading_block()
+            if block:
+                return await self._hold(intent, f"risk trim waits for trusted books: {block}")
+            fresh = await self._replan_trim(intent)
+            if isinstance(fresh, str):
+                return self._skip(intent, fresh)
+            want_qty = min(want_qty, fresh)
         if want_qty <= 0:
             return self._skip(intent, "nothing to sell")
         await self._release_short_calls(intent.symbol, pos, want_qty)
@@ -1032,6 +1083,14 @@ class ExecutionEngine:
         except Exception as e:  # normalise failures are loud but must not stop protection
             rep.errors.append(f"normalise: {e}")
             await self.alert("critical", "Account clean-up failed", str(e), key="normalise-failed")
+        if self.normalised:
+            key = f"exec.no_shorting_checked.{self.session_date().isoformat()}"
+            last = self._kv_get(key, None)
+            due = last is None or (last != "ok" and self.now() - datetime.fromisoformat(last) >= timedelta(hours=1))
+            if due:
+                # daily check (hourly retry after a failure) that shorting is off at the broker
+                ok = await self._ensure_no_shorting([])
+                self._kv_set(key, "ok" if ok else self.now().isoformat())
         try:
             await self.resolve_pending()
             # Until clean-up is done, normalise owns short covering (it sets

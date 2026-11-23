@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
@@ -45,6 +45,8 @@ class ScriptedModels:
             self.plans[eid] = Plan(symbol, "BUY", 9)
         elif "Second report" in headline:
             self.plans[eid] = Plan(symbol, "EXIT_PROPOSED", 8, "CONFIRM_BREAK")
+        elif "slowdown" in headline:
+            self.plans[eid] = Plan(symbol, "BEARISH", 8)
         elif "probe" in headline:
             self.plans[eid] = Plan(symbol, "EXIT_PROPOSED", 8, "DISAGREE")
 
@@ -120,6 +122,9 @@ def week(tmp_path_factory):
     runner.when(inv, lambda w, r: None, "invariants", once=False)
     try:
         script.run(runner)
+        # The spread the bot opens on Monday expires 2026-12-24; its T-2 is Mon 12-21.
+        # Step that one morning (overnight is not ticked) to observe the time exit.
+        runner.run_day(script.times["ccc_t_minus_2"].date(), start=time(9, 30), end=time(9, 50))
     finally:
         mp.undo()
     return world, runner, script, models, inv
@@ -227,8 +232,6 @@ def test_ledger_reconciles_to_the_broker_at_each_close(week):
     assert not bad, bad
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="R-02: one explained stop fill in a 2-position book raises a CRITICAL mass_close alert")
 def test_alerts_fire_for_real_failures_only(week):
     world, runner, *_ = week
     alerts = world.e2e_shared["alerts"]
@@ -239,23 +242,75 @@ def test_alerts_fire_for_real_failures_only(week):
     assert any(a[1] == "Bought BBB" for a in alerts) and any(a[1] == "Sold AAA" for a in alerts)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="R-01: the bot's own filled buy is booked as an 'imported' position with a warning alert")
 def test_own_fills_are_not_reported_as_imports(week):
     world, *_ = week
-    noisy = [a for a in world.e2e_shared["alerts"] if a[1] in ("Books: imported BBB", "Books: imported DDD")]
+    noisy = [a for a in world.e2e_shared["alerts"] if a[1] == "Books: imported BBB"]
     assert not noisy, noisy
 
 
-def test_option_spread_opened_atomically_and_closed_at_t_minus_2(week):
-    pytest.importorskip("stock_agent.options_manager", reason="options manager not merged into revamp/build yet")
-    world, runner, script, *_ = week
-    legs = script.ccc_contracts()
-    mleg = [b for _, b, _ in _orders(world) if b.get("order_class") == "mleg"]
-    assert mleg, "no spread order"
-    single = [b for _, b, _ in _orders(world) if b.get("symbol") in legs.values()]
-    assert not single, "a spread leg was sent as a single order"
-    close_at = script.times["ccc_t_minus_2_close"]
-    for occ in legs.values():
-        assert world.alpaca.position(occ) is None or world.clock.now() < close_at.astimezone(UTC)
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "R-03: after a lost order reply + restart, startup reconciles (scheduler.py:333-334 order, "
+    "mirrored by WeekAgent.startup) before engine.resume() acks the intent with its broker "
+    "order id, so the bot's own DDD fill is booked as an 'imported' position with a warning"))
+def test_own_fill_recovered_after_restart_is_not_an_import(week):
+    world, *_ = week
+    noisy = [a for a in world.e2e_shared["alerts"] if a[1] == "Books: imported DDD"]
+    assert not noisy, noisy
 
+
+def _mleg(world, underlying):
+    out = []
+    for at, b, q in _orders(world):
+        if b.get("order_class") == "mleg" and all(leg["symbol"].startswith(underlying) for leg in b["legs"]):
+            out.append((at, b, q))
+    return out
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "R-04: MarketCalendar only covers today-7..today+14 (market_calendar.py:200), so "
+    "trading_days_between(today, expiry) is None for every 21-45 DTE expiry and "
+    "pick_expiry (options_policy.py:219-221) rejects them all: 'no expiry fits the window'. "
+    "The options tests use a calendar adapter over the fake calendar, which hides this"))
+def test_option_spread_opened_atomically(week):
+    world, runner, script, *_ = week
+    t = script.times
+    opens = [(at, b) for at, b, q in _mleg(world, "CCC")
+             if b["legs"][0].get("position_intent", "").endswith("to_open") and q.status < 300]
+    assert len(opens) == 1, [(at, b) for at, b in opens]
+    at, body = opens[0]
+    assert t["ccc_news"] <= at < t["ccc_news"].replace(hour=16), at
+    assert len(body["legs"]) == 2 and {leg["side"] for leg in body["legs"]} == {"buy", "sell"}
+    contracts = set(script.ccc_contracts().values())
+    assert {leg["symbol"] for leg in body["legs"]} <= contracts
+    single = [b for _, b, _ in _orders(world) if b.get("symbol") in contracts]
+    assert not single, "a spread leg was sent as a single order"
+
+
+def test_adopted_spread_closed_as_one_order_at_t_minus_2(week):
+    world, runner, script, *_ = week
+    t = script.times
+    posts = _mleg(world, "EEE")
+    assert posts, "adopted spread never closed"
+    # The close limit may walk toward the natural price (cancel + resubmit); every
+    # attempt is one two-leg mleg order inside T-2 day's first minutes, none earlier.
+    for at, body, _ in posts:
+        assert t["eee_t_minus_2"] <= at < t["eee_t_minus_2"] + timedelta(minutes=10), at
+        assert {leg["position_intent"] for leg in body["legs"]} == {"sell_to_close", "buy_to_close"}
+    single = [b for _, b, _ in _orders(world) if b.get("symbol") in script.eee_legs().values()]
+    assert not single, "a spread leg was sent as a single order"
+    assert all(world.alpaca.position(occ) is None for occ in script.eee_legs().values())
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "R-04: MarketCalendar only covers today-7..today+14 (market_calendar.py:200), so "
+    "trading_days_between(today, expiry) is None for every 21-45 DTE expiry and "
+    "pick_expiry (options_policy.py:219-221) rejects them all: 'no expiry fits the window'. "
+    "The options tests use a calendar adapter over the fake calendar, which hides this"))
+def test_bot_opened_spread_closed_at_its_t_minus_2(week):
+    world, runner, script, *_ = week
+    t = script.times
+    contracts = set(script.ccc_contracts().values())
+    closes = [at for at, b, q in _mleg(world, "CCC")
+              if b["legs"][0].get("position_intent", "").endswith("to_close") and q.status < 300]
+    assert len(closes) == 1 and t["ccc_t_minus_2"] - timedelta(minutes=1) <= closes[0], closes
+    assert all(world.alpaca.position(occ) is None for occ in contracts)

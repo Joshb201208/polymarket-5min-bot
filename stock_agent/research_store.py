@@ -144,6 +144,15 @@ class ResearchStore:
         rows = self.store.query("SELECT * FROM research_work WHERE work_key=?", (work_key,))
         return rows[0] if rows else None
 
+    def retry_story_payloads(self, now: datetime, kind: str) -> list[dict]:
+        rows = self.store.query(
+            """SELECT details_json FROM research_work
+            WHERE status='retry' AND attempts<3 AND retry_after_s<=? ORDER BY claimed_at LIMIT 100""",
+            (int(now.timestamp()),),
+        )
+        details = (json.loads(row[0]) for row in rows)
+        return [detail["story"] for detail in details if detail.get("kind") == kind and detail.get("story")]
+
     def finish_work(self, work_key: str, status: str, *, thesis_id: str | None = None, detail: dict | None = None,
                     retry_at: datetime | None = None) -> None:
         with self.store.transaction() as conn:
