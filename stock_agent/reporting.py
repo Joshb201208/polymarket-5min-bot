@@ -193,6 +193,13 @@ def _parse_ts(x: Any) -> datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
+def _return_equity(snap: Any) -> Decimal | None:
+    """Equity usable as a return/drawdown terminal: only from a live snapshot."""
+    if snap is None or str(getattr(snap, "quality", "")) != "live":
+        return None
+    return snap.equity
+
+
 class ReportBuilder:
     """Builds honest morning briefs, daily summaries, and weekly scorecards."""
 
@@ -309,15 +316,20 @@ class ReportBuilder:
         marks = self.ledger.equity_marks("close") if self.ledger else []
         flows = self.ledger.cash_flows() if self.ledger else []
         prev_mark = previous_close(marks, session_date)
-        overnight_pnl, overnight_pct = day_pnl(marks, snap.equity, session_date, flows)
-        dd_pct, hwm = drawdown(marks, snap.equity)
+        # returns/drawdown only from a live (reconciled, marked) snapshot; an indicative
+        # pre-market snapshot is shown as a value but never turned into a % change
+        ret_eq = _return_equity(snap)
+        overnight_pnl, overnight_pct = (
+            day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None)
+        )
+        dd_pct, hwm = drawdown(marks, ret_eq)
         _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
 
         bm = await self.benchmark.compute(
             as_of_date=session_date,
             marks=marks,
             flows=flows,
-            live_equity=snap.equity,
+            live_equity=ret_eq,
             fallback_starting_capital=self._fallback_starting_capital(),
         )
 
@@ -340,8 +352,12 @@ class ReportBuilder:
 
         prev_label = (
             f"{_fmt_money(overnight_pnl, signed=True, decimals=2)} ({_fmt_pct(overnight_pct)}) vs {prev_mark.session_date.isoformat()} close"
-            if prev_mark is not None
-            else "First recorded session (no prior close mark yet)"
+            if prev_mark is not None and overnight_pnl is not None
+            else (
+                f"Not shown: snapshot is {snap.quality}, waiting for live marks"
+                if prev_mark is not None
+                else "First recorded session (no prior close mark yet)"
+            )
         )
 
         # 1. Account & Benchmark Embed
@@ -591,18 +607,20 @@ class ReportBuilder:
         opt_mv = today_mark.options_mv if today_mark is not None else snap.options_mv  # type: ignore[union-attr]
         mark_quality = "trusted close" if today_mark is not None else f"{snap.quality} snapshot (close mark pending)"  # type: ignore[union-attr]
 
+        # equity used for any return/drawdown: today's trusted close, else a LIVE snapshot only
+        ret_eq = today_mark.equity if today_mark is not None else _return_equity(snap)
         sess_pnl, sess_pct = (
             (close_report.day_pnl, close_report.day_pnl_pct)
             if close_report is not None and getattr(close_report, "day_pnl", None) is not None
-            else day_pnl(marks, equity, session_date, flows)
+            else (day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None))
         )
-        dd_pct, hwm = drawdown(marks, equity)
+        dd_pct, hwm = drawdown(marks, ret_eq)
         _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
         twr_pct = twr(marks, flows)
         dep = net_deposits(flows, session_date)
         total_ret_pct = (
-            ((equity - dep) / dep * Decimal(100)).quantize(Decimal("0.01"))
-            if dep > ZERO
+            ((ret_eq - dep) / dep * Decimal(100)).quantize(Decimal("0.01"))
+            if dep > ZERO and ret_eq is not None
             else None
         )
 
@@ -610,7 +628,7 @@ class ReportBuilder:
             as_of_date=session_date,
             marks=marks,
             flows=flows,
-            live_equity=equity,
+            live_equity=ret_eq,
             fallback_starting_capital=self._fallback_starting_capital(),
         )
 
@@ -642,7 +660,11 @@ class ReportBuilder:
             {"name": "Closing Account Value", "value": f"**{_fmt_money(equity, decimals=2)}** ({mark_quality})", "inline": True},
             {
                 "name": "Today's Change",
-                "value": f"{_fmt_money(sess_pnl, signed=True, decimals=2)} ({_fmt_pct(sess_pct)})" if sess_pnl is not None else "First close baseline recorded",
+                "value": f"{_fmt_money(sess_pnl, signed=True, decimals=2)} ({_fmt_pct(sess_pct)})" if sess_pnl is not None else (
+                    "Unavailable until a trusted close mark (snapshot is indicative)"
+                    if previous_close(marks, session_date) is not None
+                    else "First close baseline recorded"
+                ),
                 "inline": True,
             },
             {
@@ -800,6 +822,9 @@ class ReportBuilder:
         flows = self.ledger.cash_flows() if self.ledger else []
 
         live_eq = snap.equity if snap is not None else (marks[-1].equity if marks else ZERO)
+        ret_live_eq = _return_equity(snap) if snap is not None else None
+        if ret_live_eq is not None and ret_live_eq <= ZERO:
+            ret_live_eq = None
         cash_now = snap.cash if snap is not None else (marks[-1].cash if marks else ZERO)
         gross_exp_pct = (
             float(snap.gross_exposure_pct * 100)
@@ -815,13 +840,13 @@ class ReportBuilder:
             as_of_date=session_date,
             marks=marks,
             flows=flows,
-            live_equity=live_eq if live_eq > ZERO else None,
+            live_equity=ret_live_eq,
             cutover_date=cutover_date,
             fallback_starting_capital=self._fallback_starting_capital(),
         )
 
         # Drawdown & HWM dates
-        dd_now, hwm = drawdown(marks, live_eq if live_eq > ZERO else None)
+        dd_now, hwm = drawdown(marks, ret_live_eq)
         dd_tier, dd_label = describe_drawdown_tier(dd_now, self.ledger)
         hwm_date: str | None = None
         max_dd_pct: Decimal | None = None
@@ -1337,7 +1362,7 @@ class ReportBuilder:
             {
                 "mature_count": len(post_stop_20d),
                 "net_saved_vs_hold": round(sum(post_stop_20d), 2),
-                "display": f"{len(post_stop_20d)} stopped trade(s) 20+ sessions after the stop: stop saved {_fmt_money(sum(post_stop_20d), signed=True)} vs holding without a stop",
+                "display": f"{len(post_stop_20d)} stopped trade(s) 20+ sessions after the stop: stop saved {_fmt_money(sum(post_stop_20d), signed=True)} vs holding without a stop (no-stop marked at the latest replayed close, not a fixed day-20 mark)",
             }
             if post_stop_20d
             else {

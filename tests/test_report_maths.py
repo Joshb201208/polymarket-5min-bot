@@ -139,3 +139,33 @@ def test_shadow_stop_rows_count_sessions_after_exit_and_outlive_the_close(world,
     atr = next(r for r in row["results"] if r["variant"] == "atr_placed")
     assert str(row["through_session"])[:10] == days[-1].isoformat()   # replayed past the close
     assert atr["stopped"] and atr["sessions_after_exit"] == len([d for d in days if d > date(2026, 11, 4)])
+
+
+def test_indicative_terminal_not_return_even_with_trusted_opening_mark(world, tmp_path):
+    ledger = make_ledger(tmp_path, world)
+    ledger.record_equity_mark(PREV, "close", snapshot(equity="100"))
+    report = ReportBuilder(Config(), ledger=ledger, clock=lambda: NOW)
+    embeds = run(report.build_daily_summary(snapshot=snapshot(equity="70", quality="indicative")))
+    assert "-30.00%" not in str(embeds)
+    brief = run(report.build_morning_brief(snapshot=snapshot(equity="70", quality="indicative"), as_of=NOW))
+    assert "-30.00%" not in str(brief)
+
+
+def test_missing_terminal_mark_does_not_publish_stale_window_return():
+    bm = run(tracker([(LAUNCH_BASELINE_DATE, 100), (PREV, 101), (DAY, 150)]).compute(
+        as_of_date=DAY, marks=[mark(LAUNCH_BASELINE_DATE, 100), mark(PREV, 101)], flows=[]))
+    assert bm.portfolio_since_launch_pct is None and bm.active_vs_qqq_launch_pct is None
+
+
+def test_quote_from_an_earlier_session_is_not_todays_price():
+    from stock_agent.price_service import PriceBatchResult, Quote
+
+    class Px(StubPriceService):
+        async def get_quotes(self, symbols, purpose=""):
+            old = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
+            return PriceBatchResult(quotes={s: Quote(s, D(150), None, None, D(100), None, old, old, "fixture", False)
+                                            for s in symbols}, missing={})
+
+    bm = run(BenchmarkTracker(Px({s: [_bar(s, PREV, 100)] for s in ("QQQ", "SPY")})).compute(
+        as_of_date=DAY, marks=[mark(PREV, 100)], flows=[], live_equity=D(101)))
+    assert bm.qqq.stale and bm.qqq.session_return_pct is None and bm.active_vs_qqq_session_pct is None

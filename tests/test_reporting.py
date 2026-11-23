@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -309,8 +310,12 @@ def test_morning_brief_ignores_last_equity_flags_premarket_options_and_separates
         embeds = await rb.build_morning_brief(snapshot=live_snap)
         flat = str(embeds)
 
-        # Must compute +$2,000 (+2.00%) vs $100,000 close mark, NEVER $102,000 - $77,777 = +$24,223!
-        assert "+$2,000.00 (+2.00%)" in flat
+        # NEVER $102,000 - $77,777 = +$24,223. The snapshot is indicative (a $0 pre-market option
+        # mark), so no overnight % is printed at all; a live snapshot gives +$2,000 vs the close mark.
+        assert "24,223" not in flat and "+$2,000.00 (+2.00%)" not in flat
+        assert "Not shown: snapshot is indicative" in flat
+        live_flat = str(await rb.build_morning_brief(snapshot=dataclasses.replace(live_snap, quality="live")))
+        assert "+$2,000.00 (+2.00%)" in live_flat and "24,223" not in live_flat
         assert "24,223" not in flat
         assert "Pre-market pricing note" in flat
         assert "2 / 20 long stocks" in flat  # Short PDD not counted as long stock slot!
