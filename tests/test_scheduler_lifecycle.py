@@ -129,6 +129,40 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
     asyncio.run(check())
 
 
+def test_entry_lock_alert_names_required_health_and_cleanup(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 10, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        reported = []
+        sched.alerts = SimpleNamespace(alert_entries_locked=lambda locks, *, session_date: reported.append(
+            (locks, session_date),
+        ))
+        sched.llm = SimpleNamespace(is_healthy=lambda: True)
+        try:
+            sched.health.record_news_poll(("AAPL",), now, source="secondary", degraded=True)
+            await sched._alert_entry_locks()
+            locks, day = reported[-1]
+            assert day == now.date()
+            assert {lock["code"] for lock in locks} == {"first_run_normalise", "broker_reconcile"}
+
+            sched._normalised = sched._reconciled = True
+            await sched._alert_entry_locks()
+            assert len(reported) == 1
+
+            sched.health.record_news_poll(("AAPL",), now, source="failed", ok=False)
+            sched.llm.is_healthy = lambda: False
+            await sched._alert_entry_locks()
+            locks = {lock["code"]: lock for lock in reported[-1][0]}
+            assert set(locks) == {"news_health", "llm_health"}
+            assert "successful fresh news poll" in locks["news_health"]["clears_when"]
+            assert "model route" in locks["llm_health"]["clears_when"]
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
 def test_monday_evening_catchup_waits_for_tuesday_then_retries_at_open(tmp_path, monkeypatch):
     async def check():
         monday = datetime(2026, 11, 23, 19, tzinfo=ET)
@@ -141,7 +175,11 @@ def test_monday_evening_catchup_waits_for_tuesday_then_retries_at_open(tmp_path,
             nonlocal fresh
             events.append((kind, work_scope, current))
             fresh = work_scope == "catchup-regular"
-            return JobOutcome(JobStatus.DONE)
+            intents = (NewIntent(
+                symbol="AAPL", side="buy", dedupe_key="catchup:AAPL", origin="scheduled", session_date=current.date(),
+                next_attempt_at=current + timedelta(minutes=5),
+            ),) if fresh else ()
+            return JobOutcome(JobStatus.DONE, intents=intents)
 
         async def check_regime():
             events.append("regime")
@@ -180,6 +218,9 @@ def test_monday_evening_catchup_waits_for_tuesday_then_retries_at_open(tmp_path,
             await sched._collect_finished_jobs()
             assert events[1:] == ["regime", ("weekly", "catchup-regular", current)]
             assert sched.ledger.job_status("catchup", f"{tuesday.date()}:regular").status is JobStatus.DONE
+            assert not sched.ledger.due_intents(current + timedelta(minutes=4, seconds=59))
+            purchase, = sched.ledger.due_intents(current + timedelta(minutes=5))
+            assert purchase.symbol == "AAPL" and purchase.side == "buy" and purchase.job == "catchup"
             sched._schedule_research_catchup(current + timedelta(minutes=15))
             assert not sched._job_tasks
             assert sched._should_run_options_scan(current + timedelta(minutes=15))

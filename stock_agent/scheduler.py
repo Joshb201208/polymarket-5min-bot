@@ -305,7 +305,33 @@ class StockAgentScheduler:
                     "broker account has a trading restriction",
                     "the broker removes the restriction and a fresh account reconcile confirms it",
                 )
-        except (ValueError, StateUnavailable, sqlite3.Error):
+            account_status = flags.get("status")
+            if account_status and str(account_status).lower() != "active":
+                locks["broker_account_inactive"] = (
+                    "broker account is not active",
+                    "the broker reports ACTIVE on a fresh account reconcile",
+                )
+            if snapshot is not None and abs(_now_utc() - snapshot.as_of) <= timedelta(seconds=120):
+                margin = self.risk.margin_status(snapshot)
+                target = Decimal(str(self.config.MARGIN_MIN_EXCESS_PCT))
+                if margin is not None and margin.margin_call:
+                    locks["margin_call"] = (
+                        "broker reports a margin call",
+                        "a fresh broker reconcile confirms the margin call is cleared",
+                    )
+                if margin is not None and margin.excess_pct < target:
+                    locks["margin_buffer"] = (
+                        f"margin excess {margin.excess_pct:.1%} is below the entry minimum {target:.0%}",
+                        f"a fresh broker book and projected order both meet the {target:.0%} margin buffer",
+                    )
+                unpriced = [holding.symbol for holding in snapshot.holdings
+                            if holding.qty and (not holding.price_ok or holding.price is None or holding.price <= 0)]
+                if unpriced:
+                    locks["unpriced_stock"] = (
+                        f"stock price missing or invalid for {', '.join(unpriced)}",
+                        "a fresh broker reconcile supplies a valid mark or confirms the position is closed",
+                    )
+        except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
             locks.setdefault("risk_state_unavailable", (
                 "entry health could not be verified", "health state is readable and required inputs are healthy",
             ))
