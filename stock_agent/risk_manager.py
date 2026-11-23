@@ -229,6 +229,95 @@ class DailyBar(Protocol):
     def close(self) -> Decimal | float: ...
 
 
+@dataclass(frozen=True)
+class ShadowEntryAnchor:
+    position_id: str
+    symbol: str
+    session_date: date
+    fill_price: Decimal
+    qty: Decimal
+    stop_fraction: Decimal
+    stop_price: Decimal | None = None
+    atr: Decimal | None = None
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class ShadowDailyBar:
+    session_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+@dataclass(frozen=True)
+class ShadowStopResult:
+    variant: str
+    stopped: bool
+    exit_session: date | None
+    price: Decimal
+    return_fraction: Decimal
+    pnl: Decimal
+    through_session: date
+
+
+def shadow_stop_results(
+    entry_anchor: ShadowEntryAnchor, daily_bars: Sequence[ShadowDailyBar],
+) -> tuple[ShadowStopResult, ...]:
+    """Illustrative per-lot replay. Same-price-basis bars, no fees or intraday slippage.
+
+    Skip the entry-day bar; its low could predate the real fill. Use an opening
+    gap price when at/below the stop, otherwise the stop level when a later
+    session's low touches it. Untriggered variants mark at the final close.
+    """
+    try:
+        fill, qty = _decimal(entry_anchor.fill_price), _decimal(entry_anchor.qty)
+        fraction = _decimal(entry_anchor.stop_fraction)
+        if min(fill, qty, fraction) <= 0 or fraction >= 1:
+            return ()
+        atr_level = _decimal(entry_anchor.stop_price) if entry_anchor.stop_price is not None else stop_price(
+            fill, StopDistance(fraction, False),
+        )
+        if not 0 < atr_level < fill:
+            return ()
+        bars: dict[date, tuple[Decimal, Decimal, Decimal]] = {}
+        for bar in daily_bars:
+            if bar.session_date <= entry_anchor.session_date:
+                continue
+            opening, high, low, close = map(_decimal, (bar.open, bar.high, bar.low, bar.close))
+            if not (0 < low <= min(opening, close) <= max(opening, close) <= high):
+                return ()
+            values = opening, low, close
+            if bar.session_date in bars and bars[bar.session_date] != values:
+                return ()
+            bars[bar.session_date] = values
+        if not bars:
+            return ()
+        sessions = sorted(bars)
+        last = sessions[-1]
+        results = []
+        levels = [(f"fixed_{pct}", fill * (1 - Decimal(pct) / 100)) for pct in (7, 10, 12)]
+        levels += [("atr_placed", atr_level), ("no_stop", None)]
+        for name, level in levels:
+            price = bars[last][2]
+            exit_session = None
+            if level is not None:
+                for session in sessions:
+                    opening, low, _ = bars[session]
+                    if low <= level:
+                        price = min(opening, level)
+                        exit_session = session
+                        break
+            results.append(ShadowStopResult(
+                name, exit_session is not None, exit_session, price, price / fill - 1,
+                (price - fill) * qty, last,
+            ))
+        return tuple(results)
+    except (TypeError, ValueError, ArithmeticError, AttributeError):
+        return ()
+
+
 def normalize_sector(raw: str | None) -> CanonicalSector:
     """Collapse provider and older ledger strings into the same sector."""
     if not isinstance(raw, str):
