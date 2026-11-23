@@ -29,7 +29,7 @@ import asyncio
 import logging
 import math
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Literal
 
 import httpx
@@ -333,8 +333,8 @@ class MarketClock(_Model):
 
 class CalendarDay(_Model):
     date: date
-    open: str
-    close: str
+    open: time
+    close: time
     session_open: str | None = None
     session_close: str | None = None
     settlement_date: date | None = None
