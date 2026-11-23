@@ -202,6 +202,7 @@ class ReportBuilder:
         self.price_service = price_service
         self.health_registry = health_registry
         self.options_store = options_store
+        self._options_store_failed = False
         self.calendar = calendar
         self.research_store = research_store
         self.benchmark = benchmark_tracker or BenchmarkTracker(price_service)
@@ -214,6 +215,7 @@ class ReportBuilder:
         return now.astimezone(ET)
 
     def _load_options_structures(self) -> list[Any]:
+        self._options_store_failed = False
         if self.options_store is None:
             return []
         try:
@@ -230,6 +232,7 @@ class ReportBuilder:
                     return list(structs)
         except Exception as e:
             logger.warning("Could not read options structures for report: %s", e)
+            self._options_store_failed = True
         return []
 
     # ---- options helpers (structure maths lives in options_book)
@@ -245,15 +248,38 @@ class ReportBuilder:
         return {"ADOPTED": "adopted/legacy", "NEWS": "news"}.get(ReportBuilder._option_origin(s), "scheduled")
 
     @staticmethod
-    def _option_marks(snap: BookSnapshot | None) -> dict[str, float]:
+    def _option_mismatch(structs: Sequence[Any], snap: BookSnapshot | None) -> set[str]:
+        """Contract symbols where the broker's signed quantity differs from what the live
+        structures in the book expect (book lag, repair, store failure, or unbooked legs)."""
+        expected: dict[str, float] = defaultdict(float)
+        for s in structs:
+            if getattr(s, "st", None) is None or not s.st.live or str(getattr(s, "state", "")) == "pending":
+                continue
+            try:
+                for sym, q in s.expected_positions().items():
+                    expected[sym] += q
+            except Exception:
+                for leg in getattr(s, "legs", ()) or ():
+                    expected[getattr(leg, "symbol", "")] = float("nan")
+        held = {leg.occ_symbol: float(leg.qty) for leg in snap.legs} if snap is not None else {}
+        if snap is None:
+            return set()
+        return {sym for sym in set(expected) | set(held) if expected.get(sym, 0.0) != held.get(sym, 0.0)}
+
+    @classmethod
+    def _option_marks(cls, snap: BookSnapshot | None, structs: Sequence[Any] = ()) -> dict[str, float]:
+        """Per-share marks for legs whose held quantity matches the book; a mismatched
+        symbol has no mark, so its structures report P&L as unknown."""
         if snap is None:
             return {}
-        return {leg.occ_symbol: float(leg.price) for leg in snap.legs if leg.price_ok and leg.price is not None}
+        bad = cls._option_mismatch(structs, snap)
+        return {leg.occ_symbol: float(leg.price) for leg in snap.legs
+                if leg.price_ok and leg.price is not None and leg.occ_symbol not in bad}
 
-    @staticmethod
-    def _option_risk(structs: Sequence[Any]) -> tuple[float, int]:
-        """(sum of known max loss, count of live structures whose max loss is unknown).
-        Unknown risk is never counted as zero."""
+    def _option_risk(self, structs: Sequence[Any], snap: BookSnapshot | None = None) -> tuple[float, int]:
+        """(sum of known max loss, count of positions whose max loss is unknown).
+        Unknown counts live structures without a max loss plus each underlying whose
+        broker legs the book does not explain. Unknown risk is never counted as zero."""
         total, unknown = 0.0, 0
         for s in structs:
             ml = getattr(s, "max_loss", None)
@@ -261,12 +287,20 @@ class ReportBuilder:
                 unknown += 1
             else:
                 total += float(ml)
+        if snap is not None and snap.legs:
+            bad = self._option_mismatch(structs, snap)
+            held_bad = {leg.underlying for leg in snap.legs if leg.occ_symbol in bad}
+            if self._options_store_failed:
+                held_bad |= {leg.underlying for leg in snap.legs}
+            unknown += len(held_bad)
         return total, unknown
 
     @staticmethod
     def _fmt_option_risk(total: float, unknown: int) -> str:
         if not unknown:
             return _fmt_money(total)
+        if total <= 0:
+            return f"unknown ({unknown} structure(s); no known maximum)"
         return f"{_fmt_money(total)} known + {unknown} structure(s) with unknown max loss"
 
     def _option_total_limit_pct(self) -> float:
@@ -456,7 +490,7 @@ class ReportBuilder:
         # Options Sleeve Summary (separate from stocks!)
         structs = [s for s in self._load_options_structures() if getattr(s, "st", None) and s.st.live]
         if structs or snap.legs:
-            total_max_loss, unknown_risk = self._option_risk(structs)
+            total_max_loss, unknown_risk = self._option_risk(structs, snap)
             max_loss_pct = (total_max_loss / equity_f * 100.0) if equity_f > 0 else 0.0
             opt_lines: list[str] = []
             if structs:
@@ -469,16 +503,16 @@ class ReportBuilder:
                         f"• **{s.underlying}** {strat_label} x{s.qty} (exp {s.expiry}, {origin}) — "
                         f"max possible loss {ml_txt}"
                     )
-                opt_lines.append(
-                    f"**Total Modeled Option Max Loss:** {self._fmt_option_risk(total_max_loss, unknown_risk)} "
-                    f"({max_loss_pct:.1f}% of account vs {self._option_total_limit_pct():.1f}% limit"
-                    + (", excluding unknown" if unknown_risk else "") + ")"
-                )
             else:
                 for leg in snap.legs:
                     opt_lines.append(
                         f"• **{leg.occ_symbol}** ({float(leg.qty):+g} contracts) — value {_fmt_money(leg.market_value)}"
                     )
+            opt_lines.append(
+                f"**Total Modeled Option Max Loss:** {self._fmt_option_risk(total_max_loss, unknown_risk)} "
+                f"({max_loss_pct:.1f}% of account vs {self._option_total_limit_pct():.1f}% limit"
+                + (", excluding unknown" if unknown_risk else "") + ")"
+            )
             pos_fields.append({"name": "Options Sleeve (Separate from Stocks)", "value": "\n".join(opt_lines), "inline": False})
         else:
             pos_fields.append({"name": "Options Sleeve", "value": "No open option structures.", "inline": False})
@@ -664,7 +698,7 @@ class ReportBuilder:
             if str(getattr(s, "closed_at", "") or "")[:10] == session_date.isoformat()
         ]
         opt_realized_today = sum(float(getattr(s, "realized_pnl", 0.0) or 0.0) for s in closed_today_structs)
-        opt_open_max_loss, opt_unknown_risk = self._option_risk(live_structs)
+        opt_open_max_loss, opt_unknown_risk = self._option_risk(live_structs, snap)
 
         # Today's stock trades & closed win count (sells only — never count buys as wins!)
         did_lines, passed_lines = self._daily_decisions_summary(session_date, closed_today_structs)
@@ -883,7 +917,7 @@ class ReportBuilder:
         learned = self._compile_what_we_learned(bm)
 
         structs = [s for s in self._load_options_structures() if getattr(s, "st", None) and s.st.live]
-        open_opt_max_loss, open_opt_unknown_risk = self._option_risk(structs)
+        open_opt_max_loss, open_opt_unknown_risk = self._option_risk(structs, snap)
         open_opt_max_loss_pct = (open_opt_max_loss / float(live_eq) * 100.0) if live_eq > ZERO else 0.0
 
         invalid_marks = 0
@@ -1124,10 +1158,11 @@ class ReportBuilder:
         # subsets; adopted/legacy structures go only to ADOPTED. Never in NEWS_EQUITY.
         from stock_agent.options_book import open_pnl, structure_mark
 
-        marks = self._option_marks(snap)
+        all_structs = self._load_options_structures()
+        marks = self._option_marks(snap, all_structs)
         for b in (sleeves["OPTIONS"], *options_by_origin.values()):
             b["unrealized_unknown_count"] = 0
-        for s in self._load_options_structures():
+        for s in all_structs:
             origin_key = self._option_origin(s)
             buckets = ((options_by_origin[origin_key],) if origin_key == "ADOPTED"
                        else (sleeves["OPTIONS"], options_by_origin[origin_key]))
