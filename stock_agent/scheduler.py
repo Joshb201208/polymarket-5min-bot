@@ -143,7 +143,7 @@ class StockAgentScheduler:
         self._asset_lock = asyncio.Lock()
         self.engine = service("engine", lambda: ExecutionEngine(
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
-            bars=self._stop_bars, controls=self._risk_controls,
+            bars=self._stop_bars, controls=self._risk_controls, margin_controls=self._margin_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
             capital_lock=self.capital_lock, research_gate=self.research_gate, notifier=self.alerts,
         ))
@@ -440,7 +440,8 @@ class StockAgentScheduler:
                 break
         minimum = f"{target:.0%}"
         context = "Broker reports a margin call. " if status.margin_call else ""
-        action = ("A revalidated trim is queued." if queued else
+        when = "the next regular open plus five minutes" if at_close else "the current session"
+        action = (f"A trim is queued for {when}, subject to revalidation." if queued else
                   "The guard will re-evaluate and queue eligible shares; any pending trim is left in place.")
         await self._alert(
             "critical", "Margin buffer breached",
