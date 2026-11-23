@@ -74,7 +74,7 @@ def test_e2e_week_script_runs_against_todays_scheduler(world):
     week.run(runner)
     assert world.clock.now_et().date() == date(2026, 11, 27)
     labels = [e.detail for e in runner.timeline if e.kind == "event"]
-    assert any("BBB -12%" in s for s in labels) and any("CCC T-2" in s for s in labels)
+    assert any("BBB -12%" in s for s in labels) and any("news CCC" in s for s in labels)
     assert world.alpaca.position("AAA") is not None  # today's bot never sells AAA on news
     assert not runner.errors, runner.summary()
 
