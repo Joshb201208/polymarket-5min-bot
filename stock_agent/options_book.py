@@ -99,6 +99,8 @@ class Structure:
     exit_reason: str | None = None
     exit_credit: float | None = None  # per share, from fills
     realized_pnl: float | None = None
+    partial_pnl: float = 0.0  # realised on contracts closed before the final close
+    partial_qty: int = 0
     closed_at: str | None = None
     entry_greeks: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -131,6 +133,26 @@ class Structure:
 
     def note(self, text: str) -> None:
         self.notes = (self.notes + [text])[-20:]
+
+    def close_part(self, qty: int, credit: float | None) -> None:
+        """`qty` contracts closed at `credit` per share; the rest stays open. Max loss
+        shrinks pro rata; the part's P&L is kept for the final result."""
+        if qty <= 0:
+            return
+        if credit is not None and self.entry_debit is not None:
+            self.partial_pnl = round(self.partial_pnl + (credit - self.entry_debit) * 100 * qty, 2)
+        else:
+            self.note("partial close without fill prices; its P&L is not recorded")
+        if self.max_loss is not None and self.qty > 0:
+            self.max_loss = round(self.max_loss * (self.qty - qty) / self.qty, 2)
+        self.qty -= qty
+        self.partial_qty += qty
+
+    def final_pnl(self, credit: float | None) -> float | None:
+        """Total realised P&L when the remaining `qty` closes at `credit` per share."""
+        if credit is None or self.entry_debit is None:
+            return None
+        return round(self.partial_pnl + (credit - self.entry_debit) * 100 * self.qty, 2)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Structure:
@@ -285,7 +307,7 @@ def leg_close_value(leg: Leg, acts: list[Mapping[str, Any]]) -> tuple[float, str
 
     - a closing FILL: its price
     - OPEXP: 0 (expired worthless)
-    - OPEXC / OPASN: intrinsic value at the strike is realised through the share
+    - OPEXC or OPXRC (both names appear in Alpaca's docs) / OPASN: intrinsic value at the strike is realised through the share
       trade (OPTRD); the option itself closes at 0 and the shares are reported as
       a delivery for repair/trim.
     """
@@ -298,7 +320,7 @@ def leg_close_value(leg: Leg, acts: list[Mapping[str, Any]]) -> tuple[float, str
     kinds = {a.get("activity_type") for a in acts}
     if "OPEXP" in kinds:
         return 0.0, "expired"
-    if "OPEXC" in kinds:
+    if kinds & {"OPEXC", "OPXRC"}:
         return 0.0, "exercised"
     if "OPASN" in kinds:
         return 0.0, "assigned"
@@ -317,6 +339,7 @@ def infer_strategy(legs: list[Leg]) -> tuple[Strategy, Direction | None, float |
             return Strategy.BULL_CALL_SPREAD, Direction.BULLISH, width
         if long_leg.type == "put" and short_leg.strike < long_leg.strike:
             return Strategy.BEAR_PUT_SPREAD, Direction.BEARISH, width
+        return Strategy.UNKNOWN, None, width  # a credit vertical: defined risk, width known
     return Strategy.UNKNOWN, None, None
 
 
@@ -371,6 +394,18 @@ def adopt_positions(option_positions: list[Any], now: datetime,
     return out
 
 
+def _adopted_max_loss(legs: list[Leg], debit: float, width: float | None, qty: int) -> float | None:
+    """Defined max loss of an adopted structure in dollars: the debit paid, or for a
+    credit vertical the width less the credit. None when it is not defined (a lone
+    short leg), which keeps it a REPAIR item."""
+    if len(legs) == 2 and width is not None:
+        per = debit if debit > 0 else width + debit  # debit < 0 is a credit
+        return round(max(per, 0.0) * MULTIPLIER * qty, 2)
+    if len(legs) == 1 and legs[0].side == "buy":
+        return round(max(debit, 0.0) * MULTIPLIER * qty, 2)
+    return None
+
+
 def _adopted(und: str, exp: str, legs: list[Leg], qty: int, debit: float, now: datetime) -> Structure:
     strat, direction, width = infer_strategy(legs)
     st = Structure(
@@ -378,7 +413,7 @@ def _adopted(und: str, exp: str, legs: list[Leg], qty: int, debit: float, now: d
         direction=direction.value if direction else None, qty=qty, expiry=exp, legs=legs,
         state=StructState.OPEN.value, source="adopted", opened_at=now.isoformat(),
         entry_debit=debit, width=width,
-        max_loss=round(max(debit, 0) * MULTIPLIER * qty, 2) if debit > 0 else None,
+        max_loss=_adopted_max_loss(legs, debit, width, qty),
     )
     st.note("adopted from broker positions; entry from broker average prices")
     return st
