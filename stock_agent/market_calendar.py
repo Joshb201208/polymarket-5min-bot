@@ -32,9 +32,9 @@ class CalendarDay(Protocol):
     @property
     def date(self) -> date: ...
     @property
-    def open(self) -> time: ...
+    def open(self) -> str: ...
     @property
-    def close(self) -> time: ...
+    def close(self) -> str: ...
 
 
 class CalendarClient(Protocol):
@@ -175,6 +175,22 @@ class MarketCalendar:
                 return self._sessions[candidate]
         return None
 
+    def trading_days_between(self, start: date, end: date) -> int | None:
+        """Count sessions after ``start`` through ``end`` in the covered interval."""
+        if end < start or not self._covered(start) or not self._covered(end):
+            return None
+        return sum(start < day <= end for day in self._sessions)
+
+    def is_open(self, now: datetime) -> bool:
+        """An inexpensive scheduling check; broker submissions must call market_gate."""
+        live = self.state
+        if not live.authorizes_orders or live.session is None or live.observed_at is None:
+            return False
+        return (
+            timedelta() <= now - live.observed_at <= timedelta(seconds=60)
+            and live.session.opens_at <= now < live.session.closes_at
+        )
+
     async def _refresh_calendar(self, now: datetime, today: date) -> None:
         if self._covered(today) and self._calendar_at and now - self._calendar_at < timedelta(hours=6):
             return
@@ -187,7 +203,7 @@ class MarketCalendar:
                 days = await self.broker.get_calendar(start, end)
             sessions: dict[date, Session] = {}
             for day in days:
-                session = self._session(day.date, day.open, day.close)
+                session = self._session(day.date, time.fromisoformat(day.open), time.fromisoformat(day.close))
                 if not start <= session.date <= end or session.date in sessions:
                     raise ValueError("bad calendar date")
                 sessions[session.date] = session
@@ -210,7 +226,11 @@ class MarketCalendar:
                     clock = await self.broker.get_clock()
                 now = self.now().astimezone(ET)
                 session = self.session_on(now.date())
+                subsequent = self.next_session(now.date())
                 scheduled_open = bool(session and session.opens_at <= now < session.closes_at)
+                scheduled_next_open = session.opens_at if session and now < session.opens_at else (
+                    subsequent.opens_at if subsequent else None
+                )
                 if (
                     any(x.tzinfo is None or x.utcoffset() is None for x in (
                         clock.timestamp, clock.next_open, clock.next_close,
@@ -221,6 +241,7 @@ class MarketCalendar:
                     or clock.next_close <= clock.timestamp
                     or not self._covered(now.date())
                     or clock.is_open != scheduled_open
+                    or clock.next_open != scheduled_next_open
                     or (clock.is_open and session and clock.next_close != session.closes_at)
                 ):
                     raise ValueError("broker clock and calendar disagree")
