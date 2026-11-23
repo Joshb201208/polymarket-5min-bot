@@ -311,3 +311,9 @@ def test_drawdown_pauses_throttles_and_automatically_recovers():
     assert state.alert and not state.throttled and not state.paused
     state = update_drawdown(state, "2026-10-19", Decimal(101))
     assert state.high_water == 101 and not state.alert
+
+
+def test_missing_expected_close_breaks_drawdown_recovery_streak():
+    state = DrawdownState(Decimal(100), Decimal(".14"), True, 4, "2026-10-14")
+    result = update_drawdown(state, "2026-10-16", Decimal(86), previous_session="2026-10-15")
+    assert result.paused and result.recovery_closes == 1

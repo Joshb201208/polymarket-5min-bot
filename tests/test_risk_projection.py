@@ -253,3 +253,33 @@ def test_unknown_broker_or_unbounded_pending_order_denies_new_entries(risk):
     assert "broker_book_blocked" in risk.evaluate_trade(blocked, buy()).reasons
     pending = snapshot(orders=(order("BETA", limit=None),))
     assert risk.evaluate_trade(pending, buy()).reasons == ("invalid_risk_input",)
+
+
+def test_existing_issuer_drift_is_reported_but_only_blocks_worsening(risk):
+    book = snapshot(stock("GOOG", 160, "Communication Services"))
+    verdict = risk.evaluate_trade(book, buy(price=D(101), mark_price=D(100), fee=D(1)))
+    assert verdict.ok
+    (breach,) = verdict.allowed_existing_breaches
+    assert breach.kind == "issuer_cap" and breach.key == "GOOGL"
+    assert not risk.evaluate_trade(book, buy(symbol="GOOGL", sector="Communication Services")).ok
+
+
+def test_same_sector_cannot_add_to_drift_even_when_ticker_differs(risk):
+    book = snapshot(stock("BANKA", 140, "Financials"), stock("BANKB", 140, "Financials"),
+                    stock("BANKC", 130, "Financial Services"))
+    assert risk.evaluate_trade(book, buy()).allowed_existing_breaches[0].kind == "sector_cap"
+    assert risk.evaluate_trade(book, buy(sector="Financials")).reasons == ("sector_cap",)
+
+
+def test_concentration_exact_cap_alerts_without_buy_or_trim_veto(risk):
+    book = snapshot(stock("ALFA", 150, "Industrials"))
+    assert [(b.kind, b.key, b.at_limit) for b in risk.evaluate_portfolio(book)] == [
+        ("issuer_cap", "ALFA", True),
+    ]
+    assert not risk.plan_remediation(book, broker_action=True)
+    assert risk.evaluate_trade(book, buy("BETA")).ok
+
+
+def test_options_cannot_cross_gross_via_existing_leverage(risk):
+    book = snapshot(*(stock(f"NAME{i}", 101, "Industrials") for i in range(10)))
+    assert risk.evaluate_trade(book, option()).reasons == ("gross_cap",)
