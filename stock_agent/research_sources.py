@@ -311,6 +311,8 @@ def _news_evidence(item) -> Evidence | None:
     url = item.url
     if published is None or retrieved is None or not isinstance(url, str) or not url.startswith(("https://", "http://")):
         return None
+    if url.startswith("https://news.alpaca.invalid/"):
+        return None  # The feed returned no article URL; do not present its placeholder as a citation.
     return Evidence(
         evidence_id=item.story_id, title=str(item.headline or "")[:250], url=url,
         publisher=str(item.publisher or "")[:100], published_at=published, retrieved_at=retrieved,
