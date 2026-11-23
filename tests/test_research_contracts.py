@@ -212,7 +212,9 @@ def test_research_budget_and_claims_survive_restart(tmp_path):
     other.close()
 
 
-@pytest.mark.parametrize(("held", "closes_during_confirmation"), [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(("held", "closes_during_confirmation"), [
+    (False, False), (True, False), pytest.param(True, True, id="confirmed_at_1603_runs_next_session_open_plus_five"),
+])
 def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, tmp_path, held,
                                                                closes_during_confirmation):
     config = settings(PERPLEXITY_API_KEY="")
@@ -228,7 +230,7 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
     )
     security = SecurityInputs("ABC", "Example", "Technology", Decimal("100"), NOW, True)
     event = NewsEvent("ABC", "abc-material-1", evidence, 8)
-    session = Session(NOW.date(), NOW - timedelta(minutes=30), NOW + timedelta(hours=5))
+    session = Session(NOW.date(), NOW - timedelta(minutes=30), NOW + timedelta(hours=6))
     tomorrow = timedelta(days=1)
     next_session = Session(session.date + tomorrow, session.opens_at + tomorrow, session.closes_at + tomorrow)
     calendar = SimpleNamespace(session_on=lambda _: session, next_session=lambda _: next_session)
@@ -256,7 +258,7 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
         if body["model"] == "gpt-5.6-luna":
             assert "first model reasoning" not in body["input"]
             if closes_during_confirmation:
-                now = session.closes_at + timedelta(seconds=1)
+                now = session.closes_at + timedelta(minutes=3)
             value = {"symbol": "ABC", "verdict": "CONFIRM_BREAK", "conviction": 8,
                      "reason": "Independent", "evidence_ids": ["filing"]}
             tools = []
@@ -290,10 +292,17 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
                 monkeypatch.setattr(pipe.sources, "news", for_unheld)
             first = await pipe.run("news", snapshot)
             if closes_during_confirmation:
-                assert first.status is JobStatus.DONE and not first.intents
+                assert first.status is JobStatus.DONE and len(first.intents) == 1
+                intent = first.intents[0]
+                ready_at = next_session.opens_at + timedelta(minutes=5)
+                assert intent.side == "sell" and intent.position_id == "p-1"
+                assert intent.session_date == next_session.date and intent.expires_at == next_session.closes_at
+                assert intent.next_attempt_at == ready_at
+                assert (await pipe.run("news", snapshot)).intents == (intent,)
+                ledger.enqueue_intents(first.intents)
+                assert not ledger.due_intents(now=ready_at - timedelta(seconds=1))
+                assert [item.dedupe_key for item in ledger.due_intents(now=ready_at)] == [intent.dedupe_key]
                 assert len(calls) == 2
-                assert spend.work_state(pipe._story_key(event))["status"] == "no_action"
-                assert not (await pipe.run("news", snapshot)).intents
                 return
             assert first.status is JobStatus.DONE and len(first.intents) == 1
             intent = first.intents[0]
