@@ -169,3 +169,28 @@ def test_quote_from_an_earlier_session_is_not_todays_price():
     bm = run(BenchmarkTracker(Px({s: [_bar(s, PREV, 100)] for s in ("QQQ", "SPY")})).compute(
         as_of_date=DAY, marks=[mark(PREV, 100)], flows=[], live_equity=D(101)))
     assert bm.qqq.stale and bm.qqq.session_return_pct is None and bm.active_vs_qqq_session_pct is None
+
+
+def test_stale_cached_live_snapshot_not_current_terminal(world, tmp_path):
+    from dataclasses import replace
+
+    ledger = make_ledger(tmp_path, world)
+    ledger.record_equity_mark(PREV, "close", snapshot(equity="100"))
+    stale = replace(snapshot(equity="70"), as_of=NOW - timedelta(days=3))
+    report = ReportBuilder(Config(), ledger=ledger, clock=lambda: NOW)
+    assert "-30.00%" not in str(run(report.build_daily_summary(snapshot=stale)))
+    assert "-30.00%" not in str(run(report.build_morning_brief(snapshot=stale)))
+    # a fresh post-close live snapshot of the same session is a valid terminal
+    fresh = replace(snapshot(equity="70"), as_of=NOW - timedelta(minutes=10))
+    assert "-30.00%" in str(run(report.build_daily_summary(snapshot=fresh)))
+
+
+def test_close_report_from_another_session_is_not_todays_change(world, tmp_path):
+    from stock_agent.performance import CloseReport
+
+    ledger = make_ledger(tmp_path, world)
+    ledger.record_equity_mark(PREV, "close", snapshot(equity="100"))
+    old = CloseReport(PREV, D(70), D(-30), D("-30.00"), None, None, None, None, D(0), D(0), D(0), D(0))
+    report = ReportBuilder(Config(), ledger=ledger, clock=lambda: NOW)
+    assert "-30.00%" not in str(run(report.build_daily_summary(snapshot=snapshot(equity="70", quality="indicative"),
+                                                               close_report=old)))

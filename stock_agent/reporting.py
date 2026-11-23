@@ -193,9 +193,29 @@ def _parse_ts(x: Any) -> datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
-def _return_equity(snap: Any) -> Decimal | None:
-    """Equity usable as a return/drawdown terminal: only from a live snapshot."""
+SNAPSHOT_MAX_AGE = timedelta(minutes=90)
+
+
+def _return_equity(snap: Any, session_date: date, now: datetime, *,
+                   not_before: datetime | None = None) -> Decimal | None:
+    """Equity usable as a return/drawdown terminal for ``session_date``, else None.
+
+    Only a live (fully marked) snapshot taken during ``session_date`` (ET), no older
+    than SNAPSHOT_MAX_AGE at report time, and (for the close summary) taken at or after
+    ``not_before``. A cached snapshot from an earlier session is never today's value."""
     if snap is None or str(getattr(snap, "quality", "")) != "live":
+        return None
+    taken = getattr(snap, "as_of", None)
+    if not isinstance(taken, datetime):
+        return None
+    if taken.tzinfo is None:
+        taken = taken.replace(tzinfo=timezone.utc)
+    if taken.astimezone(ET).date() != session_date:
+        return None
+    age = now - taken
+    if age < timedelta(minutes=-5) or age > SNAPSHOT_MAX_AGE:
+        return None
+    if not_before is not None and taken < not_before:
         return None
     return snap.equity
 
@@ -225,6 +245,18 @@ class ReportBuilder:
         self.research_store = research_store
         self.benchmark = benchmark_tracker or BenchmarkTracker(price_service)
         self._clock = clock or _default_now
+
+    def _session_close(self, session_date: date) -> datetime:
+        """Regular close of ``session_date`` (market calendar when covered, else 16:00 ET)."""
+        cal = self.calendar
+        if cal is not None and hasattr(cal, "session_on"):
+            try:
+                sess = cal.session_on(session_date)
+                if sess is not None and getattr(sess, "closes_at", None) is not None:
+                    return sess.closes_at
+            except Exception:
+                pass
+        return datetime.combine(session_date, time(16, 0), tzinfo=ET)
 
     def _now_et(self) -> datetime:
         now = self._clock()
@@ -318,7 +350,7 @@ class ReportBuilder:
         prev_mark = previous_close(marks, session_date)
         # returns/drawdown only from a live (reconciled, marked) snapshot; an indicative
         # pre-market snapshot is shown as a value but never turned into a % change
-        ret_eq = _return_equity(snap)
+        ret_eq = _return_equity(snap, session_date, now_et)
         overnight_pnl, overnight_pct = (
             day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None)
         )
@@ -608,10 +640,17 @@ class ReportBuilder:
         mark_quality = "trusted close" if today_mark is not None else f"{snap.quality} snapshot (close mark pending)"  # type: ignore[union-attr]
 
         # equity used for any return/drawdown: today's trusted close, else a LIVE snapshot only
-        ret_eq = today_mark.equity if today_mark is not None else _return_equity(snap)
+        ret_eq = (
+            today_mark.equity
+            if today_mark is not None
+            else _return_equity(snap, session_date, now_et, not_before=self._session_close(session_date))
+        )
         sess_pnl, sess_pct = (
             (close_report.day_pnl, close_report.day_pnl_pct)
-            if close_report is not None and getattr(close_report, "day_pnl", None) is not None
+            if close_report is not None
+            and getattr(close_report, "day_pnl", None) is not None
+            and getattr(close_report, "session_date", None) == session_date
+            and ret_eq is not None
             else (day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None))
         )
         dd_pct, hwm = drawdown(marks, ret_eq)
@@ -822,7 +861,7 @@ class ReportBuilder:
         flows = self.ledger.cash_flows() if self.ledger else []
 
         live_eq = snap.equity if snap is not None else (marks[-1].equity if marks else ZERO)
-        ret_live_eq = _return_equity(snap) if snap is not None else None
+        ret_live_eq = _return_equity(snap, session_date, now_et) if snap is not None else None
         if ret_live_eq is not None and ret_live_eq <= ZERO:
             ret_live_eq = None
         cash_now = snap.cash if snap is not None else (marks[-1].cash if marks else ZERO)
