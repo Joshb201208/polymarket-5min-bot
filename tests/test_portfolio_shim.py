@@ -51,3 +51,18 @@ def test_unreadable_portfolio_json_is_moved_aside_not_overwritten(tmp_path):
     pf._save()
     aside = list(tmp_path.glob("portfolio.json.unreadable-*"))
     assert len(aside) == 1 and aside[0].read_text() == "{not json"
+
+
+def test_in_memory_view_never_touches_legacy_files(tmp_path):
+    (tmp_path / "portfolio.json").write_text("{not json")
+    cfg = Cfg()
+    cfg.DATA_DIR = tmp_path
+    pf = Portfolio(cfg, persist=False)
+    b = StubBroker()
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    led.add_snapshot_listener(pf.sync_from_snapshot)
+    run(led.refresh("x", rebuild=True))
+    assert pf.get_position("AAA") is not None
+    assert (tmp_path / "portfolio.json").read_text() == "{not json"
+    assert sorted(p.name for p in tmp_path.glob("portfolio*")) == ["portfolio.json"]
