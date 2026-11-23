@@ -4,6 +4,7 @@ research gate and the risk manager."""
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -85,7 +86,12 @@ class StubGate:
                                          conviction, direction, None)
 
     def is_entry_eligible(self, symbol, now):
-        return self.views.get(symbol) or Eligibility(False, ("missing_thesis",))
+        el = self.views.get(symbol)
+        if el is None:
+            return Eligibility(False, ("missing_thesis",))
+        if el.ok and el.generated_at is None:  # a thesis written an hour ago
+            el = dataclasses.replace(el, generated_at=now - timedelta(hours=1))
+        return el
 
 
 @dataclass
@@ -122,7 +128,7 @@ class Alerts:
 
 
 def make_manager(world, tmp_path: Path, *, mode=OptionsMode.DEFINED_RISK, risk=None, gate=None,
-                 covers=None, universe=("AAA",), ex_dividend=None, **settings):
+                 covers=None, universe=("AAA",), ex_dividend=None, store=None, **settings):
     a = world.alpaca
     broker = AlpacaClient("https://paper-api.alpaca.markets", "k", "s")
     broker.lookup_attempts = 1
@@ -139,7 +145,7 @@ def make_manager(world, tmp_path: Path, *, mode=OptionsMode.DEFINED_RISK, risk=N
         return None if q is None else (q.last, q.at)
 
     m = OptionsManager(
-        broker=broker, store=OptionsStore(tmp_path / "options_book.json"), gate=gate, risk=risk,
+        broker=broker, store=store or OptionsStore(tmp_path / "options_book.json"), gate=gate, risk=risk,
         snapshot=lambda: object(), calendar=cal, market_gate=cal.market_gate, spot=spot,
         cover_short=cover_short, universe=lambda: list(universe), journal=Journal(), alerts=Alerts(),
         ex_dividend=ex_dividend, settings=OptionsSettings(mode=mode, fill_poll_seconds=1.0, **settings),

@@ -497,3 +497,34 @@ def test_brief_lines(world, tmp_path):
     lines = m.brief_lines()
     assert lines[0].startswith("Options: mode defined_risk, 1 live")
     assert any("bull_call_spread" in ln for ln in lines)
+
+
+def test_news_story_kept_on_transient_denial_and_acked_on_final(world, tmp_path):
+    world.clock.set_et(2026, 11, 23, 11, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA", ok=False, reasons=("stale_quote",))
+    m = make_manager(world, tmp_path, gate=gate, universe=())
+    r = run(m.scan(candidates=[OptionCandidate("AAA", story_id="n1")]))
+    assert r[0].final is False and r[0].story_handled is False and not m.is_story_handled("n1")
+    gate.set("AAA", Direction.BUY, 6)  # thesis now healthy but conviction too low: a final answer
+    r = run(m.scan(candidates=[OptionCandidate("AAA", story_id="n1")]))
+    assert r[0].final and r[0].story_handled and m.handled_story_ids(["n1", "n2"]) == {"n1"}
+    # durable across a restart
+    m2 = make_manager(world, tmp_path, gate=gate, universe=())
+    assert m2.is_story_handled("n1")
+
+
+def test_invalid_risk_state_refuses_entries(world, tmp_path):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA")
+    m = make_manager(world, tmp_path, gate=gate)
+
+    def broken():
+        raise ValueError("drawdown record invalid")
+    m._risk_controls = broken
+    out = run(m.scan())
+    assert out[0].opened is None and "risk state" in out[0].reason
+    assert not _mleg_posts(world)
