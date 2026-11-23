@@ -85,12 +85,15 @@ def test_restart_after_lost_order_rebuilds_agent(world):
     runner = ScenarioRunner(world)
     runner.restart_after_lost_order()
 
-    def place(w, r):  # the order reaches the broker; the reply is lost
+    async def place(w, r):  # the order reaches the broker; the reply is lost
         from stock_agent.broker import OrderRequest
 
-        return r.agent.broker.submit_order(OrderRequest(symbol="AAA", side="buy", qty=5, type="limit",
-                                                        limit_price=50.5, time_in_force="day",
-                                                        client_order_id="smoke-lost-1", position_intent="buy_to_open"))
+        try:
+            await r.agent.broker.submit_order(OrderRequest(
+                symbol="AAA", side="buy", qty=5, type="limit", limit_price=50.05, time_in_force="day",
+                client_order_id="smoke-lost-1", position_intent="buy_to_open"))
+        except Exception:  # noqa: BLE001 - the client sees a timeout; that is the point
+            pass
 
     runner.at(et(2026, 11, 23, 10, 2), place, "buy AAA")
     runner.run_until(et(2026, 11, 23, 10, 10))
