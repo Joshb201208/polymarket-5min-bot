@@ -210,6 +210,10 @@ async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars
     rows = 0
     for r in ledger.journal.read(kinds={"entry.filled"}):
         pid = r.get("position_id")
+        if not pid and r.get("intent_id"):
+            hit = ledger.store.query("SELECT position_id FROM positions_meta WHERE entry_intent_id=?"
+                                     " ORDER BY opened_at DESC LIMIT 1", (r["intent_id"],))
+            pid = hit[0][0] if hit else None
         if pid not in open_ids and pid not in closed:
             continue
         key = _anchor_key(r)
