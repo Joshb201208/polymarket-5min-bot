@@ -79,23 +79,40 @@ def test_F_03_04_failed_positions_request_keeps_the_ledger(world):
     assert sched.portfolio.get_position("AAA") is not None, "ledger wiped by a failed broker read"
 
 
-@finding("F-01-03", "a buy sent on a market holiday is booked as filled")
 def test_F_01_03_holiday_order_not_booked_as_filled(world):
+    from stock_agent.ledger import IntentStatus, NewIntent
+
     world.clock.set_et(2026, 11, 26, 9, 35)  # Thanksgiving
     world.price("AAA", 50.0)
     sched = world.scheduler()
-    sched._pending_signals = [buy_signal("AAA")]
-    run(sched._tick(world.clock.now_et()))
-    world.clock.set_et(2026, 11, 27, 10, 0)
-    broker_qty = world.alpaca.position("AAA").qty if world.alpaca.position("AAA") else 0
-    booked = sched.portfolio.get_position("AAA")
-    assert (booked.shares if booked else 0) == broker_qty, "ledger holds shares the broker never bought"
+    now = world.clock.now_et()
+    sched.store.open()
+    intent_id = sched.ledger.enqueue_intents([NewIntent(
+        "AAA", "buy", "thanksgiving-fixture", session_date=now.date(),
+        expires_at=now.replace(hour=16, minute=0),
+    )])[0]
+
+    async def scenario():
+        sched._normalised = sched._reconciled = True
+        await sched._tick(now)
+        assert sched.calendar.state.source == "live"
+        assert not (await sched.market_gate("entry")).allowed
+        world.assert_no_orders()
+        world.clock.set_et(2026, 11, 27, 10, 0)
+        sched.ledger.expire_intents(world.clock.now_et())
+        assert sched.ledger.get_intent(intent_id).status is IntentStatus.EXPIRED
+        assert world.alpaca.position("AAA") is None
+        await sched._cleanup()
+
+    run(scenario())
 
 
-@finding("F-01-03", "_is_market_open checks weekday and hours only, not the exchange calendar")
 def test_F_01_03_market_closed_on_thanksgiving(world):
+    world.clock.set_et(2026, 11, 26, 10, 0)
     sched = world.scheduler()
-    assert sched._is_market_open(et(2026, 11, 26, 10, 0)) is False
+    state = run(sched.calendar.refresh())
+    assert state.source == "live"
+    assert sched._is_market_open(world.clock.now_et()) is False
 
 
 @finding("F-07-01", "an unreadable state file silently becomes an empty book and the bot trades on it")

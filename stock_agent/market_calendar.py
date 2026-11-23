@@ -32,9 +32,9 @@ class CalendarDay(Protocol):
     @property
     def date(self) -> date: ...
     @property
-    def open(self) -> str: ...
+    def open(self) -> str | time: ...
     @property
-    def close(self) -> str: ...
+    def close(self) -> str | time: ...
 
 
 class CalendarClient(Protocol):
@@ -175,6 +175,12 @@ class MarketCalendar:
                 return self._sessions[candidate]
         return None
 
+    def previous_session(self, day: date) -> Session | None:
+        for candidate in sorted(self._sessions, reverse=True):
+            if candidate < day and self._covered(candidate):
+                return self._sessions[candidate]
+        return None
+
     def trading_days_between(self, start: date, end: date) -> int | None:
         """Count sessions after ``start`` through ``end`` in the covered interval."""
         if end < start or not self._covered(start) or not self._covered(end):
@@ -187,7 +193,7 @@ class MarketCalendar:
         if not live.authorizes_orders or live.session is None or live.observed_at is None:
             return False
         return (
-            timedelta() <= now - live.observed_at <= timedelta(seconds=60)
+            timedelta(seconds=-30) <= now - live.observed_at <= timedelta(seconds=60)
             and live.session.opens_at <= now < live.session.closes_at
         )
 
@@ -203,7 +209,9 @@ class MarketCalendar:
                 days = await self.broker.get_calendar(start, end)
             sessions: dict[date, Session] = {}
             for day in days:
-                session = self._session(day.date, time.fromisoformat(day.open), time.fromisoformat(day.close))
+                opening = time.fromisoformat(day.open) if isinstance(day.open, str) else day.open
+                closing = time.fromisoformat(day.close) if isinstance(day.close, str) else day.close
+                session = self._session(day.date, opening, closing)
                 if not start <= session.date <= end or session.date in sessions:
                     raise ValueError("bad calendar date")
                 sessions[session.date] = session

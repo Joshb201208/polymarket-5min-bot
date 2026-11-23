@@ -1,10 +1,13 @@
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from stock_agent.analyst import Analyst
+from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
 from stock_agent.executor import Executor
@@ -17,8 +20,15 @@ from stock_agent.models import (
     Trade,
 )
 from stock_agent.portfolio import Portfolio
+from stock_agent.journal import Journal
+from stock_agent.ledger import JobStatus, Ledger
+from stock_agent.llm_client import LLMClient
+from stock_agent.market_calendar import GateDecision, MarketCalendar
+from stock_agent.research_gate import ResearchGate
 from stock_agent.risk_manager import RiskManager
+from stock_agent.runtime_status import ROOT, RuntimeStatus, notify_systemd
 from stock_agent.screener import Screener
+from stock_agent.state_store import StateStore
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
@@ -58,8 +68,9 @@ try:
 except KeyError:
     SGT = ZoneInfo("Singapore")
 
-MARKET_OPEN = time(9, 30)
-MARKET_CLOSE = time(16, 0)
+TICK_SECONDS = 30
+NEWS_SECONDS = 180
+MAX_JOB_ATTEMPTS = 3
 
 
 def _now_et() -> datetime:
@@ -73,24 +84,49 @@ def _now_utc() -> datetime:
 class StockAgentScheduler:
     def __init__(self, config: Config | None = None, *, services: SimpleNamespace | None = None):
         self.config = config if config is not None else Config()
-        # Integration seam for one instance of each shared service. The legacy paths
-        # below stay intact until the corresponding peer-owned service is wired.
-        self.broker = getattr(services, "broker", None)
-        self.ledger = getattr(services, "ledger", None)
-        self.risk = getattr(services, "risk", None)
-        self.calendar = getattr(services, "calendar", None)
-        self.alerts = getattr(services, "alerts", None)
-        self.health = getattr(services, "health", None)
-        self.prices = getattr(services, "prices", None)
-        self.news = getattr(services, "news", None)
-        self.llm = getattr(services, "llm", None)
-        self.engine = getattr(services, "engine", None)
-        self.options = getattr(services, "options", None)
+        def service(name, factory):
+            supplied = getattr(services, name, None)
+            return supplied if supplied is not None else factory()
+
+        self.broker = service("broker", lambda: AlpacaClient(config=self.config))
+        self.journal = service("journal", lambda: Journal(self.config.DATA_DIR / "journal"))
+        self.store = service("store", lambda: StateStore(self.config.DATA_DIR / "state.db", self.journal))
+        self.alerts = service("alerts", lambda: None)
+        self.ledger = service("ledger", lambda: Ledger(
+            self.store, self.journal, broker=self.broker, alert=self._alert,
+        ))
+        self.risk = service("risk", lambda: RiskManager(self.config))
+        self.calendar = service("calendar", lambda: MarketCalendar(
+            self.broker, self.config.DATA_DIR / "market-calendar.json", namespace=self.config.MODE,
+            now=_now_utc,
+        ))
+        self.health = service("health", lambda: None)
+        self.prices = service("prices", lambda: None)
+        self.news = service("news", lambda: None)
+        self.llm = service("llm", lambda: LLMClient(self.config))
+        self.research_gate = service("research_gate", lambda: ResearchGate(self.ledger, self.health, self.config))
+        self.research = service("research", lambda: None)
+        self.engine = service("engine", lambda: None)
+        self.options = service("options", lambda: None)
+        self.runtime = service("runtime", RuntimeStatus)
+        self.pause_file: Path = service("pause_file", lambda: ROOT / "data/pause-trading")
+        self._stop_event = asyncio.Event()
+        self._normalised = False
+        self._engine_resumed = False
+        self._state_ready = False
+        self._reconciled = False
+        self._last_news_at: datetime | None = None
+        self._last_reconcile_at: datetime | None = None
+        self._job_tasks: dict[str, asyncio.Task] = {}
+        self._order_task: asyncio.Task | None = None
+        self._options_task: asyncio.Task | None = None
+        self._last_issue: dict[str, datetime] = {}
+        # Legacy read interfaces temporarily remain for report/research callbacks.
         self.data_feed = DataFeed(self.config)
         self.analyst = Analyst(self.config)
         self.screener = Screener(self.config)
         self.portfolio = Portfolio(self.config)
-        self.risk_manager = RiskManager(self.config)
+        self.risk_manager = self.risk
         self.executor = Executor(self.config)
         self.telegram = TelegramReporter(self.config)
         self.discord = DiscordReporter(self.config)
@@ -105,7 +141,6 @@ class StockAgentScheduler:
         self._daily_prescan_done_today: str | None = None
         self._midweek_analysis_done_this_week: str | None = None
         self._earnings_check_done_today: str | None = None
-        self._first_run_done = False
         self._pending_signals: list[Signal] = []
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
@@ -117,221 +152,332 @@ class StockAgentScheduler:
         self._event_scan_cooldown: datetime | None = None  # Don’t fire twice in 30 min
 
     def shutdown(self):
-        logger.info("Shutdown requested")
-        self._shutdown = True
+        if not self._shutdown:
+            logger.info("Shutdown requested")
+            self._shutdown = True
+            self._stop_event.set()
+
+    async def _alert(self, severity: str, title: str, body: str, *, key: str | None = None):
+        now = _now_utc()
+        if key and key in self._last_issue and now - self._last_issue[key] < timedelta(minutes=30):
+            return
+        if key:
+            self._last_issue[key] = now
+        if self.alerts is not None:
+            try:
+                async with asyncio.timeout(2):
+                    await self.alerts.alert(severity, title, body, key=key)
+            except Exception:
+                logger.warning("Could not queue alert: %s", title)
+        else:
+            logger.log(logging.WARNING if severity != "info" else logging.INFO, "%s: %s", title, body)
+
+    def _entries_enabled(self) -> bool:
+        return self._normalised and self._reconciled and not self._shutdown and not self.pause_file.exists()
+
+    async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
+        if purpose != "protection" and self._shutdown:
+            return GateDecision(False, "shutdown in progress")
+        if purpose == "entry" and not self._entries_enabled():
+            return GateDecision(False, "entries paused, not normalised, or unreconciled")
+        decision = await self.calendar.market_gate(purpose, rule=rule)
+        # A signal or pause can arrive while awaiting the fresh market clock.
+        if purpose == "entry" and not self._entries_enabled():
+            return GateDecision(False, "entries paused, not normalised, or unreconciled")
+        if purpose != "protection" and self._shutdown:
+            return GateDecision(False, "shutdown in progress")
+        return decision
+
+    async def _reconcile_scheduler(self, reason: str) -> bool:
+        try:
+            async with asyncio.timeout(30):
+                await self.ledger.refresh(reason, rebuild=bool(self.ledger.trading_block()))
+            self._reconciled = not self.ledger.trading_block()
+            self._last_reconcile_at = _now_utc()
+        except Exception as exc:
+            self._reconciled = False
+            await self._alert("critical", "Broker reconciliation unavailable",
+                              f"{reason}: {type(exc).__name__}. New entries are blocked.",
+                              key="reconcile-unavailable")
+        return self._reconciled
+
+    def _publish_runtime(self):
+        self.runtime.publish(self.calendar.state, ready=self._state_ready, reconciled=self._reconciled,
+                             entries_enabled=self._entries_enabled())
+
+    async def startup(self) -> None:
+        """Prepare the single-writer ledger and resume broker lifecycle before any orders."""
+        if self._state_ready or self._shutdown:
+            return
+        mode = self.config.MODE.upper()
+        logger.info("Stock Agent starting in %s mode", mode)
+        expected = {
+            "PAPER": "https://paper-api.alpaca.markets",
+            "LIVE": "https://api.alpaca.markets",
+        }.get(mode)
+        if expected is None or self.config.ALPACA_BASE_URL.rstrip("/") != expected:
+            raise ValueError("trading mode does not match broker host")
+        store_health = self.store.open()
+        if not store_health.ok:
+            await self._alert("critical", "State needs broker rebuild",
+                              "The previous state was quarantined; new entries stay blocked until recovery.")
+        self.ledger.mark_submitting_ambiguous()
+        await self.calendar.refresh()
+        if not self._shutdown:
+            await self._reconcile_scheduler("startup")
+        if self._shutdown:
+            return
+        if self._reconciled and self.engine is not None:
+            await self._resume_execution()
+        if self._shutdown:
+            return
+        self._state_ready = True
+        self._publish_runtime()
+        notify_systemd("READY=1\nSTATUS=Scheduler running; entry gates checked separately")
+        await self._alert("info", "Stock agent started",
+                          f"{mode}; broker reconciled: {self._reconciled}; entries enabled: {self._entries_enabled()}")
 
     async def run(self):
-        """Main entry point — runs forever."""
-        logger.info("Stock Agent starting in %s mode", self.config.MODE)
+        """Validate and recover before scheduling money work; exit promptly on SIGTERM."""
         try:
-            await asyncio.gather(
-                self.telegram.send_message(
-                    f"\U0001f680 <b>Stock Agent started</b> in <code>{self.config.MODE}</code> mode"
-                ),
-                self.discord.send_startup(self.config.MODE, self.portfolio.state.cash),
-                return_exceptions=True,
-            )
-        except Exception as e:
-            logger.error("Failed to send startup message: %s", e)
-
-        # Backfill missing sectors on existing positions
-        await self._backfill_sectors()
-
-        try:
+            await self.startup()
             while not self._shutdown:
-                now = _now_et()
                 try:
-                    await self._tick(now)
-                except Exception as e:
-                    logger.exception("Error in main tick: %s", e)
+                    await self._tick_until_stopped()
+                    if self._shutdown:
+                        break
+                    self._publish_runtime()
+                    notify_systemd("WATCHDOG=1")
+                except Exception as exc:
+                    logger.error("Scheduler cycle failed: %s", type(exc).__name__)
+                    await self._alert("warning", "Scheduler cycle failed", type(exc).__name__, key="scheduler-tick")
+                if not self._shutdown:
                     try:
-                        await asyncio.gather(
-                            self.telegram.send_error_alert(str(e)),
-                            self.discord.send_error(str(e), context="Main tick"),
-                            return_exceptions=True,
-                        )
-                    except Exception:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=TICK_SECONDS)
+                    except TimeoutError:
                         pass
-
-                await asyncio.sleep(60)
         finally:
             await self._cleanup()
 
+    async def _tick_until_stopped(self) -> None:
+        tick = asyncio.create_task(self._tick(_now_et()))
+        stopping = asyncio.create_task(self._stop_event.wait())
+        try:
+            done, _ = await asyncio.wait({tick, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if tick in done:
+                tick.result()
+        finally:
+            # This coordinator only refreshes reads and launches owned, detached work.
+            # The execution lanes are not cancelled here.
+            for pending in (tick, stopping):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(tick, stopping, return_exceptions=True)
+
     async def _tick(self, now_et: datetime):
-        """Single tick of the main loop."""
-        # ── First run: execute any pending signals from pre-market scan ──
-        if not self._first_run_done:
-            self._first_run_done = True
-            if self._pending_signals:
-                logger.info("Executing %d pending signals from pre-market scan", len(self._pending_signals))
-                await self._execute_signals(self._pending_signals)
-                self._pending_signals.clear()
-
-        # ── Macro conditions check: Mon-Fri, 7-8 AM ET (before everything else) ──
-        if self._should_run_macro_check(now_et):
-            logger.info("Running macro conditions check")
-            await self._run_macro_check()
-
-        # ── Weekly analysis: Sunday, between 6-8 PM ET ──
-        if self._should_run_weekly(now_et):
-            logger.info("Starting weekly analysis cycle")
-            await self._run_weekly_analysis()
-
-        # ── Mid-week analysis: Wednesday, between 6-8 PM ET ──
-        if self._should_run_midweek(now_et):
-            logger.info("Starting mid-week analysis cycle")
-            await self._run_midweek_analysis()
-
-        # ── Morning brief: Mon-Fri, 8:15-8:45 AM ET (after macro check, before scan) ──
-        if self._should_send_morning_brief(now_et):
-            logger.info("Sending morning brief")
-            await self._send_morning_brief()
-
-        # ── Daily pre-market scan: Mon-Fri, 8-9 AM ET ──
-        if self._should_run_daily_prescan(now_et):
-            logger.info("Starting daily pre-market scan")
-            await self._run_daily_prescan()
-
-        # ── Options scan: Mon-Fri, 9:00-9:30 AM ET (after prescan, before market open) ──
-        if self._should_run_options_scan(now_et):
-            logger.info("Starting options scan")
-            await self._run_options_scan()
-
-        # ── Earnings-reactive scan: Mon-Fri, check for recent earnings ──
-        if self._should_run_earnings_check(now_et):
-            logger.info("Starting earnings-reactive scan")
-            await self._run_earnings_reactive()
-
-        # ── Market monitoring during open hours ──
+        """Run protection and maintenance first; research never holds this critical path."""
+        if self._shutdown:
+            return
+        await self.calendar.refresh()
+        if self._shutdown:
+            return
+        if not self._reconciled or self._last_reconcile_at is None or (
+            _now_utc() - self._last_reconcile_at >= timedelta(seconds=90)
+        ):
+            await self._reconcile_scheduler("scheduler tick")
+        await self._collect_finished_jobs()
+        if self._shutdown:
+            return
+        now_et = _now_et()
+        day_key = now_et.date().isoformat()
+        await self._drive_order_lane(now_et)
         if self._is_market_open(now_et):
-            # Execute any pending signals once market opens
-            if self._pending_signals:
-                logger.info("Market open — executing %d pending signals", len(self._pending_signals))
-                executed = await self._execute_signals(self._pending_signals)
-                self._pending_signals.clear()
+            if self._shutdown:
+                return
+            if self.research is not None and self._should_check_events():
+                self._last_news_at = now_et
+                slot = str(int(now_et.timestamp()) // NEWS_SECONDS)
+                self._schedule_job("live_news", f"{day_key}:{slot}", self._run_news_slot, timeout=150)
+                self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
+            if self._should_run_options_scan(now_et):
+                self._schedule_job("options", day_key, self._run_options_scan, timeout=None, replay=False)
+            if self.options is not None:
+                await self._drive_options_monitor()
 
-            if self._should_monitor(now_et):
-                logger.info("Running market monitoring")
-                await self._run_market_monitoring()
-                # Check options positions for auto-close triggers
-                await self._check_options_positions()
-                # Check for major market events that should trigger immediate re-scan
-                await self._check_for_market_event()
+        # Re-read the clock after the protection lane and schedule by actual session.
+        now_et = _now_et()
+        day_key = now_et.date().isoformat()
+        jobs = (
+            ("macro", self._should_run_macro_check, self._run_macro_check, 120),
+            ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
+            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
+            ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
+            ("daily_summary", self._should_send_daily_summary, self._send_daily_summary, 120),
+            ("weekly", self._should_run_weekly, self._run_weekly_analysis, 1500),
+            ("midweek", self._should_run_midweek, self._run_midweek_analysis, 1500),
+        )
+        for name, due, callback, timeout in jobs:
+            if name in {"earnings", "prescan", "weekly", "midweek"} and self.research is None:
+                continue
+            if not self._shutdown and due(now_et):
+                key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
+                self._schedule_job(name, key, callback, timeout=timeout, replay=name not in {
+                    "morning_brief", "daily_summary",
+                })
 
-        # ── Daily summary at market close ──
-        if self._should_send_daily_summary(now_et):
-            logger.info("Sending daily summary")
-            await self._send_daily_summary()
+    async def _run_news_slot(self):
+        return await self._run_held_news_check(self.ledger.snapshot())
+
+    def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
+        if self._shutdown or name in self._job_tasks:
+            return
+        row = self.ledger.job_status(name, window_key)
+        if row is not None:
+            if row.status in {JobStatus.DONE, JobStatus.SKIPPED} or row.attempts >= MAX_JOB_ATTEMPTS:
+                return
+            if row.status is JobStatus.STARTED and not replay:
+                # An external notification/order may have succeeded before the crash.
+                self.ledger.finish_job(name, window_key, JobStatus.SKIPPED, detail={"reason": "interrupted"})
+                return
+            if row.eligible_retry_at and row.eligible_retry_at > _now_utc():
+                return
+        attempt = self.ledger.start_job(name, window_key).attempts
+        self._job_tasks[name] = asyncio.create_task(
+            self._run_scheduled_job(name, window_key, callback, timeout, attempt),
+            name=f"stock-agent:{name}",
+        )
+
+    async def _run_scheduled_job(self, name, window_key, callback, timeout, attempt):
+        try:
+            async with asyncio.timeout(timeout):
+                outcome = await callback()
+            status = JobStatus(getattr(outcome, "status", JobStatus.DONE))
+            intents = getattr(outcome, "intents", ())
+            detail = getattr(outcome, "detail", {})
+            if not isinstance(detail, Mapping):
+                detail = {"reason": str(detail)[:160]}
+            retry = _now_utc() + timedelta(minutes=5 * attempt) if status is JobStatus.FAILED else None
+            self.ledger.finish_job(name, window_key, status, intents=intents, detail=detail, eligible_retry_at=retry)
+            if status in {JobStatus.FAILED, JobStatus.SKIPPED}:
+                await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
+                                  key=f"job-result:{name}")
+        except Exception as exc:
+            self.ledger.finish_job(name, window_key, JobStatus.FAILED,
+                                   detail={"error": type(exc).__name__},
+                                   eligible_retry_at=_now_utc() + timedelta(minutes=5 * attempt))
+            await self._alert("warning", f"{name} did not complete", type(exc).__name__, key=f"job:{name}")
+
+    async def _collect_finished_jobs(self):
+        for name, task in tuple(self._job_tasks.items()):
+            if task.done():
+                del self._job_tasks[name]
+                if not task.cancelled() and task.exception() is not None:
+                    await self._alert("critical", f"{name} could not persist its outcome",
+                                      type(task.exception()).__name__, key=f"job-write:{name}")
+
+    async def _drive_order_lane(self, now: datetime):
+        if self._order_task is not None:
+            if not self._order_task.done():
+                return
+            if not self._order_task.cancelled() and self._order_task.exception() is not None:
+                await self._alert("warning", "Order lane did not complete",
+                                  type(self._order_task.exception()).__name__, key="order-lane")
+            self._order_task = None
+        if self.engine is not None and self._reconciled and not self._shutdown and self._should_monitor(now):
+            self._last_monitor_time = now
+            self._order_task = asyncio.create_task(self._run_execution_cycle(), name="stock-agent:protection")
+
+    async def _drive_options_monitor(self):
+        if self._options_task is not None:
+            if not self._options_task.done():
+                return
+            if not self._options_task.cancelled() and self._options_task.exception() is not None:
+                await self._alert("warning", "Option protection did not complete",
+                                  type(self._options_task.exception()).__name__, key="options-monitor")
+        if "options" not in self._job_tasks and not self._shutdown:
+            self._options_task = asyncio.create_task(
+                self._check_options_positions(), name="stock-agent:options-protection",
+            )
+
+    async def _run_execution_cycle(self):
+        if not self._engine_resumed:
+            await self._resume_execution()
+        if self._shutdown:
+            return
+        await self.engine.monitor_tick()
+        if self.engine.normalised and not self._normalised:
+            self._normalised = await self._reconcile_scheduler("normalise completed")
+
+    async def _resume_execution(self):
+        async with asyncio.timeout(30):
+            await self.engine.resume()
+        self._engine_resumed = True
+        if self._reconciled:
+            self._normalised = self.engine.normalised
 
     # ── Schedule checks ──────────────────────────────────────────────
 
     def _should_run_macro_check(self, now_et: datetime) -> bool:
-        """Run macro conditions check Mon-Fri, 6:30-7:30 AM ET (before pre-market scan)."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._macro_check_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(6, 30) <= current_time <= time(7, 30)
+        return self._in_preopen(now_et, start_minutes=180, end_minutes=120)
 
     def _should_run_options_scan(self, now_et: datetime) -> bool:
-        """Run options scan Mon-Fri, 9:45 AM - 2:00 PM ET.
-
-        Wide window so restarts during market hours don't miss it.
-        Runs after market open for live bid/ask quotes on calls.
-        """
-        if now_et.weekday() >= 5:
+        if self.options is None or not self._entries_enabled() or not self._is_market_open(now_et):
             return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._options_scan_done_today == today_str:
+        session = self.calendar.session_on(now_et.date())
+        if session is None or (self._options_task is not None and not self._options_task.done()):
             return False
-        current_time = now_et.time()
-        return time(9, 45) <= current_time <= time(14, 0)
+        until = min(datetime.combine(now_et.date(), time(15, 0), ET), session.closes_at - timedelta(minutes=10))
+        return session.opens_at + timedelta(minutes=15) <= now_et < until
 
     def _should_send_morning_brief(self, now_et: datetime) -> bool:
-        """Send morning brief Mon-Fri, 8:15-8:45 AM ET (8:15-8:45 PM SGT)."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._morning_brief_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(8, 15) <= current_time <= time(8, 45)
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and session.opens_at - timedelta(minutes=75) <= now_et <
+                    session.opens_at + timedelta(hours=1))
 
     def _should_run_weekly(self, now_et: datetime) -> bool:
-        """Run weekly analysis on Sunday between 6-8 PM ET."""
-        if now_et.weekday() != self.config.WEEKLY_ANALYSIS_DAY:
-            return False
-        if not (18 <= now_et.hour <= 20):
-            return False
-        # Only once per week
-        last = self.portfolio.state.last_weekly_analysis
-        if last:
-            last_et = last.astimezone(ET) if last.tzinfo else last.replace(tzinfo=timezone.utc).astimezone(ET)
-            if (now_et - last_et).days < 5:
-                return False
-        return True
+        return self._research_window(now_et, "weekly")
 
     def _should_run_midweek(self, now_et: datetime) -> bool:
-        """Run mid-week analysis on Wednesday between 6-8 PM ET."""
-        if now_et.weekday() != self.config.MIDWEEK_ANALYSIS_DAY:
-            return False
-        if not (18 <= now_et.hour <= 20):
-            return False
-        # Only once per week
-        week_key = now_et.strftime("%Y-W%W")
-        if self._midweek_analysis_done_this_week == week_key:
-            return False
-        return True
+        return self._research_window(now_et, "midweek")
 
     def _should_run_daily_prescan(self, now_et: datetime) -> bool:
-        """Run daily pre-market scan Mon-Fri, 8-9 AM ET."""
-        if now_et.weekday() >= 5:  # Weekend
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._daily_prescan_done_today == today_str:
-            return False
-        # Between 8:00 AM and 9:00 AM ET
-        current_time = now_et.time()
-        return time(8, 0) <= current_time <= time(9, 0)
+        return self._in_preopen(now_et, start_minutes=90, end_minutes=30)
 
     def _should_run_earnings_check(self, now_et: datetime) -> bool:
-        """Check for earnings-reactive opportunities Mon-Fri, 7-8 AM ET."""
-        if now_et.weekday() >= 5:
-            return False
-        if not getattr(self.config, "EARNINGS_CHECK_ENABLED", True):
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._earnings_check_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(7, 0) <= current_time <= time(8, 0)
+        return self.config.EARNINGS_CHECK_ENABLED and self._in_preopen(now_et, start_minutes=150, end_minutes=90)
 
     def _is_market_open(self, now_et: datetime) -> bool:
-        """Check if US stock market is currently open."""
-        if now_et.weekday() >= 5:  # Saturday or Sunday
-            return False
-        current_time = now_et.time()
-        return MARKET_OPEN <= current_time <= MARKET_CLOSE
+        return self.calendar.is_open(now_et)
 
     def _should_monitor(self, now_et: datetime) -> bool:
-        """Check if enough time has passed since last monitoring run."""
-        if not self._last_monitor_time:
+        if self._last_monitor_time is None:
             return True
-        elapsed = (now_et - self._last_monitor_time).total_seconds()
-        return elapsed >= self.config.SCAN_INTERVAL_MINUTES * 60
+        elapsed = now_et.timestamp() - self._last_monitor_time.timestamp()
+        return elapsed >= TICK_SECONDS or elapsed < 0
 
     def _should_send_daily_summary(self, now_et: datetime) -> bool:
-        """Send daily summary once per day after market close."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._daily_summary_sent_today == today_str:
-            return False
-        # Between 4:05 PM and 4:30 PM ET
-        current_time = now_et.time()
-        return time(16, 5) <= current_time <= time(16, 30)
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and now_et >= session.closes_at + timedelta(minutes=5))
+
+    def _in_preopen(self, now_et: datetime, *, start_minutes: int, end_minutes: int) -> bool:
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and session.opens_at - timedelta(minutes=start_minutes) <= now_et <
+                    session.opens_at - timedelta(minutes=end_minutes))
+
+    def _research_anchor(self, now_et: datetime, job: str):
+        weekday = self.config.WEEKLY_ANALYSIS_DAY if job == "weekly" else self.config.MIDWEEK_ANALYSIS_DAY
+        return now_et.date() - timedelta(days=(now_et.weekday() - weekday) % 7)
+
+    def _research_week_key(self, now_et: datetime, job: str) -> str:
+        return self._research_anchor(now_et, job).isoformat()
+
+    def _research_window(self, now_et: datetime, job: str) -> bool:
+        anchor = self._research_anchor(now_et, job)
+        if now_et.date() == anchor:
+            return 18 <= now_et.hour < 21
+        next_session = self.calendar.next_session(anchor)
+        return bool(next_session and next_session.date == now_et.date() and
+                    self._in_preopen(now_et, start_minutes=180, end_minutes=30))
 
     # ── Weekly analysis ──────────────────────────────────────────────
 
@@ -1115,11 +1261,10 @@ class StockAgentScheduler:
             logger.exception("Market monitoring failed: %s", e)
 
     def _should_check_events(self) -> bool:
-        """Only check material events every other monitoring cycle to manage API costs."""
-        if not self._last_monitor_time:
-            return True
-        # Check events on even hours only
-        return _now_et().hour % 2 == 0
+        now = _now_et()
+        return self._is_market_open(now) and (
+            self._last_news_at is None or now.timestamp() - self._last_news_at.timestamp() >= NEWS_SECONDS
+        )
 
     # ── Daily summary ────────────────────────────────────────────────
 
@@ -1984,21 +2129,48 @@ class StockAgentScheduler:
     # ── Cleanup ──────────────────────────────────────────────────────
 
     async def _cleanup(self):
-        """Graceful cleanup of all resources."""
-        logger.info("Cleaning up resources...")
-        try:
-            await asyncio.gather(
-                self.telegram.send_message("\U0001f6d1 <b>Stock Agent shutting down</b>"),
-                self.discord.send_shutdown("Graceful shutdown"),
-                return_exceptions=True,
-            )
-        except Exception:
-            pass
+        """Cut off new work, drain order paths, then release network and database resources."""
+        self.shutdown()
+        notify_systemd("STOPPING=1\nSTATUS=Draining trading tasks")
+        passive = [task for name, task in self._job_tasks.items() if name != "options"]
+        for task in passive:
+            task.cancel()
+        active = [task for task in (self._order_task, self._options_task, self._job_tasks.get("options"))
+                  if task is not None]
+        if self.engine is not None:
+            active.append(asyncio.create_task(self.engine.drain(70)))
+        all_tasks = set(passive + active)
+        if all_tasks:
+            done, pending = await asyncio.wait(all_tasks, timeout=75)
+            if pending:
+                await self._alert("critical", "Shutdown drain deadline exceeded",
+                                  "Unresolved broker intents will be recovered by client order ID on startup.",
+                                  key="shutdown-drain")
+                for task in pending:
+                    task.cancel()
+                finished, _ = await asyncio.wait(pending, timeout=2)
+                done.update(finished)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+        self._state_ready = False
+        self._publish_runtime()
+        await self._alert("info", "Stock agent stopped", "In-flight order recovery remains durable.")
 
-        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram, self.discord, self.macro, self.options_data, self.options_executor]:
-            try:
-                await resource.close()
-            except Exception:
-                pass
-
+        seen = set()
+        dynamic = ("data_feed", "analyst", "screener", "executor", "telegram", "discord", "macro",
+                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker")
+        for name in dynamic:
+            resource = getattr(self, name, None)
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if close is not None:
+                try:
+                    async with asyncio.timeout(1):
+                        await close()
+                except Exception:
+                    logger.warning("Service resource did not close: %s", name)
+        self.store.close()
         logger.info("Cleanup complete")
