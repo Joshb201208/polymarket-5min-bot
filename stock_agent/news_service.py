@@ -430,14 +430,15 @@ class NewsService:
 
         raw_items: list[NewsItem] = []
         errors: dict[str, str] = {}
-        providers_attempted = 0
-        providers_succeeded = 0
+        alpaca_ok = False
+        finnhub_covered: tuple[str, ...] = ()
 
         # 1. Primary: Alpaca News REST (/v1beta1/news)
-        if bool(getattr(self.config, "ALPACA_API_KEY", "")) and not self.health.is_blocked(
-            "alpaca", "news", now=now_utc
-        ):
-            providers_attempted += 1
+        if not (getattr(self.config, "ALPACA_API_KEY", "") and getattr(self.config, "ALPACA_SECRET_KEY", "")):
+            errors["alpaca"] = "Alpaca news credentials not configured"
+        elif self.health.is_blocked("alpaca", "news", now=now_utc):
+            errors["alpaca"] = "Alpaca news temporarily plan-blocked"
+        else:
             alp_items, alp_err = await self._fetch_alpaca_news(
                 polled_symbols,
                 start_utc=alpaca_start,
@@ -448,7 +449,7 @@ class NewsService:
                 threshold=materiality_threshold,
             )
             if alp_err is None:
-                providers_succeeded += 1
+                alpaca_ok = True
                 raw_items.extend(alp_items)
             else:
                 errors["alpaca"] = alp_err
@@ -465,8 +466,7 @@ class NewsService:
             and bool(getattr(self.config, "FINNHUB_API_KEY", ""))
             and not self.health.is_blocked("finnhub", "company_news", now=now_utc)
         ):
-            providers_attempted += 1
-            fh_items, fh_err = await self._fetch_finnhub_news(
+            fh_items, finnhub_covered, fh_err = await self._fetch_finnhub_news(
                 priority_symbols,
                 start_utc=default_start,
                 end_utc=now_utc,
@@ -475,10 +475,8 @@ class NewsService:
                 focus_set=focus_set,
                 threshold=materiality_threshold,
             )
-            if fh_err is None:
-                providers_succeeded += 1
-                raw_items.extend(fh_items)
-            else:
+            raw_items.extend(fh_items)
+            if fh_err is not None:
                 errors["finnhub"] = fh_err
 
         # 3. Tertiary: SEC EDGAR filings (8-K, 10-Q, 10-K) when enabled
@@ -495,22 +493,7 @@ class NewsService:
             )
             raw_items.extend(sec_items)
 
-        if providers_attempted == 0:
-            errors["config"] = "no news provider credentials configured"
-            self.health.record_news_poll(polled_symbols, now_utc, source="none", ok=False)
-            batch = NewsFeedBatch(
-                ok=False,
-                degraded=False,
-                as_of=now_utc,
-                items=(),
-                new_items=(),
-                material_new_items=(),
-                errors=errors,
-            )
-            self._latest_batch = batch
-            return batch
-
-        if providers_succeeded == 0:
+        if not alpaca_ok and not finnhub_covered:
             self.health.record_news_poll(polled_symbols, now_utc, source="failed", ok=False)
             batch = NewsFeedBatch(
                 ok=False,
@@ -537,17 +520,17 @@ class NewsService:
             newest_ts = max((i.published_at for i in merged), default=now_utc)
             self._save_state(scope, max(now_utc, newest_ts))
 
-        source_label = "alpaca" if "alpaca" not in errors else "finnhub"
-        covered_syms = (
-            tuple(polled_symbols) if "alpaca" not in errors else tuple(priority_symbols)
-        )
+        source_label = "alpaca" if alpaca_ok else "finnhub"
+        covered_syms = tuple(polled_symbols) if alpaca_ok else finnhub_covered
+        covered_set = set(covered_syms)
         self.health.record_news_poll(
             covered_syms,
             now_utc,
             source=source_label,
             ok=True,
             degraded=degraded,
-            include_market=include_market and ("alpaca" not in errors),
+            include_market=include_market and alpaca_ok,
+            uncovered_symbols=(symbol for symbol in polled_symbols if symbol not in covered_set),
         )
 
         batch = NewsFeedBatch(
@@ -641,9 +624,16 @@ class NewsService:
                     )
                     return items, msg
 
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                rows = payload.get("news") if isinstance(payload, dict) else None
+                if not isinstance(rows, list):
+                    msg = "Alpaca news returned an invalid payload"
+                    self.health.record_failure("alpaca", "news", summary=msg, required=True, at=now_utc)
+                    return items, msg
                 self.health.record_ok("alpaca", "news", required=True, at=now_utc)
-                payload = resp.json()
-                rows = payload.get("news", []) if isinstance(payload, dict) else []
                 for row in rows:
                     parsed = self._parse_alpaca_item(
                         row,
@@ -731,15 +721,16 @@ class NewsService:
         target_set: set[str],
         focus_set: set[str],
         threshold: int,
-    ) -> tuple[list[NewsItem], str | None]:
+    ) -> tuple[list[NewsItem], tuple[str, ...], str | None]:
         items: list[NewsItem] = []
         from_str = start_utc.astimezone(ET).date().isoformat()
         to_str = end_utc.astimezone(ET).date().isoformat()
-        any_ok = False
+        covered: list[str] = []
         last_err: str | None = None
 
         for sym in symbols:
             if self.health.is_blocked("finnhub", "company_news", symbol=sym, now=now_utc):
+                last_err = "Finnhub company-news temporarily plan-blocked for a requested symbol"
                 continue
             try:
                 resp = await self.http.get(
@@ -763,15 +754,20 @@ class NewsService:
                     summary=last_err,
                     at=now_utc,
                 )
-                if resp.status_code in (401, 403, 429):
+                if resp.status_code in (401, 429):
                     break
                 continue
 
-            any_ok = True
-            self.health.record_ok("finnhub", "company_news", required=False, at=now_utc)
-            rows = resp.json()
+            try:
+                rows = resp.json()
+            except ValueError:
+                rows = None
             if not isinstance(rows, list):
+                last_err = "Finnhub company-news returned an invalid payload"
+                self.health.record_failure("finnhub", "company_news", symbol=sym, summary=last_err, at=now_utc)
                 continue
+            covered.append(sym)
+            self.health.record_ok("finnhub", "company_news", required=False, at=now_utc)
             for row in rows[:25]:
                 if not isinstance(row, dict):
                     continue
@@ -819,9 +815,7 @@ class NewsService:
                     )
                 )
 
-        if not any_ok and last_err is not None:
-            return [], last_err
-        return items, None
+        return items, tuple(covered), last_err
 
     async def _fetch_sec_filings(
         self,
