@@ -124,7 +124,7 @@ class MacroMonitor:
     def __init__(self, config: Any = Config, *, prices: Any = None, store: Any = None,
                  alert: Callable[..., Any] | None = None, report: Callable[..., Any] | None = None,
                  fred: Callable[[str], Awaitable[float | None]] | None = None,
-                 now: Callable[[], datetime] | None = None):
+                 now: Callable[[], datetime] | None = None, defer_load: bool = False):
         self.config = config
         self.prices = prices
         self.store = store
@@ -132,7 +132,46 @@ class MacroMonitor:
         self._report = report
         self._fred = fred
         self._now = now or (lambda: datetime.now(timezone.utc))
-        self._last_snapshot: MacroSnapshot | None = self._load_state()
+        self._snap: MacroSnapshot | None = None
+        self._loaded = False
+        if not defer_load:
+            self.load_state()
+
+    # The persisted regime is rehydrated lazily: a store that is not open yet
+    # (defer_load=True, or bind_store before open) is retried on next access
+    # rather than silently replaced by an empty state.
+    @property
+    def _last_snapshot(self) -> MacroSnapshot | None:
+        if not self._loaded:
+            self.load_state()
+        return self._snap
+
+    @_last_snapshot.setter
+    def _last_snapshot(self, snap: MacroSnapshot | None) -> None:
+        self._snap = snap
+        self._loaded = True
+
+    def bind_store(self, store: Any, *, load: bool = True) -> None:
+        """Attach the state store after construction (scheduler startup)."""
+        self.store = store
+        self._loaded = False
+        if load:
+            self.load_state()
+
+    def load_state(self) -> MacroSnapshot | None:
+        """Rehydrate the persisted regime. Idempotent; a failed read is retried later."""
+        if self.store is None:
+            return self._snap
+        try:
+            rec = self.store.kv_get(STORE_KEY, None)
+        except Exception as e:
+            logger.warning("Macro state not loaded yet (will retry): %s", e)
+            return self._snap
+        loaded = MacroSnapshot.from_record(rec)
+        if loaded is not None or self._snap is None:
+            self._snap = loaded
+        self._loaded = True
+        return self._snap
 
     async def close(self) -> None:  # kept for the scheduler's shutdown loop
         return None
@@ -368,15 +407,6 @@ class MacroMonitor:
             self.store.kv_set(HISTORY_KEY, hist[-90:])
         except Exception as e:
             logger.error("Failed to save macro state: %s", e)
-
-    def _load_state(self) -> MacroSnapshot | None:
-        if self.store is None:
-            return None
-        try:
-            return MacroSnapshot.from_record(self.store.kv_get(STORE_KEY, None))
-        except Exception as e:
-            logger.warning("Failed to load macro state: %s", e)
-            return None
 
     # ------------------------------------------------------------------ report
     def format_discord_brief(self, snapshot: MacroSnapshot) -> dict:
