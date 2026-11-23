@@ -241,18 +241,213 @@ class StockAgentScheduler:
                               key=f"exception:{where}")
 
     def _entries_enabled(self) -> bool:
-        if not self._normalised or not self._reconciled or self._shutdown or self._manually_paused():
-            return False
+        return not self._entry_safety_locks()
+
+    def _entry_safety_locks(self) -> dict[str, tuple[str, str]]:
+        if self._shutdown:
+            return {"shutdown": ("service shutdown", "the service restarts and reaches readiness")}
+        locks = {}
+        if not self._normalised:
+            locks["first_run_normalise"] = (
+                "first-run account cleanup incomplete",
+                "the bot finishes corrective orders, verifies broker no-shorting and reconciles cleanly",
+            )
+        if not self._reconciled:
+            locks["broker_reconcile"] = (
+                "broker reconciliation not clean",
+                "a fresh read of the account, positions, orders and activities resolves the discrepancies",
+            )
+        if self._manually_paused():
+            locks["operator_pause"] = (
+                "operator entry pause",
+                "every active pause-trading file is removed and any configured pause is turned off",
+            )
         try:
-            return not self._risk_controls().drawdown.paused
+            if self.ledger.trading_block():
+                locks["ledger_trading_block"] = (
+                    "ledger trading block",
+                    "a clean broker reconcile or rebuild clears the ledger block",
+                )
+            if self._drawdown_state().paused:
+                pct = getattr(self.config, "DRAWDOWN_THROTTLE_PCT", .15)
+                closes = getattr(self.config, "DRAWDOWN_RECOVERY_SESSIONS", 5)
+                locks["drawdown_pause"] = (
+                    "drawdown halt",
+                    f"drawdown is below {pct:.0%} for {closes} consecutive trusted closes",
+                )
         except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
-            return False
+            locks["risk_state_unavailable"] = (
+                "required ledger or risk state unavailable",
+                "the risk state is readable and valid and the broker reconciles cleanly",
+            )
+        return locks
+
+    def get_entry_locks(self) -> list[dict[str, str]]:
+        locks = self._entry_safety_locks()
+        try:
+            status = getattr(self.health, "status", None)
+            news = status("news", "poll") if status is not None else None
+            if news is not None and news.state in {"unhealthy", "plan_blocked", "disabled"}:
+                locks["news_health"] = (
+                    "required news coverage unavailable",
+                    "a successful fresh news poll covers the candidate",
+                )
+            check_llm = getattr(self.llm, "is_healthy", None)
+            if check_llm is not None and not check_llm():
+                locks["llm_health"] = (
+                    "no usable configured model route",
+                    "at least one valid model route recovers or its cooldown ends",
+                )
+            snapshot = self.ledger.last_snapshot()
+            flags = getattr(snapshot, "account_flags", {})
+            if any(flags.get(flag) is True for flag in ("account_blocked", "trading_blocked", "trade_suspended_by_user")):
+                locks["broker_account_block"] = (
+                    "broker account has a trading restriction",
+                    "the broker removes the restriction and a fresh account reconcile confirms it",
+                )
+            account_status = flags.get("status")
+            if account_status and str(account_status).lower() != "active":
+                locks["broker_account_inactive"] = (
+                    "broker account is not active",
+                    "the broker reports ACTIVE on a fresh account reconcile",
+                )
+            if snapshot is not None and abs(_now_utc() - snapshot.as_of) <= timedelta(seconds=120):
+                margin = self.risk.margin_status(snapshot)
+                target = Decimal(str(self.config.MARGIN_MIN_EXCESS_PCT))
+                if margin is not None and margin.margin_call:
+                    locks["margin_call"] = (
+                        "broker reports a margin call",
+                        "a fresh broker reconcile confirms the margin call is cleared",
+                    )
+                if margin is not None and margin.excess_pct < target:
+                    locks["margin_buffer"] = (
+                        f"margin excess {margin.excess_pct:.1%} is below the entry minimum {target:.0%}",
+                        f"a fresh broker book and projected order both meet the {target:.0%} margin buffer",
+                    )
+                unpriced = [holding.symbol for holding in snapshot.holdings
+                            if holding.qty and (not holding.price_ok or holding.price is None or holding.price <= 0)]
+                if unpriced:
+                    locks["unpriced_stock"] = (
+                        f"stock price missing or invalid for {', '.join(unpriced)}",
+                        "a fresh broker reconcile supplies a valid mark or confirms the position is closed",
+                    )
+        except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
+            locks.setdefault("risk_state_unavailable", (
+                "entry health could not be verified", "health state is readable and required inputs are healthy",
+            ))
+        return [{"code": code, "lock": label, "clears_when": clears} for code, (label, clears) in locks.items()]
+
+    async def _alert_entry_locks(self) -> None:
+        locks = [lock for lock in self.get_entry_locks() if lock["code"] != "shutdown"]
+        if not locks:
+            return
+        notify = getattr(self.alerts, "alert_entries_locked", None)
+        if notify is not None:
+            try:
+                notify(locks, session_date=_now_et().date())
+                return
+            except Exception:
+                logger.warning("Could not queue structured entry-lock alert")
+        for lock in locks:
+            await self._alert("warning", f"Entries locked: {lock['lock']}",
+                              f"Clears when {lock['clears_when']}.", key=f"entry-lock:{lock['code']}")
 
     def _risk_controls(self) -> RiskControls:
         commitments = getattr(self.options, "risk_commitments", None)
         return RiskControls(pause_new_buys=self._manually_paused(),
                             drawdown=self._drawdown_state(),
                             option_commitments=commitments() if commitments is not None else ())
+
+    def _margin_controls(self, snapshot) -> RiskControls:
+        convictions = {}
+        for holding in snapshot.holdings:
+            if holding.qty <= 0:
+                continue
+            thesis = self.ledger.current_thesis(
+                holding.symbol, max_age=timedelta(hours=self.config.RESEARCH_THESIS_MAX_AGE_H),
+            )
+            if (thesis is None or not thesis.actionable) and holding.meta is not None:
+                thesis = self.ledger.last_filled_thesis(holding.meta.position_id)
+            if thesis is not None and thesis.actionable:
+                grade = thesis.payload.get("effective_conviction")
+                if type(grade) is int and 1 <= grade <= 10:
+                    convictions[holding.symbol] = grade
+        commitments = getattr(self.options, "risk_commitments", None)
+        return RiskControls(
+            option_commitments=commitments() if commitments is not None else (),
+            holding_convictions=convictions,
+        )
+
+    async def _evaluate_margin_guard(self, snapshot, now: datetime, *, at_close: bool = False) -> None:
+        try:
+            await self._queue_margin_trim(snapshot, now, at_close=at_close)
+        except Exception as exc:
+            # Margin-state failure must not prevent stops or first-run repairs.
+            await self._report_exception("Margin guard", exc, critical=True)
+
+    async def _queue_margin_trim(self, snapshot, now: datetime, *, at_close: bool) -> None:
+        # Reconciliation can mark the book indicative solely due to an
+        # unrelated instrument mark. The guard uses broker account figures;
+        # the planner independently excludes unpriced stock from its sells.
+        if snapshot is None or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=120):
+            return
+        status = self.risk.margin_status(snapshot)
+        if status is None:
+            return
+        key = "a13.margin_trim_episode"
+        record = self.ledger.risk_state_get(key, {})
+        episode = record.get("opened_at")
+        target = Decimal(str(self.config.MARGIN_MIN_EXCESS_PCT))
+        if status.excess_pct >= target and not status.margin_call:
+            if episode:
+                self.ledger.risk_state_set(key, {})
+            return
+        if not episode and not status.needs_trim:
+            return
+        if not episode:
+            episode = snapshot.as_of.isoformat()
+            self.ledger.risk_state_set(key, {"opened_at": episode})
+
+        session = self.calendar.next_session(now.date()) if at_close else self.calendar.session_on(now.date())
+        queued = False
+        self.ledger.expire_intents(_now_utc())
+        existing = [row for row in self.ledger.list_intents() if row.origin == "margin_buffer"]
+        latest_execution = max(
+            (row.updated_at or row.created_at for row in existing if row.broker_order_id),
+            default=None,
+        )
+        if (session is not None and not self.ledger.trading_block()
+                and (latest_execution is None or snapshot.as_of > latest_execution)
+                and not any(not row.terminal for row in existing)):
+            plans = self.risk.plan_margin_trim(snapshot, controls=self._margin_controls(snapshot), force=True)
+            for plan in plans:
+                if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
+                    continue
+                # One live leg at a time. With unchanged holdings, avoid
+                # hammering a failed order during the same five-minute bucket.
+                slot = int(max(now, session.opens_at).timestamp()) // 300
+                event = f"{episode}:{session.date}:{holding.qty}:{slot}"
+                intents = self._trim_intents(
+                    snapshot, (plan,), "margin_buffer", event, session, eligible_at=None if at_close else now,
+                    margin_episode=episode,
+                )
+                if not intents or any(row.dedupe_key == intents[0].dedupe_key for row in existing):
+                    break
+                self.ledger.enqueue_intents(intents, job="margin_guard")
+                if not at_close:
+                    self._last_monitor_time = None
+                queued = True
+                break
+        minimum = f"{target:.0%}"
+        context = "Broker reports a margin call. " if status.margin_call else ""
+        action = ("A revalidated trim is queued." if queued else
+                  "The guard will re-evaluate and queue eligible shares; any pending trim is left in place.")
+        await self._alert(
+            "critical", "Margin buffer breached",
+            f"{context}Margin excess is {status.excess_pct:.1%} of equity. {action} "
+            f"The trim episode clears at or above the required {minimum} buffer once any margin call clears.",
+            key=f"margin-buffer:{episode}",
+        )
 
     def _drawdown_state(self) -> DrawdownState:
         return DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY), config=self.config)
@@ -352,12 +547,12 @@ class StockAgentScheduler:
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
             return GateDecision(False, "shutdown in progress")
-        if purpose == "entry" and not self._entries_enabled():
-            return GateDecision(False, "entry safety conditions are not satisfied")
+        if purpose == "entry" and (locks := self._entry_safety_locks()):
+            return GateDecision(False, "; ".join(locks))
         decision = await self.calendar.market_gate(purpose, rule=rule)
         # A signal or pause can arrive while awaiting the fresh market clock.
-        if purpose == "entry" and not self._entries_enabled():
-            return GateDecision(False, "entry safety conditions are not satisfied")
+        if purpose == "entry" and (locks := self._entry_safety_locks()):
+            return GateDecision(False, "; ".join(locks))
         if purpose != "protection" and self._shutdown:
             return GateDecision(False, "shutdown in progress")
         return decision
@@ -449,6 +644,7 @@ class StockAgentScheduler:
         notify_systemd("READY=1\nSTATUS=Scheduler running; entry gates checked separately")
         await self._alert("info", "Stock agent started",
                           f"{mode}; broker reconciled: {self._reconciled}; entries enabled: {self._entries_enabled()}")
+        await self._alert_entry_locks()
 
     async def run(self):
         """Validate and recover before scheduling money work; exit promptly on SIGTERM."""
@@ -541,7 +737,13 @@ class StockAgentScheduler:
             return
         now_et = _now_et()
         day_key = now_et.date().isoformat()
+        if self._is_market_open(now_et):
+            await self._evaluate_margin_guard(self.ledger.last_snapshot(), now_et)
         await self._drive_order_lane(now_et)
+        try:
+            self._schedule_research_catchup(now_et)
+        except (ValueError, StateUnavailable, sqlite3.Error) as exc:
+            await self._report_exception("Research catch-up", exc)
         if self._is_market_open(now_et):
             if self._shutdown:
                 return
@@ -549,7 +751,8 @@ class StockAgentScheduler:
                 self._last_news_at = now_et
                 slot = str(int(now_et.timestamp()) // NEWS_SECONDS)
                 self._schedule_job("live_news", f"{day_key}:{slot}", self._run_news_slot, timeout=150)
-                self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
+                if "catchup" not in self._job_tasks:
+                    self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
             if self._should_run_options_scan(now_et):
                 self._schedule_job("options", day_key, self._run_options_job, timeout=180)
             if self.options is not None:
@@ -558,6 +761,10 @@ class StockAgentScheduler:
         # Re-read the clock after the protection lane and schedule by actual session.
         now_et = _now_et()
         day_key = now_et.date().isoformat()
+        if self._state_ready and (self._is_market_open(now_et) or self._in_preopen(
+            now_et, start_minutes=180, end_minutes=0,
+        )):
+            await self._alert_entry_locks()
         jobs = (
             ("assets", self._should_refresh_assets, self._refresh_session_assets, 90),
             ("macro", self._should_run_macro_check, self._run_macro_check, 120),
@@ -572,6 +779,8 @@ class StockAgentScheduler:
         )
         for name, due, callback, timeout in jobs:
             if name in {"earnings", "prescan", "weekly", "midweek"} and self.research is None:
+                continue
+            if name in {"weekly", "prescan", "midweek"} and "catchup" in self._job_tasks:
                 continue
             if not self._shutdown and due(now_et):
                 key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
@@ -589,14 +798,16 @@ class StockAgentScheduler:
         if (market.source is not MarketSource.LIVE or market.status is not MarketStatus.CLOSED
                 or session is None or now < session.closes_at):
             return JobOutcome(JobStatus.FAILED, detail={"reason": "close_clock_unverified"})
+        snapshot = await self.ledger.refresh("drawdown close")
+        if (snapshot.equity <= 0 or snapshot.as_of < session.closes_at
+                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        await self._evaluate_margin_guard(snapshot, now, at_close=True)
+        if snapshot.quality != "live" or self.ledger.trading_block():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
-        snapshot = await self.ledger.refresh("drawdown close")
-        if (snapshot.quality != "live" or snapshot.equity <= 0 or snapshot.as_of < session.closes_at
-                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)
-                or self.ledger.trading_block()):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
         marks = self.ledger.equity_marks("close", since=session.date)
         mark = next((item for item in marks if item.session_date == session.date), None)
         if mark is None:
@@ -674,19 +885,22 @@ class StockAgentScheduler:
             return JobOutcome(JobStatus.DONE, intents=intents)
         return None
 
-    def _trim_intents(self, snapshot, plans, source: str, event: str, session, **proof) -> tuple[NewIntent, ...]:
+    def _trim_intents(
+        self, snapshot, plans, source: str, event: str, session, *, eligible_at=None, **proof,
+    ) -> tuple[NewIntent, ...]:
         intents = []
         for plan in plans:
             if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
                 continue
             intents.append(NewIntent(
                 symbol=plan.symbol, side="sell", kind="trim", origin=source,
-                dedupe_key=f"a6:{source}:{event}:{plan.symbol}",
+                dedupe_key=f"{'a13' if source == 'margin_buffer' else 'a6'}:{source}:{event}:{plan.symbol}",
                 position_id=holding.meta.position_id if holding.meta else None,
                 reference_price=plan.price,
-                session_date=session.date, next_attempt_at=session.opens_at + timedelta(minutes=5),
+                session_date=session.date, next_attempt_at=eligible_at or session.opens_at + timedelta(minutes=5),
                 expires_at=session.closes_at,
-                meta={"rule": "assignment" if source == "option_delivery" else "risk_limit",
+                meta={"rule": {"option_delivery": "assignment", "margin_buffer": "margin_buffer"}.get(
+                    source, "risk_limit"),
                       "qty": str(plan.qty), "reason": plan.reason, **proof},
             ))
         return tuple(intents)
@@ -869,7 +1083,7 @@ class StockAgentScheduler:
             return
         if not (await self.market_gate("entry")).allowed:
             return
-        candidates = [OptionCandidate(idea.symbol, source="news", story_id=idea.story_id,
+        candidates = [OptionCandidate(idea.symbol, source=getattr(idea, "source", "news"), story_id=idea.story_id,
                                       direction_hint=idea.direction.value) for idea in ideas]
         await self.options.scan(_now_utc(), candidates=candidates)
         handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
@@ -910,7 +1124,8 @@ class StockAgentScheduler:
         return self._in_preopen(now_et, start_minutes=180, end_minutes=120)
 
     def _should_run_options_scan(self, now_et: datetime) -> bool:
-        if self.options is None or not self._entries_enabled() or not self._is_market_open(now_et):
+        if (self.options is None or "catchup" in self._job_tasks
+                or not self._entries_enabled() or not self._is_market_open(now_et)):
             return False
         session = self.calendar.session_on(now_et.date())
         if session is None or (self._options_task is not None and not self._options_task.done()):
@@ -967,6 +1182,33 @@ class StockAgentScheduler:
         next_session = self.calendar.next_session(anchor)
         return bool(next_session and next_session.date == now_et.date() and
                     self._in_preopen(now_et, start_minutes=180, end_minutes=30))
+
+    def _schedule_research_catchup(self, now: datetime) -> None:
+        fresh = getattr(self.research, "has_fresh_thesis_set", None)
+        if (fresh is None or not self._reconciled
+                or any(name in self._job_tasks for name in ("catchup", "weekly", "midweek", "prescan"))):
+            return
+        in_session = self._is_market_open(now)
+        if not in_session and not self._in_preopen(now, start_minutes=180, end_minutes=0):
+            return
+        session = self.calendar.session_on(now.date())
+        if session is None or (in_session and now >= session.closes_at - timedelta(minutes=10)):
+            return
+        if fresh(_now_utc()):
+            return
+        phase = "regular" if in_session else "preopen"
+        self._schedule_job("catchup", f"{session.date}:{phase}",
+                           lambda: self._run_research_catchup(phase), timeout=1500)
+
+    async def _run_research_catchup(self, phase: str):
+        if phase == "regular":
+            # Regime observation can only raise the floor and never places orders.
+            try:
+                async with asyncio.timeout(15):
+                    await self._check_for_market_event()
+            except Exception as exc:
+                await self._report_exception("Catch-up regime observation", exc)
+        return await self.research.run("weekly", work_scope=f"catchup-{phase}")
 
     # ── Weekly analysis ──────────────────────────────────────────────
 
