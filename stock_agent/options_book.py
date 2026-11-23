@@ -67,6 +67,10 @@ class Leg:
     def sign(self) -> int:
         return 1 if self.side == "buy" else -1
 
+    @property
+    def close_intent(self) -> str:
+        return "sell_to_close" if self.side == "buy" else "buy_to_close"
+
 
 @dataclass
 class Structure:
@@ -160,17 +164,13 @@ class OptionsStore:
             except OSError:
                 pass
             raise OptionsStateError(f"options book unreadable ({e}); quarantined to {bad.name}") from e
-        structs = [Structure.from_dict(s) for s in raw.get("structures", [])]
-        cds = {k: Cooldown(**v) for k, v in raw.get("cooldowns", {}).items()}
-        return structs, cds, dict(raw.get("meta", {}))
+        try:
+            return _decode(raw)
+        except (TypeError, ValueError, KeyError) as e:
+            raise OptionsStateError(f"options book malformed ({e})") from e
 
     def save(self, structures: Iterable[Structure], cooldowns: Mapping[str, Cooldown], meta: Mapping[str, Any]) -> None:
-        data = {
-            "schema": SCHEMA_VERSION,
-            "structures": [asdict(s) for s in structures],
-            "cooldowns": {k: asdict(v) for k, v in cooldowns.items()},
-            "meta": dict(meta),
-        }
+        data = _encode(structures, cooldowns, meta)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name, suffix=".tmp")
         try:
@@ -189,6 +189,51 @@ class OptionsStore:
 
 class OptionsStateError(RuntimeError):
     pass
+
+
+class KvOptionsStore:
+    """The same book kept as one JSON value in the shared SQLite store (state_ledger)."""
+
+    KEY = "options.book.v1"
+
+    def __init__(self, store: Any, key: str | None = None):
+        self.store = store
+        self.key = key or self.KEY
+
+    def load(self) -> tuple[list[Structure], dict[str, Cooldown], dict[str, Any]]:
+        try:
+            raw = self.store.kv_get(self.key, None)
+        except Exception as e:
+            raise OptionsStateError(f"options book unreadable ({e})") from e
+        if not raw:
+            return [], {}, {}
+        try:
+            return _decode(raw)
+        except (TypeError, ValueError, KeyError) as e:
+            raise OptionsStateError(f"options book malformed ({e})") from e
+
+    def save(self, structures: Iterable[Structure], cooldowns: Mapping[str, Cooldown], meta: Mapping[str, Any]) -> None:
+        self.store.kv_set(self.key, _encode(structures, cooldowns, meta))
+
+
+def _encode(structures, cooldowns, meta) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA_VERSION,
+        "structures": [asdict(s) for s in structures],
+        "cooldowns": {k: {**asdict(v), "until": v.until.isoformat() if v.until else None}
+                      for k, v in cooldowns.items()},
+        "meta": dict(meta),
+    }
+
+
+def _decode(raw: Mapping[str, Any]):
+    structs = [Structure.from_dict(s) for s in raw.get("structures", [])]
+    cds = {}
+    for k, v in raw.get("cooldowns", {}).items():
+        v = dict(v)
+        v["until"] = date.fromisoformat(v["until"]) if v.get("until") else None
+        cds[k] = Cooldown(**v)
+    return structs, cds, dict(raw.get("meta", {}))
 
 
 # ----------------------------------------------------------------- reconcile

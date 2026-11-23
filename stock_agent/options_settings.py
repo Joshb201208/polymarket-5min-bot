@@ -106,5 +106,19 @@ def resolve_mode(config: Any = None, environ: Mapping[str, str] | None = None) -
     return OptionsMode.DEFINED_RISK
 
 
+# Budgets have one numerical source: the risk settings on Config, when present.
+_SHARED_BUDGETS = {
+    "max_loss_per_structure_pct": "RISK_OPTION_MAX_LOSS_PCT",
+    "max_loss_total_pct": "RISK_OPTION_TOTAL_LOSS_PCT",
+    "max_open_structures": "RISK_OPTION_MAX_STRUCTURES",
+}
+
+
 def load_options_settings(config: Any = None, environ: Mapping[str, str] | None = None) -> OptionsSettings:
-    return replace(OptionsSettings(), mode=resolve_mode(config, environ))
+    base = OptionsSettings()
+    shared: dict[str, Any] = {}
+    for field_name, cfg_name in _SHARED_BUDGETS.items():
+        v = _get(config, cfg_name)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            shared[field_name] = type(getattr(base, field_name))(v)
+    return replace(base, mode=resolve_mode(config, environ), **shared)
