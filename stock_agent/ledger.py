@@ -766,6 +766,11 @@ class Ledger:
             if cur is None or cur.thesis_id not in it.thesis_ids:
                 self._transition(intent_id, IntentStatus.CANCELLED, last_error="thesis superseded")
                 raise LedgerError(f"intent {intent_id}: thesis superseded")
+        if it.position_id:
+            row = self.store.query("SELECT closed_at FROM positions_meta WHERE position_id=?", (it.position_id,))
+            if not row or row[0][0] is not None:
+                self._transition(intent_id, IntentStatus.CANCELLED, last_error="position closed or replaced")
+                raise LedgerError(f"intent {intent_id}: position {it.position_id} is no longer open")
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
 
     def ack_intent(self, intent_id: str, status: IntentStatus | str, *, broker_order_id: str | None = None,
