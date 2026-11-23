@@ -315,11 +315,15 @@ def infer_strategy(legs: list[Leg]) -> tuple[Strategy, Direction | None, float |
     return Strategy.UNKNOWN, None, None
 
 
-def adopt_positions(option_positions: list[Any], now: datetime) -> list[Structure]:
+def adopt_positions(option_positions: list[Any], now: datetime,
+                    hints: Mapping[str, Mapping[str, Any]] | None = None) -> list[Structure]:
     """Group unowned broker option positions into structures: same underlying,
     expiry, type and contract count with one long and one short -> a vertical;
     a long alone -> a long option; anything else -> its own leg, strategy
-    unknown (a naked short becomes REPAIR)."""
+    unknown (a naked short becomes REPAIR). The broker is the truth for legs,
+    quantities and prices; `hints` (legacy rows by contract symbol) only steer
+    pairing towards the legacy group and are recorded in the notes."""
+    hints = hints or {}
     groups: dict[tuple[str, str, str], list[tuple[Leg, int, float]]] = defaultdict(list)
     for p in option_positions:
         occ = parse_occ(p.symbol)
@@ -336,8 +340,10 @@ def adopt_positions(option_positions: list[Any], now: datetime) -> list[Structur
         shorts = sorted([i for i in items if i[0].side == "sell"], key=lambda i: i[0].strike)
         while longs and shorts:
             lg, lq, lp = longs.pop(0)
-            # pair with the short of the same count, else the first
-            idx = next((k for k, s in enumerate(shorts) if s[1] == lq), 0)
+            # pair with the short from the same legacy group, else the same count, else the first
+            grp = (hints.get(lg.symbol) or {}).get("group")
+            idx = next((k for k, s in enumerate(shorts) if grp and (hints.get(s[0].symbol) or {}).get("group") == grp),
+                       next((k for k, s in enumerate(shorts) if s[1] == lq), 0))
             sg, sq, sp = shorts.pop(idx)
             q = min(lq, sq)
             out.append(_adopted(und, exp, [lg, sg], q, round(lp - sp, 4), now))
@@ -352,6 +358,11 @@ def adopt_positions(option_positions: list[Any], now: datetime) -> list[Structur
             st.state = StructState.REPAIR.value
             st.note("adopted a short option without a long leg")
             out.append(st)
+    for st in out:
+        hs = [hints[lg.symbol] for lg in st.legs if lg.symbol in hints]
+        if hs:
+            h = hs[0]
+            st.note(f"legacy group {h.get('group')} ({h.get('strategy')}), legacy entry {h.get('entry_price')}")
     return out
 
 
@@ -366,3 +377,45 @@ def _adopted(und: str, exp: str, legs: list[Leg], qty: int, debit: float, now: d
     )
     st.note("adopted from broker positions; entry from broker average prices")
     return st
+
+
+# ------------------------------------------------------------ legacy import
+LEGACY_HINTS_KEY = "legacy_hints"
+
+
+def legacy_hints_from_rows(open_rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Contract symbol -> legacy group facts, from options_portfolio.json open rows."""
+    hints: dict[str, dict[str, Any]] = {}
+    for row in open_rows:
+        if not isinstance(row, Mapping):
+            continue
+        group = str(row.get("position_id") or "") or None
+        base = {"group": group, "strategy": row.get("strategy"), "entry_price": row.get("entry_price"),
+                "opened_at": row.get("entry_date") or row.get("opened_at")}
+        for key, side_key in (("contract_symbol", "side"), ("leg2_contract_symbol", "leg2_side")):
+            sym = row.get(key)
+            if sym and parse_occ(str(sym)) is not None:
+                hints[str(sym)] = {**base, "side": row.get(side_key)}
+    return hints
+
+
+def import_legacy_options(conn: Any, open_rows: list[dict], key: str = KvOptionsStore.KEY) -> int:
+    """state_ledger's migrate_v0 options hook: `(conn, open_rows) -> rows imported`.
+
+    Legacy rows are not trusted as positions. They are stored as pairing hints in
+    the options book; the first reconcile adopts whatever the broker actually holds
+    (spreads paired by legacy group, lone longs as long options, lone shorts as
+    REPAIR) and the exit manager closes adopted structures at T-2. Runs inside the
+    migration transaction, so it writes through `conn`.
+    """
+    hints = legacy_hints_from_rows(open_rows)
+    if not hints:
+        return 0
+    row = conn.execute("SELECT value_json FROM kv WHERE key=?", (key,)).fetchone()
+    book = json.loads(row[0]) if row else {"schema": SCHEMA_VERSION, "structures": [], "cooldowns": {}, "meta": {}}
+    meta = dict(book.get("meta") or {})
+    meta[LEGACY_HINTS_KEY] = {**dict(meta.get(LEGACY_HINTS_KEY) or {}), **hints}
+    book["meta"] = meta
+    conn.execute("INSERT OR REPLACE INTO kv(key, value_json, updated_at) VALUES (?,?,?)",
+                 (key, json.dumps(book, default=str), datetime.now(timezone.utc).isoformat()))
+    return sum(1 for r in open_rows if isinstance(r, Mapping) and parse_occ(str(r.get("contract_symbol") or "")))
