@@ -66,12 +66,15 @@ class ResearchSources:
         return stamp is not None and timedelta() <= now - stamp <= _QUOTE_TTL
 
     def news_ok(self, symbol: str, now: datetime) -> bool:
-        if self.health is not None:
-            return "news_missing_or_stale" not in self.health.research_entry_blockers(
+        stamp = self._news_at.get(symbol)
+        if stamp is None or not timedelta() <= now - stamp <= _NEWS_TTL:
+            return False
+        return (
+            self.health is None
+            or "news_missing_or_stale" not in self.health.research_entry_blockers(
                 symbol, now, news_max_age_s=_NEWS_TTL.total_seconds(),
             )
-        stamp = self._news_at.get(symbol)
-        return stamp is not None and timedelta() <= now - stamp <= _NEWS_TTL
+        )
 
     async def _poll(self, symbols, *, scope, include_market, lookback_hours, focus=(), universe=()):
         if not symbols and not include_market:
