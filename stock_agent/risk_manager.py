@@ -2,7 +2,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
@@ -89,7 +89,11 @@ class DrawdownState:
 
     @property
     def throttled(self) -> bool:
-        return self.paused or self.drawdown >= Decimal("0.15")
+        return self.paused or self.drawdown >= _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+
+    @property
+    def alert(self) -> bool:
+        return self.drawdown >= _decimal(Config.DRAWDOWN_ALERT_PCT)
 
 
 @dataclass(frozen=True)
@@ -146,23 +150,123 @@ class DailyBar(Protocol):
 
 
 def normalize_sector(raw: str | None) -> CanonicalSector:
-    raise NotImplementedError
+    """Collapse provider and older ledger strings into the same sector."""
+    if not isinstance(raw, str):
+        return CanonicalSector.UNKNOWN
+    key = "".join(char for char in raw.casefold() if char.isalnum())
+    return _SECTOR_NAMES.get(key, CanonicalSector.UNKNOWN)
 
 
 def classify_symbol(symbol: str, raw_sector: str | None = None) -> Classification:
-    raise NotImplementedError
+    """Use one issuer identity, retaining all overlapping named clusters."""
+    symbol = symbol.strip().upper()
+    canonical = _ISSUER_ALIASES.get(symbol, symbol)
+    aliases = {alias for alias, issuer in _ISSUER_ALIASES.items() if issuer == canonical}
+    aliases.update((symbol, canonical))
+    sector = _SECTOR_OVERRIDES.get(canonical, normalize_sector(raw_sector))
+    if sector == CanonicalSector.UNKNOWN:
+        sector = normalize_sector(Config.SECTOR_MAP.get(symbol) or Config.SECTOR_MAP.get(canonical))
+    clusters = tuple(name for name, members in Config.SYMBOL_CLUSTERS.items()
+                     if aliases.intersection(members))
+    return Classification(canonical, sector, clusters)
+
+
+_SECTOR_NAMES = {
+    "".join(char for char in sector.value.casefold() if char.isalnum()): sector
+    for sector in CanonicalSector
+}
+_SECTOR_NAMES.update({
+    "technology": CanonicalSector.INFORMATION_TECHNOLOGY,
+    "financialservices": CanonicalSector.FINANCIALS,
+    "finance": CanonicalSector.FINANCIALS,
+    "consumercyclical": CanonicalSector.CONSUMER_DISCRETIONARY,
+    "consumerdefensive": CanonicalSector.CONSUMER_STAPLES,
+    "basicmaterials": CanonicalSector.MATERIALS,
+})
+_ISSUER_ALIASES = {"GOOG": "GOOGL", "BRK.A": "BRK.B", "BRK-A": "BRK.B", "BRK-B": "BRK.B"}
+_SECTOR_OVERRIDES = {
+    "GOOGL": CanonicalSector.COMMUNICATION_SERVICES,
+    "META": CanonicalSector.COMMUNICATION_SERVICES,
+}
+
+
+def _decimal(value: object) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a financial quantity")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid financial quantity") from exc
+    if not number.is_finite():
+        raise ValueError("financial quantity must be finite")
+    return number
 
 
 def atr14(bars: Sequence[DailyBar]) -> Decimal | None:
-    raise NotImplementedError
+    """Wilder ATR on completed, sorted, split-adjusted daily bars."""
+    period = Config.STOP_ATR_PERIOD
+    if len(bars) <= period:
+        return None
+    ranges = []
+    previous = None
+    try:
+        for bar in bars:
+            high, low, close = (_decimal(bar.high), _decimal(bar.low), _decimal(bar.close))
+            if not 0 < low <= close <= high:
+                return None
+            if previous is not None:
+                ranges.append(max(high - low, abs(high - previous), abs(low - previous)))
+            previous = close
+    except (ValueError, AttributeError):
+        return None
+    value = sum(ranges[:period], Decimal(0)) / period
+    for true_range in ranges[period:]:
+        value = (value * (period - 1) + true_range) / period
+    return value
 
 
 def stop_fraction(price: Decimal, atr: Decimal | None) -> StopDistance:
-    raise NotImplementedError
+    price = _decimal(price)
+    if price <= 0:
+        raise ValueError("stop reference price must be positive")
+    minimum = _decimal(Config.STOP_LOSS_PCT_MIN)
+    maximum = _decimal(Config.STOP_LOSS_PCT_MAX)
+    try:
+        value = _decimal(atr)
+    except ValueError:
+        return StopDistance(minimum, True)
+    if value < 0:
+        return StopDistance(minimum, True)
+    return StopDistance(
+        min(maximum, max(minimum, _decimal(Config.STOP_ATR_MULTIPLE) * value / price)), False
+    )
+
+
+def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
+    """Round up to the valid price tick so the stop never risks extra distance."""
+    price = _decimal(price)
+    if price <= 0:
+        raise ValueError("stop reference price must be positive")
+    value = price * (1 - distance.fraction)
+    tick = Decimal("0.01") if value >= 1 else Decimal("0.0001")
+    return value.quantize(tick, rounding=ROUND_CEILING)
 
 
 def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -> DrawdownState:
-    raise NotImplementedError
+    """Apply one trusted (flow-adjusted when applicable) close, once."""
+    if not session or (state.last_session is not None and session <= state.last_session):
+        return state
+    close_equity = _decimal(close_equity)
+    if close_equity <= 0:
+        raise ValueError("drawdown requires positive trusted equity")
+    high_water = max(close_equity, state.high_water)
+    drawdown = (high_water - close_equity) / high_water
+    paused = state.paused or drawdown >= _decimal(Config.DRAWDOWN_PAUSE_PCT)
+    recovering = paused and drawdown < _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+    closes = state.recovery_closes + 1 if recovering else 0
+    if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
+        paused, closes = False, 0
+    return DrawdownState(high_water, drawdown, paused, closes, session)
 
 
 class RiskManager:
