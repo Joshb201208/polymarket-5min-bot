@@ -66,16 +66,18 @@ def _manager(world, tmp_path, direction=Direction.BUY):
     return m
 
 
-def test_scan_opens_31_dte_spread_with_short_calendar_window(world, tmp_path):
+def test_scan_never_enters_on_an_estimated_count(world, tmp_path):
     m = _manager(world, tmp_path)
     out = run(m.scan())
-    assert [bool(o.opened) for o in out] == [True], [o.reason for o in out]
-    assert len(m.live()) == 1
+    assert [bool(o.opened) for o in out] == [False]
+    assert "expiry" in out[0].reason
 
 
-def test_distant_structure_is_not_time_exited_by_unknown_count(world, tmp_path):
+def test_distant_held_structure_survives_calendar_gap(world, tmp_path):
     m = _manager(world, tmp_path)
-    run(m.scan())
+    m.calendar = m.calendar.inner  # full calendar at entry
+    assert run(m.scan())[0].opened
+    m.calendar = ShortWindow(m.calendar, date(2026, 11, 23))
     world.clock.advance(minutes=20)
     seed_chain(world)
     assert run(m.monitor()).exits == []

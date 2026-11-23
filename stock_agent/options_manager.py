@@ -354,11 +354,17 @@ class OptionsManager:
     def _today(self, now: datetime) -> date:
         return now.astimezone(ET).date()
 
-    def _trading_days(self, a: date, b: date) -> int | None:
+    def _calendar_days(self, a: date, b: date) -> int | None:
+        """Broker-calendar count only; new entries never use an estimate."""
         try:
-            n = self.calendar.trading_days_between(a, b)
+            return self.calendar.trading_days_between(a, b)
         except Exception:
-            n = None
+            return None
+
+    def _trading_days(self, a: date, b: date) -> int | None:
+        """For managing held structures: falls back to an estimate for distant dates so a
+        calendar outage does not force-close them; near expiry unknown stays None (close)."""
+        n = self._calendar_days(a, b)
         if n is not None or b < a:
             return n
         # Beyond the broker calendar's window: use the weekday/holiday estimate, but only
@@ -552,14 +558,14 @@ class OptionsManager:
         if not contracts:
             return ScanOutcome(sym, None, "no listed contracts in the window")
         expiries = [date.fromisoformat(x["expiration_date"]) for x in contracts if x.get("expiration_date")]
-        exp = pick_expiry(expiries, today, s, self._trading_days)
+        exp = pick_expiry(expiries, today, s, self._calendar_days)
         if exp is None:
             return ScanOutcome(sym, None, "no expiry fits the window")
         chosen = {x["symbol"]: x for x in contracts if x.get("expiration_date") == exp.isoformat()}
         quotes = await self._quotes(sorted(chosen), chosen)
         prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
                               chain=list(quotes.values()), today=today, now=now, s=s,
-                              trading_days=self._trading_days)
+                              trading_days=self._calendar_days)
         if isinstance(prop, Rejection):
             return ScanOutcome(sym, None, prop.reason)
         if prop.strategy.is_spread and level is not None and level < 3:
