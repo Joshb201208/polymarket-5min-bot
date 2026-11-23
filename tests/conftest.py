@@ -50,3 +50,22 @@ for _name in _CREDENTIALS:
 
 # State files go to a throwaway directory, never to data/stock_agent.
 os.environ["STOCK_DATA_DIR"] = tempfile.mkdtemp(prefix="stock_agent_tests_")
+
+
+# ---------------------------------------------------------------- fakes
+import pytest  # noqa: E402
+
+
+@pytest.fixture
+def world(monkeypatch, tmp_path):
+    """The simulated outside world (clock, broker, providers), installed.
+
+    Starts Monday 23 Nov 2026 09:00 ET. Every HTTP request the code makes is
+    answered by a fake; state files go to this test's own tmp_path.
+    """
+    from tests.fakes.world import FakeWorld
+
+    w = FakeWorld()
+    w.install(monkeypatch, data_dir=tmp_path)
+    yield w
+    w.assert_no_unexpected_hosts()

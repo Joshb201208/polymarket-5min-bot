@@ -1,15 +1,301 @@
 import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from enum import StrEnum
+from typing import TYPE_CHECKING, Protocol
 
 from stock_agent.config import Config
 from stock_agent.models import PortfolioState, Trade
 
+if TYPE_CHECKING:
+    from stock_agent.ledger import BookSnapshot
+
 logger = logging.getLogger(__name__)
+
+
+class TradeKind(StrEnum):
+    BUY = "buy"
+    ADD = "add"
+    SELL = "sell"
+    BUY_TO_COVER = "buy_to_cover"
+    OPTION_OPEN = "option_open"
+    OPTION_CLOSE = "option_close"
+    OPTION_DELIVERY = "option_delivery"
+    CASH_SECURED_PUT = "cash_secured_put"
+    COVERED_CALL = "covered_call"
+
+
+class CanonicalSector(StrEnum):
+    ENERGY = "Energy"
+    MATERIALS = "Materials"
+    INDUSTRIALS = "Industrials"
+    CONSUMER_DISCRETIONARY = "Consumer Discretionary"
+    CONSUMER_STAPLES = "Consumer Staples"
+    HEALTH_CARE = "Health Care"
+    FINANCIALS = "Financials"
+    INFORMATION_TECHNOLOGY = "Information Technology"
+    COMMUNICATION_SERVICES = "Communication Services"
+    UTILITIES = "Utilities"
+    REAL_ESTATE = "Real Estate"
+    UNKNOWN = "Unknown"
+
+
+@dataclass(frozen=True)
+class Classification:
+    issuer: str
+    sector: CanonicalSector
+    clusters: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TradeIntent:
+    kind: TradeKind
+    symbol: str
+    qty: Decimal = Decimal(0)
+    price: Decimal = Decimal(0)
+    sector: str | None = None
+    fee: Decimal = Decimal(0)
+    raw_conviction: int | None = None
+    effective_conviction: int | None = None
+    last_filled_conviction: int | None = None
+    minimum_conviction: int = 7
+    stop_distance: Decimal | None = None
+    analysis_price: Decimal | None = None
+    signal_at: datetime | None = None
+    quote_at: datetime | None = None
+    option_max_loss: Decimal = Decimal(0)
+    option_cash_debit: Decimal = Decimal(0)
+    assignment_shares: Decimal = Decimal(0)
+    assignment_strike: Decimal = Decimal(0)
+    structure_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OptionCommitment:
+    structure_id: str
+    max_loss: Decimal
+    cash_reserved: Decimal = Decimal(0)
+
+
+@dataclass(frozen=True)
+class DrawdownState:
+    high_water: Decimal = Decimal(0)
+    drawdown: Decimal = Decimal(0)
+    paused: bool = False
+    recovery_closes: int = 0
+    last_session: str | None = None
+
+    @property
+    def throttled(self) -> bool:
+        return self.paused or self.drawdown >= _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+
+    @property
+    def alert(self) -> bool:
+        return self.drawdown >= _decimal(Config.DRAWDOWN_ALERT_PCT)
+
+
+@dataclass(frozen=True)
+class RiskControls:
+    pause_new_buys: bool = False
+    drawdown: DrawdownState = field(default_factory=DrawdownState)
+    option_commitments: tuple[OptionCommitment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PortfolioTotals:
+    equity: Decimal
+    free_cash: Decimal
+    gross_exposure: Decimal
+    issuer_values: Mapping[str, Decimal]
+    sector_values: Mapping[CanonicalSector, Decimal]
+    cluster_values: Mapping[str, Decimal]
+    positions: int
+    option_max_loss: Decimal
+    option_structures: int
+
+
+@dataclass(frozen=True)
+class RiskVerdict:
+    ok: bool
+    reasons: tuple[str, ...] = ()
+    after: PortfolioTotals | None = None
+    detect_only: bool = False
+
+
+@dataclass(frozen=True)
+class Breach:
+    kind: str
+    key: str
+    value: Decimal
+    cap: Decimal
+
+
+@dataclass(frozen=True)
+class StopDistance:
+    fraction: Decimal
+    fallback: bool
+
+
+class DailyBar(Protocol):
+    @property
+    def high(self) -> Decimal | float: ...
+
+    @property
+    def low(self) -> Decimal | float: ...
+
+    @property
+    def close(self) -> Decimal | float: ...
+
+
+def normalize_sector(raw: str | None) -> CanonicalSector:
+    """Collapse provider and older ledger strings into the same sector."""
+    if not isinstance(raw, str):
+        return CanonicalSector.UNKNOWN
+    key = "".join(char for char in raw.casefold() if char.isalnum())
+    return _SECTOR_NAMES.get(key, CanonicalSector.UNKNOWN)
+
+
+def classify_symbol(symbol: str, raw_sector: str | None = None) -> Classification:
+    """Use one issuer identity, retaining all overlapping named clusters."""
+    symbol = symbol.strip().upper()
+    canonical = _ISSUER_ALIASES.get(symbol, symbol)
+    aliases = {alias for alias, issuer in _ISSUER_ALIASES.items() if issuer == canonical}
+    aliases.update((symbol, canonical))
+    sector = _SECTOR_OVERRIDES.get(canonical, normalize_sector(raw_sector))
+    if sector == CanonicalSector.UNKNOWN:
+        sector = normalize_sector(Config.SECTOR_MAP.get(symbol) or Config.SECTOR_MAP.get(canonical))
+    clusters = tuple(name for name, members in Config.SYMBOL_CLUSTERS.items()
+                     if aliases.intersection(members))
+    return Classification(canonical, sector, clusters)
+
+
+_SECTOR_NAMES = {
+    "".join(char for char in sector.value.casefold() if char.isalnum()): sector
+    for sector in CanonicalSector
+}
+_SECTOR_NAMES.update({
+    "technology": CanonicalSector.INFORMATION_TECHNOLOGY,
+    "financialservices": CanonicalSector.FINANCIALS,
+    "finance": CanonicalSector.FINANCIALS,
+    "consumercyclical": CanonicalSector.CONSUMER_DISCRETIONARY,
+    "consumerdefensive": CanonicalSector.CONSUMER_STAPLES,
+    "basicmaterials": CanonicalSector.MATERIALS,
+})
+_ISSUER_ALIASES = {"GOOG": "GOOGL", "BRK.A": "BRK.B", "BRK-A": "BRK.B", "BRK-B": "BRK.B"}
+_SECTOR_OVERRIDES = {
+    "GOOGL": CanonicalSector.COMMUNICATION_SERVICES,
+    "META": CanonicalSector.COMMUNICATION_SERVICES,
+}
+
+
+def _decimal(value: object) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a financial quantity")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid financial quantity") from exc
+    if not number.is_finite():
+        raise ValueError("financial quantity must be finite")
+    return number
+
+
+def atr14(bars: Sequence[DailyBar]) -> Decimal | None:
+    """Wilder ATR on completed, sorted, split-adjusted daily bars."""
+    period = Config.STOP_ATR_PERIOD
+    if len(bars) <= period:
+        return None
+    ranges = []
+    previous = None
+    try:
+        for bar in bars:
+            high, low, close = (_decimal(bar.high), _decimal(bar.low), _decimal(bar.close))
+            if not 0 < low <= close <= high:
+                return None
+            if previous is not None:
+                ranges.append(max(high - low, abs(high - previous), abs(low - previous)))
+            previous = close
+    except (ValueError, AttributeError):
+        return None
+    value = sum(ranges[:period], Decimal(0)) / period
+    for true_range in ranges[period:]:
+        value = (value * (period - 1) + true_range) / period
+    return value
+
+
+def stop_fraction(price: Decimal, atr: Decimal | None) -> StopDistance:
+    price = _decimal(price)
+    if price <= 0:
+        raise ValueError("stop reference price must be positive")
+    minimum = _decimal(Config.STOP_LOSS_PCT_MIN)
+    maximum = _decimal(Config.STOP_LOSS_PCT_MAX)
+    try:
+        value = _decimal(atr)
+    except ValueError:
+        return StopDistance(minimum, True)
+    if value < 0:
+        return StopDistance(minimum, True)
+    return StopDistance(
+        min(maximum, max(minimum, _decimal(Config.STOP_ATR_MULTIPLE) * value / price)), False
+    )
+
+
+def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
+    """Round up to the valid price tick so the stop never risks extra distance."""
+    price = _decimal(price)
+    if price <= 0:
+        raise ValueError("stop reference price must be positive")
+    value = price * (1 - distance.fraction)
+    tick = Decimal("0.01") if value >= 1 else Decimal("0.0001")
+    return value.quantize(tick, rounding=ROUND_CEILING)
+
+
+def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -> DrawdownState:
+    """Apply one trusted (flow-adjusted when applicable) close, once."""
+    if not session or (state.last_session is not None and session <= state.last_session):
+        return state
+    close_equity = _decimal(close_equity)
+    if close_equity <= 0:
+        raise ValueError("drawdown requires positive trusted equity")
+    high_water = max(close_equity, state.high_water)
+    drawdown = (high_water - close_equity) / high_water
+    paused = state.paused or drawdown >= _decimal(Config.DRAWDOWN_PAUSE_PCT)
+    recovering = paused and drawdown < _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+    closes = state.recovery_closes + 1 if recovering else 0
+    if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
+        paused, closes = False, 0
+    return DrawdownState(high_water, drawdown, paused, closes, session)
 
 
 class RiskManager:
     def __init__(self, config: Config):
         self.config = config
+
+    def evaluate_trade(
+        self, snapshot: "BookSnapshot", intent: TradeIntent, *,
+        now: datetime | None = None, controls: RiskControls | None = None,
+    ) -> RiskVerdict:
+        raise NotImplementedError
+
+    def propose_equity_qty(
+        self, snapshot: "BookSnapshot", intent: TradeIntent, *,
+        now: datetime | None = None, controls: RiskControls | None = None,
+    ) -> int:
+        raise NotImplementedError
+
+    def evaluate_portfolio(
+        self, snapshot: "BookSnapshot", *, controls: RiskControls | None = None,
+    ) -> tuple[Breach, ...]:
+        raise NotImplementedError
+
+    def plan_remediation(
+        self, snapshot: "BookSnapshot", *,
+        consecutive_closes: Mapping[tuple[str, str], int] | None = None,
+        broker_action: bool = False, controls: RiskControls | None = None,
+    ) -> tuple[TradeIntent, ...]:
+        raise NotImplementedError
 
     def can_open_position(
         self,
