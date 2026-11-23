@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from stock_agent.analyst import Analyst
@@ -70,8 +71,21 @@ def _now_utc() -> datetime:
 
 
 class StockAgentScheduler:
-    def __init__(self):
-        self.config = Config()
+    def __init__(self, config: Config | None = None, *, services: SimpleNamespace | None = None):
+        self.config = config if config is not None else Config()
+        # Integration seam for one instance of each shared service. The legacy paths
+        # below stay intact until the corresponding peer-owned service is wired.
+        self.broker = getattr(services, "broker", None)
+        self.ledger = getattr(services, "ledger", None)
+        self.risk = getattr(services, "risk", None)
+        self.calendar = getattr(services, "calendar", None)
+        self.alerts = getattr(services, "alerts", None)
+        self.health = getattr(services, "health", None)
+        self.prices = getattr(services, "prices", None)
+        self.news = getattr(services, "news", None)
+        self.llm = getattr(services, "llm", None)
+        self.engine = getattr(services, "engine", None)
+        self.options = getattr(services, "options", None)
         self.data_feed = DataFeed(self.config)
         self.analyst = Analyst(self.config)
         self.screener = Screener(self.config)
