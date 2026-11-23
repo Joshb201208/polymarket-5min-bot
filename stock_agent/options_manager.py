@@ -402,6 +402,11 @@ class OptionsManager:
             if c.story_id:
                 self.meta["stories"] = (list(self.meta.get("stories", [])) + [c.story_id])[-200:]
                 self._save()
+        # ---- fresh underlying quote first: it also refreshes the shared price
+        # health the research gate checks, so a prescan thesis isn't blocked by staleness
+        spot, why = await self._spot_now(sym, now)
+        if spot is None:
+            return ScanOutcome(sym, None, f"underlying {why}")
         # ---- research gate
         el = await _maybe(self.gate.is_entry_eligible(sym, now))
         if not el.ok:
@@ -414,10 +419,6 @@ class OptionsManager:
         conv = el.effective_conviction
         if conv is None or conv < s.min_effective_conviction or (el.raw_conviction or 0) < 7:
             return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}")
-        # ---- prices
-        spot, why = await self._spot_now(sym, now)
-        if spot is None:
-            return ScanOutcome(sym, None, f"underlying {why}")
         account = await self.broker.get_account()
         level = account.options_trading_level
         kind = "call" if direction is Direction.BULLISH else "put"
