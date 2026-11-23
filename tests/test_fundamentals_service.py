@@ -215,7 +215,7 @@ def test_fmp_profile_skipped_while_plan_blocked(world):
         s._companies.clear()
         return await s.fetch_company("AAA")
     run_svc(two, assets=assets, health=health)
-    assert health.is_blocked("fmp", "fundamentals", now=NOW)
+    assert health.is_blocked("fmp", "fundamentals", "AAA", now=NOW)
     assert len(world.net.requests(service="fmp", path="/stable/profile")) == 1
 
 
