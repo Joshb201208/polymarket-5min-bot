@@ -32,7 +32,7 @@ _LOCAL_DATA_DIR = _REPO_ROOT / "data" / "stock_agent"
 _VPS_DATA_DIR = Path("/root/polymarket-bot/data/stock_agent")
 
 _SECRET_SUFFIXES = ("_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
-_SECRET_EXTRA_NAMES = frozenset({"TIPRANKS_EMAIL"})
+_SECRET_EXTRA_NAMES = frozenset({"TIPRANKS_EMAIL", "HEARTBEAT_PING_URL", "HEARTBEAT_URL"})
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
 _VALID_RESEARCH_PROVIDERS = frozenset({"perplexity", "openai", "anthropic"})
@@ -261,6 +261,12 @@ class Settings(BaseModel):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     HEARTBEAT_URL: str = ""
+    HEARTBEAT_PING_URL: str = ""
+    HEARTBEAT_INTERVAL_SEC: int = Field(default=300, ge=1)
+    ALERT_CRITICAL_REMIND_SEC: int = Field(default=3600, ge=1)
+    ALERT_WARNING_COOLDOWN_SEC: int = Field(default=14400, ge=0)
+    ALERT_INFO_COOLDOWN_SEC: int = Field(default=3600, ge=0)
+    ALERT_OUTBOX_MAX_ITEMS: int = Field(default=200, ge=1)
 
     # ── Risk limits (owned by risk_limits) ─────────────────────────────────────────
     MAX_POSITION_PCT: float = Field(default=0.15, gt=0.0, le=1.0)
@@ -489,7 +495,7 @@ class Settings(BaseModel):
                 "tipranks": bool(self.TIPRANKS_API_KEY and self.TIPRANKS_API_TOKEN),
                 "discord": bool(self.DISCORD_BOT_TOKEN),
                 "telegram": bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID),
-                "heartbeat": bool(self.HEARTBEAT_URL),
+                "heartbeat": bool(self.HEARTBEAT_PING_URL or self.HEARTBEAT_URL),
             },
             "limits": {
                 "max_position_pct": self.MAX_POSITION_PCT,
