@@ -14,6 +14,7 @@ from stock_agent.research_schemas import Evidence, utc_datetime
 
 _NEWS_TTL = timedelta(minutes=20)
 _QUOTE_TTL = timedelta(seconds=90)
+_COMPANY_TTL = timedelta(hours=6)
 _MARKET = ("SPY", "QQQ")
 _NEWS_LIMIT = 5
 
@@ -26,6 +27,7 @@ class ResearchSources:
         fetch_releases: Callable[[tuple[str, ...], datetime], Awaitable[Sequence[Any]]] | None = None,
         asset_for: Callable[[str], Any] | None = None,
         health=None,
+        fundamental_limit: int = 10,
     ):
         self.prices = prices
         self.news_service = news
@@ -34,10 +36,12 @@ class ResearchSources:
         self.fetch_releases = fetch_releases
         self.asset_for = asset_for or (lambda _symbol: None)
         self.health = health
+        self.fundamental_limit = max(0, fundamental_limit)
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._news_at: dict[str, datetime] = {}
         self._quote_at: dict[str, datetime] = {}
+        self._companies: dict[str, tuple[datetime, Any]] = {}
 
     async def universe(self, now: datetime) -> tuple[str, ...]:
         if self._universe_at is None or now - self._universe_at >= timedelta(hours=12):
@@ -173,15 +177,29 @@ class ResearchSources:
 
     async def securities(self, symbols: tuple[str, ...], now: datetime) -> dict[str, SecurityInputs]:
         limiter = asyncio.Semaphore(5)
+        cached = {
+            symbol: stamp[1] for symbol in symbols if (stamp := self._companies.get(symbol)) is not None
+            and timedelta() <= now - stamp[0] <= _COMPANY_TTL
+        }
+        # The order is held, focus, then universe. Company data is optional:
+        # don't fire several provider requests per symbol across the whole list.
+        allowed = set(tuple(dict.fromkeys(symbol for symbol in symbols if symbol not in cached))[
+            :self.fundamental_limit
+        ])
 
         async def company(symbol):
-            if self.fetch_company is None:
+            if symbol in cached:
+                return cached[symbol]
+            if self.fetch_company is None or symbol not in allowed:
                 return None
             async with limiter:
                 try:
-                    return await self.fetch_company(symbol)
+                    snapshot = await self.fetch_company(symbol)
                 except (SourceUnavailable, TimeoutError):
                     return None
+            if snapshot is not None:
+                self._companies[symbol] = (now, snapshot)
+            return snapshot
 
         fundamentals = await asyncio.gather(*(company(symbol) for symbol in symbols))
         quotes = await self._quotes(symbols, purpose="order_sizing")
@@ -253,6 +271,9 @@ def _provenance(values) -> dict[str, dict]:
                 "as_of": stamp.isoformat(), "source": str(source)[:100], "unit": str(getattr(item, "unit", ""))[:40],
                 "period": str(getattr(item, "period", ""))[:40],
             }
+            url = getattr(item, "url", None)
+            if isinstance(url, str) and url.startswith("https://"):
+                result[key]["url"] = url[:500]
     return result
 
 
