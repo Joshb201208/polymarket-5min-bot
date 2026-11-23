@@ -9,6 +9,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from stock_agent.health import HealthState, ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient, RedactingLogFilter, scrub_secrets
@@ -316,3 +317,61 @@ def test_failed_news_providers_never_masquerade_as_empty_news(world):
     assert batch.errors
     assert health.status("news", "poll").state is HealthState.UNHEALTHY
     assert "news_missing_or_stale" in health.research_entry_blockers("AAA")
+
+
+@pytest.mark.parametrize("primary", ["missing_secret", "plan_blocked", "malformed_response"])
+def test_finnhub_fallback_does_not_certify_the_unpolled_universe(world, primary):
+    cfg = make_cfg(**({"ALPACA_SECRET_KEY": ""} if primary == "missing_secret" else {}))
+    health = ProviderHealthRegistry(cfg, now=world.clock.now)
+    health.record_news_poll(["CCC"], world.clock.now(), source="alpaca")  # Prior proof must be cleared.
+    if primary == "plan_blocked":
+        health.record_failure("alpaca", "news", status_code=403)
+    if primary == "malformed_response":
+        world.alpaca.fail("/v1beta1/news", "status", status=200, body={"unexpected": []}, times=None)
+    svc = NewsService(config=cfg, health=health, now=world.clock.now)
+
+    async def poll():
+        try:
+            return await svc.poll_news(["AAA"], universe=["CCC"], include_market=True)
+        finally:
+            await svc.aclose()
+
+    batch = run(poll())
+    assert batch.ok and batch.degraded and "alpaca" in batch.errors
+    assert batch.covered_symbols == ("AAA",)
+    assert "news_missing_or_stale" not in health.research_entry_blockers("AAA")
+    assert "news_missing_or_stale" in health.research_entry_blockers("CCC")
+    assert "news_missing_or_stale" in health.research_entry_blockers("SPY")
+    requests = world.net.requests(service="alpaca", path="/v1beta1/news")
+    assert bool(requests) == (primary == "malformed_response")
+
+
+def test_partial_finnhub_fallback_preserves_only_valid_symbol_coverage(world):
+    cfg = make_cfg(ALPACA_API_KEY="")
+    health = ProviderHealthRegistry(cfg, now=world.clock.now)
+    health.record_news_poll(["AAA", "BBB", "CCC", "OTHER"], world.clock.now(), source="alpaca")
+
+    def company_news(request):
+        symbol = request.url.params["symbol"]
+        if symbol == "BBB":
+            return httpx.Response(403, json={"error": "symbol not covered on this plan"})
+        if symbol == "CCC":
+            return httpx.Response(200, content=b"invalid JSON")
+        return []
+
+    world.finnhub.on("GET", "/api/v1/company-news", company_news)
+    svc = NewsService(config=cfg, health=health, now=world.clock.now)
+
+    async def poll():
+        try:
+            return await svc.poll_news(["AAA", "BBB", "CCC", "DDD"], include_market=False)
+        finally:
+            await svc.aclose()
+
+    batch = run(poll())
+    assert batch.ok and batch.degraded and "finnhub" in batch.errors
+    assert batch.covered_symbols == ("AAA", "DDD")
+    for symbol in ("BBB", "CCC"):
+        assert "news_missing_or_stale" in health.research_entry_blockers(symbol)
+    for symbol in ("AAA", "DDD", "OTHER"):
+        assert "news_missing_or_stale" not in health.research_entry_blockers(symbol)
