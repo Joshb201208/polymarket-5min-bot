@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 from dataclasses import dataclass, field
@@ -108,7 +109,7 @@ def _reconstitute(payload: dict) -> NewIntent:
 
 class ResearchPipeline:
     def __init__(self, config, ledger, calendar, analyst: Analyst, store: ResearchStore, sources: Sources, gate,
-                 *, clock=None, context=None, focus=focus_symbols):
+                 *, clock=None, context=None, focus=focus_symbols, alerts=None):
         self.config = config
         self.ledger = ledger
         self.calendar = calendar
@@ -119,8 +120,16 @@ class ResearchPipeline:
         self.clock = clock or ledger.now
         self.context = context or (lambda: {})
         self.focus = focus
+        self.alerts = alerts
+        self._analysis_lock = asyncio.Lock()
 
     async def run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
+        # Avoid overlapping scheduled/news windows superseding a thesis
+        # during its independent review. Broker protection has its own lane.
+        async with self._analysis_lock:
+            return await self._run(kind, snapshot)
+
+    async def _run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
         now = self.clock()
         session = self._session(now)
         if session is None:
@@ -155,11 +164,14 @@ class ResearchPipeline:
             chosen = tuple(dict.fromkeys((*held, *focus, *(r["symbol"] for r in ranked[:8]))))
             work = [(sym, f"{kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
-        failed = attempted = 0
+        failed = attempted = deferred = 0
         for symbol, key, story in work:
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
             if not self.store.claim_work(key, symbol, as_of):
+                state = self.store.work_state(key)
+                if state is not None and state["status"] == "retry":
+                    deferred += 1
                 continue
             attempted += 1
             try:
@@ -167,10 +179,13 @@ class ResearchPipeline:
             except ProviderUnavailable as exc:
                 failed += 1
                 pre_inference = all(err.kind in _PRE_INFERENCE for err in exc.attempts)
+                if pre_inference:
+                    deferred += 1
                 self.store.finish_work(
                     key, "retry" if pre_inference else "unavailable",
                     detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
-                    retry_at=self.clock() + timedelta(minutes=15) if pre_inference else None,
+                    retry_at=self.clock() + timedelta(minutes=15 if kind == "news" else 5)
+                    if pre_inference else None,
                 )
         for proposal in self.store.unqueued_proposals():
             intent = _reconstitute(proposal)
@@ -181,9 +196,11 @@ class ResearchPipeline:
                 # never rescans the same expired proposal forever.
                 collected.append(NewIntent(intent.symbol, intent.side, intent.dedupe_key,
                                            status=IntentStatus.SKIPPED, last_error="research_proposal_expired"))
-        status = JobStatus.FAILED if attempted and failed == attempted and not collected else JobStatus.DONE
         ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(self.clock()))
-        return JobOutcome(status, tuple(collected), {"reviewed": attempted, "unavailable": failed}, ideas)
+        incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
+        status = JobStatus.FAILED if incomplete else JobStatus.DONE
+        return JobOutcome(status, tuple(collected),
+                          {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
 
     def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
         """Scheduler calls after the options manager has durably handled each story."""
@@ -260,14 +277,15 @@ class ResearchPipeline:
         role = ThesisRole.HELD_REVIEW if holding else ThesisRole.ENTRY_CANDIDATE
         payload = record.model_dump(mode="json") | {"inputs": result.inputs, "job": kind}
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
+        entry_blockers = ()
         with self.store.store.transaction():
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=fresh_quote or direction not in {Direction.BUY, Direction.BEARISH},
+                activate=not self.store.has_unqueued_exit(symbol, now),
             )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
-                self._record_entry(
+                entry_blockers = self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
                     thesis_id, record, fresh_quote, price, evidence_ids, context,
                 )
@@ -277,7 +295,13 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
-                return
+        if direction is not Direction.EXIT_PROPOSED or not position_id:
+            if entry_blockers and self.alerts is not None:
+                await self.alerts.alert(
+                    "WARN", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
+                    key=f"research_entry_inputs:{symbol}:{':'.join(entry_blockers)}",
+                )
+            return
         try:
             confirmation = await self.analyst.confirm_exit(data, result.result.route)
         except ProviderUnavailable as exc:
@@ -335,6 +359,14 @@ class ResearchPipeline:
             idea = OptionIdea(symbol, direction, story.story_id, thesis_id, record.raw_conviction,
                               record.effective_conviction, record.generated_at, evidence_ids)
             self.store.record_option_idea(story.story_id, idea, session.closes_at)
+        if not qualifies and direction in {Direction.BUY, Direction.BEARISH} and record.effective_conviction >= floor:
+            health_reasons = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
+                              "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
+            if not fresh_quote:
+                return ("quote_stale_or_unavailable",)
+            if gate is not None:
+                return tuple(reason for reason in gate.reasons if reason in health_reasons)
+        return ()
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):

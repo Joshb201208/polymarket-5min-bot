@@ -43,7 +43,8 @@ class ResearchGate:
         utc_now = utc_datetime(now)
         if utc_now is None:
             return Eligibility(False, ("invalid_clock",))
-        reasons = list(self.health.research_entry_blockers(symbol, utc_now))
+        lookup = getattr(self.health, "research_entry_blockers", None)
+        reasons = list(lookup(symbol, utc_now)) if lookup is not None else ["research_health_unavailable"]
         pending = getattr(self.ledger, "list_intents", None)
         if pending is not None and any(
             intent.side == "sell" and not intent.terminal for intent in pending(symbol=symbol)
@@ -55,7 +56,7 @@ class ResearchGate:
 
         payload = record.payload
         draft = payload.get("draft")
-        if not isinstance(draft, dict) or draft.get("symbol") != symbol:
+        if not getattr(record, "actionable", True) or not isinstance(draft, dict) or draft.get("symbol") != symbol:
             return Eligibility(False, (*reasons, "unverified_thesis"))
         raw, effective = payload.get("raw_conviction"), payload.get("effective_conviction")
         generated = utc_datetime(payload.get("generated_at"))
