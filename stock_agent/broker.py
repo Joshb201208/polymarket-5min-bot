@@ -715,16 +715,20 @@ class AlpacaClient:
 
     # ------------------------------------------------------------ activities
 
-    async def get_activities(self, activity_types: tuple[str, ...] | list[str] = ("FILL",), *,
+    async def get_activities(self, activity_types: tuple[str, ...] | list[str] | None = ("FILL",), *,
                              after: datetime | None = None, page_size: int = 100,
                              max_pages: int = 20) -> list[dict]:
-        """Account activities, newest first, following `page_token` paging."""
+        """Account activities, newest first, following `page_token` paging.
+
+        `activity_types=None` omits the filter (all types). Raises
+        BrokerError("bad_response") if `max_pages` is used up with more to read."""
         out: list[dict] = []
         token: str | None = None
         path = "/v2/account/activities"
         for _ in range(max_pages):
-            params: dict[str, Any] = {"activity_types": ",".join(activity_types), "page_size": page_size,
-                                      "direction": "desc"}
+            params: dict[str, Any] = {"page_size": page_size, "direction": "desc"}
+            if activity_types:
+                params["activity_types"] = ",".join(activity_types)
             if after:
                 params["after"] = after.astimezone(timezone.utc).isoformat()
             if token:
@@ -734,11 +738,11 @@ class AlpacaClient:
                 raise BrokerError("bad_response", "activities reply was not a list", method="GET", path=path)
             out.extend(data)
             if len(data) < page_size or not data:
-                break
+                return out
             token = data[-1].get("id")
             if not token:
-                break
-        return out
+                return out
+        raise BrokerError("bad_response", "activities truncated", method="GET", path=path)
 
     # ------------------------------------------------------------ options support (used by the options module)
 
