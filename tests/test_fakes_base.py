@@ -147,27 +147,24 @@ def test_fmp_quote_follows_broker_price(net):
     assert c.get("https://financialmodelingprep.com/stable/ratios", params={"symbol": "AAA"}).json() == []
 
 
-def test_world_fixture_runs_the_real_executor(world):
-    """The bot's own Executor, unchanged, against the fake broker."""
-    from stock_agent.config import Config
-    from stock_agent.executor import Executor
+def test_world_fixture_runs_the_real_broker_client(world):
+    """The bot's AlpacaClient, unchanged, against the fake broker (executor.py is retired)."""
+    from stock_agent.broker import AlpacaClient, OrderRequest
 
     world.clock.set_et(2026, 11, 23, 10, 0)
     world.price("AAA", 50)
-    ex = Executor(Config())
+    c = AlpacaClient("https://paper-api.alpaca.markets", "k", "s")
 
     async def go():
-        acct = await ex.get_account()
-        res = await ex.place_buy("AAA", 10, 46.5)
-        return acct, res, await ex.get_positions(), await ex.get_open_orders()
+        acct = await c.get_account()
+        o = await c.submit_order(OrderRequest(symbol="AAA", side="buy", qty=10, type="market",
+                                              time_in_force="day", client_order_id="t-1", position_intent="buy_to_open"))
+        await c.wait_terminal(o.id, timeout_s=10, poll_s=1)
+        return acct, await c.get_positions()
 
-    acct, res, positions, open_orders = asyncio.run(go())
-    assert acct["equity"] == "100000"
-    assert positions[0]["symbol"] == "AAA" and positions[0]["qty"] == "10"
-    assert [o["type"] for o in open_orders] == ["stop"]
-    assert len(world.orders_sent()) == 2
-    assert world.clock.sleeps == [3]
-
+    acct, positions = asyncio.run(go())
+    assert float(acct.equity) == 100000
+    assert positions[0].symbol == "AAA" and positions[0].qty == 10
 
 def test_llm_shapes():
     from tests.fakes.providers import FakeAnthropic, FakePerplexity, LLMReply

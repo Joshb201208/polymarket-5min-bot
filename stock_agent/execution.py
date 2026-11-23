@@ -707,6 +707,12 @@ class ExecutionEngine:
             except (TypeError, ValueError):
                 continue
         snap = await self._snapshot(f"trim replan {intent.symbol}")
+        if not counters and intent.origin == "limit_drift":
+            # Drift was confirmed at the close that queued this trim; re-check only that
+            # the breach is still beyond its band on today's fresh book.
+            need = int(getattr(self.risk.config, "RISK_DRIFT_CONFIRM_SESSIONS", 2))
+            counters = {(b.kind, b.key): need
+                        for b in self.risk.evaluate_portfolio(snap, controls=self._risk_controls())}
         delivery = intent.origin == "option_delivery"
         plan = self.risk.plan_remediation(snap, consecutive_closes=counters, broker_action=delivery,
                                           broker_symbol=m.get("delivery_symbol") if delivery else None,
