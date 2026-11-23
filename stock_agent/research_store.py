@@ -151,6 +151,20 @@ class ResearchStore:
         )
         return [json.loads(row[0])["intent"] for row in rows]
 
+    def has_unqueued_exit(self, symbol: str, now: datetime) -> bool:
+        rows = self.store.query(
+            """SELECT w.details_json FROM research_work w
+            WHERE w.symbol=? AND w.status='proposed' AND NOT EXISTS (
+                SELECT 1 FROM order_intents i WHERE i.dedupe_key=w.work_key
+            )""",
+            (symbol,),
+        )
+        for row in rows:
+            intent = json.loads(row[0])["intent"]
+            if intent["side"] == "sell" and datetime.fromisoformat(intent["expires_at"]) > now:
+                return True
+        return False
+
     def reserve_exit(self, session: str, position_id: str) -> bool:
         with self.store.transaction() as conn:
             if conn.execute(
