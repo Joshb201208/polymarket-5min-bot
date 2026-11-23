@@ -8,7 +8,7 @@ A6: an option assignment (OPASN + OPTRD) that leaves a long over the cap is
 trimmed at the next session open + 5, without waiting for two closes.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import pytest
 
@@ -94,3 +94,58 @@ def test_assignment_over_cap_is_trimmed_next_session_open(world):
     assert stop.qty == held
     (intent,) = [i for i in runner.agent.ledger.list_intents() if i.origin == "option_delivery"]
     assert intent.kind == "trim"
+
+
+@pytest.mark.world_start(et(2026, 11, 23, 7, 0))
+def test_b3_first_run_full_chain_then_adopted_spread_closed_at_t_minus_2(world):
+    """B3 order on one book: cover both shorts -> no_shorting -> buy back the short
+    call -> trim to 15% -> sell the half share -> one stop per long; the adopted
+    (legacy) spread is held, then closed as one mleg order at T-2 (Wed 2 Dec for
+    the Fri 4 Dec expiry: Thu and Fri are the two sessions left)."""
+    a = world.alpaca
+    a.cash = 60_000
+    for s, px in (("HHH", 100.0), ("SHA", 20.0), ("SHB", 40.0), ("FRC", 50.0), ("SPR", 100.0)):
+        world.price(s, px, spread=0.02)
+    a.seed_position("HHH", 400, 90.0)
+    a.seed_position("SHA", -50, 21.0)
+    a.seed_position("SHB", -20, 41.0)
+    a.seed_position("FRC", 10.5, 48.0)
+    call = a.add_option_contract("HHH", date(2026, 12, 24), "call", 110)
+    a.set_option_quote(call.symbol, 0.9, 1.1)
+    a.seed_position(call.symbol, -1, 1.5)
+    lo = a.add_option_contract("SPR", date(2026, 12, 4), "call", 100)
+    hi = a.add_option_contract("SPR", date(2026, 12, 4), "call", 105)
+    a.set_option_quote(lo.symbol, 2.9, 3.1)
+    a.set_option_quote(hi.symbol, 0.9, 1.1)
+    a.seed_position(lo.symbol, 1, 3.0)
+    a.seed_position(hi.symbol, -1, 1.0)
+
+    runner = ScenarioRunner(world)
+    runner.run_until(et(2026, 11, 23, 11, 0))
+    assert not runner.errors, runner.summary()
+    assert runner.agent.engine._norm_state()["state"] == "done"
+
+    # B3 order, from the requests the bot sent (one minute holds them all)
+    seq = []
+    for r in world.net.requests(service="alpaca"):
+        if r.method == "PATCH" and r.path == "/v2/account/configurations" and (r.json or {}).get("no_shorting"):
+            seq.append("no_shorting")
+        elif r.method == "POST" and r.path == "/v2/orders" and r.status == 200 and r.json.get("type") != "stop":
+            seq.append(f"{r.json['side']} {r.json['symbol']}")
+    want = ["buy SHA", "buy SHB", "no_shorting", f"buy {call.symbol}", "sell HHH", "sell FRC"]
+    assert [s for s in seq if s in want] == want, seq
+    assert "SHA" not in a.positions and "SHB" not in a.positions and call.symbol not in a.positions
+    assert a.positions["FRC"].qty == 10 and a.positions["HHH"].qty * 100.0 <= 0.15 * _equity(a) + 1e-6
+    for sym in ("HHH", "FRC"):
+        (stop,) = [o for o in a.open_orders(sym) if o.type == "stop"]
+        assert stop.qty == a.positions[sym].qty
+    assert a.positions[lo.symbol].qty == 1 and a.positions[hi.symbol].qty == -1   # adopted, held
+
+    runner.run_days(date(2026, 11, 24), 6, start=time(9, 0), end=time(16, 10))     # through Tue 1 Dec
+    assert lo.symbol in a.positions and hi.symbol in a.positions, "closed before T-2"
+    runner.run_day(date(2026, 12, 2), start=time(9, 0), end=time(10, 30))
+    assert not runner.errors, runner.summary()
+    assert lo.symbol not in a.positions and hi.symbol not in a.positions
+    spr = [o for o in _orders(a) if o.symbol in (lo.symbol, hi.symbol)]
+    assert spr and all(o.order_class == "mleg" for o in spr), "the spread is never legged out"
+    assert {o.created_at.astimezone(ET).date() for o in spr} == {date(2026, 12, 2)}
