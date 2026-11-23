@@ -289,6 +289,23 @@ def _renames(ledger: Ledger) -> dict[str, str]:
     return {g["old"]: g["new"] for g in groups.values() if g.get("old") and g.get("new")}
 
 
+def _own_intent_for(ledger: Ledger, open_activity_id: str | None) -> dict | None:
+    """The bot's intent whose broker order produced this opening fill, if any."""
+    if not open_activity_id:
+        return None
+    rows = ledger.store.query("SELECT order_id FROM broker_activities WHERE activity_id=?", (open_activity_id,))
+    if not rows or not rows[0][0]:
+        return None
+    hit = ledger.store.query("SELECT intent_id, thesis_ids_json, meta_json, position_id FROM order_intents"
+                             " WHERE broker_order_id=?", (rows[0][0],))
+    if not hit:
+        return None
+    r = hit[0]
+    meta = json.loads(r["meta_json"] or "{}")
+    tids = json.loads(r["thesis_ids_json"] or "[]")
+    return {"intent_id": r["intent_id"], "thesis_id": tids[0] if tids else None, "sector": meta.get("sector")}
+
+
 def _new_meta(c, symbol: str, asset_class: str, opened_at: datetime | None, source: str,
               sector: str | None = None, open_activity_id: str | None = None) -> str:
     pid = new_id("pos")
@@ -339,6 +356,8 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
                    if (_dec(_g(p, "qty")) or ZERO) != 0}
     to_close = [s for s in open_meta if s not in broker_syms]
     diffs: list[Diff] = []
+    # broker activity is fact even if the rest of this run aborts; ingest first so closes can be explained
+    _ingest_activities(ledger, acts)
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())
@@ -349,12 +368,15 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         broker_syms = {str(_g(p, "symbol")) for p in positions if (_dec(_g(p, "qty")) or ZERO) != 0}
         to_close = [s for s in open_meta if s not in broker_syms]
         if len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
-            diffs.append(Diff(DiffKind.MASS_CLOSE, None, Severity.CRITICAL, ledger=len(open_meta),
-                              broker=len(open_meta) - len(to_close),
-                              explanation=f"{len(to_close)} of {len(open_meta)} positions gone (confirmed twice)",
-                              action="applied"))
+            unexplained = [s for s in to_close if not _explain_close(ledger, s, open_meta[s].opened_at)]
+            critical = len(open_meta) >= 3 and len(unexplained) / len(open_meta) >= MASS_CLOSE_FRACTION
+            if critical or (len(open_meta) >= 3 and not unexplained):
+                diffs.append(Diff(DiffKind.MASS_CLOSE, None, Severity.CRITICAL if critical else Severity.WARNING,
+                                  ledger=len(open_meta), broker=len(open_meta) - len(to_close),
+                                  explanation=(f"{len(to_close)} of {len(open_meta)} positions gone (confirmed twice),"
+                                               f" {len(unexplained)} without broker activity"),
+                                  action="applied"))
 
-    _ingest_activities(ledger, acts)
     if acts:
         newest = max((_activity_ts(a) for a in acts), default="")
         if newest and (cursor is None or newest > cursor.isoformat()):
@@ -392,7 +414,17 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
             ev_open, how, open_aid = _open_event(ledger, sym, qty)
             source = {"fill": "import", "assignment_or_exercise": "assignment"}.get(how, "import")
             asset_class = "us_option" if option else "us_equity"
-            if meta is None:
+            own = _own_intent_for(ledger, open_aid) if meta is None else None
+            if meta is None and own is not None:
+                # the bot's own filled order: open the position with its intent, thesis and sector
+                pid = _new_meta(c, sym, asset_class, ev_open, "bot", sector=own["sector"], open_activity_id=open_aid)
+                c.execute("UPDATE positions_meta SET entry_intent_id=?, entry_thesis_id=? WHERE position_id=?",
+                          (own["intent_id"], own["thesis_id"], pid))
+                meta = PositionMeta(position_id=pid, symbol=sym, asset_class=asset_class, opened_at=ev_open,
+                                    opened_source="bot", sector=own["sector"], entry_intent_id=own["intent_id"],
+                                    entry_thesis_id=own["thesis_id"], notes={"open_activity_id": open_aid})
+                open_meta[sym] = meta
+            elif meta is None:
                 pid = _new_meta(c, sym, asset_class, ev_open, source, open_activity_id=open_aid)
                 meta = PositionMeta(position_id=pid, symbol=sym, asset_class=asset_class, opened_at=ev_open,
                                     opened_source=source, notes={"open_activity_id": open_aid} if open_aid else {})
@@ -486,7 +518,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
             expl = _explain_close(ledger, sym, meta.opened_at)
             c.execute("UPDATE positions_meta SET closed_at=?, close_cause=? WHERE position_id=?",
                       (now.isoformat(), expl or "unexplained", meta.position_id))
-            diffs.append(Diff(DiffKind.CLOSED, sym, Severity.WARNING if expl else Severity.CRITICAL,
+            diffs.append(Diff(DiffKind.CLOSED, sym, Severity.INFO if expl else Severity.CRITICAL,
                               ledger=prev_qty.get(sym), broker="0",
                               explanation=expl or "no activity explains it", action="position closed in ledger"))
 

@@ -7,7 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from stock_agent.analyst import Analyst
+from stock_agent.asset_registry import AssetRegistry
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
@@ -25,7 +28,13 @@ from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.options_book import KvOptionsStore, import_legacy_options
+from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
+from stock_agent.performance import close_session, shadow_stops
+from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
+from stock_agent.research_focus import focus_symbols
+from stock_agent.research_pipeline import JobOutcome, OptionIdea
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, update_drawdown
 from stock_agent.runtime_status import RuntimeStatus, notify_systemd
@@ -100,13 +109,20 @@ class StockAgentScheduler:
         ))
         self.store = self.ledger.store
         self.journal = self.ledger.journal
+        self.http = service("http", lambda: httpx.AsyncClient(timeout=10))
         self.risk = service("risk", lambda: RiskManager(self.config))
         self.calendar = service("calendar", lambda: MarketCalendar(
             self.broker, self.config.DATA_DIR / "market-calendar.json", namespace=self.config.MODE,
             now=_now_utc,
         ))
         self.health = service("health", lambda: None)
-        self.prices = service("prices", lambda: None)
+        self.assets = service("assets", lambda: AssetRegistry(
+            self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
+        ))
+        self.prices = service("prices", lambda: PriceService(
+            self.http, config=self.config, store=self.store, calendar=self.calendar,
+            assets=self.assets, report=self._provider_health, now=_now_utc,
+        ))
         self.news = service("news", lambda: None)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
         self.llm = service("llm", lambda: LLMClient(
@@ -114,11 +130,24 @@ class StockAgentScheduler:
         ))
         self.research_gate = service("research_gate", lambda: ResearchGate(self.ledger, self.health, self.config))
         self.research = service("research", lambda: None)
+        self.capital_lock = asyncio.Lock()
         self.engine = service("engine", lambda: ExecutionEngine(
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
+            bars=self._stop_bars, controls=self._risk_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
+            capital_lock=self.capital_lock, research_gate=self.research_gate,
         ))
-        self.options = service("options", lambda: None)
+        self.options_store = service("options_store", lambda: KvOptionsStore(self.store))
+        self.options = service("options", lambda: OptionsManager(
+            broker=self.broker, store=self.options_store, gate=self.research_gate, risk=self.risk,
+            snapshot=self._options_snapshot, calendar=self.calendar, market_gate=self.market_gate,
+            spot=self._option_spot, cover_short=getattr(self.engine, "cover_short", None),
+            universe=self._option_universe, risk_controls=self._risk_controls, journal=self.journal,
+            alerts=self.alerts, config=self.config, now=_now_utc,
+            capital_lock=self.capital_lock, defer_load=True,
+        ))
+        if isinstance(self.engine, ExecutionEngine):
+            self.engine.options = self.options
         self.runtime = service("runtime", lambda: RuntimeStatus(self.config.DATA_DIR / "runtime-health.json"))
         self.pause_file: Path = service("pause_file", lambda: self.config.DATA_DIR / "pause-trading")
         self._stop_event = asyncio.Event()
@@ -129,6 +158,7 @@ class StockAgentScheduler:
         self._needs_rebuild = False
         self._last_news_at: datetime | None = None
         self._last_reconcile_at: datetime | None = None
+        self._last_close_report = None
         self._job_tasks: dict[str, asyncio.Task] = {}
         self._order_task: asyncio.Task | None = None
         self._options_task: asyncio.Task | None = None
@@ -138,7 +168,8 @@ class StockAgentScheduler:
         self.data_feed = DataFeed(self.config)
         self.analyst = Analyst(self.llm)
         self.screener = Screener(self.config)
-        self.portfolio = Portfolio(self.config)
+        self.portfolio = Portfolio(self.config, persist=False)
+        self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
         self.risk_manager = self.risk
         self.executor = Executor(self.config)
         self.telegram = TelegramReporter(self.config)
@@ -200,12 +231,14 @@ class StockAgentScheduler:
             return False
         try:
             return not self._risk_controls().drawdown.paused
-        except (ValueError, StateUnavailable, sqlite3.Error):
+        except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
             return False
 
     def _risk_controls(self) -> RiskControls:
+        commitments = getattr(self.options, "risk_commitments", None)
         return RiskControls(pause_new_buys=self._manually_paused(),
-                            drawdown=DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY)))
+                            drawdown=DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY)),
+                            option_commitments=commitments() if commitments is not None else ())
 
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
@@ -216,6 +249,33 @@ class StockAgentScheduler:
     async def _on_research_failure(self, error) -> None:
         await self._alert("warning", "Research provider unavailable", f"{error.provider}: {error.kind}",
                           key=f"research-provider:{error.provider}:{error.kind}")
+
+    async def _provider_health(self, provider: str, capability: str, ok: bool, error: str | None) -> None:
+        # The health service persists provider proof; provider failures do not prevent protection.
+        if not ok:
+            await self._alert("warning", "Market data unavailable", f"{provider}: {capability}",
+                              key=f"data-provider:{provider}:{capability}")
+
+    async def _stop_bars(self, symbol: str):
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if getter is None:
+            return ()
+        return (await getter([symbol], sessions=60)).get(symbol, ())
+
+    async def _shadow_bars(self, symbol, start, end):
+        return (await self.prices.get_daily_bars([symbol], start_date=start, end_date=end)).get(symbol, ())
+
+    async def _options_snapshot(self):
+        return await self.ledger.refresh("option entry recheck")
+
+    async def _option_spot(self, symbol: str):
+        quote = (await self.prices.get_quotes([symbol], purpose="order_sizing")).quotes.get(symbol)
+        return quote if quote is not None and getattr(quote, "symbol", symbol) == symbol else None
+
+    def _option_universe(self) -> tuple[str, ...]:
+        current = self.ledger.last_snapshot()
+        holding_symbols = (position.symbol for position in current.holdings) if current else ()
+        return tuple(dict.fromkeys([*holding_symbols, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS]))
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -235,7 +295,8 @@ class StockAgentScheduler:
             async with asyncio.timeout(30):
                 await self.ledger.refresh(reason, rebuild=self._needs_rebuild or bool(self.ledger.trading_block()))
             self._needs_rebuild = False
-            self._reconciled = not self.ledger.trading_block()
+            result = self.ledger.last_reconcile()
+            self._reconciled = not self.ledger.trading_block() and bool(result is None or result.get("clean"))
             self._last_reconcile_at = _now_utc()
         except Exception as exc:
             self._reconciled = False
@@ -260,8 +321,10 @@ class StockAgentScheduler:
         }.get(mode)
         if expected is None or self.config.ALPACA_BASE_URL.rstrip("/") != expected:
             raise ValueError("trading mode does not match broker host")
-        boot = prepare_ledger(self.ledger, self.config.DATA_DIR)
+        boot = prepare_ledger(self.ledger, self.config.DATA_DIR, options_importer=import_legacy_options)
         self._needs_rebuild = boot.needs_rebuild
+        if isinstance(self.options, OptionsManager):
+            self.options.load_state()
         if not boot.health.ok:
             await self._alert("critical", "State needs broker rebuild",
                               "The previous state was quarantined; new entries stay blocked until recovery.")
@@ -278,6 +341,13 @@ class StockAgentScheduler:
                 await self._alert("warning", "Order recovery is still pending",
                                   "The scheduler will keep retrying; new entries are blocked.",
                                   key="order-resume")
+        if not self._shutdown and self._last_reconcile_at is not None and isinstance(self.options, OptionsManager):
+            try:
+                async with asyncio.timeout(8):
+                    await self.options.reconcile(_now_utc())
+            except Exception as exc:
+                await self._alert("warning", "Option startup reconcile pending", type(exc).__name__,
+                                  key="options-startup")
         if self._shutdown:
             return
         self._state_ready = True
@@ -349,9 +419,9 @@ class StockAgentScheduler:
                 self._schedule_job("live_news", f"{day_key}:{slot}", self._run_news_slot, timeout=150)
                 self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
             if self._should_run_options_scan(now_et):
-                self._schedule_job("options", day_key, self._run_options_scan, timeout=None, replay=False)
+                self._schedule_job("options", day_key, self._run_options_job, timeout=180)
             if self.options is not None:
-                await self._drive_options_monitor()
+                await self._drive_options_monitor(now_et)
 
         # Re-read the clock after the protection lane and schedule by actual session.
         now_et = _now_et()
@@ -361,8 +431,9 @@ class StockAgentScheduler:
             ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
             ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
             ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
-            ("daily_summary", self._should_send_daily_summary, self._send_daily_summary, 120),
-            ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 45),
+            ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 55),
+            ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
+            ("shadow_close", self._should_run_shadow_close, self._run_shadow_close, 240),
             ("weekly", self._should_run_weekly, self._run_weekly_analysis, 1500),
             ("midweek", self._should_run_midweek, self._run_midweek_analysis, 1500),
         )
@@ -379,8 +450,6 @@ class StockAgentScheduler:
         return await self._run_held_news_check(self.ledger.snapshot())
 
     async def _close_drawdown(self):
-        from stock_agent.research_pipeline import JobOutcome
-
         now = _now_et()
         market = await self.calendar.refresh()
         session = self.calendar.session_on(now.date())
@@ -390,6 +459,15 @@ class StockAgentScheduler:
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
+        snapshot = await self.ledger.refresh("drawdown close")
+        if (snapshot.quality != "live" or snapshot.equity <= 0 or snapshot.as_of < session.closes_at
+                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)
+                or self.ledger.trading_block()):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        marks = self.ledger.equity_marks("close", since=session.date)
+        mark = next((item for item in marks if item.session_date == session.date), None)
+        if mark is None:
+            self._last_close_report = await close_session(self.ledger, snapshot, session.date)
         try:
             state = DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
         except ValueError:
@@ -397,12 +475,7 @@ class StockAgentScheduler:
                               "Existing high-water record retained; entries stay blocked.",
                               key="invalid-drawdown")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_record_invalid"})
-        snapshot = await self.ledger.refresh("drawdown close")
-        if (snapshot.quality != "live" or snapshot.equity <= 0 or snapshot.as_of < session.closes_at
-                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)
-                or self.ledger.trading_block()):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
-        updated = update_drawdown(state, session.date.isoformat(), snapshot.equity,
+        updated = update_drawdown(state, session.date.isoformat(), mark.equity if mark else snapshot.equity,
                                   previous_session=previous.date.isoformat())
         if updated == state:
             return None
@@ -414,6 +487,24 @@ class StockAgentScheduler:
                 f"Drawdown: {updated.drawdown:.1%}; throttled: {updated.throttled}; paused: {updated.paused}.",
                 key=f"drawdown:{session.date}",
             )
+
+    def _summary_ready(self, now: datetime) -> bool:
+        if not self._should_send_daily_summary(now):
+            return False
+        close = self.ledger.job_status("drawdown_close", now.date().isoformat())
+        return bool(close and (close.status is JobStatus.DONE or (
+            close.status is JobStatus.FAILED and close.attempts >= MAX_JOB_ATTEMPTS
+        )))
+
+    def _should_run_shadow_close(self, now: datetime) -> bool:
+        session = self.calendar.session_on(now.date())
+        return bool(session and now >= session.closes_at + timedelta(minutes=17))
+
+    async def _run_shadow_close(self):
+        warnings: list[str] = []
+        rows = await shadow_stops(self.ledger, _now_et().date(), self._shadow_bars, warnings)
+        status = JobStatus.FAILED if warnings else JobStatus.DONE
+        return JobOutcome(status, detail={"shadow_rows": rows, "warnings": len(warnings)})
 
     def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
         if self._shutdown or name in self._job_tasks:
@@ -475,7 +566,13 @@ class StockAgentScheduler:
             self._last_monitor_time = now
             self._order_task = asyncio.create_task(self._run_execution_cycle(), name="stock-agent:protection")
 
-    async def _drive_options_monitor(self):
+    async def _run_options_job(self):
+        outcomes = await self._run_options_scan()
+        if outcomes and not any(getattr(outcome, "final", True) for outcome in outcomes):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "option_scan_temporarily_blocked"})
+        return None
+
+    async def _drive_options_monitor(self, now: datetime):
         if self._options_task is not None:
             if not self._options_task.done():
                 return
@@ -484,8 +581,26 @@ class StockAgentScheduler:
                                   type(self._options_task.exception()).__name__, key="options-monitor")
         if "options" not in self._job_tasks and not self._shutdown:
             self._options_task = asyncio.create_task(
-                self._check_options_positions(), name="stock-agent:options-protection",
+                self._run_options_lane(now), name="stock-agent:options-protection",
             )
+        else:
+            self._options_task = None
+
+    async def _run_options_lane(self, now: datetime):
+        await self._check_options_positions()
+        if not self._entries_enabled():
+            return
+        ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        if not ideas:
+            return
+        if not (await self.market_gate("entry")).allowed:
+            return
+        candidates = [OptionCandidate(idea.symbol, source="news", story_id=idea.story_id,
+                                      direction_hint=idea.direction.value) for idea in ideas]
+        await self.options.scan(_now_utc(), candidates=candidates)
+        handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
+        if handled:
+            self.research_store.acknowledge_options(tuple(sorted(handled)))
 
     async def _run_execution_cycle(self):
         if not self._engine_resumed:
@@ -498,7 +613,7 @@ class StockAgentScheduler:
                 return
         if self._shutdown:
             return
-        await self.engine.monitor_tick()
+        await self._run_market_monitoring()
         if self.engine.normalised and not self._normalised:
             self._normalised = await self._reconcile_scheduler("normalise completed")
 
@@ -639,21 +754,24 @@ class StockAgentScheduler:
     # ── Shared helpers ───────────────────────────────────────────────
 
     async def _sync_portfolio_from_alpaca(self) -> None:
-        """Pull live positions + account from Alpaca and overwrite local state.
+        """Reconcile the ledger with the broker and mirror it into the legacy view.
 
-        This makes Alpaca the source of truth for share counts, avg entry
-        prices, and cash (including margin balances). Runs at the top of
-        every weekly / mid-week cycle so risk checks see real weights.
+        The ledger is the source of truth. A failed or malformed broker read
+        raises inside ``refresh`` and leaves both the ledger and the legacy
+        ``portfolio`` view untouched (never read as "no positions").
         """
+        if self.ledger is None:
+            logger.error("Broker sync: ledger not wired; legacy view left unchanged")
+            return
         try:
-            account = await self.executor.get_account()
-            positions = await self.executor.get_positions()
-            if account is None and not positions:
-                logger.warning("Alpaca sync: no account + no positions returned — skipping")
-                return
-            self.portfolio.sync_from_alpaca(positions or [], account)
+            snapshot = await self.ledger.refresh("portfolio sync")
         except Exception as exc:
-            logger.exception("Alpaca sync failed — continuing with local state: %s", exc)
+            logger.error("Broker sync failed; ledger and legacy view unchanged: %s", exc)
+            return
+        try:
+            self.portfolio.sync_from_snapshot(snapshot)
+        except Exception as exc:
+            logger.error("Legacy portfolio view update failed: %s", exc)
 
     async def _load_tipranks_data(self) -> dict:
         """Fetch TipRanks Smart Score data via API screener."""
@@ -686,35 +804,15 @@ class StockAgentScheduler:
     # ── Market monitoring ────────────────────────────────────────────
 
     async def _run_market_monitoring(self):
-        """Broker safety and queued orders, then the held-position news hook.
-
-        Order of work: engine.monitor_tick (clean-up, cover any short, one
-        broker stop per long, queued exits then entries), then the research
-        hook, whose intents are persisted and dispatched in the same cycle.
-        There is no software stop sell: the broker stop is the only one.
-        """
+        """Broker safety and queued orders: engine.monitor_tick only (clean-up,
+        resolve accepted orders, cover any short, one broker stop per long,
+        queued exits then entries). No software stop sell, no legacy APIs; the
+        research hook is dispatched separately by the execution cycle."""
         self._last_monitor_time = _now_et()
         if self.engine is None:
             logger.error("Execution engine not wired; no monitoring")
             return None
-        report = await self.engine.monitor_tick()
-        hook = getattr(self, "_run_held_news_check", None)
-        if hook is None or self.ledger is None:
-            return report
-        try:
-            try:
-                snapshot = self.ledger.snapshot()
-            except Exception:
-                snapshot = await self.ledger.refresh("held news check")
-            outcome = await hook(snapshot)
-            intents = list(getattr(outcome, "intents", outcome) or [])
-            if intents:
-                self.ledger.enqueue_intents(intents, job="held_news")
-                report.executed.extend(await self.engine.execute_due())
-        except Exception as e:
-            logger.exception("Held news check failed: %s", e)
-            report.errors.append(f"held news: {e}")
-        return report
+        return await self.engine.monitor_tick()
 
     def _should_check_events(self) -> bool:
         now = _now_et()
@@ -859,206 +957,31 @@ class StockAgentScheduler:
         return await self.engine.execute_intent(intent)
 
     async def _run_options_scan(self):
-        """Daily options scan: find and execute options opportunities."""
-        try:
-            now = _now_et()
-            self._options_scan_done_today = now.strftime("%Y-%m-%d")
+        """Once-per-session options entry scan via OptionsManager.
 
-            await self.discord.send_system_log("INFO", "Options scan starting")
-
-            # Reconcile options portfolio against Alpaca FIRST — mark expired/
-            # closed legs so we don't double-count them in the "skip underlyings
-            # with existing positions" block below.
-            portfolio_value = self.portfolio.get_portfolio_value()
-            try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                sync_result = await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
-                )
-                if sync_result["closed"]:
-                    logger.info(
-                        "Options reconcile: %d positions closed, $%.0f realized P&L captured",
-                        sync_result["closed"], sync_result["realized_pnl"],
-                    )
-            except Exception as e:
-                logger.warning("Options Alpaca reconcile failed (non-fatal): %s", e)
-
-            # Refresh remaining open options with latest prices
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Build inputs for the options engine
-            stock_positions = {
-                p.symbol: p.shares for p in self.portfolio.state.positions
-            }
-
-            # Build screener candidates: (symbol, conviction, price, target_price)
-            screener_candidates: list[tuple[str, int, float, float | None]] = []
-
-            # Track underlyings already in options portfolio to prevent duplicates
-            import re as _re
-            existing_options_underlyings: set[str] = set()
-            for op in self.options_portfolio.state.positions:
-                m = _re.match(r'([A-Z]+)', op.contract_symbol)
-                if m:
-                    existing_options_underlyings.add(m.group(1))
-            if existing_options_underlyings:
-                logger.info(
-                    "Skipping options scan for underlyings with existing positions: %s",
-                    existing_options_underlyings,
-                )
-
-            universe = self.portfolio.state.universe or []
-            for sym in universe[:30]:
-                if sym in existing_options_underlyings:
-                    continue  # Already have an options position on this underlying
-                try:
-                    company = await self.data_feed.get_company_fundamentals(sym)
-                    if not company or company.price <= 0:
-                        continue
-                    # Get conviction from active theses if available
-                    thesis = self.portfolio.state.active_theses.get(sym)
-                    conviction = 6  # default
-                    target_price = None
-                    if isinstance(thesis, dict):
-                        conviction = thesis.get("conviction", 6)
-                        target_price = thesis.get("target_price")
-                    screener_candidates.append((sym, conviction, company.price, target_price))
-                except Exception:
-                    continue
-
-            current_exposure = self.options_portfolio.total_exposure_pct
-
-            # Filter stock_positions to exclude underlyings with existing options
-            filtered_stock_positions = {
-                sym: shares for sym, shares in stock_positions.items()
-                if sym not in existing_options_underlyings
-            }
-
-            # Run the engine
-            signals = await self.options_engine.scan_opportunities(
-                portfolio_value=portfolio_value,
-                open_options_count=self.options_portfolio.open_position_count,
-                current_options_exposure=current_exposure,
-                stock_positions=filtered_stock_positions,
-                screener_candidates=screener_candidates,
-            )
-
-            # Execute each signal
-            signals_executed = 0
-            for signal in signals:
-                try:
-                    if signal.leg2_contract_symbol:
-                        # Spread order
-                        order = await self.options_executor.place_spread_order(
-                            long_symbol=signal.contract_symbol,
-                            short_symbol=signal.leg2_contract_symbol,
-                            qty=signal.qty,
-                            order_type=OptionOrderType.MARKET,
-                        )
-                    else:
-                        # Single-leg order — resolve side to proper enum
-                        side_str = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
-                        side_enum = OptionSide.SELL if side_str == "sell" else OptionSide.BUY
-                        order = await self.options_executor.place_option_order(
-                            contract_symbol=signal.contract_symbol,
-                            qty=signal.qty,
-                            side=side_enum,
-                            order_type=OptionOrderType.MARKET,
-                            limit_price=None,
-                        )
-
-                    if order:
-                        # Use max_debit as fill price proxy; fall back to 0.0
-                        fill_price = getattr(signal, 'max_debit_per_contract', None) or \
-                                     getattr(signal, 'min_credit_per_contract', None) or 0.0
-                        regime = self.macro.get_current_regime()
-                        pos = self.options_portfolio.open_position(
-                            signal=signal,
-                            filled_price=fill_price,
-                            portfolio_value=portfolio_value,
-                            regime=regime,
-                        )
-                        signals_executed += 1
-                        logger.info(
-                            "Options: executed %s on %s — %s",
-                            signal.strategy.value, signal.underlying_symbol, signal.contract_symbol,
-                        )
-                        try:
-                            embed = self.options_portfolio.format_position_alert(pos, "OPENED")
-                            await self.discord.send_embed(
-                                self.discord.channels.get("trades", ""), embed
-                            )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.error("Options execution failed for %s: %s", signal.contract_symbol, e)
-
-            await self.discord.send_system_log(
-                "INFO",
-                f"Options scan complete — {signals_executed} trades executed, "
-                f"{self.options_portfolio.open_position_count} open options positions",
-            )
-            logger.info("Options scan complete — %d executed", signals_executed)
-
-        except Exception as e:
-            logger.exception("Options scan failed: %s", e)
-            await self.discord.send_error(str(e), context="Options scan")
+        The manager owns everything else: mode, market gate, research gate,
+        risk, sizing, the write-ahead book and confirmed orders. Without a
+        manager no options orders are placed (the legacy path is not used).
+        Returns the manager's ScanOutcomes; exceptions propagate to the caller,
+        which records the job status and retries.
+        """
+        now = _now_utc()
+        if self.options is None:
+            logger.warning("Options scan skipped: no OptionsManager wired")
+            return []
+        outcomes = await self.options.scan(now)
+        self._options_scan_done_today = now.astimezone(ET).strftime("%Y-%m-%d")
+        opened = [o for o in outcomes if getattr(o, "opened", None)]
+        logger.info("Options scan: %d candidates, %d opened", len(outcomes), len(opened))
+        return outcomes
 
     async def _check_options_positions(self):
-        """Monitor options positions and send expiry alerts.
-
-        Note: Auto-close via order submission is disabled because Alpaca paper
-        trading rejects SELL orders on long options as 'uncovered'. Positions
-        will be managed to expiry or closed manually. Only expiry warnings
-        (3 DTE) are sent as alerts.
-        """
-        try:
-            if not self.options_portfolio.state.positions:
-                return
-
-            # Reconcile with Alpaca first (catch expirations/assignments)
-            portfolio_value = self.portfolio.get_portfolio_value()
-            try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
-                )
-            except Exception as e:
-                logger.warning("Intraday options reconcile failed: %s", e)
-
-            # Refresh prices on remaining open positions
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Expiry alerts only (3 DTE warning)
-            expiry_alerts = self.options_portfolio.get_expiry_alerts()
-            for pos in expiry_alerts:
-                try:
-                    await self.discord.send_embed(
-                        self.discord.channels.get("risk", ""),
-                        {
-                            "title": "\u26a0\ufe0f Options Expiry Alert",
-                            "description": (
-                                f"**{pos.contract_symbol}** expires in **{pos.dte} days**\n"
-                                f"Strategy: {pos.strategy.value}\n"
-                                f"Unrealized P&L tracked internally only — "
-                                f"positions will run to expiry.\n"
-                                f"Strike: ${getattr(pos, 'strike', '?')}  "
-                                f"Expiry: {getattr(pos, 'expiration_date', '?')}"
-                            ),
-                            "color": 0xF59E0B,
-                        },
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.error("Options position check failed: %s", e)
+        """Exit manager and repair pass: reconcile with the broker, then apply
+        exits (T-2 time exit, targets, thesis break, ex-dividend) and repairs.
+        Returns the MonitorOutcome; exceptions propagate to the caller."""
+        if self.options is None:
+            return None
+        return await self.options.monitor(_now_utc())
 
     async def _check_for_market_event(self):
         """A healthy regime change can alert, but cannot open a trade job."""
@@ -1315,34 +1238,34 @@ class StockAgentScheduler:
     # ── Sector backfill ──────────────────────────────────────────────
 
     async def _backfill_sectors(self):
-        """Backfill sectors on positions marked 'Unknown'.
+        """Fill a missing or unrecognised sector on open ledger positions.
 
-        Uses Config.SECTOR_MAP first (fast, deterministic) then falls back to
-        FMP for symbols we haven't hardcoded.
+        Order: risk_limits' issuer overrides / SECTOR_MAP, then FMP. Stored in
+        the ledger (canonical names), so sector caps see the same value.
         """
+        if self.ledger is None:
+            return
+        from stock_agent.risk_manager import CanonicalSector, classify_symbol
+
         sector_map = getattr(self.config, "SECTOR_MAP", {}) or {}
         updated = 0
-        for pos in self.portfolio.state.positions:
-            if pos.sector and pos.sector != "Unknown":
+        for meta in self.ledger.all_open_meta():
+            if meta.asset_class != "us_equity":
                 continue
-            # 1. Hardcoded map (fast path)
-            mapped = sector_map.get(pos.symbol)
-            if mapped:
-                pos.sector = mapped
+            if classify_symbol(meta.symbol, meta.sector).sector != CanonicalSector.UNKNOWN:
+                continue
+            found = classify_symbol(meta.symbol, sector_map.get(meta.symbol)).sector
+            if found == CanonicalSector.UNKNOWN:
+                try:
+                    company = await self.data_feed.get_company_fundamentals(meta.symbol)
+                    found = classify_symbol(meta.symbol, getattr(company, "sector", None)).sector
+                except Exception as e:
+                    logger.warning("Sector backfill failed for %s: %s", meta.symbol, e)
+                    continue
+            if found != CanonicalSector.UNKNOWN:
+                self.ledger.set_sector(meta.position_id, found.value)
                 updated += 1
-                logger.info("Backfilled sector for %s from SECTOR_MAP: %s", pos.symbol, mapped)
-                continue
-            # 2. FMP lookup for unknowns
-            try:
-                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                if company and company.sector and company.sector != "Unknown":
-                    pos.sector = company.sector
-                    updated += 1
-                    logger.info("Backfilled sector for %s from FMP: %s", pos.symbol, company.sector)
-            except Exception as e:
-                logger.warning("Sector backfill failed for %s: %s", pos.symbol, e)
         if updated:
-            self.portfolio._save()
             logger.info("Backfilled sectors for %d positions", updated)
 
     # ── Cleanup ──────────────────────────────────────────────────────
@@ -1382,13 +1305,13 @@ class StockAgentScheduler:
 
         seen = set()
         dynamic = ("data_feed", "screener", "executor", "telegram", "discord", "macro",
-                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker")
+                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker", "http")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:
                 continue
             seen.add(id(resource))
-            close = getattr(resource, "close", None)
+            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
             if close is not None:
                 try:
                     async with asyncio.timeout(1):

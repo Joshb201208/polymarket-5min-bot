@@ -81,7 +81,7 @@ def test_F_03_05_every_filled_buy_gets_a_broker_stop(world, tmp_path, monkeypatc
     assert sum(o.remaining for o in stops) == held.qty, "filled buy left without a broker stop"
 
 
-@finding("F-03-04", "a failed positions request is read as 'no positions' and wipes the ledger")
+# F-03-04 fixed by state_ledger: a failed positions read leaves the ledger and legacy view untouched
 def test_F_03_04_failed_positions_request_keeps_the_ledger(world):
     world.clock.set_et(2026, 11, 23, 10, 0)
     sched = world.scheduler()
@@ -143,8 +143,9 @@ def test_F_07_01_unreadable_state_is_not_an_empty_book(world, tmp_path, monkeypa
     assert snap is not None and snap.holding("AAA") is not None, "sized a trade on a book without AAA"
 
 
-@finding("F-04-01", "a spread is recorded as opened when one leg is rejected")
 def test_F_04_01_spread_not_recorded_when_a_leg_fails(world, monkeypatch):
+    # Fixed: the scheduler no longer uses the legacy per-leg path; OptionsManager sends one
+    # atomic mleg order (see tests/test_options_manager.py for leg-level coverage).
     from stock_agent.options_models import OptionSide, OptionsSignal, OptionsStrategy, OptionType
 
     world.clock.set_et(2026, 11, 23, 10, 0)

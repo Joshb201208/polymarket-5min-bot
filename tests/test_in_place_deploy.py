@@ -80,6 +80,24 @@ def test_update_checks_new_pid_and_exact_sha(tmp_path):
     assert updater.unit_path.read_text() == "candidate unit"
 
 
+def test_health_requires_fresh_matching_pid_sha_and_reconcile(tmp_path):
+    updater = FakeUpdater(tmp_path)
+    now = datetime.now(timezone.utc)
+    base = {
+        "updated_at": now.isoformat(), "pid": updater.service_pid, "release_sha": NEW,
+        "ready": True, "reconciled": True,
+    }
+    mod.save_json(updater.heartbeat, base)
+    assert updater.healthy(NEW, 99)
+    assert not updater.healthy(NEW, updater.service_pid)
+    for change in (
+        {"release_sha": OLD}, {"pid": 0}, {"ready": False}, {"reconciled": False},
+        {"updated_at": (now - timedelta(seconds=61)).isoformat()},
+    ):
+        mod.save_json(updater.heartbeat, {**base, **change})
+        assert not updater.healthy(NEW, 99)
+
+
 def test_unhealthy_candidate_rolls_back_unit_and_checkout(tmp_path):
     updater = FakeUpdater(tmp_path)
     updater.healthy_candidate = False

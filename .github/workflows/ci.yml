@@ -1,8 +1,8 @@
 name: CI
 
 # Runs on pull requests so a broken change is caught before it is merged.
-# It also runs on master, but note: the droplet deploys master on its own
-# timer and does not wait for this to pass.
+# The in-place updater requires this workflow's successful master push run
+# and successful test job for the exact candidate SHA.
 
 on:
   pull_request:

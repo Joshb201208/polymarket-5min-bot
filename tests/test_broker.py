@@ -144,3 +144,29 @@ def test_clock_and_cancel(world):
     o = run(c.submit_order(_buy("AAA", 2, limit=40.0)))
     run(c.cancel_order(o.id))
     assert run(c.get_order(o.id)).is_terminal
+
+
+def test_nan_position_qty_is_a_bad_response(world):
+    import asyncio
+
+    import pytest
+
+    from stock_agent.broker import AlpacaClient, BrokerError
+
+    world.alpaca.fail("/v2/positions", "status", method="GET", status=200,
+                      body=[{"symbol": "AAA", "qty": "NaN", "qty_available": "NaN", "avg_entry_price": "50",
+                             "side": "long", "asset_class": "us_equity"}])
+    c = AlpacaClient("https://paper-api.alpaca.markets", "k", "s")
+    with pytest.raises(BrokerError) as ei:
+        asyncio.run(c.get_positions())
+    assert ei.value.kind == "bad_response"
+
+
+def test_resolve_base_url_prefers_settings_property():
+    from types import SimpleNamespace
+
+    from stock_agent.broker import resolve_base_url
+
+    cfg = SimpleNamespace(settings=SimpleNamespace(trading_base_url="https://paper-api.alpaca.markets/"),
+                          ALPACA_BASE_URL="https://other.example", MODE="PAPER")
+    assert resolve_base_url(cfg) == "https://paper-api.alpaca.markets"

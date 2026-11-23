@@ -393,3 +393,266 @@ def test_normalise_rerun_after_cancelled_fraction_sale_finishes_the_job(world, t
     assert st.state == "done", st
     assert a.position("MMM").qty == 3
     assert len(_stops(a, "MMM")) == 1
+
+
+# ---------------------------------------------------------------- lead review (a)-(f) and analyst repros
+def test_buy_to_cover_works_with_no_shorting_already_true(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("PPP", 100, spread=0.02)
+    a.configurations["no_shorting"] = True
+    a.shorting_enabled = False
+    a.seed_position("PPP", -20, 100)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    o = run(eng.cover_short("PPP", reason="assignment"))
+    assert o is not None and o.filled_qty == 20 and a.position("PPP") is None
+
+
+def test_normalise_covers_first_and_continues_when_no_shorting_cannot_be_set(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.price("PPP", 100, spread=0.02)
+    world.price("DDD", 100, spread=0.02)
+    a.seed_position("PPP", -10, 100)
+    a.seed_position("DDD", 10, 100)
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    assert run(eng.normalise_step()).state == "planned"
+    world.clock.set_et(2026, 11, 23, 9, 36)
+    a.fail("/v2/account/configurations", "status", method="PATCH", status=403, times=None,
+           body={"code": 40310000, "message": "forbidden"})
+    st = run(eng.normalise_step())
+    assert st.state == "done", st
+    assert a.position("PPP") is None and _no_shorts(a)
+    assert any(t == "Could not turn shorting off at the broker" for _, t, _ in eng.alerts)
+    assert len(_stops(a, "DDD")) == 1
+
+
+def test_first_monitor_tick_before_normalise_covers_nothing(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 9, 31)
+    world.price("PPP", 100, spread=0.02)
+    a.seed_position("PPP", -10, 100)
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    rep = run(eng.monitor_tick())
+    assert rep.normalise.state == "planned" and rep.covered == []
+    assert [o for o in a.orders.values() if o.side == "buy"] == []
+
+
+def test_early_assignment_short_repaired_under_no_shorting(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("CCC", 50, spread=0.02)
+    a.configurations["no_shorting"] = True
+    a.shorting_enabled = False
+    occ = "CCC261218C00045000"
+    a.seed_position(occ, -1, 2.0)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    a.assign_early(occ)
+    assert a.position("CCC").qty == -100
+    rep = run(eng.monitor_tick())
+    assert rep.covered == ["CCC"] and a.position("CCC") is None
+
+
+def test_rejected_buy_and_stop_raise_alerts(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    a.fail("/v2/orders", "status", method="POST", status=403, body={"code": 40310000, "message": "no"})
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.REJECTED
+    assert any("buy failed" in t for _, t, _ in eng.alerts)
+    a.seed_position("BBB", 10, 50)
+    world.price("BBB", 50, spread=0.02)
+    a.fail("/v2/orders", "status", method="POST", status=403, body={"code": 40310000, "message": "no"})
+    run(eng.ensure_protection())
+    assert any(s == "critical" and "stop not in place" in t for s, t, _ in eng.alerts)
+
+
+def test_execute_sell_on_wired_scheduler_does_not_touch_tipranks(world, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tests.exec_helpers import wired_scheduler
+
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    sched, eng = wired_scheduler(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+
+    def boom(*_a, **_k):
+        raise AssertionError("tipranks lookup must not run on the sell path")
+
+    sched._tipranks_lookup = boom
+    run(sched._execute_sell(SimpleNamespace(symbol="AAA"), "model exit"))
+    assert a.position("AAA") is None and _no_shorts(a)
+
+
+def test_crash_after_buy_filled_resume_places_stop(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    c = eng.ledger.claim_intent(it.intent_id)
+    a.submit({"symbol": "AAA", "side": "buy", "qty": "5", "type": "market", "time_in_force": "day",
+              "client_order_id": c.client_order_id})
+    world.clock.advance(seconds=5)  # filled at the broker; the process died before recording it
+    assert a.position("AAA").qty == 5 and _stops(a, "AAA") == []
+    run(eng.resume())
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == 5
+
+
+def test_confirmed_partial_is_protected_when_cancel_refused(world, tmp_path, monkeypatch):
+    """Transient cancel refusal: retried at once, so the 3 filled are stopped in the same call."""
+    from stock_agent.execution import ExecSettings
+
+    a = world.alpaca
+    assert a.behaviour.wash_trade_check  # the broker's default wash protection stays on
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.script_partial_fills("AAA", [3])
+    eng = make_engine(world, tmp_path, monkeypatch, settings=ExecSettings(fill_wait_seconds=10))
+    a.fail("/v2/orders/*", "status", method="DELETE", status=403, body={"code": 40310000, "message": "no"})
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.FILLED and res.filled_qty == 3
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
+    assert [o for o in a.open_orders("AAA") if o.side == "buy"] == []
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == a.position("AAA").qty == 3
+
+
+def test_partial_with_persistent_cancel_refusal_is_loud_then_recovers(world, tmp_path, monkeypatch):
+    """Unavoidable gap: while the broker refuses both the cancel and (wash trade) the stop,
+    the filled shares cannot be protected. The bot alerts critical and retries each tick."""
+    from stock_agent.execution import ExecSettings
+
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.script_partial_fills("AAA", [3])
+    eng = make_engine(world, tmp_path, monkeypatch, settings=ExecSettings(fill_wait_seconds=10))
+    f = a.fail("/v2/orders/*", "status", method="DELETE", status=403, times=None,
+               body={"code": 40310000, "message": "no"})
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.SUBMITTED
+    assert any(s == "critical" and "unprotected" in t for s, t, _ in eng.alerts)
+    run(eng.monitor_tick())
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.SUBMITTED  # still refusing
+    a.faults.remove(f)
+    run(eng.monitor_tick())
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
+    assert [o for o in a.open_orders("AAA") if o.side == "buy"] == []
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == a.position("AAA").qty
+
+def test_split_rescales_recorded_stop_instead_of_flattening(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.FILLED
+    old_stop = _stops(a, "AAA")[0].stop_price
+    q0 = a.position("AAA").qty
+    a.corporate_action_cancel("AAA")
+    p = a.positions["AAA"]
+    p.qty, p.avg_entry_price = q0 * 2, p.avg_entry_price / 2  # 2:1 split
+    world.price("AAA", 25, spread=0.02)
+    run(eng.monitor_tick())
+    assert a.position("AAA").qty == q0 * 2
+    assert not any(o.side == "sell" and o.type != "stop" for o in a.orders.values())
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == q0 * 2
+    assert abs(stops[0].stop_price - old_stop / 2) <= 0.02
+
+
+def test_entry_gate_rechecked_right_before_submit(world, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    calls = []
+
+    async def gate(purpose, rule=None):
+        calls.append(purpose)
+        ok = len(calls) == 1
+        return SimpleNamespace(allowed=ok, reason="" if ok else "entry cutoff", next_open=None)
+
+    eng._market_gate = gate
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.QUEUED and len(calls) == 2
+    world.assert_no_orders()
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.QUEUED
+
+
+def test_capital_lock_serialises_opening_buys_but_not_protection(world, tmp_path, monkeypatch):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+
+    async def go():
+        lock = asyncio.Lock()
+        eng._capital_lock = lock
+        await lock.acquire()  # the options engine is authorising
+        t = asyncio.ensure_future(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not t.done()
+        await eng.ensure_protection()  # protection never waits for the lock
+        lock.release()
+        res = await t
+        assert not lock.locked()
+        return res
+
+    res = run(go())
+    assert res.status == IntentStatus.FILLED and len(_stops(world.alpaca, "AAA")) == 1
+
+
+def test_research_gate_rechecked_at_submission(world, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+
+    class Gate:
+        def is_entry_eligible(self, symbol, now):
+            return SimpleNamespace(direction="BUY", thesis_id="th-newer")
+
+    eng._research_gate = Gate()
+    ids = eng.ledger.enqueue_intents([NewIntent(
+        symbol="AAA", side="buy", dedupe_key="news:AAA", reference_price=Decimal("50"), origin="news",
+        thesis_ids=("th-old",), meta={"effective_conviction": 8, "raw_conviction": 8, "sector": "Technology"})])
+    res = run(eng.execute_intent(eng.ledger.get_intent(ids[0])))
+    assert res.status == IntentStatus.SKIPPED and "thesis" in res.reason
+    world.assert_no_orders()
+
+
+def test_buy_skipped_when_quote_reports_a_renamed_symbol(world, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    orig = eng.prices.get_quotes
+
+    async def renamed(symbols, **kw):
+        res = await orig(symbols, **kw)
+        q = res.quotes["AAA"]
+        res.quotes["AAA"] = SimpleNamespace(symbol="AAAB", price=q.price, bid=q.bid, ask=q.ask, as_of=q.as_of)
+        return res
+
+    eng.prices.get_quotes = renamed
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.SKIPPED and "AAAB" in res.reason
+    world.assert_no_orders()

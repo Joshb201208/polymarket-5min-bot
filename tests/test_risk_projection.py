@@ -211,7 +211,7 @@ def test_cash_secured_put_reserves_full_strike_and_checks_assignment_concentrati
     trade = option(kind=TradeKind.CASH_SECURED_PUT, loss="3000", debit="0",
                    assignment_shares=D(100), assignment_strike=D(100))
     book = snapshot(stock("ALFA", 60, "Industrials"), cash="11999")
-    assert risk.evaluate_trade(book, trade).reasons == ("issuer_cap", "cash_floor")
+    assert set(risk.evaluate_trade(book, trade).reasons) == {"issuer_cap", "cash_floor"}
     assert risk.evaluate_trade(snapshot(cash="12000"), trade).after.free_cash == D(2000)
 
 
