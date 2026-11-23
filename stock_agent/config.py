@@ -43,18 +43,33 @@ class Config:
     # Trading mode
     MODE = os.environ.get("STOCK_AGENT_MODE", "PAPER")
 
-    # Risk limits — conviction-tiered sizing
-    # Hard ceiling per symbol (new buys AND top-ups are blocked once reached).
-    # Target sizes from CONVICTION_SIZE_MAP go up to 10% — the extra 5pp here
-    # absorbs price appreciation before we force a trim.
+    # Risk limits. Apply to the broker book after the proposed trade.
     MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "0.15"))
-    MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "1.00"))  # 50%
-    MAX_POSITIONS = 20           # Max concurrent positions
-    MAX_SECTOR_PCT = 0.40        # 40% max in any sector
-    # Cross-sector correlation cap. Caps exposure to groups of symbols that tend
-    # to move together regardless of official sector (e.g. semis, mega-cap tech,
-    # China ADRs). Enforced in risk_manager.can_open_position.
+    MAX_TOTAL_EXPOSURE = float(os.environ.get("MAX_TOTAL_EXPOSURE_PCT", "1.00"))
+    MAX_POSITIONS = 20
+    MAX_SECTOR_PCT = 0.40
     MAX_CLUSTER_PCT = float(os.environ.get("MAX_CLUSTER_PCT", "0.48"))
+    MIN_FREE_CASH_PCT = 0.02
+    MAX_INITIAL_STOP_RISK_PCT = 0.01
+    CONVICTION_MAX_ADJUSTMENT = 1
+    TOP_UP_TARGET_TOLERANCE = 0.90
+    MAX_ENTRY_SIGNAL_HOURS = 96
+    MAX_ENTRY_PRICE_DRIFT_PCT = 0.03
+    MAX_ENTRY_QUOTE_AGE_SECONDS = 60
+    RISK_DRIFT_BUFFER_PCT = 0.02
+    RISK_TRIM_HEADROOM_PCT = 0.02
+    RISK_DRIFT_CONFIRM_SESSIONS = 2
+    RISK_PAUSE_NEW_BUYS = os.environ.get("RISK_PAUSE_NEW_BUYS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    DRAWDOWN_ALERT_PCT = 0.10
+    DRAWDOWN_THROTTLE_PCT = 0.15
+    DRAWDOWN_PAUSE_PCT = 0.20
+    DRAWDOWN_THROTTLE_SCALE = 0.50
+    DRAWDOWN_RECOVERY_SESSIONS = 5
+    RISK_OPTION_MAX_LOSS_PCT = 0.03
+    RISK_OPTION_TOTAL_LOSS_PCT = 0.10
+    RISK_OPTION_MAX_STRUCTURES = 6
 
     # Priority symbols — always injected into the scanned universe regardless
     # of FMP screener output. Used for curated high-conviction names flagged
@@ -153,15 +168,12 @@ class Config:
         10: 0.10,  # 10%
     }
 
-    # Stop-loss: volatility-adjusted, clamped to range
-    # Stop-loss floor widened from 5% -> 7% on 2026-04-25 to reduce whipsaw on
-    # low-beta defensives. The 5% min was firing on ~1% intraday wiggles after
-    # the price had already moved a small amount against us (5 of 5 historical
-    # sells were stop-outs by tiny margins, e.g. PDD $98.06 vs stop $98.70,
-    # all small losses ~$150-230). 7% gives positions room to breathe.
-    STOP_LOSS_PCT_MIN = 0.07     # 7% minimum stop-loss (was 0.05)
-    STOP_LOSS_PCT_MAX = 0.12     # 12% maximum stop-loss for high-beta names (was 0.10)
-    STOP_LOSS_PCT = 0.07         # Legacy fallback (used if beta unavailable)
+    # Fill-anchored ATR stop, with a labelled 7% fallback without usable bars.
+    STOP_ATR_PERIOD = 14
+    STOP_ATR_MULTIPLE = 2.5
+    STOP_LOSS_PCT_MIN = 0.07
+    STOP_LOSS_PCT_MAX = 0.12
+    STOP_LOSS_PCT = 0.07
 
     # Strategy params
     MIN_CONVICTION = 7           # Only trade conviction >= 7

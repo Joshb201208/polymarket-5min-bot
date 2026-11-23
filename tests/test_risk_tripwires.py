@@ -10,14 +10,19 @@ the change is an approved plan item before editing the test, and call the
 change out at the top of the pull request.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
 from stock_agent import options_engine, options_portfolio
 from stock_agent.config import Config
 from stock_agent.models import PortfolioState, Position, Thesis
-from stock_agent.risk_manager import RiskManager
+from stock_agent.risk_manager import (
+    CanonicalSector, DrawdownState, RiskManager, StopDistance, atr14,
+    classify_symbol, normalize_sector, stop_fraction, stop_price, update_drawdown,
+)
 
 NOW = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
 
@@ -80,6 +85,12 @@ def test_equity_limit_values():
     assert Config.MAX_SECTOR_PCT == 0.40
     assert Config.MAX_CLUSTER_PCT == 0.48
     assert Config.MIN_CONVICTION == 7
+    assert Config.MIN_FREE_CASH_PCT == 0.02
+    assert Config.MAX_INITIAL_STOP_RISK_PCT == 0.01
+    assert Config.DRAWDOWN_ALERT_PCT == 0.10
+    assert Config.DRAWDOWN_THROTTLE_PCT == 0.15
+    assert Config.DRAWDOWN_PAUSE_PCT == 0.20
+    assert Config.DRAWDOWN_RECOVERY_SESSIONS == 5
 
 
 def test_conviction_size_map():
@@ -227,3 +238,76 @@ def test_buy_blocked_when_cash_cannot_cover_one_share(risk):
 def test_buy_blocked_when_portfolio_value_is_zero(risk):
     allowed, _ = risk.can_open_position(PortfolioState(positions=[], cash=0.0), "XYZ", "Utilities", 100.0, 8)
     assert allowed is False
+
+
+@pytest.mark.parametrize(("name", "expected"), [
+    (" Financial Services ", CanonicalSector.FINANCIALS),
+    ("consumer-cyclical", CanonicalSector.CONSUMER_DISCRETIONARY),
+    ("Technology", CanonicalSector.INFORMATION_TECHNOLOGY),
+    ("healthcare", CanonicalSector.HEALTH_CARE),
+    ("basic materials", CanonicalSector.MATERIALS),
+    ("nonsense", CanonicalSector.UNKNOWN),
+    (None, CanonicalSector.UNKNOWN),
+])
+def test_canonical_sector_aliases(name, expected):
+    assert normalize_sector(name) == expected
+
+
+def test_common_issuer_and_overlapping_cluster_classification():
+    assert classify_symbol("goog", "Technology") == classify_symbol("GOOGL", "Communication Services")
+    assert classify_symbol("BRK-A").issuer == classify_symbol("brk.b").issuer
+    assert set(classify_symbol("NVDA").clusters) == {"Semiconductors", "MegaCapTech"}
+
+
+@dataclass
+class Bar:
+    high: int
+    low: int
+    close: int
+
+
+def test_atr_uses_prior_close_then_wilder_smoothing():
+    first = Bar(101, 99, 100)
+    normal = Bar(104, 102, 103)
+    bars = [first, *([normal] * 14), Bar(118, 115, 117)]
+    seeded = (Decimal(4) + Decimal(2) * 13) / 14
+    assert atr14(bars) == (seeded * 13 + 15) / 14
+    assert atr14(bars[:14]) is None
+    assert atr14([*bars, Bar(101, 99, 1)]) is None
+
+
+@pytest.mark.parametrize(("atr", "expected", "fallback"), [
+    (None, "0.07", True), (Decimal("NaN"), "0.07", True),
+    (Decimal(1), "0.07", False), (Decimal(4), "0.10", False),
+    (Decimal(8), "0.12", False),
+])
+def test_atr_stop_distance_widens_with_usable_bars(atr, expected, fallback):
+    assert stop_fraction(Decimal(100), atr) == StopDistance(Decimal(expected), fallback)
+
+
+def test_fill_stop_uses_conservative_valid_tick():
+    assert stop_price(Decimal("100.06"), StopDistance(Decimal("0.12"), False)) == Decimal("88.06")
+
+
+def test_drawdown_pauses_throttles_and_automatically_recovers():
+    state = update_drawdown(DrawdownState(), "2026-10-01", Decimal(100))
+    assert not state.alert and not state.paused
+    state = update_drawdown(state, "2026-10-02", Decimal(90))
+    assert state.alert and not state.throttled
+    state = update_drawdown(state, "2026-10-05", Decimal(85))
+    assert state.throttled and not state.paused
+    state = update_drawdown(state, "2026-10-06", Decimal(80))
+    assert state.paused
+    for day in ("07", "08"):
+        state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
+    assert state.recovery_closes == 2
+    state = update_drawdown(state, "2026-10-09", Decimal(85))
+    assert state.recovery_closes == 0
+    for day in ("12", "13", "14", "15"):
+        state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
+        assert state.paused
+    assert update_drawdown(state, "2026-10-15", Decimal(90)) == state
+    state = update_drawdown(state, "2026-10-16", Decimal(86))
+    assert state.alert and not state.throttled and not state.paused
+    state = update_drawdown(state, "2026-10-19", Decimal(101))
+    assert state.high_water == 101 and not state.alert
