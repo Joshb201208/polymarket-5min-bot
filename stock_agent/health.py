@@ -4,6 +4,9 @@ Tracks per-provider/endpoint health, consecutive failures, HTTP 402/403 plan-blo
 suppression (persisted across restarts via StateStore.kv so blocked endpoints are
 not retried every loop), per-symbol quote/news freshness, and ResearchGate's
 `research_entry_blockers(symbol, now)` contract.
+
+Supports `defer_load=True` and lazy `load_state()` so constructing the singleton
+before `StateStore.open()` never reads SQLite prematurely.
 """
 
 from __future__ import annotations
@@ -19,13 +22,13 @@ from typing import Any
 from stock_agent.config import Config
 from stock_agent.http_safety import scrub_secrets
 from stock_agent.research_schemas import utc_datetime
-from stock_agent.state_store import StateStore
+from stock_agent.state_store import StateStore, StateUnavailable
 
 logger = logging.getLogger(__name__)
 
 _HTTP_STATUS_RE = re.compile(r"\b(401|402|403|404|422|429|5\d\d)\b")
-
 _KV_HEALTH_KEY = "health:provider_registry:v1"
+
 DEFAULT_PLAN_BLOCK_TTL = timedelta(hours=24)
 DEFAULT_QUOTE_MAX_AGE_S = 300.0
 DEFAULT_NEWS_MAX_AGE_S = 900.0
@@ -108,6 +111,7 @@ class ProviderHealthRegistry:
         config: Any = Config,
         *,
         store: StateStore | None = None,
+        defer_load: bool = False,
         now: Callable[[], datetime] | None = None,
         plan_block_ttl: timedelta = DEFAULT_PLAN_BLOCK_TTL,
         quote_max_age_s: float = DEFAULT_QUOTE_MAX_AGE_S,
@@ -130,10 +134,11 @@ class ProviderHealthRegistry:
         self._symbol_blocks: dict[tuple[str, str, str], datetime] = {}
         self._quotes: dict[str, SymbolFreshness] = {}
         self._news: dict[str, SymbolFreshness] = {}
-        self._global_news_poll: SymbolFreshness | None = None
+        self._state_loaded: bool = store is None
 
         self._seed_defaults()
-        self._load_persisted()
+        if not defer_load:
+            self.load_state()
 
     def register_listener(self, callback: TransitionCallback) -> None:
         """Register a state-transition listener for alerts_reporting."""
@@ -145,7 +150,10 @@ class ProviderHealthRegistry:
         )
         finnhub_configured = bool(getattr(self.config, "FINNHUB_API_KEY", ""))
         fmp_configured = bool(getattr(self.config, "FMP_API_KEY", ""))
-        tipranks_configured = bool(
+        tipranks_configured = any(
+            bool(getattr(self.config, attr, ""))
+            for attr in ("TIPRANKS_API_KEY", "TIPRANKS_API_TOKEN")
+        ) or bool(
             getattr(self.config, "TIPRANKS_EMAIL", "") and getattr(self.config, "TIPRANKS_PASSWORD", "")
         )
         llm_configured = any(
@@ -179,12 +187,18 @@ class ProviderHealthRegistry:
                 required_for_trading=required,
             )
 
-    def _load_persisted(self) -> None:
+    def load_state(self) -> bool:
+        """Hydrate persisted plan-blocks and statuses from StateStore once open."""
         if self.store is None:
-            return
-        raw = self.store.kv_get(_KV_HEALTH_KEY)
+            self._state_loaded = True
+            return True
+        try:
+            raw = self.store.kv_get(_KV_HEALTH_KEY)
+        except StateUnavailable:
+            return False
+        self._state_loaded = True
         if not isinstance(raw, dict):
-            return
+            return True
         now = utc_datetime(self._now())
         for item in raw.get("statuses", ()):
             if not isinstance(item, dict):
@@ -213,6 +227,8 @@ class ProviderHealthRegistry:
             )
             if existing and existing.state is HealthState.DISABLED:
                 continue
+            if existing and (existing.last_ok_at is not None or existing.last_error_at is not None):
+                continue
             self._statuses[(provider, capability)] = InputHealthStatus(
                 provider=provider,
                 capability=capability,
@@ -232,18 +248,47 @@ class ProviderHealthRegistry:
                 parts = str(composite).split(":", 2)
                 until = _parse_iso(until_raw)
                 if len(parts) == 3 and until is not None and until > now:
-                    self._symbol_blocks[(parts[0], parts[1], parts[2])] = until
+                    self._symbol_blocks.setdefault((parts[0], parts[1], parts[2]), until)
+        return True
+
+    _load_persisted = load_state
+
+    def _ensure_loaded(self) -> None:
+        if not self._state_loaded:
+            self.load_state()
+
+    def _expire_if_due(self, key: tuple[str, str], now_utc: datetime) -> InputHealthStatus | None:
+        st = self._statuses.get(key)
+        if st is None:
+            return None
+        if st.state is HealthState.PLAN_BLOCKED and st.blocked_until is not None and st.blocked_until <= now_utc:
+            restored = HealthState.HEALTHY if st.last_ok_at is not None else HealthState.UNKNOWN
+            updated = InputHealthStatus(
+                provider=st.provider,
+                capability=st.capability,
+                state=restored,
+                required_for_trading=st.required_for_trading,
+                last_ok_at=st.last_ok_at,
+                last_error_at=st.last_error_at,
+                consecutive_failures=0,
+                last_status_code=st.last_status_code,
+                last_error_summary=st.last_error_summary,
+                blocked_until=None,
+            )
+            self._statuses[key] = updated
+            return updated
+        return st
 
     def _persist(self) -> None:
         if self.store is None:
             return
+        self._ensure_loaded()
         now = utc_datetime(self._now())
         active_symbol_blocks = {
             f"{p}:{c}:{s}": until.isoformat()
             for (p, c, s), until in list(self._symbol_blocks.items())
             if until > now
         }
-        # Cap symbol block entries to stay compact on 1 GB droplet
         if len(active_symbol_blocks) > 500:
             sorted_items = sorted(active_symbol_blocks.items(), key=lambda kv: kv[1], reverse=True)[:500]
             active_symbol_blocks = dict(sorted_items)
@@ -253,6 +298,8 @@ class ProviderHealthRegistry:
         }
         try:
             self.store.kv_set(_KV_HEALTH_KEY, payload)
+        except StateUnavailable:
+            return
         except Exception as exc:
             logger.warning("Failed to persist provider health registry: %s", scrub_secrets(str(exc)))
 
@@ -280,8 +327,9 @@ class ProviderHealthRegistry:
         now: datetime | None = None,
     ) -> bool:
         """Return True when endpoint or specific symbol is plan-blocked (402/403) or disabled."""
+        self._ensure_loaded()
         at = utc_datetime(now or self._now())
-        st = self._statuses.get((provider, capability))
+        st = self._expire_if_due((provider, capability), at)
         if st is not None:
             if st.state is HealthState.DISABLED:
                 return True
@@ -306,6 +354,7 @@ class ProviderHealthRegistry:
         at: datetime | None = None,
     ) -> InputHealthStatus:
         """Record a successful provider/capability call."""
+        self._ensure_loaded()
         ts = utc_datetime(at or self._now())
         key = (provider, capability)
         prev = self._statuses.get(key)
@@ -340,9 +389,11 @@ class ProviderHealthRegistry:
         summary: str = "",
         symbol: str | None = None,
         required: bool | None = None,
+        force_unhealthy: bool = False,
         at: datetime | None = None,
     ) -> InputHealthStatus:
         """Record a failed call; HTTP 402/403 triggers plan-block suppression."""
+        self._ensure_loaded()
         ts = utc_datetime(at or self._now())
         key = (provider, capability)
         prev = self._statuses.get(key)
@@ -354,24 +405,20 @@ class ProviderHealthRegistry:
             f"HTTP {status_code}" if status_code is not None else "provider error"
         )
         failures = (prev.consecutive_failures if prev else 0) + 1
-        blocked_until: datetime | None = prev.blocked_until if prev else None
+        blocked_until: datetime | None = None
 
         if status_code in (402, 403):
             until = ts + self.plan_block_ttl
             if symbol:
+                # Symbol-scoped 402/403 blocks ONLY that symbol so healthy unrelated symbols continue!
                 sym = symbol.strip().upper()
                 self._symbol_blocks[(provider, capability, sym)] = until
-                # If this endpoint has succeeded before for other symbols (e.g. FMP Basic 87-symbol whitelist),
-                # mark endpoint DEGRADED while blocking the specific non-entitled symbol!
-                if prev and prev.last_ok_at is not None:
-                    new_state = HealthState.DEGRADED
-                else:
-                    new_state = HealthState.PLAN_BLOCKED
-                    blocked_until = until
+                new_state = HealthState.DEGRADED
+                blocked_until = None
             else:
                 new_state = HealthState.PLAN_BLOCKED
                 blocked_until = until
-        elif status_code == 401:
+        elif status_code == 401 or force_unhealthy:
             new_state = HealthState.UNHEALTHY
         else:
             new_state = (
@@ -456,9 +503,20 @@ class ProviderHealthRegistry:
         include_market: bool = False,
     ) -> None:
         poll_ts = utc_datetime(as_of)
+        sym_list = [str(raw).strip().upper() for raw in symbols if raw and str(raw).strip()]
         if not ok:
-            self.record_failure("news", "poll", summary="all news providers failed", required=True, at=poll_ts)
+            for sym in sym_list:
+                self._news.pop(sym, None)
+            self.record_failure(
+                "news",
+                "poll",
+                summary="all news providers failed",
+                required=True,
+                force_unhealthy=True,
+                at=poll_ts,
+            )
             return
+
         if degraded:
             prev = self._statuses.get(("news", "poll"))
             prev_state = prev.state if prev else HealthState.UNKNOWN
@@ -478,13 +536,8 @@ class ProviderHealthRegistry:
         else:
             self.record_ok("news", "poll", required=True, at=poll_ts)
 
-        stamp = SymbolFreshness(symbol="*", as_of=poll_ts, source=source, fresh=True)
-        if include_market:
-            self._global_news_poll = stamp
-        for raw in symbols:
-            sym = str(raw).strip().upper()
-            if sym:
-                self._news[sym] = SymbolFreshness(symbol=sym, as_of=poll_ts, source=source, fresh=True)
+        for sym in sym_list:
+            self._news[sym] = SymbolFreshness(symbol=sym, as_of=poll_ts, source=source, fresh=True)
 
     def record_broker_ok(self, *, at: datetime | None = None) -> InputHealthStatus:
         return self.record_ok("alpaca", "broker", required=True, at=at)
@@ -502,6 +555,7 @@ class ProviderHealthRegistry:
             status_code=status_code,
             summary=summary,
             required=True,
+            force_unhealthy=True,
             at=at,
         )
 
@@ -529,9 +583,14 @@ class ProviderHealthRegistry:
     def _has_healthy_llm_route(self, now_utc: datetime) -> bool:
         if self._llm_route_healthy is not None:
             return bool(self._llm_route_healthy(now_utc))
-        overall = self._statuses.get(("llm", "research"))
-        if overall and overall.state in (HealthState.UNHEALTHY, HealthState.DISABLED, HealthState.PLAN_BLOCKED):
+        overall = self._expire_if_due(("llm", "research"), now_utc)
+        if overall and overall.state in (
+            HealthState.UNHEALTHY,
+            HealthState.DISABLED,
+            HealthState.PLAN_BLOCKED,
+        ):
             return False
+
         provider_key_attrs = (
             ("perplexity", "PERPLEXITY_API_KEY"),
             ("openai", "OPENAI_API_KEY"),
@@ -542,13 +601,12 @@ class ProviderHealthRegistry:
         ]
         if not configured:
             return bool(overall and overall.state is HealthState.HEALTHY)
+
         for prov in configured:
-            st = self._statuses.get((f"llm_{prov}", "route"))
-            if st is None or st.state not in (
-                HealthState.UNHEALTHY,
-                HealthState.PLAN_BLOCKED,
-                HealthState.DISABLED,
-            ):
+            st = self._expire_if_due((f"llm_{prov}", "route"), now_utc)
+            if st is None:
+                return True
+            if st.state in (HealthState.HEALTHY, HealthState.UNKNOWN):
                 return True
         return False
 
@@ -565,23 +623,20 @@ class ProviderHealthRegistry:
         """Return A12 entry blockers for `symbol` at `now` (empty tuple = healthy).
 
         Required inputs for a NEW ENTRY (Decision A12):
-        1. Healthy broker (`alpaca:broker`)
+        1. Verified healthy broker (`alpaca:broker` observed OK)
         2. Fresh positive quote for `symbol`
-        3. Fresh healthy news poll covering `symbol`
+        3. Fresh healthy news poll explicitly covering `symbol`
         4. At least one healthy configured LLM route
         """
+        self._ensure_loaded()
         now_utc = utc_datetime(now or self._now())
         sym = symbol.strip().upper()
         max_q_age = self.quote_max_age_s if quote_max_age_s is None else float(quote_max_age_s)
         max_n_age = self.news_max_age_s if news_max_age_s is None else float(news_max_age_s)
         blockers: list[str] = []
 
-        broker = self._statuses.get(("alpaca", "broker"))
-        if broker is None or broker.state in (
-            HealthState.UNHEALTHY,
-            HealthState.PLAN_BLOCKED,
-            HealthState.DISABLED,
-        ):
+        broker = self._expire_if_due(("alpaca", "broker"), now_utc)
+        if broker is None or broker.state is not HealthState.HEALTHY:
             blockers.append("broker_unhealthy")
 
         quote_stamp = self._quotes.get(sym)
@@ -592,11 +647,16 @@ class ProviderHealthRegistry:
         ):
             blockers.append("quote_missing_or_stale")
 
-        news_status = self._statuses.get(("news", "poll"))
-        sym_news = self._news.get(sym) or self._global_news_poll
+        news_status = self._expire_if_due(("news", "poll"), now_utc)
+        sym_news = self._news.get(sym)
         if (
-            (news_status is not None and news_status.state in (HealthState.UNHEALTHY, HealthState.PLAN_BLOCKED, HealthState.DISABLED))
+            (
+                news_status is not None
+                and news_status.state
+                in (HealthState.UNHEALTHY, HealthState.PLAN_BLOCKED, HealthState.DISABLED)
+            )
             or sym_news is None
+            or not sym_news.fresh
             or (now_utc - sym_news.as_of).total_seconds() > max_n_age
         ):
             blockers.append("news_missing_or_stale")
@@ -609,14 +669,21 @@ class ProviderHealthRegistry:
     # ------------------------------------------------- Reporting & inspection
 
     def status(self, provider: str, capability: str) -> InputHealthStatus | None:
-        return self._statuses.get((provider, capability))
+        self._ensure_loaded()
+        now_utc = utc_datetime(self._now())
+        return self._expire_if_due((provider, capability), now_utc)
 
     def get_input_health(self) -> dict[str, InputHealthStatus]:
         """Return snapshot keyed by 'provider:capability' for alerts_reporting."""
+        self._ensure_loaded()
+        now_utc = utc_datetime(self._now())
+        for key in list(self._statuses):
+            self._expire_if_due(key, now_utc)
         return {st.key: st for st in self._statuses.values()}
 
     def summary_rows(self) -> list[dict[str, Any]]:
         """Return deterministic list of status dicts for morning brief and status dumps."""
+        self.get_input_health()
         ordered = sorted(
             self._statuses.values(),
             key=lambda s: (not s.required_for_trading, s.provider, s.capability),
@@ -625,16 +692,20 @@ class ProviderHealthRegistry:
 
     def format_brief_lines(self) -> list[str]:
         """Human-readable summary lines for Discord/Telegram morning brief."""
+        self.get_input_health()
         lines: list[str] = []
         for st in sorted(
             self._statuses.values(),
             key=lambda s: (not s.required_for_trading, s.provider, s.capability),
         ):
             tier = "req" if st.required_for_trading else "opt"
-            detail = f" ({st.last_error_summary})" if st.last_error_summary and st.state is not HealthState.HEALTHY else ""
+            detail = (
+                f" ({st.last_error_summary})"
+                if st.last_error_summary and st.state is not HealthState.HEALTHY
+                else ""
+            )
             lines.append(f"[{tier}] {st.provider}.{st.capability}: {st.state.value}{detail}")
         return lines
 
 
-# Public alias so callers using either name work cleanly
 InputHealthRegistry = ProviderHealthRegistry

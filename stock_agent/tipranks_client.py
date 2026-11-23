@@ -12,20 +12,20 @@ from typing import Any, Iterable
 
 import requests
 
+from stock_agent.config import Config
+
 logger = logging.getLogger(__name__)
 
-# Credentials embedded directly (per integration spec) — env vars still win via config.
-TIPRANKS_API_KEY = "TR_SilverArrow"
-TIPRANKS_API_TOKEN = "f8ed6170-a853-42a6-a76d-a3c244560c17"
 TIPRANKS_SCREENER_URL = "https://api.tipranks.com/api/stocks/screener"
 
 _DEFAULT_TIMEOUT = 15
 
 
-def _headers() -> dict[str, str]:
+def _headers(config: Any = None) -> dict[str, str]:
+    cfg = Config if config is None else config
     return {
-        "X-APIKey": TIPRANKS_API_KEY,
-        "X-APIToken": TIPRANKS_API_TOKEN,
+        "X-APIKey": getattr(cfg, "TIPRANKS_API_KEY", "") or "",
+        "X-APIToken": getattr(cfg, "TIPRANKS_API_TOKEN", "") or "",
         "Accept": "application/json",
         "User-Agent": "stock-agent/1.0 (+tipranks-client)",
     }
@@ -50,10 +50,14 @@ def _call_screener(params: dict) -> list[dict]:
       - bare list               [...]
     Returns an empty list on any error or unrecognised payload.
     """
+    hdrs = _headers()
+    if not hdrs["X-APIKey"] or not hdrs["X-APIToken"]:
+        logger.debug("TipRanks credentials not configured; skipping screener request")
+        return []
     try:
         resp = requests.get(
             TIPRANKS_SCREENER_URL,
-            headers=_headers(),
+            headers=hdrs,
             params=params,
             timeout=_DEFAULT_TIMEOUT,
         )

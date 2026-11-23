@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from deploy import update_release as mod
+from stock_agent.runtime_status import RuntimeStatus
 
 OLD = "a" * 40
 NEW = "b" * 40
@@ -78,6 +79,15 @@ def test_update_checks_new_pid_and_exact_sha(tmp_path):
     assert ("try-restart", mod.UNIT) in updater.events
     assert ("health", NEW, 100) in updater.events
     assert updater.unit_path.read_text() == "candidate unit"
+    event = RuntimeStatus(updater.heartbeat, sha=NEW).deployment_event()
+    assert event["event"] == "deployed"
+    assert RuntimeStatus(updater.heartbeat, sha=OLD).deployment_event() is None
+
+
+def test_systemd_runtime_status_matches_updater_even_with_separate_ledger_path(tmp_path, monkeypatch):
+    updater = FakeUpdater(tmp_path)
+    monkeypatch.setenv("STOCK_AGENT_RUNTIME_STATUS", str(updater.heartbeat))
+    assert RuntimeStatus.for_data_dir(tmp_path / "data/stock_agent").path == updater.heartbeat
 
 
 def test_health_requires_fresh_matching_pid_sha_and_reconcile(tmp_path):
@@ -106,6 +116,8 @@ def test_unhealthy_candidate_rolls_back_unit_and_checkout(tmp_path):
     assert updater.unit_path.read_text() == "working unit"
     assert ("health", OLD, 101) in updater.events
     assert mod.read_json(updater.state)["failed_sha"] == NEW
+    event = RuntimeStatus(updater.heartbeat, sha=OLD).deployment_event()
+    assert event["event"] == "rollback" and event["candidate_sha"] == NEW
 
 
 def test_existing_stopped_and_hold_do_not_fetch(tmp_path):
