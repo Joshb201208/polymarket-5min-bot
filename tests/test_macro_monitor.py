@@ -108,3 +108,27 @@ def test_no_price_service_is_degraded_normal_not_zeros(world, tmp_path):
     assert all(v is None for v in snap.factors.values()) and snap.closes["SPY"] is None
     assert snap.regime == REGIME_NORMAL and m.get_effective_min_conviction() == 7
     assert m.format_discord_brief(snap)["title"].startswith("Macro Brief")
+
+
+def test_deferred_load_rehydrates_once_the_store_is_open(world, tmp_path):
+    seed(world, {"SPY": tail(480, 30, -6), "QQQ": tail(380, 30, -8), "TLT": tail(92, 20, -6),
+                 "USO": tail(72, 20, 20), "UUP": tail(28, 20, 4), "VIXY": tail(18, 10, 15)})
+    m, store, _ = monitor(world, tmp_path)
+    assert run(m.check_conditions()).regime == REGIME_CAUTIOUS
+    store.close()
+
+    # Scheduler path: build without a store, bind an unopened store, open, then rehydrate.
+    fresh = StateStore(tmp_path / "macro.db", clock=world.clock.now)
+    m2 = MacroMonitor(Config, prices=PriceService(now=world.clock.now), defer_load=True,
+                      now=world.clock.now)
+    m2.bind_store(fresh, load=False)
+    fresh.open()
+    assert m2.load_state().regime == REGIME_CAUTIOUS
+    assert m2.get_effective_min_conviction() == 8
+
+    # Eager load against an unopened store does not lose state: it retries on access.
+    again = StateStore(tmp_path / "macro.db", clock=world.clock.now)
+    m3 = MacroMonitor(Config, prices=PriceService(now=world.clock.now), store=again,
+                      now=world.clock.now)
+    again.open()
+    assert m3.get_current_regime() == REGIME_CAUTIOUS
