@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
-from stock_agent.analyst import Analyst, ResearchInput
+from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, ThesisRole
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
@@ -54,6 +54,7 @@ class SecurityInputs:
     tradable: bool = False
     metrics: dict = field(default_factory=dict)
     evidence: tuple[Evidence, ...] = ()
+    metric_provenance: dict = field(default_factory=dict)
 
 
 class Sources(Protocol):
@@ -312,19 +313,27 @@ class ResearchPipeline:
         price = security.price
         quote_at = security.quote_at
         fresh_quote = _fresh_quote(security, now)
+        metrics = dict(security.metrics)
+        if security.metric_provenance:
+            metrics["point_in_time_provenance"] = security.metric_provenance
         data = ResearchInput(
             symbol, now, security.name, security.sector, float(price) if fresh_quote else None,
-            quote_at if fresh_quote else None, security.metrics, tuple(evidence.values())[:24],
+            quote_at if fresh_quote else None, metrics, tuple(evidence.values())[:24],
             (story.evidence.evidence_id,) if story else (), _safe_previous(entry),
             _safe_previous(baseline or current), {"held": True, "opened_at": holding.meta.opened_at.isoformat()
                                                if holding.meta and holding.meta.opened_at else None}
             if holding else None, context,
         )
-        result = await self.analyst.evaluate(data, task=ResearchTask.NEWS if story else ResearchTask.THESIS)
+        task = ResearchTask.NEWS if story else ResearchTask.REVIEW if holding else ResearchTask.THESIS
+        result = await self.analyst.evaluate(data, task=task)
         record = result.record
         direction = record.draft.direction
         role = ThesisRole.HELD_REVIEW if holding else ThesisRole.ENTRY_CANDIDATE
-        payload = record.model_dump(mode="json") | {"inputs": result.inputs, "job": kind}
+        payload = record.model_dump(mode="json") | {
+            "inputs": result.inputs, "job": kind, "fallbacks": [
+                f"{err.provider}:{err.kind}" for err in result.result.attempts
+            ],
+        }
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
         entry_blockers = ()
         confirmation_requested = False
@@ -404,6 +413,8 @@ class ResearchPipeline:
                 symbol, confirmation.result.value.model_dump(mode="json") | {
                     "inputs": confirmation.inputs,
                     "degraded": confirmation.result.degraded_confirmation,
+                    "prompt_version": EXIT_PROMPT_VERSION,
+                    "input_hash": confirmation.result.input_hash,
                 },
                 ThesisRole.EXIT_CONFIRMATION,
                 source=f"{confirmation.result.route.provider}/{confirmation.result.route.model}",
