@@ -384,9 +384,12 @@ def resolve_base_url(config: type[Config] | Any = Config) -> str:
     An explicit ALPACA_BASE_URL wins; otherwise STOCK_AGENT_MODE=LIVE selects
     the live host and anything else selects paper.
     """
-    settings = getattr(config, "settings", None)  # security_config's settings object, when present
-    for name in ("trading_base_url", "alpaca_base_url"):
-        url = getattr(settings, name, None) if settings is not None else None
+    # security_config's validated property (checked against MODE and the live confirmation)
+    for holder in (config, getattr(config, "settings", None)):
+        try:
+            url = getattr(holder, "trading_base_url", None) if holder is not None else None
+        except Exception:
+            url = None
         if isinstance(url, str) and url:
             return url.rstrip("/")
     explicit = (getattr(config, "ALPACA_BASE_URL", "") or "").rstrip("/")
@@ -418,7 +421,10 @@ class AlpacaClient:
         data_url: str | None = None,
     ):
         self.base_url = (base_url or resolve_base_url(config)).rstrip("/")
-        self.data_url = (data_url or getattr(config, "ALPACA_DATA_URL", "") or "https://data.alpaca.markets").rstrip("/")
+        md = getattr(config, "market_data_url", None)
+        md = md if isinstance(md, str) else None
+        self.data_url = (data_url or md or getattr(config, "ALPACA_DATA_URL", "")
+                         or "https://data.alpaca.markets").rstrip("/")
         self._key = key_id if key_id is not None else getattr(config, "ALPACA_API_KEY", "")
         self._secret = secret if secret is not None else getattr(config, "ALPACA_SECRET_KEY", "")
         self.timeout = timeout
