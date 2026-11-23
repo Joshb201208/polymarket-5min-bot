@@ -154,6 +154,36 @@ class AlpacaBehaviour:
     # market-data-api.json). Real response unverified: "reject" = 400,
     # "clamp" = return at most the maximum.
     screener_top_over_max: str = "reject"
+    # ---- margin (https://docs.alpaca.markets/us/docs/margin-and-short-selling,
+    # https://docs.alpaca.markets/us/docs/account-plans)
+    # Which buying power a new buy/short is checked against. Docs: orders need
+    # "sufficient buying power" (orders-at-alpaca); with multiplier 4 that is the
+    # 4x intraday `buying_power` -> "buying_power". "regt" = overnight 2x figure
+    # (stricter; unverified as broker behaviour, for tests of our own sizing).
+    order_buying_power_check: str = "buying_power"
+    # buying_power for multiplier 4 is documented as (last_equity -
+    # last_maintenance_margin) * 4. "last_close" uses those values; "current"
+    # uses live equity and maintenance (approximation; default because the
+    # fake's first last_equity is only the seeded cash).
+    buying_power_basis: str = "current"
+    # Docs: one security >= 70% of equities market value with a margin balance
+    # >= $100,000 -> 50% maintenance on that position.
+    concentration_rule: bool = True
+    # options_buying_power is not defined in the docs (unverified). "cash" =
+    # max(cash - open option buy reserves, 0): long options are not marginable.
+    options_buying_power_basis: str = "cash"
+    # Maintenance on option positions is not in the table (unverified): long
+    # options have no loan value (100%); short options 100% of market value.
+    option_maintenance_rate: float = 1.0
+    # Margin interest: accrues on the end-of-day debit balance at rate/360 per
+    # calendar day (Friday -> 3 days) and posts at month end as an INT/MGN
+    # activity. Docs rate: 6.50% non-elite, 5.00% elite.
+    margin_interest_rate: float = 0.065
+    post_margin_interest: bool = False
+    # A closing mleg order that costs a debit (e.g. buying back a credit spread)
+    # is not checked against options buying power (docs: the buying power check
+    # applies to orders that open or add to positions; unverified for mleg).
+    check_closing_mleg_debits: bool = False
 
 
 @dataclass
@@ -168,6 +198,7 @@ class Asset:
     easy_to_borrow: bool = True
     fractionable: bool = True
     status: str = "active"
+    leverage: int = 1  # 2 or 3 for leveraged ETFs (maintenance 50% / 75%)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_json(self) -> dict:
@@ -176,7 +207,8 @@ class Asset:
             "symbol": self.symbol, "name": self.name or f"{self.symbol} Inc.",
             "status": self.status, "tradable": self.tradable, "marginable": self.marginable,
             "shortable": self.shortable, "easy_to_borrow": self.easy_to_borrow,
-            "fractionable": self.fractionable, "maintenance_margin_requirement": 30,
+            "fractionable": self.fractionable,
+            "maintenance_margin_requirement": {2: 50, 3: 75}.get(self.leverage, 30 if self.marginable else 100),
             "attributes": [],
         }
 
@@ -305,6 +337,12 @@ class FakeAlpaca(FakeService):
         self.trading_blocked = False
         self.account_blocked = False
         self.last_equity = float(cash)
+        self.last_maintenance_margin = 0.0
+        # Not a documented account field (unverified). None = not served; a bool
+        # is served as "margin_call" for tests of the bot's margin-call path.
+        self.margin_call: bool | None = None
+        self.margin_interest_accrued = 0.0
+        self._interest_accrued_through: date | None = None
         self.configurations: dict[str, Any] = {
             "dtbp_check": "entry", "trade_confirm_email": "all", "suspend_trade": False,
             "no_shorting": not shorting_enabled, "fractional_trading": True,
@@ -568,25 +606,105 @@ class FakeAlpaca(FakeService):
                 total += o.remaining * px * self.behaviour.short_sale_bp_factor
         return total
 
-    def _buying_power(self) -> float:
-        """Approximation of https://docs.alpaca.markets/docs/orders-at-alpaca buying power.
+    def maintenance_rate(self, symbol: str, qty: float | None = None) -> float:
+        """Overnight maintenance rate for one position (docs table)."""
+        if OCC_RE.match(symbol):
+            return self.behaviour.option_maintenance_rate
+        px = self._mark(symbol)
+        a = self.assets.get(symbol)
+        if qty is not None and qty < 0:
+            return 1.0 if px < 5.0 else 0.30  # plus a per-share floor, see _position_maintenance
+        if a is not None and not a.marginable:
+            return 1.0
+        if a is not None and a.leverage in (2, 3):
+            return 0.50 if a.leverage == 2 else 0.75
+        if px < 2.50:
+            return 1.0
+        if px <= 6.00:
+            return 0.50
+        return 0.30
 
-        multiplier 1 -> cash; otherwise (equity - maintenance margin) * multiplier,
-        using current values instead of last close (documented approximation),
-        minus what open orders reserve.
-        """
-        lm, sm = self._market_values()
-        eq = self.cash + lm + sm
+    def _position_maintenance(self, p) -> float:
+        mv = abs(p.qty * self._mark(p.symbol) * self._mult(p.symbol))
+        if p.qty < 0 and not OCC_RE.match(p.symbol):
+            per = 2.50 if self._mark(p.symbol) < 5.0 else 5.00
+            return max(abs(p.qty) * per, mv * self.maintenance_rate(p.symbol, p.qty))
+        return mv * self.maintenance_rate(p.symbol, p.qty)
+
+    def maintenance_margin(self) -> float:
+        total = 0.0
+        longs = {s: p.qty * self._mark(s) for s, p in self.positions.items() if p.qty > 0 and not OCC_RE.match(s)}
+        stock_mv = sum(longs.values())
+        debit = max(-self.cash, 0.0)
+        for p in self.positions.values():
+            m = self._position_maintenance(p)
+            if (self.behaviour.concentration_rule and p.symbol in longs and stock_mv > 0
+                    and longs[p.symbol] >= 0.70 * stock_mv and debit >= 100_000):
+                m = max(m, 0.50 * longs[p.symbol])
+            total += m
+        return total
+
+    def initial_margin(self) -> float:
+        """Reg T initial: 50% of marginable stock, 100% of non-marginable and options."""
+        total = 0.0
+        for p in self.positions.values():
+            mv = abs(p.qty * self._mark(p.symbol) * self._mult(p.symbol))
+            a = self.assets.get(p.symbol)
+            marginable = not OCC_RE.match(p.symbol) and (a is None or a.marginable)
+            total += mv * (0.5 if marginable else 1.0)
+        return total
+
+    def _buying_power(self) -> float:
+        """Documented on https://docs.alpaca.markets/us/docs/account-plans:
+        multiplier 4: (last_equity - last_maintenance_margin) * 4 (see the switch
+        `buying_power_basis`); multiplier 2: max(equity - initial_margin, 0) * 2;
+        multiplier 1: cash. Less what open buy / short orders reserve
+        (orders-at-alpaca)."""
+        eq = self.equity()
         if self.multiplier <= 1:
             bp = self.cash
+        elif self.multiplier == 2:
+            bp = max(eq - self.initial_margin(), 0.0) * 2
+        elif self.behaviour.buying_power_basis == "last_close":
+            bp = max(self.last_equity - self.last_maintenance_margin, 0.0) * 4
         else:
-            maint = 0.3 * (lm + abs(sm))
-            bp = max(eq - maint, 0.0) * min(self.multiplier, 4)
-            if self.multiplier == 2:
-                bp = max(eq - 0.5 * (lm + abs(sm)), 0.0) * 2
+            bp = max(eq - self.maintenance_margin(), 0.0) * 4
         return max(bp - self._open_order_reserve(), 0.0)
 
+    def _regt_buying_power(self) -> float:
+        """Overnight (Reg T) buying power: excess equity (equity - initial margin)
+        times 2; cash for a 1x account. Less open-order reserves."""
+        if self.multiplier <= 1:
+            return max(self.cash - self._open_order_reserve(), 0.0)
+        return max(max(self.equity() - self.initial_margin(), 0.0) * 2 - self._open_order_reserve(), 0.0)
+
+    def _order_buying_power(self) -> float:
+        if self.behaviour.order_buying_power_check == "regt":
+            return self._regt_buying_power()
+        return self._buying_power()
+
+    def _accrue_margin_interest(self, close_day: date) -> None:
+        """At a session close: accrue the debit balance for each calendar day
+        until the next session; post the month's total at the month's last close."""
+        if self._interest_accrued_through is not None and close_day <= self._interest_accrued_through:
+            return
+        self._interest_accrued_through = close_day
+        nxt = close_day + timedelta(days=1)
+        for _ in range(10):  # bounded: a calendar with no next session must not hang the fake
+            if self.calendar.is_trading_day(nxt):
+                break
+            nxt += timedelta(days=1)
+        debit = max(-self.cash, 0.0)
+        self.margin_interest_accrued += debit * self.behaviour.margin_interest_rate / 360 * (nxt - close_day).days
+        if self.behaviour.post_margin_interest and nxt.month != close_day.month and self.margin_interest_accrued:
+            amt = round(self.margin_interest_accrued, 2)
+            self.margin_interest_accrued = 0.0
+            self.cash -= amt
+            self._nta("INT", activity_sub_type="MGN", net_amount=-amt, description="margin interest")
+
     def _options_buying_power(self) -> float:
+        if self.behaviour.options_buying_power_basis == "regt":
+            return self._regt_buying_power()
         reserve = sum(
             o.remaining * (o.limit_price or 0.0) * 100
             for o in self.open_orders() if o.asset_class == "us_option" and o.side == "buy"
@@ -638,13 +756,14 @@ class FakeAlpaca(FakeService):
         lm, sm = self._market_values()
         eq = self.cash + lm + sm
         bp = self._buying_power()
+        maint = self.maintenance_margin()
         return {
             "id": self.account_id, "account_number": "PA0FAKE0000", "status": "ACTIVE",
             "crypto_status": "INACTIVE", "currency": "USD",
             "cash": _f(round(self.cash, 2)), "portfolio_value": _f(round(eq, 2)), "equity": _f(round(eq, 2)),
             "last_equity": _f(round(self.last_equity, 2)),
             "long_market_value": _f(round(lm, 2)), "short_market_value": _f(round(sm, 2)),
-            "buying_power": _f(round(bp, 2)), "regt_buying_power": _f(round(bp / 2 if self.multiplier > 2 else bp, 2)),
+            "buying_power": _f(round(bp, 2)), "regt_buying_power": _f(round(self._regt_buying_power(), 2)),
             "daytrading_buying_power": _f(round(bp if self.multiplier >= 4 else 0, 2)),
             "effective_buying_power": _f(round(bp, 2)), "non_marginable_buying_power": _f(round(max(self.cash, 0), 2)),
             "options_buying_power": _f(round(self._options_buying_power(), 2)),
@@ -653,11 +772,12 @@ class FakeAlpaca(FakeService):
             "pattern_day_trader": self.pattern_day_trader, "trading_blocked": self.trading_blocked,
             "transfers_blocked": False, "account_blocked": self.account_blocked,
             "trade_suspended_by_user": bool(self.configurations.get("suspend_trade")),
-            "initial_margin": _f(round(0.5 * (lm + abs(sm)), 2)),
-            "maintenance_margin": _f(round(0.3 * (lm + abs(sm)), 2)),
-            "last_maintenance_margin": _f(round(0.3 * (lm + abs(sm)), 2)),
+            "initial_margin": _f(round(self.initial_margin(), 2)),
+            "maintenance_margin": _f(round(maint, 2)),
+            "last_maintenance_margin": _f(round(self.last_maintenance_margin or maint, 2)),
             "sma": _f(round(eq, 2)), "daytrade_count": 0, "accrued_fees": "0", "pending_transfer_in": "0",
             "created_at": "2025-01-02T14:30:00Z",
+            **({"margin_call": self.margin_call} if self.margin_call is not None else {}),
         }
 
     def position_json(self, p: Position) -> dict:
@@ -803,8 +923,10 @@ class FakeAlpaca(FakeService):
             if s and now >= s.close and (not self.equity_history or self.equity_history[-1][0] < s.close):
                 self.equity_history.append((s.close, self.equity()))
                 self.last_equity = self.equity()
+                self.last_maintenance_margin = self.maintenance_margin()
                 for p in self.positions.values():
                     p.lastday_price = self._mark(p.symbol)
+                self._accrue_margin_interest(s.close.astimezone(ET).date())
 
     def _finish(self, o: Order, status: str, at: datetime) -> None:
         o.status = status
@@ -1306,16 +1428,18 @@ class FakeAlpaca(FakeService):
                 if fractional:
                     return _err(422, 40010001, "fractional orders cannot be sold short"), info
                 cost = want * (q.bid if q else ref) * b.short_sale_bp_factor
-                if cost > self._buying_power() + 1e-6:
-                    return _err(403, 40310000, "insufficient buying power", buying_power=_f(round(self._buying_power(), 2)),
+                if cost > self._order_buying_power() + 1e-6:
+                    return _err(403, 40310000, "insufficient buying power",
+                                buying_power=_f(round(self._order_buying_power(), 2)),
                                 cost_basis=_f(round(cost, 2))), info
                 info["position_intent"] = "sell_to_open_short"
         else:
             pos = self.positions.get(sym)
             info["position_intent"] = "buy_to_cover" if pos and pos.qty < 0 else "buy_to_open"
             cost = notional if notional is not None else qty_f * ref
-            if cost > self._buying_power() + 1e-6:
-                return _err(403, 40310000, "insufficient buying power", buying_power=_f(round(self._buying_power(), 2)),
+            if cost > self._order_buying_power() + 1e-6 and info["position_intent"] == "buy_to_open":
+                return _err(403, 40310000, "insufficient buying power",
+                            buying_power=_f(round(self._order_buying_power(), 2)),
                             cost_basis=_f(round(cost, 2))), info
         return None, info
 
@@ -1430,7 +1554,9 @@ class FakeAlpaca(FakeService):
                 return _err(422, 42210000, f'contract "{leg.get("symbol")}" not found')
         qty = float(body.get("qty", 1))
         limit = float(body["limit_price"]) if body.get("limit_price") is not None else None
-        if limit is not None and limit > 0 and limit * qty * 100 > self._options_buying_power():
+        opening = any(str(leg.get("position_intent", "")).endswith("_to_open") for leg in legs)
+        if (limit is not None and limit > 0 and limit * qty * 100 > self._options_buying_power()
+                and (opening or self.behaviour.check_closing_mleg_debits)):
             return _err(403, 40310000, "insufficient options buying power")
         parent = self._new_order(symbol="", side="buy" if (limit or 0) >= 0 else "sell", type=typ,
                                  tif=body.get("time_in_force", "day"), qty=qty, asset_class="us_option",

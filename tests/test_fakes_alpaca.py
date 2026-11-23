@@ -564,3 +564,114 @@ def test_screener_top_over_documented_max_is_a_switch(env):
     assert c.get(f"{DATA}/v1beta1/screener/stocks/movers", params={"top": 51}).status_code == 400
     alpaca.behaviour.screener_top_over_max = "clamp"
     assert c.get(f"{DATA}/v1beta1/screener/stocks/movers", params={"top": 51}).status_code == 200
+
+
+# ------------------------------------------------------------------ margin (A13)
+# https://docs.alpaca.markets/us/docs/margin-and-short-selling
+# https://docs.alpaca.markets/us/docs/account-plans
+def acct(c):
+    return {k: v for k, v in c.get(f"{BASE}/v2/account").json().items()}
+
+
+def test_margin_fields_cash_only_account(env):
+    _, _, _, c = env
+    a = acct(c)
+    assert a["multiplier"] == "4" and float(a["buying_power"]) == 400_000      # 4x intraday
+    assert float(a["regt_buying_power"]) == 200_000                            # 2x overnight
+    assert float(a["maintenance_margin"]) == 0 and float(a["initial_margin"]) == 0
+    assert float(a["options_buying_power"]) == 100_000
+    assert "margin_call" not in a                                              # undocumented: opt-in
+
+
+def test_buying_on_margin_makes_cash_negative_and_sets_requirements(env):
+    clock, alpaca, _, c = env
+    alpaca.cash = 50_000
+    alpaca.set_price("AAA", 100.0)
+    r = order(c, symbol="AAA", qty="800")                                      # $80k on $50k equity
+    assert r.status_code == 200, r.json()
+    clock.advance(seconds=1)
+    a = acct(c)
+    assert float(a["cash"]) == -30_000 and float(a["equity"]) == 50_000
+    assert float(a["maintenance_margin"]) == 24_000                            # 30% of long value
+    assert float(a["initial_margin"]) == 40_000                                # 50% Reg T
+    assert float(a["regt_buying_power"]) == 20_000                             # (50k - 40k) * 2
+    assert float(a["buying_power"]) == 104_000                                 # (50k - 24k) * 4
+    assert float(a["options_buying_power"]) == 0 and float(a["non_marginable_buying_power"]) == 0
+
+
+def test_maintenance_rates_follow_the_docs_table(env):
+    _, alpaca, _, _ = env
+    alpaca.set_price("PNY", 2.0)
+    alpaca.set_price("MID", 5.0)
+    alpaca.add_asset("TQQ", leverage=3)
+    alpaca.set_price("TQQ", 50.0)
+    alpaca.add_asset("SSO", leverage=2)
+    alpaca.set_price("SSO", 50.0)
+    assert [alpaca.maintenance_rate(s) for s in ("PNY", "MID", "AAA", "SSO", "TQQ")] == [1.0, 0.5, 0.3, 0.5, 0.75]
+
+
+def test_buy_over_buying_power_is_rejected_with_alpaca_shape(env):
+    _, alpaca, _, c = env
+    alpaca.multiplier = 1
+    r = order(c, symbol="AAA", qty="1001", type="limit", limit_price="100")
+    assert r.status_code == 403
+    body = r.json()
+    assert body["code"] == 40310000 and "buying power" in body["message"]
+
+
+def test_regt_order_check_switch_refuses_beyond_overnight_power(env):
+    _, alpaca, _, c = env
+    alpaca.behaviour.order_buying_power_check = "regt"
+    assert order(c, symbol="AAA", qty="2100", type="limit", limit_price="100").status_code == 403
+    assert order(c, symbol="AAA", qty="1900", type="limit", limit_price="100").status_code == 200
+
+
+def test_cover_goes_through_with_negative_cash(env):
+    clock, alpaca, _, c = env
+    alpaca.cash = -5_000
+    alpaca.seed_position("AAA", -10, 100.0)
+    alpaca.seed_position("BBB", 200, 50.0)
+    alpaca.set_price("BBB", 50.0)
+    alpaca.multiplier = 1                                                       # no buying power at all
+    r = order(c, symbol="AAA", qty="10")
+    assert r.status_code == 200 and r.json()["position_intent"] == "buy_to_cover"
+
+
+def test_margin_interest_accrues_daily_and_posts_at_month_end(env):
+    clock, alpaca, _, c = env
+    alpaca.behaviour.post_margin_interest = True
+    alpaca.cash = -36_000                                                       # debit; equity from AAA
+    alpaca.seed_position("AAA", 1000, 100.0)
+    clock.set_et(2026, 11, 25, 16, 1)                                           # three closes
+    c.get(f"{BASE}/v2/account")
+    # Mon 1 day, Tue 1, Wed -> Fri 2 (Thanksgiving)
+    assert alpaca.margin_interest_accrued == pytest.approx(36_000 * 0.065 / 360 * 4)
+    clock.set_et(2026, 12, 1, 9, 0)                                             # + Fri 3 days, Mon 30 Nov 1 day; posts at the month-end close
+    c.get(f"{BASE}/v2/account")
+    (int_,) = [x for x in c.get(f"{BASE}/v2/account/activities").json() if x["activity_type"] == "INT"]
+    assert int_["activity_sub_type"] == "MGN" and float(int_["net_amount"]) == -round(36_000 * 0.065 / 360 * 8, 2)
+    assert alpaca.margin_interest_accrued == 0
+
+
+def test_margin_call_flag_is_opt_in(env):
+    _, alpaca, _, c = env
+    alpaca.margin_call = True
+    assert acct(c)["margin_call"] is True
+
+
+def test_closing_debit_spread_not_blocked_by_options_buying_power(env):
+    _, alpaca, _, c = env
+    lo = alpaca.add_option_contract("AAA", date(2026, 12, 18), "put", 95)
+    hi = alpaca.add_option_contract("AAA", date(2026, 12, 18), "put", 100)
+    for leg in (lo, hi):
+        alpaca.set_option_quote(leg.symbol, 1.9, 2.1)
+    alpaca.seed_position(lo.symbol, 1, 1.0)
+    alpaca.seed_position(hi.symbol, -1, 3.0)
+    alpaca.cash = -1_000
+    body = {"order_class": "mleg", "qty": "1", "type": "limit", "limit_price": "2.5", "time_in_force": "day",
+            "legs": [{"symbol": hi.symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+                     {"symbol": lo.symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"}]}
+    assert c.post(f"{BASE}/v2/orders", json=body).status_code == 200
+    alpaca.behaviour.check_closing_mleg_debits = True
+    r = c.post(f"{BASE}/v2/orders", json={**body, "client_order_id": "x2"})
+    assert r.status_code == 403 and "options buying power" in r.json()["message"]
