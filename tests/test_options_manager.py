@@ -528,3 +528,13 @@ def test_invalid_risk_state_refuses_entries(world, tmp_path):
     out = run(m.scan())
     assert out[0].opened is None and "risk state" in out[0].reason
     assert not _mleg_posts(world)
+
+
+def test_stale_opposite_research_does_not_break_thesis(world, tmp_path):
+    gate = StubGate()
+    gate.set("AAA", Direction.BUY, 8)
+    m, out = _open_spread(world, tmp_path, gate=gate)
+    world.clock.advance(minutes=20)
+    seed_chain(world)
+    gate.set("AAA", Direction.BEARISH, 8, ok=False, reasons=("stale_or_invalid_thesis",))
+    assert run(m.monitor()).exits == []

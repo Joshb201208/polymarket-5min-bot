@@ -273,16 +273,27 @@ class CloseReport:
 
 
 async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: date, *,
-                        daily_bars: DailyBars | None = None) -> CloseReport:
-    """Daily close: record the trusted close mark, compute and journal performance."""
+                        daily_bars: DailyBars | None = None, replace_mark: bool = False) -> CloseReport:
+    """Daily close: record the trusted close mark, compute and journal performance.
+
+    Idempotent: calling again for a session that already has a close mark keeps
+    that mark and does not journal ``performance.close`` again (it only catches up
+    shadow stops), unless ``replace_mark=True``."""
     warnings: list[str] = []
     marks_before = ledger.equity_marks("close")
-    equity = Decimal(str(snapshot.equity))
+    existing = next((m for m in marks_before if m.session_date == session_date), None)
+    retry = existing is not None and not replace_mark
+    if retry:
+        # a later retry (e.g. close + 16 min for bars): keep the recorded close, only catch up shadows
+        equity = existing.equity
+        quality = "close"
+    else:
+        equity = Decimal(str(snapshot.equity))
+        quality = "close" if snapshot.quality == "live" else "indicative"
+        if quality != "close":
+            warnings.append(f"snapshot quality {snapshot.quality}: mark stored as indicative")
+        ledger.record_equity_mark(session_date, quality, snapshot)
     pnl, pnl_pct = day_pnl(marks_before, equity, session_date)
-    quality = "close" if snapshot.quality == "live" else "indicative"
-    if quality != "close":
-        warnings.append(f"snapshot quality {snapshot.quality}: mark stored as indicative")
-    ledger.record_equity_mark(session_date, quality, snapshot)
     marks = ledger.equity_marks("close")
     flows = ledger.cash_flows()
     dep = net_deposits(flows, session_date)
@@ -300,6 +311,8 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
             rep.shadow_rows = await shadow_stops(ledger, session_date, daily_bars, warnings)
         except Exception as e:
             warnings.append(f"shadow stops skipped: {type(e).__name__}: {e}")
+    if retry:
+        return rep
     ledger.journal.append("performance.close", session_date=session_date, equity=equity, day_pnl=pnl,
                           day_pnl_pct=pnl_pct, total_return_pct=rep.total_return_pct, twr_pct=rep.twr_pct,
                           drawdown_pct=dd, hwm=hwm, deposits=dep, realised_pnl=real.total,

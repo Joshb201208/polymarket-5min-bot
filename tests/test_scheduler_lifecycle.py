@@ -13,6 +13,7 @@ import pytest
 
 from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
+from stock_agent.asset_registry import SymbolRenameEvent
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
@@ -385,6 +386,107 @@ def test_close_performance_and_drawdown_share_trusted_mark_persisted_once(tmp_pa
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == state.to_record()
         assert sched.ledger.equity_marks("close")[0].equity == Decimal(790)
         await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_two_trusted_closes_execute_one_next_session_trim(world):
+    async def check():
+        sched = module.StockAgentScheduler(services=SimpleNamespace(prices=FakePrices(world)))
+        sched.store.open()
+        sched.options.load_state()
+        world.alpaca.cash = 80_000
+        world.price("ALFA", 100)
+        world.alpaca.seed_position("ALFA", 200, 100)
+
+        async def close(day):
+            world.clock.set_et(2026, 11, day, 16, 5)
+            key = world.clock.now_et().date().isoformat()
+            sched._schedule_job("drawdown_close", key, sched._close_drawdown, timeout=5)
+            if task := sched._job_tasks.get("drawdown_close"):
+                await task
+                await sched._collect_finished_jobs()
+            assert sched.ledger.job_status("drawdown_close", key).status is JobStatus.DONE
+
+        try:
+            await close(23)
+            await close(23)
+            assert sched.ledger.risk_state_get("a6.close_drift")["counts"] == [["issuer_cap", "ALFA", 1]]
+            assert not sched.ledger.list_intents()
+            await close(24)
+            (trim,) = sched.ledger.list_intents()
+            assert trim.kind == "trim" and trim.origin == "limit_drift" and trim.meta["qty"] == "70"
+            assert not await sched.engine.execute_due()
+            world.clock.set_et(2026, 11, 25, 9, 34)
+            assert not await sched.engine.execute_due()
+            world.clock.advance(minutes=1)
+            (result,) = await sched.engine.execute_due()
+            assert result.filled_qty == 70
+            assert world.alpaca.position("ALFA").qty == 130
+            (stop,) = [order for order in world.alpaca.open_orders("ALFA") if order.type == "stop"]
+            assert stop.qty == 130 and stop.time_in_force == "gtc"
+            assert not await sched.engine.execute_due()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_option_delivery_trims_next_session_without_waiting_two_closes(world):
+    async def check():
+        sched = module.StockAgentScheduler(services=SimpleNamespace(prices=FakePrices(world)))
+        sched.store.open()
+        sched.options.load_state()
+        world.clock.set_et(2026, 11, 23, 16, 20)
+        world.alpaca.cash = 90_000
+        world.price("ALFA", 100)
+        world.alpaca.seed_position("ALFA", 100, 100)
+        expiry = world.clock.now_et().date() + timedelta(days=18)
+        contract = world.alpaca.add_option_contract("ALFA", expiry, "put", 100)
+        world.alpaca.seed_position(contract.symbol, -1, 2)
+        world.alpaca.assign_early(contract.symbol)
+        try:
+            await sched.calendar.refresh()
+            await sched.ledger.refresh("after option delivery")
+            await sched._queue_delivery_trims(world.clock.now_et())
+            assert not sched.ledger.list_intents()
+            world.clock.set_et(2026, 11, 24, 9, 35)
+            await sched.calendar.refresh()
+            await sched._queue_delivery_trims(world.clock.now_et())
+            await sched._queue_delivery_trims(world.clock.now_et())
+            (trim,) = sched.ledger.list_intents()
+            assert trim.kind == "trim" and trim.origin == "option_delivery"
+            assert trim.meta["qty"] == "50"
+            (result,) = await sched.engine.execute_due()
+            assert result.filled_qty == 50
+            assert world.alpaca.position("ALFA").qty == 150
+            assert sched.ledger.risk_state_get("a6.close_drift") is None
+            assert not await sched.engine.execute_due()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_asset_refresh_tracks_focus_and_drops_dead_poll_symbols(world, monkeypatch):
+    async def check():
+        sched = world.scheduler()
+        sched.store.open()
+        monkeypatch.setattr(module, "focus_symbols", lambda **kw: ("DEAD", "FORMER", "ALFA"))
+        world.price("ALFA", 100)
+        world.price("CURRENT", 100)
+        try:
+            await sched._refresh_assets()
+            assert "ALFA" in sched._option_universe()
+            assert "DEAD" not in sched._option_universe()
+            assert "FORMER" not in sched._option_universe()
+            assert "CURRENT" in sched._option_universe()
+            day = world.clock.now_et().date()
+            await sched._on_asset_rename(SymbolRenameEvent("FORMER", "CURRENT", None, day))
+            alias = sched.store.kv_get("symbol_aliases")["FORMER"]
+            assert alias["new"] == "CURRENT" and alias["effective"] == day.isoformat()
+        finally:
+            await sched._cleanup()
 
     asyncio.run(check())
 

@@ -418,3 +418,30 @@ def test_own_filled_buy_opens_position_with_its_thesis(tmp_path):
     assert m.sector == "Technology"
     assert led.entry_thesis(m.position_id).thesis_id == tid
     assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs) and alerts == []
+
+
+def test_registered_alias_moves_meta_only_when_qty_carries_over(tmp_path):
+    b = StubBroker()
+    b.pos("OLD", 78, 100)
+    b.pos("XXX", 5, 10)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    pid = led.open_position_meta("OLD").position_id
+    led.register_symbol_alias("OLD", "NEW", source="asset_registry")
+    del b.positions["OLD"]
+    b.pos("NEW", 78, 100)
+    snap = run(led.refresh("rename"))
+    assert ("renamed", "NEW") in kinds(snap) and led.open_position_meta("NEW").position_id == pid
+
+
+def test_registered_alias_ignored_on_qty_mismatch(tmp_path):
+    b = StubBroker()
+    b.pos("OLD", 78, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    pid = led.open_position_meta("OLD").position_id
+    led.register_symbol_alias("OLD", "NEW", source="asset_registry")
+    del b.positions["OLD"]
+    b.pos("NEW", 40, 100)
+    run(led.refresh("rename"))
+    assert led.open_position_meta("NEW").position_id != pid
