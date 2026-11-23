@@ -364,3 +364,32 @@ def test_requirements_files_are_exact_pinned_and_lightweight() -> None:
             assert {"pytest", "ruff"} <= pkgs
 
 
+def test_owner_checklist_and_readme_cover_security_controls() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    checklist = (repo_root / "docs" / "revamp" / "OWNER_CHECKLIST.md").read_text(encoding="utf-8")
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+
+    for required_term in (
+        "@BotFather",
+        ".mcp.json",
+        "TIPRANKS_API_KEY",
+        "FMP_API_KEY",
+        "FINNHUB_API_KEY",
+        "PRIVATE_KEY",
+        "nginx",
+        "OPTIONS_MODE",
+        "STOCK_TRADING_PAUSED",
+        "STOCK_AGENT_LIVE_CONFIRMED",
+    ):
+        assert required_term in checklist, f"OWNER_CHECKLIST.md missing {required_term}"
+
+    for required_readme in (
+        "OWNER_CHECKLIST.md",
+        "STOCK_AGENT_LIVE_CONFIRMED",
+        "STOCK_TRADING_PAUSED",
+        "OPTIONS_MODE",
+    ):
+        assert required_readme in readme, f"README.md missing {required_readme}"
+
+
+
