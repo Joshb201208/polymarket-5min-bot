@@ -126,6 +126,31 @@ def test_fundamental_requests_are_capped_per_pass_and_cache_does_not_consume_all
     asyncio.run(run())
 
 
+def test_shared_fundamentals_cache_does_not_consume_cold_allowance():
+    class Prices:
+        async def get_quotes(self, symbols, **_):
+            return SimpleNamespace(quotes={})
+
+    async def universe():
+        return ["CACHED", "COLD"]
+
+    async def company(symbol):
+        assert symbol == "COLD"
+        return SimpleNamespace(metrics={"pe_ttm": 20})
+
+    async def run():
+        cached = {"CACHED": SimpleNamespace(metrics={"pe_ttm": 10})}
+        sources = ResearchSources(
+            Prices(), None, list_universe=universe, fetch_company=company, cached_company=cached.get,
+            fundamental_limit=1,
+        )
+        rows = await sources.securities(await sources.universe(NOW), NOW)
+        assert rows["CACHED"].metrics["pe_ttm"] == 10
+        assert rows["COLD"].metrics["pe_ttm"] == 20
+
+    asyncio.run(run())
+
+
 def test_only_confirmed_prior_earnings_release_materializes():
     class News:
         async def poll_news(self, symbols, **_):
@@ -189,6 +214,7 @@ def test_actual_fundamentals_service_maps_snapshot_and_release_offline():
             sources = ResearchSources(
                 Prices(), News(), list_universe=fundamentals.list_universe,
                 fetch_company=fundamentals.fetch_company, fetch_releases=fundamentals.fetch_releases,
+                cached_company=fundamentals.cached_company,
             )
             symbols = await sources.universe(NOW)
             assert symbols == ("AAA", "BBB")
