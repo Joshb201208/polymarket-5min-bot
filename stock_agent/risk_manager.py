@@ -1,15 +1,197 @@
 import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from enum import StrEnum
+from typing import TYPE_CHECKING, Protocol
 
 from stock_agent.config import Config
 from stock_agent.models import PortfolioState, Trade
 
+if TYPE_CHECKING:
+    from stock_agent.ledger import BookSnapshot
+
 logger = logging.getLogger(__name__)
+
+
+class TradeKind(StrEnum):
+    BUY = "buy"
+    ADD = "add"
+    SELL = "sell"
+    BUY_TO_COVER = "buy_to_cover"
+    OPTION_OPEN = "option_open"
+    OPTION_CLOSE = "option_close"
+    OPTION_DELIVERY = "option_delivery"
+    CASH_SECURED_PUT = "cash_secured_put"
+    COVERED_CALL = "covered_call"
+
+
+class CanonicalSector(StrEnum):
+    ENERGY = "Energy"
+    MATERIALS = "Materials"
+    INDUSTRIALS = "Industrials"
+    CONSUMER_DISCRETIONARY = "Consumer Discretionary"
+    CONSUMER_STAPLES = "Consumer Staples"
+    HEALTH_CARE = "Health Care"
+    FINANCIALS = "Financials"
+    INFORMATION_TECHNOLOGY = "Information Technology"
+    COMMUNICATION_SERVICES = "Communication Services"
+    UTILITIES = "Utilities"
+    REAL_ESTATE = "Real Estate"
+    UNKNOWN = "Unknown"
+
+
+@dataclass(frozen=True)
+class Classification:
+    issuer: str
+    sector: CanonicalSector
+    clusters: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TradeIntent:
+    kind: TradeKind
+    symbol: str
+    qty: Decimal = Decimal(0)
+    price: Decimal = Decimal(0)
+    sector: str | None = None
+    fee: Decimal = Decimal(0)
+    raw_conviction: int | None = None
+    effective_conviction: int | None = None
+    last_filled_conviction: int | None = None
+    minimum_conviction: int = 7
+    stop_distance: Decimal | None = None
+    analysis_price: Decimal | None = None
+    signal_at: datetime | None = None
+    quote_at: datetime | None = None
+    option_max_loss: Decimal = Decimal(0)
+    option_cash_debit: Decimal = Decimal(0)
+    assignment_shares: Decimal = Decimal(0)
+    assignment_strike: Decimal = Decimal(0)
+    structure_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OptionCommitment:
+    structure_id: str
+    max_loss: Decimal
+    cash_reserved: Decimal = Decimal(0)
+
+
+@dataclass(frozen=True)
+class DrawdownState:
+    high_water: Decimal = Decimal(0)
+    drawdown: Decimal = Decimal(0)
+    paused: bool = False
+    recovery_closes: int = 0
+    last_session: str | None = None
+
+    @property
+    def throttled(self) -> bool:
+        return self.paused or self.drawdown >= Decimal("0.15")
+
+
+@dataclass(frozen=True)
+class RiskControls:
+    pause_new_buys: bool = False
+    drawdown: DrawdownState = field(default_factory=DrawdownState)
+    option_commitments: tuple[OptionCommitment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PortfolioTotals:
+    equity: Decimal
+    free_cash: Decimal
+    gross_exposure: Decimal
+    issuer_values: Mapping[str, Decimal]
+    sector_values: Mapping[CanonicalSector, Decimal]
+    cluster_values: Mapping[str, Decimal]
+    positions: int
+    option_max_loss: Decimal
+    option_structures: int
+
+
+@dataclass(frozen=True)
+class RiskVerdict:
+    ok: bool
+    reasons: tuple[str, ...] = ()
+    after: PortfolioTotals | None = None
+    detect_only: bool = False
+
+
+@dataclass(frozen=True)
+class Breach:
+    kind: str
+    key: str
+    value: Decimal
+    cap: Decimal
+
+
+@dataclass(frozen=True)
+class StopDistance:
+    fraction: Decimal
+    fallback: bool
+
+
+class DailyBar(Protocol):
+    @property
+    def high(self) -> Decimal | float: ...
+
+    @property
+    def low(self) -> Decimal | float: ...
+
+    @property
+    def close(self) -> Decimal | float: ...
+
+
+def normalize_sector(raw: str | None) -> CanonicalSector:
+    raise NotImplementedError
+
+
+def classify_symbol(symbol: str, raw_sector: str | None = None) -> Classification:
+    raise NotImplementedError
+
+
+def atr14(bars: Sequence[DailyBar]) -> Decimal | None:
+    raise NotImplementedError
+
+
+def stop_fraction(price: Decimal, atr: Decimal | None) -> StopDistance:
+    raise NotImplementedError
+
+
+def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -> DrawdownState:
+    raise NotImplementedError
 
 
 class RiskManager:
     def __init__(self, config: Config):
         self.config = config
+
+    def evaluate_trade(
+        self, snapshot: "BookSnapshot", intent: TradeIntent, *,
+        now: datetime | None = None, controls: RiskControls | None = None,
+    ) -> RiskVerdict:
+        raise NotImplementedError
+
+    def propose_equity_qty(
+        self, snapshot: "BookSnapshot", intent: TradeIntent, *,
+        now: datetime | None = None, controls: RiskControls | None = None,
+    ) -> int:
+        raise NotImplementedError
+
+    def evaluate_portfolio(
+        self, snapshot: "BookSnapshot", *, controls: RiskControls | None = None,
+    ) -> tuple[Breach, ...]:
+        raise NotImplementedError
+
+    def plan_remediation(
+        self, snapshot: "BookSnapshot", *,
+        consecutive_closes: Mapping[tuple[str, str], int] | None = None,
+        broker_action: bool = False, controls: RiskControls | None = None,
+    ) -> tuple[TradeIntent, ...]:
+        raise NotImplementedError
 
     def can_open_position(
         self,
