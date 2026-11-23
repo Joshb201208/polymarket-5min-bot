@@ -51,6 +51,7 @@ from stock_agent.options_policy import (
     ExitInputs,
     ExitReason,
     Proposal,
+    mark_problem,
     Rejection,
     apply_result,
     breaks_thesis,
@@ -103,6 +104,11 @@ class ScanOutcome:
     symbol: str
     opened: str | None = None  # structure id
     reason: str = ""
+    # False when the answer may change soon (market or data gate, broker error, research
+    # gate health); the caller should keep a news idea and offer it again later.
+    final: bool = True
+    story_id: str | None = None
+    story_handled: bool = False  # the story id is durably recorded as handled
 
 
 @dataclass
@@ -172,6 +178,7 @@ class OptionsManager:
         self._cover_short = cover_short
         self._universe = universe or (lambda: ())
         self._risk_controls = risk_controls or (lambda: RiskControls())
+        self._bad_marks: set[str] = set()
         self._ex_dividend = ex_dividend
         self.journal = journal
         self.alerts = alerts
@@ -346,37 +353,61 @@ class OptionsManager:
             blocker = self.open_blocker()
             if blocker:
                 syms = [c.symbol for c in candidates] if candidates else []
-                return [ScanOutcome(s, None, blocker) for s in syms] or [ScanOutcome("*", None, blocker)]
+                return [ScanOutcome(s, None, blocker, final=False) for s in syms] or [ScanOutcome("*", None, blocker, final=False)]
             try:
                 await self._reconcile_locked(now)
             except BrokerError as e:
-                return [ScanOutcome("*", None, f"reconcile failed: {e}")]
+                return [ScanOutcome("*", None, f"reconcile failed: {e}", final=False)]
             blocker = self.open_blocker()
             if blocker:
-                return [ScanOutcome("*", None, blocker)]
+                return [ScanOutcome("*", None, blocker, final=False)]
             ok, why = await self._gate("entry")
             if not ok:
-                return [ScanOutcome("*", None, f"market gate: {why}")]
+                return [ScanOutcome("*", None, f"market gate: {why}", final=False)]
             if candidates is None:
                 cands = [OptionCandidate(s, source="scan") for s in dict.fromkeys(self._universe())]
             else:
                 cands = list(candidates)
             out = []
             for c in cands:
+                err: BrokerError | None = None
                 try:
-                    out.append(await self._try_open(c, now))
+                    o = await self._try_open(c, now)
                 except BrokerError as e:
-                    out.append(ScanOutcome(c.symbol, None, f"broker: {e}"))
-                    if e.uncertain:
-                        await self._alert("critical", "Options order outcome unknown", f"{c.symbol}: {e}",
+                    err = e
+                    o = ScanOutcome(c.symbol, None, f"broker: {e}", final=False)
+                if c.story_id:
+                    o.story_id = c.story_id
+                    if o.final or o.opened:
+                        self._mark_story(c.story_id)
+                    o.story_handled = self.is_story_handled(c.story_id)
+                out.append(o)
+                if err is not None:
+                    if err.uncertain:
+                        await self._alert("critical", "Options order outcome unknown", f"{c.symbol}: {err}",
                                           key=f"opt-uncertain-{c.symbol}")
                         break
-                    if e.kind in ("auth", "network", "timeout", "server"):
+                    if err.kind in ("auth", "network", "timeout", "server"):
                         break
             for o in out:
                 if not o.opened:
                     self._j("options.scan_skip", symbol=o.symbol, reason=o.reason)
             return out
+
+    def is_story_handled(self, story_id: str) -> bool:
+        """True once a news story has had a final answer or an order was sent for it.
+        Persisted in the book, so replays after a crash are answered the same way."""
+        return story_id in set(self.meta.get("stories", [])) or any(
+            x.story_id == story_id for x in self.structures)
+
+    def handled_story_ids(self, story_ids: Iterable[str]) -> set[str]:
+        return {sid for sid in story_ids if sid and self.is_story_handled(sid)}
+
+    def _mark_story(self, story_id: str) -> None:
+        if story_id in set(self.meta.get("stories", [])):
+            return
+        self.meta["stories"] = (list(self.meta.get("stories", [])) + [story_id])[-500:]
+        self._save()
 
     def _news_opens_today(self, today: date) -> int:
         return sum(1 for s in self.structures
@@ -395,22 +426,19 @@ class OptionsManager:
         if in_cooldown(self.cooldowns.get(sym), today):
             return ScanOutcome(sym, None, f"cool-down until {self.cooldowns[sym].until}")
         if c.source == "news":
-            if c.story_id and c.story_id in set(self.meta.get("stories", [])):
+            if c.story_id and self.is_story_handled(c.story_id):
                 return ScanOutcome(sym, None, "story already handled")
             if self._news_opens_today(today) >= s.max_news_opens_per_session:
                 return ScanOutcome(sym, None, "news-driven option opens for this session used up")
-            if c.story_id:
-                self.meta["stories"] = (list(self.meta.get("stories", [])) + [c.story_id])[-200:]
-                self._save()
         # ---- fresh underlying quote first: it also refreshes the shared price
         # health the research gate checks, so a prescan thesis isn't blocked by staleness
         spot, why = await self._spot_now(sym, now)
         if spot is None:
-            return ScanOutcome(sym, None, f"underlying {why}")
+            return ScanOutcome(sym, None, f"underlying {why}", final=False)
         # ---- research gate
         el = await _maybe(self.gate.is_entry_eligible(sym, now))
         if not el.ok:
-            return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons))
+            return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
         direction = parse_direction(el.direction)
         if direction is None:
             return ScanOutcome(sym, None, f"thesis direction {el.direction} is not tradeable with options")
@@ -443,7 +471,14 @@ class OptionsManager:
         if prop.strategy.is_spread and level is not None and level < 3:
             return ScanOutcome(sym, None, f"options level {level} does not allow spreads")
         # ---- sizing and risk
-        controls = await _maybe(self._risk_controls())
+        if el.generated_at is None:
+            return ScanOutcome(sym, None, "thesis has no generation time")
+        try:
+            controls = await _maybe(self._risk_controls())
+        except Exception as e:  # e.g. an invalid drawdown record: refuse entries
+            await self._alert("critical", "Options entries refused: risk state unreadable", str(e),
+                              key="opt-risk-state")
+            return ScanOutcome(sym, None, f"risk state unavailable: {e}", final=False)
         halted = bool(getattr(getattr(controls, "drawdown", None), "throttled", False))
         ladder = self._open_ladder(prop)
         if not ladder:
@@ -472,7 +507,7 @@ class OptionsManager:
         except BrokerError:
             raise
         except Exception as e:  # risk unavailable -> no entry
-            return ScanOutcome(sym, None, f"risk check unavailable: {e}")
+            return ScanOutcome(sym, None, f"risk check unavailable: {e}", final=False)
         if not verdict.ok:
             return ScanOutcome(sym, None, "risk: " + "; ".join(verdict.reasons))
         existing = getattr(verdict, "allowed_existing_breaches", ()) or ()
@@ -483,7 +518,7 @@ class OptionsManager:
                               for b in existing])
         ok, why = await self._gate("entry")
         if not ok:
-            return ScanOutcome(sym, None, f"market gate: {why}")
+            return ScanOutcome(sym, None, f"market gate: {why}", final=False)
         st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
         return await self._submit_open(st, prop, now)
 
@@ -547,7 +582,7 @@ class OptionsManager:
                 st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
                 self._save()
-            # the budget was checked at the first limit; a higher limit must still fit it
+            # sized at the ladder's top rung, so every rung's max loss is within the budget
             st.limit_debit = limit
             st.max_loss = round(limit * MULTIPLIER * st.qty, 2)
             try:
@@ -560,6 +595,8 @@ class OptionsManager:
                 st.state = StructState.VOID.value
                 st.note(f"open rejected: {e.message}")
                 self._save()
+                await self._alert("critical", f"Options open rejected: {st.underlying}", e.message,
+                                  key=f"opt-open-{st.id}")
                 return ScanOutcome(st.underlying, None, f"order rejected: {e.message}")
             st.open_order_id = order.id
             self._save()
@@ -578,7 +615,7 @@ class OptionsManager:
                               key=f"opt-open-{st.id}")
             return ScanOutcome(st.underlying, st.id, "opened")
         if st.st is StructState.PENDING:
-            return ScanOutcome(st.underlying, None, "open order still working")
+            return ScanOutcome(st.underlying, None, "open order still working", final=False)
         return ScanOutcome(st.underlying, None, f"not filled ({order.status if order else 'not sent'})")
 
     async def _wait_or_cancel(self, order: BrokerOrder) -> BrokerOrder:
@@ -723,7 +760,7 @@ class OptionsManager:
         extras = [_Pos(sym, broker_qty[sym], p.avg_entry_price) for sym, p in opt_pos.items()
                   if sym not in claimed and sym not in in_flight and broker_qty[sym] != 0]
         if extras:
-            for st in adopt_positions(extras, now):
+            for st in adopt_positions(extras, now, self.meta.get("legacy_hints")):
                 self.structures.append(st)
                 rep.adopted.append(st.id)
                 if st.st is StructState.REPAIR:
@@ -743,7 +780,7 @@ class OptionsManager:
         self.meta["last_reconcile_clean"] = rep.clean
         self._save()
         if rep.unknown:
-            await self._alert("error", "Options book disagrees with the broker",
+            await self._alert("critical", "Options book disagrees with the broker",
                               f"{len(rep.unknown)} structure(s) unknown; new option entries blocked",
                               key="opt-unknown")
         for sid in rep.unknown:
@@ -821,7 +858,7 @@ class OptionsManager:
                 out.reconcile = await self._reconcile_locked(now)
             except BrokerError as e:
                 out.skipped = f"reconcile failed: {e}"
-                await self._alert("error", "Options reconcile failed", str(e), key="opt-reconcile")
+                await self._alert("critical", "Options reconcile failed", str(e), key="opt-reconcile")
                 return out
             ok, why = await self._gate("exit")
             if not ok:
@@ -841,7 +878,7 @@ class OptionsManager:
                     out.exits.append((st.id, reason.value, res))
                 except BrokerError as e:
                     out.exits.append((st.id, "error", str(e)))
-                    await self._alert("error", f"Options exit failed: {st.underlying}", str(e),
+                    await self._alert("critical", f"Options exit failed: {st.underlying}", str(e),
                                       key=f"opt-exit-{st.id}")
                     if e.uncertain:
                         break
@@ -871,7 +908,7 @@ class OptionsManager:
                 await self._alert("critical", f"Options repair failed: {st.underlying}", str(e),
                                   key=f"opt-repair-{st.id}")
         for d in rep.deliveries:
-            await self._alert("error", f"Option delivery on {d['underlying']}",
+            await self._alert("critical", f"Option delivery on {d['underlying']}",
                               f"exercise/assignment moved shares ({d['legs']}); trim policy applies",
                               key=f"opt-delivery-{d['structure_id']}")
 
@@ -882,7 +919,14 @@ class OptionsManager:
         if days_left is None and st.expiry_date <= today:
             days_left = 0
         quotes = await self._quotes([lg.symbol for lg in st.legs])
-        value_mid = self._value(st, quotes, "mid")
+        bad = {lg.symbol: mark_problem(quotes.get(lg.symbol), now, s) for lg in st.legs}
+        bad = {k: v for k, v in bad.items() if v}
+        value_mid = None if bad else self._value(st, quotes, "mid")
+        if bad and st.id not in self._bad_marks:
+            self._bad_marks.add(st.id)
+            self._j("options.mark_rejected", structure_id=st.id, problems=bad)
+        elif not bad:
+            self._bad_marks.discard(st.id)
         spot = None
         short_call = next((lg for lg in st.legs if lg.side == "sell" and lg.type == "call"), None)
         extrinsic = None
@@ -968,8 +1012,11 @@ class OptionsManager:
         market on later attempts or when getting out is urgent."""
         today = self._today(now)
         days_left = self._trading_days(today, st.expiry_date)
-        urgent = reason in (ExitReason.REPAIR, ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY,
-                            ExitReason.EX_DIVIDEND) and (days_left is None or days_left <= 1 or st.close_attempts >= 2)
+        # a lone short leg is closed at market straight away; time and ex-dividend exits
+        # escalate to market close to expiry or after two unfilled attempts
+        urgent = reason is ExitReason.REPAIR or (
+            reason in (ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND)
+            and (days_left is None or days_left <= 1 or st.close_attempts >= 2))
         if urgent or st.close_attempts >= 3:
             fracs: list[float | None] = [None]
         elif st.close_attempts == 0:
@@ -992,7 +1039,10 @@ class OptionsManager:
                 if natural is not None and mid is not None:
                     limit = close_limit(natural, mid, frac)
                 if limit is None or limit <= 0:
-                    limit = None  # no usable quote or nothing to collect: market
+                    # no usable quote: don't send a market order on a bad mark unless urgent
+                    st.note("close skipped: no usable quote")
+                    self._save()
+                    return "no usable quote"
             st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + i)
             st.exit_reason = reason.value
             st.state = StructState.CLOSING.value
@@ -1009,7 +1059,7 @@ class OptionsManager:
                 st.close_attempts += 1
                 st.note(f"close rejected: {e.message}")
                 self._save()
-                await self._alert("error", f"Options close rejected: {st.underlying}", e.message,
+                await self._alert("critical", f"Options close rejected: {st.underlying}", e.message,
                                   key=f"opt-close-{st.id}")
                 return f"rejected: {e.message}"
             st.close_order_id = order.id
@@ -1085,6 +1135,8 @@ class OptionsManager:
             except BrokerError as e:
                 if e.uncertain:
                     raise OptionsError(f"buy to close {contract}: outcome unknown ({e})") from e
+                await self._alert("critical", f"Options buy-to-close rejected: {contract}", e.message,
+                                  key=f"opt-bsc-{contract}")
                 return CloseResult(False, 0, None, None, "rejected", e.message)
             try:
                 order = await self._wait_or_cancel(order)
