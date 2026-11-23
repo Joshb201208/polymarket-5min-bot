@@ -6,8 +6,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from stock_agent.fundamentals_service import FundamentalsService
+from stock_agent.research_pipeline import SourceUnavailable
 from stock_agent.research_sources import ResearchSources
 
 NOW = datetime(2026, 11, 23, 15, tzinfo=UTC)
@@ -68,6 +70,32 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
     asyncio.run(run())
 
 
+def test_global_feed_health_cannot_substitute_for_symbol_coverage():
+    class News:
+        fails = False
+
+        async def poll_news(self, symbols, **_):
+            return SimpleNamespace(ok=not self.fails, degraded=True, as_of=NOW, covered_symbols={"AAA"}, items=[])
+
+    async def universe():
+        return ["AAA", "BBB"]
+
+    async def run():
+        service = News()
+        health = SimpleNamespace(research_entry_blockers=lambda *_args, **_kwargs: ())
+        sources = ResearchSources(None, service, list_universe=universe, health=health)
+        assert await sources.news(("AAA", "BBB"), NOW) == ()
+        assert sources.news_ok("AAA", NOW)
+        assert not sources.news_ok("BBB", NOW)
+        assert not sources.news_ok("AAA", NOW - timedelta(seconds=1))
+        service.fails = True
+        with pytest.raises(SourceUnavailable):
+            await sources.news(("AAA", "BBB"), NOW)
+        assert not sources.news_ok("AAA", NOW)
+
+    asyncio.run(run())
+
+
 def test_fundamental_requests_are_capped_per_pass_and_cache_does_not_consume_allowance():
     class Prices:
         async def get_quotes(self, symbols, **_):
@@ -94,6 +122,31 @@ def test_fundamental_requests_are_capped_per_pass_and_cache_does_not_consume_all
         assert all(row.metrics["pe_ttm"] == 20 for row in second.values())
         await sources.securities(symbols, NOW + timedelta(hours=7))
         assert calls == [*symbols, "HELD", "FOCUS"]
+
+    asyncio.run(run())
+
+
+def test_shared_fundamentals_cache_does_not_consume_cold_allowance():
+    class Prices:
+        async def get_quotes(self, symbols, **_):
+            return SimpleNamespace(quotes={})
+
+    async def universe():
+        return ["CACHED", "COLD"]
+
+    async def company(symbol):
+        assert symbol == "COLD"
+        return SimpleNamespace(metrics={"pe_ttm": 20})
+
+    async def run():
+        cached = {"CACHED": SimpleNamespace(metrics={"pe_ttm": 10})}
+        sources = ResearchSources(
+            Prices(), None, list_universe=universe, fetch_company=company, cached_company=cached.get,
+            fundamental_limit=1,
+        )
+        rows = await sources.securities(await sources.universe(NOW), NOW)
+        assert rows["CACHED"].metrics["pe_ttm"] == 10
+        assert rows["COLD"].metrics["pe_ttm"] == 20
 
     asyncio.run(run())
 
@@ -161,6 +214,7 @@ def test_actual_fundamentals_service_maps_snapshot_and_release_offline():
             sources = ResearchSources(
                 Prices(), News(), list_universe=fundamentals.list_universe,
                 fetch_company=fundamentals.fetch_company, fetch_releases=fundamentals.fetch_releases,
+                cached_company=fundamentals.cached_company,
             )
             symbols = await sources.universe(NOW)
             assert symbols == ("AAA", "BBB")

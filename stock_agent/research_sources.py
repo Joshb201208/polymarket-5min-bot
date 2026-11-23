@@ -24,6 +24,7 @@ class ResearchSources:
         self, prices, news, *,
         list_universe: Callable[[], Awaitable[Sequence[str]]],
         fetch_company: Callable[[str], Awaitable[Any]] | None = None,
+        cached_company: Callable[[str], Any | None] | None = None,
         fetch_releases: Callable[[tuple[str, ...], datetime], Awaitable[Sequence[Any]]] | None = None,
         asset_for: Callable[[str], Any] | None = None,
         health=None,
@@ -33,6 +34,7 @@ class ResearchSources:
         self.news_service = news
         self.list_universe = list_universe
         self.fetch_company = fetch_company
+        self.cached_company = cached_company
         self.fetch_releases = fetch_releases
         self.asset_for = asset_for or (lambda _symbol: None)
         self.health = health
@@ -66,12 +68,15 @@ class ResearchSources:
         return stamp is not None and timedelta() <= now - stamp <= _QUOTE_TTL
 
     def news_ok(self, symbol: str, now: datetime) -> bool:
-        if self.health is not None:
-            return "news_missing_or_stale" not in self.health.research_entry_blockers(
+        stamp = self._news_at.get(symbol)
+        if stamp is None or not timedelta() <= now - stamp <= _NEWS_TTL:
+            return False
+        return (
+            self.health is None
+            or "news_missing_or_stale" not in self.health.research_entry_blockers(
                 symbol, now, news_max_age_s=_NEWS_TTL.total_seconds(),
             )
-        stamp = self._news_at.get(symbol)
-        return stamp is not None and timedelta() <= now - stamp <= _NEWS_TTL
+        )
 
     async def _poll(self, symbols, *, scope, include_market, lookback_hours, focus=(), universe=()):
         if not symbols and not include_market:
@@ -181,6 +186,10 @@ class ResearchSources:
             symbol: stamp[1] for symbol in symbols if (stamp := self._companies.get(symbol)) is not None
             and timedelta() <= now - stamp[0] <= _COMPANY_TTL
         }
+        if self.cached_company is not None:
+            for symbol in symbols:
+                if symbol not in cached and (snapshot := self.cached_company(symbol)) is not None:
+                    cached[symbol] = snapshot
         # The order is held, focus, then universe. Company data is optional:
         # don't fire several provider requests per symbol across the whole list.
         allowed = set(tuple(dict.fromkeys(symbol for symbol in symbols if symbol not in cached))[
