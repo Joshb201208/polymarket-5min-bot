@@ -829,16 +829,25 @@ class RiskManager:
 
     @staticmethod
     def _covered_shares(snapshot: "BookSnapshot", symbol: str) -> Decimal:
-        total = Decimal(0)
-        for leg in snapshot.legs:
-            right = getattr(leg, "right", "")
-            qty = _decimal(leg.qty)
-            short = qty < 0 or getattr(leg, "side", "") == "short"
-            if leg.underlying == symbol and str(right).lower() in {"c", "call"} and short:
-                # A short call with no explicit stock coverage need not pledge stock.
-                # Until the option manager clears it, never sell potential covering shares.
-                total += abs(qty) * _decimal(leg.multiplier)
-        return total
+        calls = [leg for leg in snapshot.legs_for(symbol) if leg.right.lower() in {"c", "call"}]
+        hedges = {leg.occ_symbol: leg.qty for leg in calls if leg.qty > 0}
+        reserved = Decimal(0)
+        for leg in sorted((leg for leg in calls if leg.qty < 0), key=lambda leg: leg.strike):
+            unhedged = -leg.qty
+            for hedge in calls:
+                available = hedges.get(hedge.occ_symbol, Decimal(0))
+                if (available <= 0 or hedge.expiry != leg.expiry or hedge.multiplier != leg.multiplier
+                        or hedge.strike >= leg.strike):
+                    continue
+                paired = min(available, unhedged)
+                hedges[hedge.occ_symbol] -= paired
+                unhedged -= paired
+                if unhedged == 0:
+                    break
+            # Existing broker qty_available is a separate, authoritative ceiling.
+            # Long calls serving as spread hedges do not also tie up stock shares.
+            reserved += unhedged * leg.multiplier
+        return reserved
 
     @staticmethod
     def _contributes(stock: _Stock, breach: Breach) -> bool:
