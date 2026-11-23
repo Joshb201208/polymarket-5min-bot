@@ -287,6 +287,9 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
             assert intent.side == ("sell" if held else "buy")
             assert intent.position_id == ("p-1" if held else None)
             assert intent.expires_at == session.closes_at
+            if not held:
+                assert intent.meta["minimum_conviction"] == 8
+                assert intent.meta["signal_at"] == NOW.isoformat()
             replayed = await pipe.run("news", snapshot)
             assert replayed.intents == first.intents
             assert replayed.option_candidates == first.option_candidates

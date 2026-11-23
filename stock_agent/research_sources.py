@@ -15,7 +15,7 @@ from stock_agent.research_schemas import Evidence, utc_datetime
 _NEWS_TTL = timedelta(minutes=20)
 _QUOTE_TTL = timedelta(seconds=90)
 _MARKET = ("SPY", "QQQ")
-_NEWS_LIMIT = 0.55
+_NEWS_LIMIT = 5
 
 
 class ResearchSources:
@@ -25,6 +25,7 @@ class ResearchSources:
         fetch_company: Callable[[str], Awaitable[Any]] | None = None,
         fetch_releases: Callable[[tuple[str, ...], datetime], Awaitable[Sequence[Any]]] | None = None,
         asset_for: Callable[[str], Any] | None = None,
+        health=None,
     ):
         self.prices = prices
         self.news_service = news
@@ -32,6 +33,7 @@ class ResearchSources:
         self.fetch_company = fetch_company
         self.fetch_releases = fetch_releases
         self.asset_for = asset_for or (lambda _symbol: None)
+        self.health = health
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._news_at: dict[str, datetime] = {}
@@ -51,32 +53,41 @@ class ResearchSources:
         last_quote = getattr(self.prices, "last_quote", None)
         if last_quote is not None:
             quote = last_quote(symbol)
-            stamp = utc_datetime(quote.as_of) if quote is not None and _price(quote.price) is not None else None
+            stamp = (
+                utc_datetime(quote.as_of) if quote is not None and quote.symbol == symbol
+                and _price(quote.price) is not None else None
+            )
         else:
             stamp = self._quote_at.get(symbol)
         return stamp is not None and timedelta() <= now - stamp <= _QUOTE_TTL
 
     def news_ok(self, symbol: str, now: datetime) -> bool:
+        if self.health is not None:
+            return "news_missing_or_stale" not in self.health.research_entry_blockers(
+                symbol, now, news_max_age_s=_NEWS_TTL.total_seconds(),
+            )
         stamp = self._news_at.get(symbol)
         return stamp is not None and timedelta() <= now - stamp <= _NEWS_TTL
 
-    async def _poll(self, symbols, *, consumer, include_market, lookback_hours):
+    async def _poll(self, symbols, *, scope, include_market, lookback_hours, focus=(), universe=()):
         if not symbols and not include_market:
             return ()
         batch = await self.news_service.poll_news(
-            list(symbols), consumer=consumer, include_market=include_market, lookback_hours=lookback_hours,
+            symbols, scope=scope, include_market=include_market, lookback_hours=lookback_hours,
+            focus=focus, universe=universe, mark_seen=False,
         )
         stamp = utc_datetime(batch.as_of)
-        if stamp is None or batch.status == "failed":
-            for symbol in symbols:
+        coverage_set = tuple(dict.fromkeys((*symbols, *focus, *universe)))
+        if stamp is None or not batch.ok:
+            for symbol in coverage_set:
                 self._news_at.pop(symbol, None)
             raise SourceUnavailable("news poll failed")
         items = tuple(batch.items)
         covered = getattr(batch, "covered_symbols", None)
         if covered is None:
-            covered = symbols if batch.status == "ok" else {s for item in items for s in item.symbols}
+            covered = coverage_set if not batch.degraded else {s for item in items for s in item.symbols}
         covered = set(covered)
-        for symbol in symbols:
+        for symbol in coverage_set:
             if symbol in covered:
                 self._news_at[symbol] = stamp
             else:
@@ -84,22 +95,26 @@ class ResearchSources:
         return items
 
     async def news(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
-        items = await self._poll(symbols, consumer="live_news", include_market=True, lookback_hours=24)
+        return await self.live_news(symbols, (), (), now)
+
+    async def live_news(self, held, focus, universe, now) -> tuple[NewsEvent, ...]:
+        items = await self._poll(held, scope="live", include_market=True, lookback_hours=24,
+                                 focus=focus, universe=universe)
         events = []
-        allowed = set(symbols)
+        allowed = set((*held, *focus, *universe))
         for item in items:
             score = _finite(item.materiality_score)
             if score is None or score < _NEWS_LIMIT:
                 continue
             evidence = _news_evidence(item)
             if evidence is not None:
-                events.extend(NewsEvent(symbol, item.story_id, evidence, round(score * 100))
+                events.extend(NewsEvent(symbol, item.story_id, evidence, round(score))
                               for symbol in item.symbols if symbol in allowed)
         return tuple(events)
 
     async def background(self, symbols: tuple[str, ...]) -> dict[str, tuple[Evidence, ...]]:
         try:
-            items = await self._poll(symbols, consumer="scheduled_research", include_market=False, lookback_hours=72)
+            items = await self._poll(symbols, scope="scheduled_research", include_market=False, lookback_hours=72)
         except SourceUnavailable:
             return {}  # Independent news health blocks entries; held research may continue.
         result: dict[str, list[Evidence]] = {symbol: [] for symbol in symbols}
@@ -183,6 +198,8 @@ class ResearchSources:
             )
             decide = getattr(asset, "tradable", getattr(snapshot, "tradable", None))
             tradable = decide if type(decide) is bool else symbol in self._universe
+            if getattr(asset, "renamed_to", None):
+                tradable = False
             metrics = _metrics(getattr(snapshot, "metrics", {}))
             quote = quotes.get(symbol)
             out[symbol] = SecurityInputs(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -93,6 +94,21 @@ class ResearchInput:
             "current_thesis": None if blind else self.current_thesis, "context": self.context,
         }
 
+    @classmethod
+    def from_payload(cls, payload: dict) -> ResearchInput:
+        """Rehydrate the immutable original inputs; never use a newer thesis for a retry."""
+        return cls(
+            symbol=payload["symbol"], as_of=datetime.fromisoformat(payload["AS_OF"]),
+            company_name=payload["company_name"], sector=payload["canonical_sector"],
+            price=payload["reference_price"],
+            quote_at=datetime.fromisoformat(payload["quote_at"]) if payload["quote_at"] else None,
+            metrics=payload["metrics"], evidence=tuple(
+                Evidence.model_validate_json(json.dumps(item)) for item in payload["evidence"]
+            ),
+            trigger_evidence_ids=tuple(payload["trigger_evidence_ids"]), entry_thesis=payload["entry_thesis"],
+            current_thesis=payload["current_thesis"], holding=payload["holding"], context=payload["context"],
+        )
+
 
 @dataclass(frozen=True)
 class ThesisEvaluation:
@@ -149,7 +165,9 @@ class Analyst:
                     raise ValueError("news reaction did not cite the triggering evidence")
 
         prompt = _THESIS + (_NEWS if task is ResearchTask.NEWS else "") + _RUBRIC
-        result = await self.llm.complete(LLMRequest(task, ThesisDraft, THESIS_PROMPT_VERSION, prompt, inputs, grounded, validate=validate))
+        result = await self.llm.complete(LLMRequest(
+            task, ThesisDraft, THESIS_PROMPT_VERSION, prompt, inputs, grounded, validate=validate, exit_work=held,
+        ))
         known = _index_evidence(data, result.evidence)
         if result.value.direction in {Direction.HOLD, Direction.AVOID, Direction.INSUFFICIENT_EVIDENCE}:
             kept = result.value

@@ -67,7 +67,12 @@ class ResearchGate:
             direction = None
         if direction not in {Direction.BUY, Direction.BEARISH}:
             reasons.append("non_entry_direction")
-        if any(type(score) is not int or not 7 <= score <= 10 for score in (raw, effective)):
+        choose_floor = getattr(self.health, "extra_conviction_floor", None)
+        floor = max(
+            8 if payload.get("job") in {"news", "earnings"} else 7,
+            choose_floor(utc_now) if choose_floor is not None else 7,
+        )
+        if type(raw) is not int or not 7 <= raw <= 10 or type(effective) is not int or not floor <= effective <= 10:
             reasons.append("conviction_below_floor_or_invalid")
         max_age_s = self.config.RESEARCH_THESIS_MAX_AGE_H * 3600
         if (

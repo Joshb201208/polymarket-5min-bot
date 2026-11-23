@@ -20,17 +20,17 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
             })
 
     class News:
-        async def poll_news(self, symbols, *, consumer, include_market, lookback_hours):
-            assert include_market and lookback_hours == 24
+        async def poll_news(self, symbols, *, scope, include_market, lookback_hours, mark_seen, focus, universe):
+            assert include_market and lookback_hours == 24 and not mark_seen
             return SimpleNamespace(
-                status="degraded", as_of=NOW, covered_symbols={"AAA"}, items=[
+                ok=True, degraded=True, as_of=NOW, covered_symbols={"AAA"}, items=[
                     SimpleNamespace(
-                        symbols=("AAA",), materiality_score=.7, story_id="abc", publisher="Issuer",
+                        symbols=("AAA",), materiality_score=7, story_id="abc", publisher="Issuer",
                         url="https://example.org/story", snippet="Reported results", headline="Results",
                         published_at=NOW - timedelta(minutes=10), retrieved_at=NOW,
                     ),
                     SimpleNamespace(
-                        symbols=("AAA", "BBB"), materiality_score=.2, story_id="ignore",
+                        symbols=("AAA", "BBB"), materiality_score=2, story_id="ignore",
                         url="https://example.org/low", published_at=NOW, retrieved_at=NOW,
                     ),
                 ],
@@ -63,7 +63,7 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
 def test_only_confirmed_prior_earnings_release_materializes():
     class News:
         async def poll_news(self, symbols, **_):
-            return SimpleNamespace(status="ok", as_of=NOW, items=[])
+            return SimpleNamespace(ok=True, degraded=False, as_of=NOW, items=[])
 
     async def universe():
         return ["AAA", "BBB"]
