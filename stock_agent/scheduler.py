@@ -686,75 +686,35 @@ class StockAgentScheduler:
     # ── Market monitoring ────────────────────────────────────────────
 
     async def _run_market_monitoring(self):
-        """Check positions during market hours."""
+        """Broker safety and queued orders, then the held-position news hook.
+
+        Order of work: engine.monitor_tick (clean-up, cover any short, one
+        broker stop per long, queued exits then entries), then the research
+        hook, whose intents are persisted and dispatched in the same cycle.
+        There is no software stop sell: the broker stop is the only one.
+        """
+        self._last_monitor_time = _now_et()
+        if self.engine is None:
+            logger.error("Execution engine not wired; no monitoring")
+            return None
+        report = await self.engine.monitor_tick()
+        hook = getattr(self, "_run_held_news_check", None)
+        if hook is None or self.ledger is None:
+            return report
         try:
-            self._last_monitor_time = _now_et()
-            positions = self.portfolio.state.positions
-            if not positions:
-                logger.debug("No positions to monitor")
-                return
-
-            # 1. Update prices
-            symbols = [p.symbol for p in positions]
-            prices = await self.data_feed.get_batch_quotes(symbols)
-            self.portfolio.update_prices(prices)
-
-            # 2. Check stop-losses (belt-and-suspenders with Alpaca bracket orders)
-            alerts = self.risk_manager.check_position_health(self.portfolio.state)
-            for alert in alerts:
-                sym = alert["symbol"]
-                pos = self.portfolio.get_position(sym)
-                if pos:
-                    logger.warning("Stop-loss triggered for %s", sym)
-                    await self._execute_sell(pos, reason=alert["reason"])
-
-            # 3. Check for material events (only every other check to save API costs)
-            if self._should_check_events():
-                for pos in list(self.portfolio.state.positions):
-                    try:
-                        event_check = await self.analyst.check_for_material_events(
-                            pos.symbol, pos.thesis.symbol
-                        )
-                        if event_check.get("material_event"):
-                            severity = event_check.get("severity", 0)
-                            impact = event_check.get("thesis_impact", "neutral")
-                            event_desc = event_check.get("event", "Unknown event")
-
-                            logger.info(
-                                "Material event for %s: %s (severity=%d, impact=%s)",
-                                pos.symbol, event_desc, severity, impact,
-                            )
-
-                            # Send to Discord market-monitor
-                            try:
-                                await self.discord.send_material_event(
-                                    pos.symbol, event_desc, impact, severity,
-                                )
-                            except Exception:
-                                pass
-
-                            # Severe negative event → full re-analysis
-                            if severity >= 7 and impact == "negative":
-                                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                                if company:
-                                    new_thesis = await self.analyst.re_analyze_position(
-                                        pos.symbol, company, pos.thesis
-                                    )
-                                    if new_thesis and new_thesis.direction == "SELL":
-                                        await self._execute_sell(
-                                            pos,
-                                            reason=f"Material event: {event_desc}",
-                                        )
-                                    elif new_thesis:
-                                        self.portfolio.update_thesis(pos.symbol, new_thesis)
-                    except Exception as e:
-                        logger.error("Event check failed for %s: %s", pos.symbol, e)
-
-            self.portfolio.set_last_daily_check(_now_utc())
-            logger.info("Market monitoring complete — %d positions checked", len(positions))
-
+            try:
+                snapshot = self.ledger.snapshot()
+            except Exception:
+                snapshot = await self.ledger.refresh("held news check")
+            outcome = await hook(snapshot)
+            intents = list(getattr(outcome, "intents", outcome) or [])
+            if intents:
+                self.ledger.enqueue_intents(intents, job="held_news")
+                report.executed.extend(await self.engine.execute_due())
         except Exception as e:
-            logger.exception("Market monitoring failed: %s", e)
+            logger.exception("Held news check failed: %s", e)
+            report.errors.append(f"held news: {e}")
+        return report
 
     def _should_check_events(self) -> bool:
         now = _now_et()
@@ -826,205 +786,77 @@ class StockAgentScheduler:
     # ── Trade execution ──────────────────────────────────────────────
 
     async def _execute_signals(self, signals: list[Signal]) -> list[Signal]:
-        """Execute BUY signals that pass risk checks."""
-        executed: list[Signal] = []
+        """Queue BUY signals as order intents and let the execution engine run them.
 
-        # Check PDT compliance first
-        if not self.risk_manager.check_pdt_compliance(self.portfolio.state.trade_history):
-            logger.warning("PDT limit reached — skipping new buys")
-            await asyncio.gather(
-                self.telegram.send_message("\u26a0\ufe0f PDT limit reached — no new trades today"),
-                self.discord.send_risk_alert("PDT_WARNING", "PDT day-trade limit reached — no new trades today"),
-                return_exceptions=True,
-            )
-            return executed
+        Sizing, risk limits, market hours and the protective stop are all
+        decided by the engine at execution time from fresh broker state.
+        Returns the signals whose buy filled.
+        """
+        if self.engine is None or self.ledger is None:
+            logger.error("Execution engine not wired; %d signals not executed", len(signals))
+            return []
+        from decimal import Decimal
 
-        for signal in signals:
-            if signal.action != "BUY":
-                continue
+        from stock_agent.ledger import NewIntent
 
-            sym = signal.symbol
-            # Get sector from company fundamentals (FMP profile)
-            company_sector = "Unknown"
+        session = _now_et().date()
+        buys = [s for s in signals if s.action == "BUY"]
+        missing = [s.symbol.upper() for s in buys if not s.entry_price]
+        marks: dict = {}
+        if missing and self.prices is not None:
             try:
-                company_data = await self.data_feed.get_company_fundamentals(sym)
-                if company_data and company_data.sector:
-                    company_sector = company_data.sector
-            except Exception:
-                pass
-
-            price = signal.entry_price or 0
-            if price <= 0:
-                quote = await self.data_feed.get_stock_quote(sym)
-                if quote:
-                    price = quote["price"]
-                else:
-                    logger.warning("Cannot get price for %s — skipping", sym)
-                    continue
-
-            ok, reason = self.risk_manager.can_open_position(
-                self.portfolio.state, sym, company_sector, price,
-                conviction=signal.conviction,
-            )
-            if not ok:
-                logger.warning("Risk check BLOCKED %s (sector=%s): %s", sym, company_sector, reason)
-                try:
-                    await self.discord.send_system_log(
-                        "WARNING", f"Trade blocked for {sym}: {reason}"
-                    )
-                except Exception:
-                    pass
-                continue
-
-            is_add_on = (reason == "ADD_TO_EXISTING")
-            pv = self.portfolio.get_portfolio_value()
-
-            if is_add_on:
-                # Calculate how many MORE shares to reach effective target weight.
-                # Effective target = min(conviction-size, hard cap) — so a single
-                # add can never take us above config.MAX_POSITION_PCT, even if
-                # conviction target is higher.
-                existing = self.portfolio.get_position(sym)
-                if not existing:
-                    continue
-                conviction_target = self.config.CONVICTION_SIZE_MAP.get(
-                    signal.conviction, 0.05
-                )
-                hard_cap = self.config.MAX_POSITION_PCT
-                target_pct = min(conviction_target, hard_cap)
-                target_value = pv * target_pct
-                current_value = existing.current_price * existing.shares
-                additional_value = target_value - current_value
-                qty = int(additional_value / price)
-                if qty <= 0:
-                    logger.info("Add-on for %s: already at target weight — skipping", sym)
-                    continue
-                logger.info(
-                    "Adding to %s: %d more shares (%.1f%% → %.1f%% target, cap %.0f%%)",
-                    sym, qty, current_value / pv * 100, target_pct * 100, hard_cap * 100,
-                )
-            else:
-                qty = self.risk_manager.calculate_position_size(pv, price, signal.conviction)
-                if qty <= 0:
-                    logger.info("Position size 0 for %s — skipping", sym)
-                    continue
-
-            # Volatility-adjusted stop-loss
-            beta = getattr(signal.thesis, "beta", None)
-            stop_loss = self.risk_manager.get_stop_loss_price(price, beta)
-            if hasattr(signal.thesis, "stop_loss_price"):
-                signal.thesis.stop_loss_price = stop_loss
-
-            # Execute order
-            order = await self.executor.place_buy(sym, qty, stop_loss)
-            if not order:
-                logger.error("Order execution failed for %s", sym)
-                continue
-
-            # Record position and trade
-            now = _now_utc()
-            if is_add_on:
-                # Update existing position shares
-                existing = self.portfolio.get_position(sym)
-                if existing:
-                    existing.shares += qty
-                    existing.market_value = existing.current_price * existing.shares
-                    existing.last_updated = now
-                    self.portfolio._save()
-            else:
-                position = Position(
-                    symbol=sym,
-                    shares=qty,
-                    entry_price=price,
-                    entry_date=now,
-                    current_price=price,
-                    market_value=price * qty,
-                    stop_loss=stop_loss,
-                    thesis=signal.thesis,
-                    sector=company_sector,
-                    last_updated=now,
-                )
-                self.portfolio.add_position(position)
-
-            action_type = "Add-on" if is_add_on else "New thesis"
-            trade = Trade(
-                symbol=sym,
-                action="BUY",
-                shares=qty,
-                price=price,
-                timestamp=now,
-                reason=f"{action_type}: {signal.thesis.summary[:100]}",
-            )
-            self.portfolio.log_trade(trade)
-
-            await asyncio.gather(
-                self.telegram.send_trade_alert(trade, signal.thesis),
-                self.discord.send_trade_alert(trade, signal.thesis),
-                self.discord.send_eli5_trade(trade, signal.thesis, is_buy=True),
-                return_exceptions=True,
-            )
-            executed.append(signal)
-            logger.info("Executed BUY: %s x%d @ $%.2f", sym, qty, price)
-
+                marks = (await self.prices.get_quotes(missing, purpose="order_sizing")).quotes
+            except Exception as e:
+                logger.warning("Quotes for signal reference prices failed: %s", e)
+        by_symbol: dict[str, Signal] = {}
+        items: list[NewIntent] = []
+        for signal in buys:
+            sym = signal.symbol.upper()
+            by_symbol[sym] = signal
+            ref = signal.entry_price or getattr(marks.get(sym), "price", None)
+            items.append(NewIntent(
+                symbol=sym, side="buy", dedupe_key=f"signal:{sym}:{session.isoformat()}",
+                reference_price=None if not ref else Decimal(str(ref)),
+                origin="scheduled", sleeve="CORE_EQUITY", session_date=session,
+                meta={"conviction": signal.conviction, "effective_conviction": signal.conviction,
+                      "raw_conviction": signal.conviction, "signal_at": signal.generated_at.isoformat()},
+            ))
+        if not items:
+            return []
+        ids = set(self.ledger.enqueue_intents(items, job="signals"))
+        executed: list[Signal] = []
+        for res in await self.engine.execute_due():
+            if res.intent_id in ids and res.filled_qty > 0 and res.symbol in by_symbol:
+                executed.append(by_symbol[res.symbol])
         return executed
 
     async def _execute_sell(self, position: Position, reason: str):
-        """Sell an entire position."""
-        try:
-            # Get current price
-            quote = await self.data_feed.get_stock_quote(position.symbol)
-            sell_price = quote["price"] if quote else position.current_price
+        """Queue an exit for a held position and run it through the engine.
 
-            order = await self.executor.place_sell(position.symbol, position.shares)
-            if not order:
-                logger.error("Sell order failed for %s", position.symbol)
-                return
+        Never sells directly: the engine cancels and confirms the broker stop
+        first and sells at most the free shares the broker reports.
+        """
+        return await self._submit_exit(position.symbol, reason=reason)
 
-            pnl = (sell_price - position.entry_price) * position.shares
-            pnl_pct = (sell_price - position.entry_price) / position.entry_price if position.entry_price > 0 else 0
-            hold_days = (_now_utc() - position.entry_date).days
+    async def _submit_exit(self, symbol: str, *, reason: str, rule: str = "model", qty: float | None = None):
+        if self.engine is None or self.ledger is None:
+            logger.error("Execution engine not wired; exit for %s not sent", symbol)
+            return None
+        from stock_agent.ledger import NewIntent
 
-            trade = Trade(
-                symbol=position.symbol,
-                action="SELL",
-                shares=position.shares,
-                price=sell_price,
-                timestamp=_now_utc(),
-                reason=reason,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                hold_days=hold_days,
-            )
-
-            # Remove position first (log_trade also removes, but be explicit)
-            self.portfolio.remove_position(position.symbol)
-            self.portfolio.log_trade(trade)
-
-            tr_clause = format_tipranks_telegram_clause(
-                self._tipranks_lookup.get(position.symbol.upper())
-            )
-            alert_tasks = [
-                self.telegram.send_trade_alert(trade),
-                self.discord.send_trade_alert(trade),
-                self.discord.send_eli5_trade(trade, position.thesis, is_buy=False),
-            ]
-            if tr_clause:
-                alert_tasks.append(self.telegram.send_message(tr_clause.lstrip(" |").strip()))
-            await asyncio.gather(*alert_tasks, return_exceptions=True)
-            logger.info(
-                "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%.1f%%)",
-                position.symbol, position.shares, sell_price, pnl, pnl_pct * 100,
-            )
-
-        except Exception as e:
-            logger.exception("Sell execution failed for %s: %s", position.symbol, e)
-            await asyncio.gather(
-                self.telegram.send_error_alert(f"Sell failed for {position.symbol}: {e}"),
-                self.discord.send_error(str(e), context=f"Sell execution for {position.symbol}"),
-                return_exceptions=True,
-            )
-
-    # ── Options Trading ─────────────────────────────────────────────
+        meta = self.ledger.open_position_meta(symbol)
+        session = _now_et().date()
+        m: dict = {"rule": rule, "reason": reason}
+        if qty is not None:
+            m["qty"] = qty
+        ids = self.ledger.enqueue_intents([NewIntent(
+            symbol=symbol, side="sell", dedupe_key=f"exit:{symbol}:{rule}:{session.isoformat()}",
+            position_id=getattr(meta, "position_id", None), origin="scheduled", session_date=session, meta=m,
+        )], job="exit")
+        intent = self.ledger.get_intent(ids[0])
+        if intent is None or intent.terminal:
+            return None
+        return await self.engine.execute_intent(intent)
 
     async def _run_options_scan(self):
         """Daily options scan: find and execute options opportunities."""

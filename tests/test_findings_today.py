@@ -42,26 +42,38 @@ def seed_held(world, sched, symbol="AAA", shares=10, entry=100.0, stop=93.0, *, 
     sched.portfolio.add_position(position(symbol, shares, entry, stop=stop))
 
 
-@finding("F-03-01", "broker stop fills, then the software stop sells again and opens a short")
-def test_F_03_01_stop_out_is_not_sold_twice(world):
+def test_F_03_01_stop_out_is_not_sold_twice(world, tmp_path, monkeypatch):
+    """Fixed by the execution engine: the broker stop is the only stop; monitoring never sells it again."""
+    from tests.exec_helpers import wired_scheduler
+
     world.clock.set_et(2026, 11, 23, 9, 50)
-    sched = world.scheduler()
+    sched, eng = wired_scheduler(world, tmp_path, monkeypatch)
     seed_held(world, sched)
+    run(eng.ledger.refresh("t"))
     world.clock.set_et(2026, 11, 23, 10, 0)
     world.price("AAA", 92.0)  # broker stop at 93 fills
     assert world.alpaca.position("AAA") is None
-    run(sched._tick(world.clock.now_et()))
+    sent = len(world.orders_sent())
+    run(sched._run_market_monitoring())
     world.clock.advance(minutes=1)
     assert world.alpaca.position("AAA") is None, "the bot sold shares it no longer held (short opened)"
+    assert len(world.orders_sent()) == sent, "monitoring sent an order after the broker stop filled"
+    fills = [o for o in world.alpaca.orders.values() if o.symbol == "AAA" and o.status == "filled"]
+    assert [o.type for o in fills] == ["stop"]
 
 
-@finding("F-03-05", "the stop is sent 3 s after the buy, before the fill, and is rejected")
-def test_F_03_05_every_filled_buy_gets_a_broker_stop(world):
+def test_F_03_05_every_filled_buy_gets_a_broker_stop(world, tmp_path, monkeypatch):
+    """Fixed: the stop is placed only after the fill is confirmed, for the filled quantity."""
+    from tests.exec_helpers import wired_scheduler
+
     world.clock.set_et(2026, 11, 23, 9, 31)
     world.price("AAA", 50.0, spread=0.02)
-    sched = world.scheduler()
-    sched._pending_signals = [buy_signal("AAA")]
-    run(sched._tick(world.clock.now_et()))
+    sched, eng = wired_scheduler(world, tmp_path, monkeypatch)
+    run(sched._execute_signals([buy_signal("AAA")]))   # before open+5: queued, nothing sent
+    world.assert_no_orders()
+    world.clock.set_et(2026, 11, 23, 9, 40)
+    world.price("AAA", 50.0, spread=0.02)
+    run(sched._run_market_monitoring())
     world.clock.advance(minutes=15)
     held = world.alpaca.position("AAA")
     assert held is not None and held.qty > 0, "precondition: the buy filled"
@@ -115,19 +127,20 @@ def test_F_01_03_market_closed_on_thanksgiving(world):
     assert sched._is_market_open(world.clock.now_et()) is False
 
 
-@finding("F-07-01", "an unreadable state file silently becomes an empty book and the bot trades on it")
-def test_F_07_01_unreadable_state_is_not_an_empty_book(world, tmp_path):
+def test_F_07_01_unreadable_state_is_not_an_empty_book(world, tmp_path, monkeypatch):
+    """Fixed for orders: the engine sizes from a fresh broker reconcile, not portfolio.json."""
+    from tests.exec_helpers import wired_scheduler
+
     (tmp_path / "portfolio.json").write_text("{not json")
     (tmp_path / "portfolio.json.bak").write_text("{also not json")
     world.clock.set_et(2026, 11, 23, 10, 0)
     world.price("AAA", 100.0)
     world.price("BBB", 40.0)
     world.alpaca.seed_position("AAA", 100, 90.0)
-    sched = world.scheduler()
-    sched._pending_signals = [buy_signal("BBB")]
-    run(sched._tick(world.clock.now_et()))
-    known = {p.symbol for p in sched.portfolio.state.positions}
-    assert "AAA" in known or not world.orders_sent(), "traded on an empty book that ignores the broker's holdings"
+    sched, eng = wired_scheduler(world, tmp_path, monkeypatch)
+    run(sched._execute_signals([buy_signal("BBB")]))
+    snap = eng.ledger.last_snapshot()
+    assert snap is not None and snap.holding("AAA") is not None, "sized a trade on a book without AAA"
 
 
 @finding("F-04-01", "a spread is recorded as opened when one leg is rejected")
