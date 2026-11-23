@@ -494,3 +494,53 @@ def test_foreign_fill_still_imported_when_client_id_differs(tmp_path):
     snap = run(led.refresh("x"))
     assert led.open_position_meta("DDD").opened_source != "bot"
     assert any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
+
+
+def _split_setup(tmp_path):
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-16T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first", rebuild=True))
+    m = led.open_position_meta("AAA")
+    led.set_stop(m.position_id, 93, "stop-1")
+    return b, led, m
+
+
+def test_forward_split_keeps_entry_date_explains_qty_and_rescales_stop(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="-10", group_id="g1")
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="20", group_id="g1")
+    b.pos("AAA", 20, 50)
+    snap = run(led.refresh("after split"))
+    after = led.open_position_meta("AAA")
+    assert after.position_id == m.position_id and after.opened_at == m.opened_at
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
+    assert any(d.kind == DiffKind.QTY_CHANGED and "split" in (d.explanation or "") for d in snap.diffs)
+    assert float(after.stop_price) == pytest.approx(46.5)
+    # an entry-date check after the split replays fills + split to the broker qty
+    from stock_agent.reconcile import _open_event
+    opened, how, _ = _open_event(led, "AAA", Decimal("20"))
+    assert how == "fill" and opened is not None
+    run(led.refresh("again", rebuild=True))
+    assert float(led.open_position_meta("AAA").stop_price) == pytest.approx(46.5)   # applied once
+
+
+def test_split_leaves_stop_to_execution_when_it_keeps_a_basis(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    led.store.kv_set("exec.stop_basis.AAA", {"qty": "10", "avg": "100"})
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="-10", group_id="g1")
+    b.act("SPLIT", "AAA", ts="2026-11-20T13:00:00Z", qty="20", group_id="g1")
+    b.pos("AAA", 20, 50)
+    run(led.refresh("after split"))
+    assert float(led.open_position_meta("AAA").stop_price) == 93
+
+
+def test_legacy_ssp_unknown_ratio_clears_recorded_stop(tmp_path):
+    b, led, m = _split_setup(tmp_path)
+    b.act("SSP", "AAA", ts="2026-11-20T13:00:00Z", qty="10")
+    b.pos("AAA", 20, 50)
+    snap = run(led.refresh("after split"))
+    assert led.open_position_meta("AAA").stop_price is None
+    assert led.open_position_meta("AAA").position_id == m.position_id
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
