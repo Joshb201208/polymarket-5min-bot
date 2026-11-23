@@ -501,9 +501,13 @@ class ProviderHealthRegistry:
         ok: bool = True,
         degraded: bool = False,
         include_market: bool = False,
+        uncovered_symbols: Iterable[str] = (),
     ) -> None:
         poll_ts = utc_datetime(as_of)
         sym_list = [str(raw).strip().upper() for raw in symbols if raw and str(raw).strip()]
+        for raw in uncovered_symbols:
+            if raw:
+                self._news.pop(str(raw).strip().upper(), None)
         if not ok:
             for sym in sym_list:
                 self._news.pop(sym, None)
