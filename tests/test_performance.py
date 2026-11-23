@@ -102,3 +102,24 @@ def test_close_session_survives_bar_errors(tmp_path):
 
     rep = run(close_session(led, snap, date(2026, 11, 23), daily_bars=broken))
     assert rep.shadow_rows == 0 and any("provider down" in w for w in rep.warnings)
+
+
+def test_shadow_waits_for_the_session_bar(tmp_path):
+    from stock_agent.risk_manager import ShadowDailyBar
+
+    b = StubBroker()
+    b.fill("AAA", "buy", 1, 100, ts="2026-11-16T15:00:00Z")
+    b.pos("AAA", 1, 100)
+    led = make_ledger(tmp_path, broker=b)
+    snap = run(led.refresh("x", rebuild=True))
+    led.journal.append("entry.filled", position_id=led.open_position_meta("AAA").position_id, symbol="AAA",
+                       session_date="2026-11-16", fill_price="100", qty="1", stop_fraction="0.07", fill_id="f")
+    have = [ShadowDailyBar(date(2026, 11, d), *(Decimal(x) for x in (100, 101, 99, 100))) for d in (16, 17, 18, 19, 20)]
+
+    async def bars(sym, start, end):
+        return list(have)
+
+    rep = run(close_session(led, snap, date(2026, 11, 23), daily_bars=bars))
+    assert rep.shadow_rows == 0 and any("no completed bar" in w for w in rep.warnings)
+    have.append(ShadowDailyBar(date(2026, 11, 23), *(Decimal(x) for x in (100, 101, 99, 100))))
+    assert run(close_session(led, snap, date(2026, 11, 23), daily_bars=bars)).shadow_rows == 1
