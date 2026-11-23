@@ -65,6 +65,20 @@ os.environ["STOCK_DATA_DIR"] = tempfile.mkdtemp(prefix="stock_agent_tests_")
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _empty_owner_focus(monkeypatch, tmp_path_factory):
+    """Tests never depend on the owner's real watch list.
+
+    `stock_agent/owner_focus.json` changes whenever the owner updates it, so
+    every test starts from an empty list and passes its own symbols in.
+    """
+    from stock_agent import research_focus
+
+    empty = tmp_path_factory.mktemp("focus") / "owner_focus.json"
+    empty.write_text("[]")
+    monkeypatch.setitem(research_focus.load_focus.__kwdefaults__, "path", empty)
+
+
 @pytest.fixture
 def world(request, monkeypatch, tmp_path):
     """The simulated outside world (clock, broker, providers), installed.
