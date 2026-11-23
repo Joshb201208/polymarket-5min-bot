@@ -19,8 +19,6 @@ from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsSer
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
-from stock_agent.models import DailySummary, Signal
-from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
@@ -43,7 +41,7 @@ from stock_agent.state_boot import build_ledger, prepare_ledger
 from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
-from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
+from stock_agent.macro_monitor import MacroMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -177,9 +175,6 @@ class StockAgentScheduler:
         self._telemetry_task: asyncio.Task | None = None
         self._last_issue: dict[str, datetime] = {}
         self._pending_ledger_alerts: set[asyncio.Task] = set()
-        # Legacy read view temporarily retained for the two reporting callbacks.
-        self.portfolio = Portfolio(self.config, persist=False)
-        self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
         self.macro = service("macro", lambda: MacroMonitor(
             self.config, prices=self.prices, store=self.store, defer_load=True,
             alert=self._alert, report=self._provider_health, now=_now_utc,
@@ -190,7 +185,6 @@ class StockAgentScheduler:
         self._daily_prescan_done_today: str | None = None
         self._midweek_analysis_done_this_week: str | None = None
         self._earnings_check_done_today: str | None = None
-        self._pending_signals: list[Signal] = []
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
         self._options_scan_done_today: str | None = None

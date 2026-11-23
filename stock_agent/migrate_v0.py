@@ -9,10 +9,8 @@ Rules
 -----
 * One transaction: either everything is imported or nothing is.
 * Idempotent: a store that already records ``migrated_v0_at`` is left alone.
-* Never deletes or edits the legacy files.  They are copied to
-  ``<data_dir>/legacy_v0/`` and left in place, because ``Portfolio`` (the shim
-  that older callers still use) keeps reading ``portfolio.json`` until every
-  area has moved to the ledger.
+* Never deletes or edits the legacy files. They are copied to
+  ``<data_dir>/legacy_v0/`` and left in place for audit and recovery.
 * Entry dates are provisional (``opened_source='v0'``): the next reconcile
   replaces them with the date of the first broker fill after flat, which fixes
   placeholders such as positions imported with the date they were noticed.

@@ -529,8 +529,7 @@ class Ledger:
                           key=f"stop_filled:{symbol}:{order_id}" if order_id else None)
 
     def add_snapshot_listener(self, fn: Callable[[BookSnapshot], Any]) -> None:
-        """Call ``fn(snapshot)`` after every successful refresh (e.g. the legacy
-        ``Portfolio.sync_from_snapshot`` view). Exceptions are logged, not raised."""
+        """Call ``fn(snapshot)`` after a successful refresh; log listener exceptions."""
         self._listeners.append(fn)
 
     def snapshot(self, max_age_s: int | None = None) -> BookSnapshot:
