@@ -424,7 +424,8 @@ def test_weekly_scorecard_paper_test_keys_no_double_count_and_na_when_missing(
             through_session="2026-11-20",
             closed=True,
             results=[
-                {"variant": "live_atr_stop", "stopped": True, "pnl": -350.0},
+                {"variant": "live_atr_stop", "stopped": True, "pnl": -350.0, "exit_session": "2026-10-23",
+                 "sessions_after_exit": 20},
                 {"variant": "fixed_7pct", "stopped": True, "pnl": -280.0},
                 {"variant": "fixed_10pct", "stopped": True, "pnl": -400.0},
                 {"variant": "fixed_12pct", "stopped": True, "pnl": -480.0},
