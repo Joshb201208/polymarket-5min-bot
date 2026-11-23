@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -34,7 +35,7 @@ from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSour
 from stock_agent.news_service import NewsService
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
-from stock_agent.performance import close_session
+from stock_agent.performance import DEPOSIT_KINDS, close_session
 from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
@@ -640,9 +641,27 @@ class StockAgentScheduler:
                               "Existing high-water record retained; entries stay blocked.",
                               key="invalid-drawdown")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_record_invalid"})
+        try:
+            day = session.date.isoformat()
+            net_flow = Decimal(0)
+            if state.last_session is not None and state.last_session < day:
+                last_day = date.fromisoformat(state.last_session)
+                net_flow = sum(
+                    (flow.amount for flow in self.ledger.cash_flows()
+                     if flow.kind in DEPOSIT_KINDS and last_day < flow.date <= session.date),
+                    Decimal(0),
+                )
+            updated = update_drawdown(
+                state, day, mark.equity if mark else snapshot.equity,
+                previous_session=previous.date.isoformat(), net_external_flow=net_flow, config=self.config,
+            )
+        except (ValueError, InvalidOperation):
+            await self._alert("critical", "Drawdown close could not be verified",
+                              "External cash flows could not be reconciled to the close. "
+                              "The existing high-water record was retained.",
+                              key=f"invalid-drawdown-close:{session.date}")
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_close_invalid"})
         risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
-        updated = update_drawdown(state, session.date.isoformat(), mark.equity if mark else snapshot.equity,
-                                  previous_session=previous.date.isoformat(), config=self.config)
         if updated == state:
             return risk_result
         self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
