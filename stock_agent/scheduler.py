@@ -883,206 +883,34 @@ class StockAgentScheduler:
         return await self.engine.execute_intent(intent)
 
     async def _run_options_scan(self):
-        """Daily options scan: find and execute options opportunities."""
+        """Once-per-session options entry scan via OptionsManager.
+
+        The manager owns everything else: mode, market gate, research gate,
+        risk, sizing, the write-ahead book and confirmed orders. Without a
+        manager no options orders are placed (the legacy path is not used).
+        """
+        now = datetime.now(timezone.utc)
+        self._options_scan_done_today = now.astimezone(ET).strftime("%Y-%m-%d")
+        if self.options is None:
+            logger.warning("Options scan skipped: no OptionsManager wired")
+            return
         try:
-            now = _now_et()
-            self._options_scan_done_today = now.strftime("%Y-%m-%d")
-
-            await self.discord.send_system_log("INFO", "Options scan starting")
-
-            # Reconcile options portfolio against Alpaca FIRST — mark expired/
-            # closed legs so we don't double-count them in the "skip underlyings
-            # with existing positions" block below.
-            portfolio_value = self.portfolio.get_portfolio_value()
-            try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                sync_result = await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
-                )
-                if sync_result["closed"]:
-                    logger.info(
-                        "Options reconcile: %d positions closed, $%.0f realized P&L captured",
-                        sync_result["closed"], sync_result["realized_pnl"],
-                    )
-            except Exception as e:
-                logger.warning("Options Alpaca reconcile failed (non-fatal): %s", e)
-
-            # Refresh remaining open options with latest prices
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Build inputs for the options engine
-            stock_positions = {
-                p.symbol: p.shares for p in self.portfolio.state.positions
-            }
-
-            # Build screener candidates: (symbol, conviction, price, target_price)
-            screener_candidates: list[tuple[str, int, float, float | None]] = []
-
-            # Track underlyings already in options portfolio to prevent duplicates
-            import re as _re
-            existing_options_underlyings: set[str] = set()
-            for op in self.options_portfolio.state.positions:
-                m = _re.match(r'([A-Z]+)', op.contract_symbol)
-                if m:
-                    existing_options_underlyings.add(m.group(1))
-            if existing_options_underlyings:
-                logger.info(
-                    "Skipping options scan for underlyings with existing positions: %s",
-                    existing_options_underlyings,
-                )
-
-            universe = self.portfolio.state.universe or []
-            for sym in universe[:30]:
-                if sym in existing_options_underlyings:
-                    continue  # Already have an options position on this underlying
-                try:
-                    company = await self.data_feed.get_company_fundamentals(sym)
-                    if not company or company.price <= 0:
-                        continue
-                    # Get conviction from active theses if available
-                    thesis = self.portfolio.state.active_theses.get(sym)
-                    conviction = 6  # default
-                    target_price = None
-                    if isinstance(thesis, dict):
-                        conviction = thesis.get("conviction", 6)
-                        target_price = thesis.get("target_price")
-                    screener_candidates.append((sym, conviction, company.price, target_price))
-                except Exception:
-                    continue
-
-            current_exposure = self.options_portfolio.total_exposure_pct
-
-            # Filter stock_positions to exclude underlyings with existing options
-            filtered_stock_positions = {
-                sym: shares for sym, shares in stock_positions.items()
-                if sym not in existing_options_underlyings
-            }
-
-            # Run the engine
-            signals = await self.options_engine.scan_opportunities(
-                portfolio_value=portfolio_value,
-                open_options_count=self.options_portfolio.open_position_count,
-                current_options_exposure=current_exposure,
-                stock_positions=filtered_stock_positions,
-                screener_candidates=screener_candidates,
-            )
-
-            # Execute each signal
-            signals_executed = 0
-            for signal in signals:
-                try:
-                    if signal.leg2_contract_symbol:
-                        # Spread order
-                        order = await self.options_executor.place_spread_order(
-                            long_symbol=signal.contract_symbol,
-                            short_symbol=signal.leg2_contract_symbol,
-                            qty=signal.qty,
-                            order_type=OptionOrderType.MARKET,
-                        )
-                    else:
-                        # Single-leg order — resolve side to proper enum
-                        side_str = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
-                        side_enum = OptionSide.SELL if side_str == "sell" else OptionSide.BUY
-                        order = await self.options_executor.place_option_order(
-                            contract_symbol=signal.contract_symbol,
-                            qty=signal.qty,
-                            side=side_enum,
-                            order_type=OptionOrderType.MARKET,
-                            limit_price=None,
-                        )
-
-                    if order:
-                        # Use max_debit as fill price proxy; fall back to 0.0
-                        fill_price = getattr(signal, 'max_debit_per_contract', None) or \
-                                     getattr(signal, 'min_credit_per_contract', None) or 0.0
-                        regime = self.macro.get_current_regime()
-                        pos = self.options_portfolio.open_position(
-                            signal=signal,
-                            filled_price=fill_price,
-                            portfolio_value=portfolio_value,
-                            regime=regime,
-                        )
-                        signals_executed += 1
-                        logger.info(
-                            "Options: executed %s on %s — %s",
-                            signal.strategy.value, signal.underlying_symbol, signal.contract_symbol,
-                        )
-                        try:
-                            embed = self.options_portfolio.format_position_alert(pos, "OPENED")
-                            await self.discord.send_embed(
-                                self.discord.channels.get("trades", ""), embed
-                            )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.error("Options execution failed for %s: %s", signal.contract_symbol, e)
-
-            await self.discord.send_system_log(
-                "INFO",
-                f"Options scan complete — {signals_executed} trades executed, "
-                f"{self.options_portfolio.open_position_count} open options positions",
-            )
-            logger.info("Options scan complete — %d executed", signals_executed)
-
-        except Exception as e:
-            logger.exception("Options scan failed: %s", e)
-            await self.discord.send_error(str(e), context="Options scan")
+            outcomes = await self.options.scan(now)
+        except Exception:
+            logger.exception("Options scan failed")
+            return
+        opened = [o for o in outcomes if getattr(o, "opened", None)]
+        logger.info("Options scan: %d candidates, %d opened", len(outcomes), len(opened))
 
     async def _check_options_positions(self):
-        """Monitor options positions and send expiry alerts.
-
-        Note: Auto-close via order submission is disabled because Alpaca paper
-        trading rejects SELL orders on long options as 'uncovered'. Positions
-        will be managed to expiry or closed manually. Only expiry warnings
-        (3 DTE) are sent as alerts.
-        """
+        """Exit manager and repair pass: reconcile with the broker, then apply
+        exits (T-2 time exit, targets, thesis break, ex-dividend) and repairs."""
+        if self.options is None:
+            return
         try:
-            if not self.options_portfolio.state.positions:
-                return
-
-            # Reconcile with Alpaca first (catch expirations/assignments)
-            portfolio_value = self.portfolio.get_portfolio_value()
-            try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
-                )
-            except Exception as e:
-                logger.warning("Intraday options reconcile failed: %s", e)
-
-            # Refresh prices on remaining open positions
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Expiry alerts only (3 DTE warning)
-            expiry_alerts = self.options_portfolio.get_expiry_alerts()
-            for pos in expiry_alerts:
-                try:
-                    await self.discord.send_embed(
-                        self.discord.channels.get("risk", ""),
-                        {
-                            "title": "\u26a0\ufe0f Options Expiry Alert",
-                            "description": (
-                                f"**{pos.contract_symbol}** expires in **{pos.dte} days**\n"
-                                f"Strategy: {pos.strategy.value}\n"
-                                f"Unrealized P&L tracked internally only — "
-                                f"positions will run to expiry.\n"
-                                f"Strike: ${getattr(pos, 'strike', '?')}  "
-                                f"Expiry: {getattr(pos, 'expiration_date', '?')}"
-                            ),
-                            "color": 0xF59E0B,
-                        },
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.error("Options position check failed: %s", e)
+            await self.options.monitor(datetime.now(timezone.utc))
+        except Exception:
+            logger.exception("Options monitor failed")
 
     async def _check_for_market_event(self):
         """A healthy regime change can alert, but cannot open a trade job."""
