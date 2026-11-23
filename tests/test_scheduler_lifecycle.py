@@ -3,6 +3,7 @@
 import asyncio
 import shutil
 import signal
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,8 +14,10 @@ import pytest
 from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
 from stock_agent.config import Config
-from stock_agent.ledger import JobStatus, NewIntent
+from stock_agent.ledger import BookSnapshot, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
+from stock_agent.research_pipeline import OptionIdea
+from stock_agent.research_schemas import Direction
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
 from tests.exec_helpers import FakePrices, enqueue
 
@@ -327,14 +330,19 @@ def test_half_day_summary_uses_calendar_close(tmp_path, monkeypatch):
     assert sched._should_send_daily_summary(now + timedelta(minutes=1))
 
 
-def test_drawdown_uses_only_trusted_close_and_persists_once(tmp_path, monkeypatch):
+def test_close_performance_and_drawdown_share_trusted_mark_persisted_once(tmp_path, monkeypatch):
     async def check():
         now = datetime(2026, 11, 27, 13, 5, tzinfo=ET)
         sched, _ = build(tmp_path, monkeypatch, now)
         sched.store.open()
         old = DrawdownState(high_water=Decimal(1000), last_session="2026-11-25")
         sched.ledger.risk_state_set(DRAWDOWN_STATE_KEY, old.to_record())
-        snapshot = SimpleNamespace(quality="indicative", equity=Decimal(790), as_of=now)
+        snapshot = BookSnapshot(
+            as_of=now, run_id="close-fixture", equity=Decimal(790), cash=Decimal(790),
+            long_mv=Decimal(0), short_mv=Decimal(0), options_mv=Decimal(0),
+            last_equity=Decimal(1), buying_power=Decimal(790),
+            holdings=(), legs=(), open_orders=(), diffs=(), quality="indicative",
+        )
 
         async def refresh(reason):
             return snapshot
@@ -345,14 +353,50 @@ def test_drawdown_uses_only_trusted_close_and_persists_once(tmp_path, monkeypatc
         sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, sess)
         assert (await sched._close_drawdown()).detail == {"reason": "close_equity_unverified"}
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == old.to_record()
-        snapshot.quality = "live"
+        assert not sched.ledger.equity_marks("close")
+        snapshot = replace(snapshot, quality="live")
         await sched._close_drawdown()
         state = DrawdownState.from_record(sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
         assert state.last_session == "2026-11-27"
         assert state.paused and state.drawdown == Decimal("0.21")
-        snapshot.equity = Decimal(1000)
+        assert sched.ledger.equity_marks("close")[0].equity == Decimal(790)
+        snapshot = replace(snapshot, equity=Decimal(1000))
         await sched._close_drawdown()
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == state.to_record()
+        assert sched.ledger.equity_marks("close")[0].equity == Decimal(790)
+        await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_live_option_story_replayed_until_manager_confirms_durable_handling(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 12, 40, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        sched._normalised = sched._reconciled = True
+        idea = OptionIdea("AAA", Direction.BEARISH, "story-1", "thesis-1", 8, 9, now, ("evidence",))
+        sched.research_store.record_option_idea(idea.story_id, idea, now + timedelta(minutes=10))
+        calls = []
+        handled = set()
+
+        async def monitor(now):
+            calls.append("monitor")
+
+        async def scan(now, *, candidates):
+            calls.append(candidates)
+
+        sched.options = SimpleNamespace(monitor=monitor, scan=scan,
+                                        handled_story_ids=lambda ids: handled.intersection(ids))
+        await sched._run_options_lane(now)
+        assert sched.research_store.pending_option_ideas(now)
+        assert calls[0] == "monitor"
+        assert calls[1][0].direction_hint == "BEARISH"
+        handled.add(idea.story_id)
+        await sched._run_options_lane(now)
+        assert sched.research_store.pending_option_ideas(now) == []
+        await sched._run_options_lane(now)
+        assert len(calls) == 5  # monitor runs even when candidate already acknowledged
         await sched._cleanup()
 
     asyncio.run(check())

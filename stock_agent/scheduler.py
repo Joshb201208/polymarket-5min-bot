@@ -28,8 +28,12 @@ from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.options_book import import_legacy_options
+from stock_agent.options_manager import OptionCandidate
+from stock_agent.performance import close_session
 from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
+from stock_agent.research_pipeline import JobOutcome, OptionIdea
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, update_drawdown
 from stock_agent.runtime_status import RuntimeStatus, notify_systemd
@@ -141,6 +145,7 @@ class StockAgentScheduler:
         self._needs_rebuild = False
         self._last_news_at: datetime | None = None
         self._last_reconcile_at: datetime | None = None
+        self._last_close_report = None
         self._job_tasks: dict[str, asyncio.Task] = {}
         self._order_task: asyncio.Task | None = None
         self._options_task: asyncio.Task | None = None
@@ -216,8 +221,10 @@ class StockAgentScheduler:
             return False
 
     def _risk_controls(self) -> RiskControls:
+        commitments = getattr(self.options, "commitments", None)
         return RiskControls(pause_new_buys=self._manually_paused(),
-                            drawdown=DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY)))
+                            drawdown=DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY)),
+                            option_commitments=commitments() if commitments is not None else ())
 
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
@@ -240,6 +247,9 @@ class StockAgentScheduler:
         if getter is None:
             return ()
         return (await getter([symbol], sessions=60)).get(symbol, ())
+
+    async def _shadow_bars(self, symbol, start, end):
+        return (await self.prices.get_daily_bars([symbol], start_date=start, end_date=end)).get(symbol, ())
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -284,7 +294,7 @@ class StockAgentScheduler:
         }.get(mode)
         if expected is None or self.config.ALPACA_BASE_URL.rstrip("/") != expected:
             raise ValueError("trading mode does not match broker host")
-        boot = prepare_ledger(self.ledger, self.config.DATA_DIR)
+        boot = prepare_ledger(self.ledger, self.config.DATA_DIR, options_importer=import_legacy_options)
         self._needs_rebuild = boot.needs_rebuild
         if not boot.health.ok:
             await self._alert("critical", "State needs broker rebuild",
@@ -373,9 +383,9 @@ class StockAgentScheduler:
                 self._schedule_job("live_news", f"{day_key}:{slot}", self._run_news_slot, timeout=150)
                 self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
             if self._should_run_options_scan(now_et):
-                self._schedule_job("options", day_key, self._run_options_scan, timeout=None, replay=False)
+                self._schedule_job("options", day_key, self._run_options_job, timeout=180)
             if self.options is not None:
-                await self._drive_options_monitor()
+                await self._drive_options_monitor(now_et)
 
         # Re-read the clock after the protection lane and schedule by actual session.
         now_et = _now_et()
@@ -385,8 +395,8 @@ class StockAgentScheduler:
             ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
             ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
             ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
-            ("daily_summary", self._should_send_daily_summary, self._send_daily_summary, 120),
-            ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 45),
+            ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 150),
+            ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
             ("weekly", self._should_run_weekly, self._run_weekly_analysis, 1500),
             ("midweek", self._should_run_midweek, self._run_midweek_analysis, 1500),
         )
@@ -403,8 +413,6 @@ class StockAgentScheduler:
         return await self._run_held_news_check(self.ledger.snapshot())
 
     async def _close_drawdown(self):
-        from stock_agent.research_pipeline import JobOutcome
-
         now = _now_et()
         market = await self.calendar.refresh()
         session = self.calendar.session_on(now.date())
@@ -414,6 +422,17 @@ class StockAgentScheduler:
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
+        snapshot = await self.ledger.refresh("drawdown close")
+        if (snapshot.quality != "live" or snapshot.equity <= 0 or snapshot.as_of < session.closes_at
+                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)
+                or self.ledger.trading_block()):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        marks = self.ledger.equity_marks("close", since=session.date)
+        mark = next((item for item in marks if item.session_date == session.date), None)
+        if mark is None:
+            self._last_close_report = await close_session(
+                self.ledger, snapshot, session.date, daily_bars=self._shadow_bars,
+            )
         try:
             state = DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
         except ValueError:
@@ -421,12 +440,7 @@ class StockAgentScheduler:
                               "Existing high-water record retained; entries stay blocked.",
                               key="invalid-drawdown")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_record_invalid"})
-        snapshot = await self.ledger.refresh("drawdown close")
-        if (snapshot.quality != "live" or snapshot.equity <= 0 or snapshot.as_of < session.closes_at
-                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)
-                or self.ledger.trading_block()):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
-        updated = update_drawdown(state, session.date.isoformat(), snapshot.equity,
+        updated = update_drawdown(state, session.date.isoformat(), mark.equity if mark else snapshot.equity,
                                   previous_session=previous.date.isoformat())
         if updated == state:
             return None
@@ -438,6 +452,14 @@ class StockAgentScheduler:
                 f"Drawdown: {updated.drawdown:.1%}; throttled: {updated.throttled}; paused: {updated.paused}.",
                 key=f"drawdown:{session.date}",
             )
+
+    def _summary_ready(self, now: datetime) -> bool:
+        if not self._should_send_daily_summary(now):
+            return False
+        close = self.ledger.job_status("drawdown_close", now.date().isoformat())
+        return bool(close and (close.status is JobStatus.DONE or (
+            close.status is JobStatus.FAILED and close.attempts >= MAX_JOB_ATTEMPTS
+        )))
 
     def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
         if self._shutdown or name in self._job_tasks:
@@ -499,7 +521,13 @@ class StockAgentScheduler:
             self._last_monitor_time = now
             self._order_task = asyncio.create_task(self._run_execution_cycle(), name="stock-agent:protection")
 
-    async def _drive_options_monitor(self):
+    async def _run_options_job(self):
+        outcomes = await self._run_options_scan()
+        if outcomes and not any(getattr(outcome, "final", True) for outcome in outcomes):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "option_scan_temporarily_blocked"})
+        return None
+
+    async def _drive_options_monitor(self, now: datetime):
         if self._options_task is not None:
             if not self._options_task.done():
                 return
@@ -508,8 +536,26 @@ class StockAgentScheduler:
                                   type(self._options_task.exception()).__name__, key="options-monitor")
         if "options" not in self._job_tasks and not self._shutdown:
             self._options_task = asyncio.create_task(
-                self._check_options_positions(), name="stock-agent:options-protection",
+                self._run_options_lane(now), name="stock-agent:options-protection",
             )
+        else:
+            self._options_task = None
+
+    async def _run_options_lane(self, now: datetime):
+        await self._check_options_positions()
+        if not self._entries_enabled():
+            return
+        ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        if not ideas:
+            return
+        if not (await self.market_gate("entry")).allowed:
+            return
+        candidates = [OptionCandidate(idea.symbol, source="news", story_id=idea.story_id,
+                                      direction_hint=idea.direction.value) for idea in ideas]
+        await self.options.scan(_now_utc(), candidates=candidates)
+        handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
+        if handled:
+            self.research_store.acknowledge_options(tuple(sorted(handled)))
 
     async def _run_execution_cycle(self):
         if not self._engine_resumed:
