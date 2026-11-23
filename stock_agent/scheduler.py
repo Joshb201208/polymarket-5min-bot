@@ -7,7 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from stock_agent.analyst import Analyst
+from stock_agent.asset_registry import AssetRegistry
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
@@ -25,6 +28,7 @@ from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, update_drawdown
@@ -100,13 +104,20 @@ class StockAgentScheduler:
         ))
         self.store = self.ledger.store
         self.journal = self.ledger.journal
+        self.http = service("http", lambda: httpx.AsyncClient(timeout=10))
         self.risk = service("risk", lambda: RiskManager(self.config))
         self.calendar = service("calendar", lambda: MarketCalendar(
             self.broker, self.config.DATA_DIR / "market-calendar.json", namespace=self.config.MODE,
             now=_now_utc,
         ))
         self.health = service("health", lambda: None)
-        self.prices = service("prices", lambda: None)
+        self.assets = service("assets", lambda: AssetRegistry(
+            self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
+        ))
+        self.prices = service("prices", lambda: PriceService(
+            self.http, config=self.config, store=self.store, calendar=self.calendar,
+            assets=self.assets, report=self._provider_health, now=_now_utc,
+        ))
         self.news = service("news", lambda: None)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
         self.llm = service("llm", lambda: LLMClient(
@@ -116,6 +127,7 @@ class StockAgentScheduler:
         self.research = service("research", lambda: None)
         self.engine = service("engine", lambda: ExecutionEngine(
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
+            bars=self._stop_bars, controls=self._risk_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
         ))
         self.options = service("options", lambda: None)
@@ -216,6 +228,18 @@ class StockAgentScheduler:
     async def _on_research_failure(self, error) -> None:
         await self._alert("warning", "Research provider unavailable", f"{error.provider}: {error.kind}",
                           key=f"research-provider:{error.provider}:{error.kind}")
+
+    async def _provider_health(self, provider: str, capability: str, ok: bool, error: str | None) -> None:
+        # The health service persists provider proof; provider failures do not prevent protection.
+        if not ok:
+            await self._alert("warning", "Market data unavailable", f"{provider}: {capability}",
+                              key=f"data-provider:{provider}:{capability}")
+
+    async def _stop_bars(self, symbol: str):
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if getter is None:
+            return ()
+        return (await getter([symbol], sessions=60)).get(symbol, ())
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -1382,13 +1406,13 @@ class StockAgentScheduler:
 
         seen = set()
         dynamic = ("data_feed", "screener", "executor", "telegram", "discord", "macro",
-                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker")
+                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker", "http")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:
                 continue
             seen.add(id(resource))
-            close = getattr(resource, "close", None)
+            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
             if close is not None:
                 try:
                     async with asyncio.timeout(1):
