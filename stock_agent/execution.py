@@ -519,6 +519,10 @@ class ExecutionEngine:
         if not gate.allowed:
             return await self._hold(intent, f"market gate: {gate.reason}", gate.next_open)
         q = await self._quote(intent.symbol)
+        actual = str(getattr(q, "symbol", "") or intent.symbol).upper()
+        if actual != intent.symbol.upper():
+            # renamed ticker: the analysis was for the old symbol; never trade a stale one
+            return self._skip(intent, f"{intent.symbol} now trades as {actual}; re-research before buying")
         ask = _f(q.ask) or _f(q.price)
         ref = _f(intent.reference_price)
         if ref > 0 and ask > ref * (1 + self.s.max_price_drift_pct):

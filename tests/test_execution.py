@@ -636,3 +636,23 @@ def test_research_gate_rechecked_at_submission(world, tmp_path, monkeypatch):
     res = run(eng.execute_intent(eng.ledger.get_intent(ids[0])))
     assert res.status == IntentStatus.SKIPPED and "thesis" in res.reason
     world.assert_no_orders()
+
+
+def test_buy_skipped_when_quote_reports_a_renamed_symbol(world, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    orig = eng.prices.get_quotes
+
+    async def renamed(symbols, **kw):
+        res = await orig(symbols, **kw)
+        q = res.quotes["AAA"]
+        res.quotes["AAA"] = SimpleNamespace(symbol="AAAB", price=q.price, bid=q.bid, ask=q.ask, as_of=q.as_of)
+        return res
+
+    eng.prices.get_quotes = renamed
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.SKIPPED and "AAAB" in res.reason
+    world.assert_no_orders()
