@@ -5,6 +5,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
+
+from stock_agent.fundamentals_service import FundamentalsService
 from stock_agent.research_sources import ResearchSources
 
 NOW = datetime(2026, 11, 23, 15, tzinfo=UTC)
@@ -44,7 +47,7 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
             canonical_sector="Technology", name=symbol, tradable=True,
             metrics={"pe_ttm": SimpleNamespace(value=20), "revenue_growth_yoy": 0.2,
                      "gross_margin_ttm": SimpleNamespace(value=0.3, as_of=NOW, source="Fixture", unit="ratio",
-                                                         period="ttm")},
+                                                         period="ttm", url="https://example.org/metric")},
         )
 
     async def run():
@@ -57,9 +60,40 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
         assert rows["AAA"].metrics["earnings_yield"] == 0.05
         assert rows["AAA"].metrics["gross_margin"] == 0.3
         assert rows["AAA"].metric_provenance["gross_margin_ttm"]["as_of"] == NOW.isoformat()
+        assert rows["AAA"].metric_provenance["gross_margin_ttm"]["url"] == "https://example.org/metric"
         assert sources.quote_ok("AAA", NOW) and not sources.quote_ok("BBB", NOW)
         assert sources.news_ok("AAA", NOW) and not sources.news_ok("BBB", NOW)
         assert not sources.news_ok("AAA", NOW + timedelta(minutes=21))
+
+    asyncio.run(run())
+
+
+def test_fundamental_requests_are_capped_per_pass_and_cache_does_not_consume_allowance():
+    class Prices:
+        async def get_quotes(self, symbols, **_):
+            return SimpleNamespace(quotes={})
+
+    calls = []
+
+    async def universe():
+        return ["HELD", "FOCUS", "FIRST", "LATER"]
+
+    async def company(symbol):
+        calls.append(symbol)
+        return SimpleNamespace(metrics={"pe_ttm": 20})
+
+    async def run():
+        sources = ResearchSources(Prices(), None, list_universe=universe, fetch_company=company, fundamental_limit=2)
+        symbols = await sources.universe(NOW)
+        first = await sources.securities(symbols, NOW)
+        assert calls == ["HELD", "FOCUS"]
+        assert tuple(first) == symbols
+        assert "pe_ttm" in first["HELD"].metrics and first["FIRST"].metrics == {}
+        second = await sources.securities(symbols, NOW + timedelta(minutes=1))
+        assert calls == list(symbols)
+        assert all(row.metrics["pe_ttm"] == 20 for row in second.values())
+        await sources.securities(symbols, NOW + timedelta(hours=7))
+        assert calls == [*symbols, "HELD", "FOCUS"]
 
     asyncio.run(run())
 
@@ -86,5 +120,61 @@ def test_only_confirmed_prior_earnings_release_materializes():
         assert len(items) == 1 and items[0].symbol == "BBB"
         assert items[0].evidence.published_at == NOW - timedelta(minutes=1)
         assert "Reported EPS: 0.25" in items[0].evidence.snippet
+
+    asyncio.run(run())
+
+
+def test_actual_fundamentals_service_maps_snapshot_and_release_offline():
+    class News:
+        async def poll_news(self, symbols, **_):
+            return SimpleNamespace(ok=True, degraded=False, as_of=NOW, items=[])
+
+    class Prices:
+        async def get_quotes(self, symbols, **_):
+            return SimpleNamespace(quotes={})
+
+    def respond(request):
+        if request.url.host == "market-data.example":
+            assert request.url.path.endswith(("/most-actives", "/movers"))
+            return httpx.Response(200, json={})
+        assert request.url.host == "finnhub.io"
+        payload = {
+            "/api/v1/stock/metric": {"metric": {"peTTM": 20, "grossMarginTTM": 48, "marketCapitalization": 50}},
+            "/api/v1/stock/profile2": {"name": "Fixture Industries", "finnhubIndustry": "Technology"},
+            "/api/v1/stock/insider-transactions": {"data": []},
+            "/api/v1/stock/recommendation": [],
+            "/api/v1/calendar/earnings": {"earningsCalendar": [
+                {"symbol": "AAA", "date": "2026-11-23", "hour": "bmo", "epsActual": 0.25, "epsEstimate": 0.23,
+                 "year": 2026, "quarter": 4},
+                {"symbol": "BBB", "date": "2026-11-23", "hour": "amc", "epsActual": 0.50},
+            ]},
+        }[request.url.path]
+        return httpx.Response(200, json=payload)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            config = SimpleNamespace(FINNHUB_API_KEY="fixture", FMP_API_KEY="",
+                                     ALPACA_DATA_URL="https://market-data.example")
+            fundamentals = FundamentalsService(
+                http, config=config, focus_symbols=("AAA", "BBB"), now=lambda: NOW, universe_size=0,
+            )
+            sources = ResearchSources(
+                Prices(), News(), list_universe=fundamentals.list_universe,
+                fetch_company=fundamentals.fetch_company, fetch_releases=fundamentals.fetch_releases,
+            )
+            symbols = await sources.universe(NOW)
+            assert symbols == ("AAA", "BBB")
+            row = (await sources.securities(("AAA",), NOW))["AAA"]
+            assert row.name == "Fixture Industries"
+            assert row.metrics["gross_margin_ttm"] == 0.48
+            assert row.metrics["market_cap_usd"] == 50_000_000
+            assert row.metric_provenance["gross_margin_ttm"] == {
+                "as_of": NOW.isoformat(), "source": "finnhub", "period": "TTM", "unit": "ratio",
+                "url": "https://finnhub.io/docs/api/company-basic-financials?symbol=AAA",
+            }
+            assert row.evidence[0].publisher == "Finnhub"
+            releases = await sources.releases(symbols, NOW)
+            assert [(release.symbol, release.story_id) for release in releases] == [("AAA", "earnings:AAA:2026-Q4")]
+            assert "Reported EPS: 0.25" in releases[0].evidence.snippet
 
     asyncio.run(run())
