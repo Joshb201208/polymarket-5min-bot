@@ -2,17 +2,21 @@
 Description=Stock Trading Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=4
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 WorkingDirectory=/root/polymarket-bot
 EnvironmentFile=/root/polymarket-bot/.env
-ExecStartPre=/usr/bin/git -C /root/polymarket-bot fetch --all
-ExecStartPre=/usr/bin/git -C /root/polymarket-bot reset --hard origin/master
 ExecStart=/root/polymarket-bot/venv/bin/python -m stock_agent
-Restart=always
+Restart=on-failure
 RestartSec=30
+TimeoutStartSec=90
+TimeoutStopSec=105
+WatchdogSec=180
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
