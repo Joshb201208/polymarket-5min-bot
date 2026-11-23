@@ -122,8 +122,15 @@ class _Model(BaseModel):
 
 
 def _num(v: Any) -> Any:
+    """Empty -> None; anything else must be a finite number (NaN/inf are refused)."""
     if v is None or v == "":
         return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"not a number: {v!r}") from None
+    if not math.isfinite(f):
+        raise ValueError(f"non-finite number: {v!r}")
     return v
 
 
