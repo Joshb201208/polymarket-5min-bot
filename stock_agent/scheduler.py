@@ -149,6 +149,7 @@ class StockAgentScheduler:
         self.analyst = service("analyst", lambda: Analyst(self.llm))
         self.research_sources = service("research_sources", lambda: ResearchSources(
             self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
+            cached_company=getattr(self.fundamentals, "cached_company", None),
             fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
         ) if self.news is not None else None)
         self.research_health = service("research_health", lambda: ResearchInputHealth(
@@ -203,7 +204,9 @@ class StockAgentScheduler:
         self.screener = Screener(self.config)
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
-        self.macro = MacroMonitor(self.config)
+        self.macro = service("macro", lambda: MacroMonitor(
+            self.config, prices=self.prices, alert=self._alert, report=self._provider_health, now=_now_utc,
+        ))
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
@@ -434,6 +437,9 @@ class StockAgentScheduler:
             self.health._load_persisted()
         if isinstance(self.assets, AssetRegistry):
             self.assets.load_state()
+        if isinstance(self.macro, MacroMonitor):
+            self.macro.store = self.store
+            self.macro._last_snapshot = self.macro._load_state()
         if isinstance(self.options, OptionsManager):
             self.options.load_state()
         if not boot.health.ok:
@@ -1481,28 +1487,14 @@ class StockAgentScheduler:
             })
 
             # ── 5. KEY LEVELS ────────────────────────────────────
-            from stock_agent.macro_monitor import (
-                SPX_SUPPORT_LOW, SPX_SUPPORT_HIGH,
-                SPX_RESISTANCE_1, SPX_RESISTANCE_2, SPX_RESISTANCE_CONFIRM,
-                QQQ_RESISTANCE_1, QQQ_RESISTANCE_2,
-            )
-
-            spx_price = macro_snap.spx_price if macro_snap else 0
-            qqq_price = macro_snap.qqq_price if macro_snap else 0
-
-            levels_text = (
-                f"**S&P 500** (current: ${spx_price:,.0f})\n"
-                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-                f"\U0001f534 Support: {SPX_SUPPORT_LOW:,} - {SPX_SUPPORT_HIGH:,} (buy zone)\n"
-                f"\U0001f7e1 Resistance 1: {SPX_RESISTANCE_1:,}\n"
-                f"\U0001f7e1 Resistance 2: {SPX_RESISTANCE_2:,}\n"
-                f"\U0001f7e2 Trend Confirmed: {SPX_RESISTANCE_CONFIRM:,}\n"
-                f"\n"
-                f"**QQQ** (current: ${qqq_price:,.2f})\n"
-                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-                f"\U0001f7e1 Resistance 1: {QQQ_RESISTANCE_1}\n"
-                f"\U0001f7e1 Resistance 2: {QQQ_RESISTANCE_2}\n"
-            )
+            levels = macro_snap.key_levels if macro_snap else {}
+            fields = (("close", "Last close"), ("sma50", "50-day average"), ("sma200", "200-day average"),
+                      ("high90", "90-day high"))
+            levels_text = "\n".join(
+                f"**{symbol}**: " + " | ".join(f"{label} ${value:,.2f}" for key, label in fields
+                                                if (value := levels.get(symbol, {}).get(key)) is not None)
+                for symbol in ("SPY", "QQQ") if any(levels.get(symbol, {}).values())
+            ) or "Completed market bars unavailable."
 
             embeds.append({
                 "title": "\U0001f4ca Key Levels to Watch",
