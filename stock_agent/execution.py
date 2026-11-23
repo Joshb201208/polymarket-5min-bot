@@ -226,6 +226,10 @@ class ExecutionEngine:
         q = res.quotes.get(symbol)
         if q is None:
             raise ExecutionError(f"no fresh quote for {symbol}: {res.missing.get(symbol, 'missing')}")
+        actual = str(getattr(q, "symbol", "") or symbol).upper()
+        if actual != symbol.upper():
+            # renamed ticker: never size an order for the old symbol from the new one's quote
+            raise ExecutionError(f"symbol changed: {symbol} now trades as {actual}; fresh thesis required")
         return q
 
     async def _stop_distance(self, symbol: str, price: float):
@@ -519,10 +523,6 @@ class ExecutionEngine:
         if not gate.allowed:
             return await self._hold(intent, f"market gate: {gate.reason}", gate.next_open)
         q = await self._quote(intent.symbol)
-        actual = str(getattr(q, "symbol", "") or intent.symbol).upper()
-        if actual != intent.symbol.upper():
-            # renamed ticker: the analysis was for the old symbol; never trade a stale one
-            return self._skip(intent, f"{intent.symbol} now trades as {actual}; re-research before buying")
         ask = _f(q.ask) or _f(q.price)
         ref = _f(intent.reference_price)
         if ref > 0 and ask > ref * (1 + self.s.max_price_drift_pct):
