@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -16,6 +15,7 @@ from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
 from stock_agent.execution import ExecutionEngine
+from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsService
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
@@ -133,10 +133,16 @@ class StockAgentScheduler:
         ))
         self.price_service = self.prices
         self.health_registry = self.health
+        self._universe_symbols: tuple[str, ...] = ()
+        self.fundamentals = service("fundamentals", lambda: FundamentalsService(
+            self.http, config=self.config, health=self.health, assets=self.assets, prices=self.prices,
+            focus_symbols=self._pollable_focus, now=_now_utc, universe_size=self.config.UNIVERSE_SIZE,
+        ))
         self.news = service("news", lambda: None)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
         self.llm = service("llm", lambda: LLMClient(
             self.config, spend=self.research_store, on_failure=self._on_research_failure, now=_now_utc,
+            health=self.health,
         ))
         self.research_gate = service("research_gate", lambda: ResearchGate(self.ledger, self.health, self.config))
         self.research = service("research", lambda: None)
@@ -159,7 +165,7 @@ class StockAgentScheduler:
         ))
         if isinstance(self.engine, ExecutionEngine):
             self.engine.options = self.options
-        self.runtime = service("runtime", lambda: RuntimeStatus(self.config.DATA_DIR / "runtime-health.json"))
+        self.runtime = service("runtime", lambda: RuntimeStatus.for_data_dir(self.config.DATA_DIR))
         self.pause_file: Path = service("pause_file", lambda: self.config.DATA_DIR / "pause-trading")
         self._stop_event = asyncio.Event()
         self._normalised = False
@@ -258,6 +264,8 @@ class StockAgentScheduler:
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
             return True
+        if isinstance(self.runtime, RuntimeStatus) and self.runtime.path.with_name("pause-trading").exists():
+            return True
         configured = getattr(self.config, "is_trading_paused", None)
         return bool(configured is not None and configured(self.config.DATA_DIR))
 
@@ -282,10 +290,19 @@ class StockAgentScheduler:
     def _tracked_symbols(self) -> tuple[str, ...]:
         current = self.ledger.last_snapshot()
         held = (position.symbol for position in current.holdings) if current else ()
+        catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
         return tuple(dict.fromkeys([
             *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
-            *self.assets.active_symbols()[:self.config.UNIVERSE_SIZE],
+            *self._universe_symbols, *catalogue,
         ]))
+
+    def _resolve_symbols(self, symbols) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            resolved for symbol in symbols if (resolved := self.assets.resolve_symbol(symbol))
+        ))
+
+    def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
 
     async def _refresh_assets(self, *, force: bool = False):
         if isinstance(self.assets, AssetRegistry) and not (
@@ -301,7 +318,11 @@ class StockAgentScheduler:
         return None
 
     async def _list_universe(self) -> tuple[str, ...]:
-        return self._option_universe()[:self.config.UNIVERSE_SIZE]
+        candidates = await self.fundamentals.list_universe()
+        self._universe_symbols = self._resolve_symbols((*self.config.PRIORITY_SYMBOLS, *candidates))[
+            :self.config.UNIVERSE_SIZE
+        ]
+        return self._universe_symbols
 
     async def _stop_bars(self, symbol: str):
         getter = getattr(self.prices, "get_daily_bars", None)
@@ -320,9 +341,10 @@ class StockAgentScheduler:
         return quote if quote is not None and getattr(quote, "symbol", symbol) == symbol else None
 
     def _option_universe(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(
-            resolved for symbol in self._tracked_symbols() if (resolved := self.assets.resolve_symbol(symbol))
-        ))
+        current = self.ledger.last_snapshot()
+        held = (position.symbol for position in current.holdings) if current else ()
+        candidates = self._universe_symbols or self.assets.active_symbols()[:self.config.UNIVERSE_SIZE]
+        return self._resolve_symbols((*held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS, *candidates))
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -452,6 +474,14 @@ class StockAgentScheduler:
         self._telemetry_task = asyncio.create_task(self._notification_tick(), name="stock-agent:notifications")
 
     async def _notification_tick(self) -> None:
+        if isinstance(self.runtime, RuntimeStatus) and isinstance(self.alerts, AlertService):
+            event = self.runtime.deployment_event()
+            if event and event["at"] != self.store.kv_get("deploy.last_notified"):
+                if self.alerts.alert_deploy_event(
+                    event["event"], self.runtime.sha, reason=str(event.get("reason") or ""),
+                    rollback=event["event"] == "rollback",
+                ):
+                    self.store.kv_set("deploy.last_notified", event["at"])
         try:
             async with asyncio.timeout(6):
                 note = "broker sync healthy" if self._reconciled else "broker sync needs attention"
