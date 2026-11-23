@@ -1,149 +1,78 @@
-import json
-import logging
-from datetime import datetime, timezone
+"""Deterministic ranking of observed financial factors; no LLM dependency."""
 
-import httpx
+from __future__ import annotations
 
-from stock_agent.config import Config
-from stock_agent.models import CompanyData
+import math
+from dataclasses import dataclass, field
 
-logger = logging.getLogger(__name__)
 
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+@dataclass(frozen=True)
+class Candidate:
+    symbol: str
+    name: str
+    sector: str
+    tradable: bool
+    metrics: dict[str, float] = field(default_factory=dict)
+    focus: bool = False
+
+
+_FACTORS = {
+    "revenue_growth_yoy": (30, 1),
+    "gross_margin": (20, 1),
+    "earnings_yield": (20, 1),
+    "debt_to_equity": (15, -1),
+    "relative_strength": (15, 1),
+}
 
 
 class Screener:
-    def __init__(self, config: Config):
+    def __init__(self, config):
         self.config = config
-        self._client: httpx.AsyncClient | None = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=60.0)
-        return self._client
+    async def close(self) -> None:
+        return None
 
-    async def close(self):
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-
-    async def _call_openai(self, messages: list[dict]) -> dict | None:
-        """Call OpenAI GPT-4.1 Nano for structured screening."""
-        client = await self._get_client()
-        headers = {
-            "Authorization": f"Bearer {self.config.OPENAI_API_KEY}",
-            "Content-Type": "application/json",
+    @staticmethod
+    def rank(companies: list[Candidate]) -> list[dict]:
+        eligible = {row.symbol: row for row in companies if row.tradable}
+        observations = {
+            name: {ticker: row.metrics[name] * position for ticker, row in eligible.items()
+                   if name in row.metrics and math.isfinite(row.metrics[name])}
+            for name, (_, position) in _FACTORS.items()
         }
-        payload = {
-            "model": "gpt-4.1-nano",
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.3,
-        }
+        ranked = []
+        for symbol, row in eligible.items():
+            scores = {}
+            for name, values in observations.items():
+                if symbol not in values:
+                    continue
+                same_sector = [value for other, value in values.items() if eligible[other].sector == row.sector]
+                peers = same_sector if len(same_sector) >= 3 else list(values.values())
+                target = values[symbol]
+                scores[name] = ((sum(value < target for value in peers) +
+                                sum(value == target for value in peers) / 2) / len(peers)) * 10
+            # Unknown factors center at neutral rather than increasing score,
+            # then factor coverage is prioritized at a tied composite. The
+            # screener only directs research; it is never an entry gate.
+            composite = sum(weight * scores.get(name, 5.0) for name, (weight, _) in _FACTORS.items()) / 100
+            ranked.append({"symbol": symbol, "name": row.name, "scores": scores, "composite": composite,
+                           "score": composite, "coverage": len(scores), "focus": row.focus})
+        return sorted(ranked, key=lambda row: (-row["focus"], -row["composite"], -row["coverage"], row["symbol"]))
 
-        try:
-            resp = await client.post(OPENAI_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.error("OpenAI API error: %s — %s", e.response.status_code, e.response.text[:500])
-            return None
-        except Exception as e:
-            logger.error("OpenAI call failed: %s", e)
-            return None
-
-    def _format_company_for_screening(self, company: CompanyData) -> str:
-        lines = [
-            f"Symbol: {company.symbol} | {company.name}",
-            f"Sector: {company.sector} | Market Cap: ${company.market_cap:,.0f}",
-            f"Price: ${company.price:.2f}",
-        ]
-
-        def _add(label: str, val, fmt: str = ".2f"):
-            if val is not None:
-                lines.append(f"{label}: {val:{fmt}}")
-
-        _add("P/E", company.pe_ratio, ".1f")
-        _add("Forward P/E", company.forward_pe, ".1f")
-        _add("P/B", company.pb_ratio, ".1f")
-        _add("EV/EBITDA", company.ev_ebitda, ".1f")
-        _add("Rev Growth YoY", company.revenue_growth_yoy, ".1%")
-        _add("Earnings Growth YoY", company.earnings_growth_yoy, ".1%")
-        _add("Gross Margin", company.gross_margin, ".1%")
-        _add("Operating Margin", company.operating_margin, ".1%")
-        _add("Net Margin", company.net_margin, ".1%")
-        _add("ROE", company.roe, ".1%")
-        _add("ROIC", company.roic, ".1%")
-        _add("FCF Yield", company.fcf_yield, ".1%")
-        _add("Debt/Equity", company.debt_to_equity, ".2f")
-        _add("Current Ratio", company.current_ratio, ".2f")
-        _add("Analyst Target", company.analyst_target_price, ".2f")
-        _add("DCF Value", company.dcf_value, ".2f")
-
-        return "\n".join(lines)
-
-    async def screen_candidates(self, companies: list[CompanyData]) -> list[dict]:
-        """Screen and score a list of companies using GPT-4.1 Nano.
-
-        Returns ranked list of dicts with scores and summaries.
-        """
-        all_results: list[dict] = []
-        batch_size = 5
-
-        for i in range(0, len(companies), batch_size):
-            batch = companies[i : i + batch_size]
-            batch_results = await self._screen_batch(batch)
-            all_results.extend(batch_results)
-
-        # Sort by composite score descending
-        all_results.sort(key=lambda x: x.get("composite", 0), reverse=True)
-        logger.info(
-            "Screened %d companies, top score: %s (%.1f)",
-            len(all_results),
-            all_results[0].get("symbol", "?") if all_results else "N/A",
-            all_results[0].get("composite", 0) if all_results else 0,
-        )
-        return all_results
-
-    async def _screen_batch(self, companies: list[CompanyData]) -> list[dict]:
-        """Score a batch of companies."""
-        companies_text = ""
-        for c in companies:
-            companies_text += f"\n---\n{self._format_company_for_screening(c)}\n"
-
-        prompt = f"""You are a quantitative stock screener. For EACH of the following companies, score them 1-10 on each factor:
-- Revenue Growth (YoY quarterly)
-- Margin Quality (gross margin trend, operating margin trend)
-- Valuation (P/E vs sector, P/FCF, EV/EBITDA)
-- Balance Sheet (debt/equity, current ratio, FCF yield)
-- Analyst Sentiment (consensus rating, price target upside)
-
-COMPANIES:
-{companies_text}
-
-Return JSON with a "results" array. Each element must have:
-{{"symbol": "...", "scores": {{"revenue_growth": X, "margin_quality": X, "valuation": X, "balance_sheet": X, "analyst_sentiment": X}}, "composite": X, "summary": "one sentence"}}
-
-The composite score should be the weighted average: revenue_growth (25%), margin_quality (20%), valuation (25%), balance_sheet (15%), analyst_sentiment (15%).
-
-Return ONLY the JSON object with the "results" array."""
-
-        messages = [
-            {"role": "system", "content": "You are a quantitative stock screener. Return only valid JSON."},
-            {"role": "user", "content": prompt},
-        ]
-
-        response = await self._call_openai(messages)
-        if not response:
-            return [{"symbol": c.symbol, "composite": 0, "summary": "Screening failed"} for c in companies]
-
-        try:
-            content = response["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            results = parsed.get("results", [])
-            if isinstance(results, list):
-                return results
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            logger.error("Failed to parse screening response: %s", e)
-
-        return [{"symbol": c.symbol, "composite": 0, "summary": "Parse failed"} for c in companies]
+    async def screen_candidates(self, companies: list) -> list[dict]:
+        """Compatibility for callers still preparing the legacy CompanyData rows."""
+        rows = []
+        for company in companies:
+            metrics = {}
+            for field in _FACTORS:
+                value = getattr(company, field, None)
+                if value is not None:
+                    metrics[field] = value
+            if company.pe_ratio is not None and company.pe_ratio > 0:
+                metrics["earnings_yield"] = 1 / company.pe_ratio
+            rows.append(Candidate(
+                company.symbol, company.name, company.sector,
+                company.price > 0 and (not company.market_cap or company.market_cap >= self.config.MIN_MARKET_CAP),
+                metrics,
+            ))
+        return self.rank(rows)
