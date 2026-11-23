@@ -93,11 +93,13 @@ def test_reconcile_close_explained_by_stop_fill(tmp_path):
     alerts = []
     led = make_ledger(tmp_path, broker=b, alerts=alerts)
     run(led.refresh("first"))
+    alerts.clear()
     b.fill("AAA", "sell", 10, 92.0, ts="2026-11-23T14:40:00Z")
     del b.positions["AAA"]
     snap = run(led.refresh("after stop"))
     [d] = [d for d in snap.diffs if d.kind == DiffKind.CLOSED]
-    assert d.severity == Severity.WARNING and "sell fill" in d.explanation
+    assert d.severity == Severity.INFO and "sell fill" in d.explanation
+    assert not any(a[0] in ("warning", "critical") for a in alerts)
 
 
 def test_reconcile_unexplained_close_is_critical(tmp_path):
@@ -163,7 +165,7 @@ def test_reconcile_mass_close_guard_rereads(tmp_path):
 
 def test_reconcile_mass_close_confirmed_is_critical(tmp_path):
     b = StubBroker()
-    for s in ("AAA", "BBB"):
+    for s in ("AAA", "BBB", "CCC"):
         b.pos(s, 10, 50)
     led = make_ledger(tmp_path, broker=b)
     run(led.refresh("first"))
@@ -378,3 +380,41 @@ def test_last_reconcile_reports_clean_separately(tmp_path):
     run(led.refresh("gone"))
     lr = led.last_reconcile()
     assert lr["ok"] and not lr["clean"]
+
+
+def test_small_book_stop_fill_is_not_mass_close(tmp_path):
+    b = StubBroker()
+    b.pos("AAA", 10, 50)
+    b.pos("BBB", 10, 50)
+    alerts = []
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first", rebuild=True))
+    alerts.clear()
+    b.fill("BBB", "sell", 10, 45, ts="2026-11-23T15:00:00Z")
+    del b.positions["BBB"]
+    snap = run(led.refresh("stop"))
+    assert not any(d.kind == DiffKind.MASS_CLOSE for d in snap.diffs)
+    assert alerts == []
+
+
+def test_own_filled_buy_opens_position_with_its_thesis(tmp_path):
+    from stock_agent.ledger import IntentStatus, NewIntent
+
+    b = StubBroker()
+    alerts = []
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first"))
+    tid = led.record_thesis("BBB", {"c": 8}, ThesisRole.ENTRY_CANDIDATE, activate=True)
+    [iid] = led.enqueue_intents([NewIntent(symbol="BBB", side="buy", dedupe_key="buy:BBB", thesis_ids=(tid,),
+                                           meta={"sector": "Technology"})])
+    led.claim_intent(iid)
+    led.ack_intent(iid, IntentStatus.SUBMITTED, broker_order_id="ord-9")
+    a = b.fill("BBB", "buy", 5, 40, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "ord-9"
+    b.pos("BBB", 5, 40)
+    snap = run(led.refresh("after fill"))
+    m = led.open_position_meta("BBB")
+    assert m.opened_source == "bot" and m.entry_intent_id == iid and m.entry_thesis_id == tid
+    assert m.sector == "Technology"
+    assert led.entry_thesis(m.position_id).thesis_id == tid
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs) and alerts == []
