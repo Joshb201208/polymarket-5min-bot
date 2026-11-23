@@ -292,6 +292,46 @@ def _renames(ledger: Ledger) -> dict[str, str]:
     return out
 
 
+async def _link_own_orders(ledger: Ledger, broker: Any, acts: list[dict]) -> int:
+    """Attach broker order ids to our intents by ``client_order_id`` (R-03).
+
+    After a lost submit reply and a restart, reconcile can run before the
+    execution engine re-acks the intent, so the fill's ``order_id`` is unknown.
+    For each FILL whose order is unknown while an un-acked intent exists for the
+    same symbol, ask the broker for that order and match its client_order_id.
+    Read-only at the broker; failures are ignored (the next run retries)."""
+    pending = {}
+    for r in ledger.store.query("SELECT intent_id, client_order_id, symbol, status FROM order_intents"
+                                " WHERE broker_order_id IS NULL"):
+        if r["status"] in ("submitting", "submitted", "ambiguous", "partially_filled", "filled"):
+            pending.setdefault(str(r["symbol"]), {})[str(r["client_order_id"])] = r["intent_id"]
+    if not pending:
+        return 0
+    seen: set[str] = set()
+    linked = 0
+    for a in acts:
+        oid, sym = a.get("order_id"), a.get("symbol")
+        if a.get("activity_type") != "FILL" or not oid or oid in seen or sym not in pending:
+            continue
+        seen.add(oid)
+        if ledger.store.query("SELECT 1 FROM order_intents WHERE broker_order_id=?", (oid,)):
+            continue
+        try:
+            order = await broker.get_order(oid)
+        except Exception:
+            continue
+        intent_id = pending[sym].get(str(_g(order, "client_order_id") or ""))
+        if not intent_id:
+            continue
+        with ledger.store.transaction() as c:
+            c.execute("UPDATE order_intents SET broker_order_id=? WHERE intent_id=? AND broker_order_id IS NULL",
+                      (oid, intent_id))
+        ledger.journal.append("state_event", event="intent_linked", intent_id=intent_id, broker_order_id=oid,
+                              via="client_order_id")
+        linked += 1
+    return linked
+
+
 def _own_intent_for(ledger: Ledger, open_activity_id: str | None) -> dict | None:
     """The bot's intent whose broker order produced this opening fill, if any."""
     if not open_activity_id:
@@ -361,6 +401,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     diffs: list[Diff] = []
     # broker activity is fact even if the rest of this run aborts; ingest first so closes can be explained
     _ingest_activities(ledger, acts)
+    await _link_own_orders(ledger, broker, acts)
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())

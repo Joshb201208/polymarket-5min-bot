@@ -445,3 +445,52 @@ def test_registered_alias_ignored_on_qty_mismatch(tmp_path):
     b.pos("NEW", 40, 100)
     run(led.refresh("rename"))
     assert led.open_position_meta("NEW").position_id != pid
+
+
+def test_own_fill_linked_by_client_order_id_before_ack(tmp_path):
+    """R-03: lost submit reply + restart; reconcile runs before the engine re-acks."""
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    b = StubBroker()
+    orders = {}
+
+    async def get_order(oid):
+        return orders[oid]
+    b.get_order = get_order
+    alerts = []
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first"))
+    tid = led.record_thesis("DDD", {"c": 8}, ThesisRole.ENTRY_CANDIDATE, activate=True)
+    [iid] = led.enqueue_intents([NewIntent(symbol="DDD", side="buy", dedupe_key="buy:DDD", thesis_ids=(tid,))])
+    led.claim_intent(iid)                                   # submit sent, reply lost; no broker_order_id
+    a = b.fill("DDD", "buy", 5, 40, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "ord-lost"
+    orders["ord-lost"] = SimpleNamespace(id="ord-lost", client_order_id=led.get_intent(iid).client_order_id)
+    b.pos("DDD", 5, 40)
+    snap = run(led.refresh("restart"))
+    m = led.open_position_meta("DDD")
+    assert m.opened_source == "bot" and m.entry_intent_id == iid and m.entry_thesis_id == tid
+    assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs) and alerts == []
+
+
+def test_foreign_fill_still_imported_when_client_id_differs(tmp_path):
+    from types import SimpleNamespace
+
+    from stock_agent.ledger import NewIntent
+
+    b = StubBroker()
+
+    async def get_order(oid):
+        return SimpleNamespace(id=oid, client_order_id="someone-else")
+    b.get_order = get_order
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    [iid] = led.enqueue_intents([NewIntent(symbol="DDD", side="buy", dedupe_key="buy:DDD")])
+    led.claim_intent(iid)
+    b.fill("DDD", "buy", 5, 40, ts="2026-11-23T15:00:00Z")
+    b.pos("DDD", 5, 40)
+    snap = run(led.refresh("x"))
+    assert led.open_position_meta("DDD").opened_source != "bot"
+    assert any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
