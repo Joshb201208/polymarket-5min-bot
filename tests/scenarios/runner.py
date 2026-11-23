@@ -93,6 +93,7 @@ class ScenarioRunner:
         shutdown: Callable[[Any], Awaitable[None]] | None = _default_shutdown,
         step_seconds: int = 60,
         max_steps: int = 50_000,
+        settle_rounds: int = 200,
     ):
         self.world = world
         self.clock = world.clock
@@ -102,6 +103,7 @@ class ScenarioRunner:
         self._shutdown = shutdown
         self.step_seconds = step_seconds
         self.max_steps = max_steps
+        self.settle_rounds = settle_rounds
         self.agent = None
         self.builds = 0
         self.steps = 0
@@ -230,6 +232,16 @@ class ScenarioRunner:
         self.note("error", repr(e))
         logger.warning("scenario tick error at %s: %r", self.clock.now_et(), e)
 
+    async def _settle(self) -> None:
+        """Let work the tick launched as detached tasks (the scheduler's job and
+        order lanes) run until it blocks, before the clock moves on. Without this
+        those tasks only get the loop when a run_* call ends."""
+        loop = asyncio.get_running_loop()
+        for _ in range(self.settle_rounds):
+            await asyncio.sleep(0)
+            if not getattr(loop, "_ready", None):  # CPython: callbacks ready to run
+                break
+
     async def _run_until(self, end: datetime) -> None:
         while self.clock.now_et() < end:
             if self.steps >= self.max_steps:
@@ -242,6 +254,7 @@ class ScenarioRunner:
             except Exception as e:  # noqa: BLE001 - mirrors the production loop
                 self._record_error(e)
             self.steps += 1
+            await self._settle()
             for item in list(self._watchers):
                 pred, fn, label, once = item
                 if pred(self.world, self):
