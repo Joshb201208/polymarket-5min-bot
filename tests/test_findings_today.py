@@ -113,8 +113,9 @@ def test_F_07_01_unreadable_state_is_not_an_empty_book(world, tmp_path):
     assert "AAA" in known or not world.orders_sent(), "traded on an empty book that ignores the broker's holdings"
 
 
-@finding("F-04-01", "a spread is recorded as opened when one leg is rejected")
 def test_F_04_01_spread_not_recorded_when_a_leg_fails(world, monkeypatch):
+    # Fixed: the scheduler no longer uses the legacy per-leg path; OptionsManager sends one
+    # atomic mleg order (see tests/test_options_manager.py for leg-level coverage).
     from stock_agent.options_models import OptionSide, OptionsSignal, OptionsStrategy, OptionType
 
     world.clock.set_et(2026, 11, 23, 10, 0)
