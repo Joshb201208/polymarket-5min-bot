@@ -23,16 +23,17 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from stock_agent.alerts import redact_secrets_in_text
-from stock_agent.benchmark import BenchmarkSnapshot, BenchmarkTracker
+from stock_agent.benchmark import MIN_PAIRED_IR, BenchmarkSnapshot, BenchmarkTracker
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, EquityMark, Holding, Ledger
 from stock_agent.performance import (
+    SHADOW_POST_STOP_SESSIONS,
     day_pnl,
     drawdown,
     net_deposits,
@@ -179,6 +180,17 @@ def _holding_stop_status(h: Holding, snap: BookSnapshot) -> tuple[str, bool]:
     if h.is_fractional and whole_qty == ZERO:
         return ("ℹ️ Sub-1 fractional share (GTC stop unsupported; watched live)", True)
     return ("🚨 MISSING BROKER STOP", False)
+
+
+def _parse_ts(x: Any) -> datetime | None:
+    """ISO timestamp from SQLite/journal rows -> aware datetime (naive treated as UTC)."""
+    if x is None or x == "":
+        return None
+    try:
+        t = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
 class ReportBuilder:
@@ -342,7 +354,7 @@ class ReportBuilder:
         marks = self.ledger.equity_marks("close") if self.ledger else []
         flows = self.ledger.cash_flows() if self.ledger else []
         prev_mark = previous_close(marks, session_date)
-        overnight_pnl, overnight_pct = day_pnl(marks, snap.equity, session_date)
+        overnight_pnl, overnight_pct = day_pnl(marks, snap.equity, session_date, flows)
         dd_pct, hwm = drawdown(marks, snap.equity)
         _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
 
@@ -629,7 +641,7 @@ class ReportBuilder:
         sess_pnl, sess_pct = (
             (close_report.day_pnl, close_report.day_pnl_pct)
             if close_report is not None and getattr(close_report, "day_pnl", None) is not None
-            else day_pnl(marks, equity, session_date)
+            else day_pnl(marks, equity, session_date, flows)
         )
         dd_pct, hwm = drawdown(marks, equity)
         _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
@@ -766,6 +778,9 @@ class ReportBuilder:
 
         closed_stock_wins = 0
         closed_stock_total = 0
+        sold_seen: set[str] = set()
+        day_start = datetime.combine(session_date, time.min, tzinfo=ET)
+        day_end = datetime.combine(session_date, time.max, tzinfo=ET)
 
         for it in intents:
             if it.status == "filled":
@@ -775,7 +790,9 @@ class ReportBuilder:
                 if it.side == "buy":
                     did.append(f"• **Bought {it.symbol}** ({it.sleeve}){conv_txt} — {reason}.")
                 else:
-                    sym_pnl = real_all.by_symbol.get(it.symbol)
+                    # realised lots of this symbol booked during this ET session, counted once per symbol
+                    sym_pnl = None if it.symbol in sold_seen else real_all.between(it.symbol, day_start, day_end)
+                    sold_seen.add(it.symbol)
                     if sym_pnl is not None:
                         closed_stock_total += 1
                         if sym_pnl > ZERO:
@@ -1101,7 +1118,8 @@ class ReportBuilder:
                 else sym_to_sleeve.get(sym, "CORE_EQUITY")
             )
             sleeves[sl]["closed_count"] += 1
-            pnl_dec = real_fifo.by_symbol.get(sym)
+            # only the lots closed during THIS position (a symbol traded twice has two positions)
+            pnl_dec = real_fifo.between(sym, _parse_ts(r["opened_at"]), _parse_ts(r["closed_at"]))
             if pnl_dec is not None:
                 pnl_f = float(pnl_dec)
                 sleeves[sl]["realized_pnl"] = round(sleeves[sl]["realized_pnl"] + pnl_f, 2)
@@ -1265,6 +1283,29 @@ class ReportBuilder:
             "input_health_rows": rows,
         }
 
+    def _sessions_after_stop(self, result: dict[str, Any], row: dict[str, Any]) -> int:
+        """Completed trading sessions after a shadow stop's exit session (0 if unknown).
+
+        Prefers the count journalled by ``performance.shadow_stops`` (from the daily-bar
+        session calendar); else asks the market calendar; unknown is treated as immature."""
+        n = result.get("sessions_after_exit")
+        if isinstance(n, int) and not isinstance(n, bool):
+            return n
+        try:
+            exit_d = date.fromisoformat(str(result.get("exit_session"))[:10])
+            thru_d = date.fromisoformat(str(result.get("through_session") or row.get("through_session"))[:10])
+        except ValueError:
+            return 0
+        cal = self.calendar
+        if cal is not None and hasattr(cal, "trading_days_between"):
+            try:
+                got = cal.trading_days_between(exit_d, thru_d)
+            except Exception:
+                got = None
+            if isinstance(got, int):
+                return got
+        return 0
+
     def _compile_what_we_learned(self, bm: BenchmarkSnapshot) -> dict[str, Any]:
         """Aggregate shadow-stop, sizing, and news outcomes from the journal.
 
@@ -1328,16 +1369,16 @@ class ReportBuilder:
                     if res.get("stopped"):
                         stopped_count[canon] += 1
 
-            # Check >=20 calendar day post-stop maturity when both live stop & no_stop exist
+            # Post-stop check: mature only once 20 completed TRADING sessions have passed
+            # after the live stop's exit session (not calendar days from entry).
             try:
-                d_entry = date.fromisoformat(str(ev.get("entry_session"))[:10])
-                d_thru = date.fromisoformat(str(ev.get("through_session"))[:10])
-                if (d_thru - d_entry).days >= 20:
-                    res_list = ev.get("results") or []
-                    live_r = next((x for x in res_list if "live" in str(x.get("variant", "")).lower() or "atr" in str(x.get("variant", "")).lower()), None)
-                    nostop_r = next((x for x in res_list if "no" in str(x.get("variant", "")).lower()), None)
-                    if live_r and nostop_r and live_r.get("stopped") and live_r.get("pnl") is not None and nostop_r.get("pnl") is not None:
-                        post_stop_20d.append(float(live_r["pnl"]) - float(nostop_r["pnl"]))
+                res_list = ev.get("results") or []
+                live_r = next((x for x in res_list if "live" in str(x.get("variant", "")).lower() or "atr" in str(x.get("variant", "")).lower()), None)
+                nostop_r = next((x for x in res_list if "no" in str(x.get("variant", "")).lower()), None)
+                if (live_r and nostop_r and live_r.get("stopped") and live_r.get("pnl") is not None
+                        and nostop_r.get("pnl") is not None
+                        and self._sessions_after_stop(live_r, ev) >= SHADOW_POST_STOP_SESSIONS):
+                    post_stop_20d.append(float(live_r["pnl"]) - float(nostop_r["pnl"]))
             except Exception:
                 pass
 
@@ -1366,13 +1407,13 @@ class ReportBuilder:
             {
                 "mature_count": len(post_stop_20d),
                 "net_saved_vs_hold": round(sum(post_stop_20d), 2),
-                "display": f"{len(post_stop_20d)} stopped trade(s) >=20d: stop saved {_fmt_money(sum(post_stop_20d), signed=True)} vs holding without a stop",
+                "display": f"{len(post_stop_20d)} stopped trade(s) 20+ sessions after the stop: stop saved {_fmt_money(sum(post_stop_20d), signed=True)} vs holding without a stop",
             }
             if post_stop_20d
             else {
                 "mature_count": 0,
                 "net_saved_vs_hold": None,
-                "display": "N/A (no stopped trades with 20+ days of history yet)",
+                "display": "N/A (no stopped trades with 20+ trading sessions after the stop yet)",
             }
         )
 
@@ -1390,7 +1431,14 @@ class ReportBuilder:
             "information_ratio_display": (
                 f"{float(bm.information_ratio_vs_qqq):.2f}"
                 if bm.information_ratio_vs_qqq is not None
-                else f"N/A (early sample: {bm.paired_sessions}/20 paired sessions)"
+                else f"N/A (early sample: {bm.paired_sessions}/{MIN_PAIRED_IR} paired sessions)"
+            ),
+            "paired_sessions": bm.paired_sessions,
+            "stats_early": bm.stats_early,
+            "risk_stats_label": (
+                f"early sample: {bm.paired_sessions} paired sessions, treat as indicative"
+                if bm.stats_early
+                else f"{bm.paired_sessions} paired sessions"
             ),
         }
 
@@ -1500,6 +1548,7 @@ class ReportBuilder:
             f"Annualized Volatility: {_fmt_pct(wl['realized_vol_ann_pct'], signed=False)} | "
             f"Beta to QQQ: {wl['beta_to_qqq'] if wl['beta_to_qqq'] is not None else 'N/A'} | "
             f"Information Ratio: {wl['information_ratio_display']}"
+            + (f" ({wl['risk_stats_label']})" if wl.get("risk_stats_label") else "")
         )
 
         e3 = {

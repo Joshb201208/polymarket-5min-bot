@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Any
 
 from stock_agent.ledger import CashFlow, EquityMark
-from stock_agent.performance import DEPOSIT_KINDS, net_deposits, previous_close
+from stock_agent.performance import flows_between, previous_close
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,12 @@ ZERO = Decimal("0")
 LAUNCH_DATE = date(2026, 3, 30)
 LAUNCH_BASELINE_DATE = date(2026, 3, 27)
 BENCHMARK_SYMBOLS = ("QQQ", "SPY")
+# Paired-session sample sizes before risk statistics are shown at all, and before
+# they stop being labelled "early sample".
+MIN_PAIRED_VOL = 10
+MIN_PAIRED_BETA = 20
+MIN_PAIRED_IR = 20
+MATURE_PAIRED_SESSIONS = 60
 
 
 def _q4(val: Decimal | float) -> Decimal:
@@ -71,12 +77,13 @@ def flow_adjusted_return_pct(
 
     points: list[tuple[date, Decimal]] = []
     if start_date is not None:
-        # Anchor on the latest close on or before start_date if available
+        # Anchor on the latest trusted close on or before start_date. If the ledger history
+        # starts later, the window cannot be measured: never silently start it later.
         prior_or_on = [m for m in closes if m.session_date <= start_date]
-        after = [m for m in closes if m.session_date > start_date]
-        if prior_or_on:
-            points.append((prior_or_on[-1].session_date, prior_or_on[-1].equity))
-        points.extend((m.session_date, m.equity) for m in after)
+        if not prior_or_on:
+            return None
+        points.append((prior_or_on[-1].session_date, prior_or_on[-1].equity))
+        points.extend((m.session_date, m.equity) for m in closes if m.session_date > start_date)
     else:
         points = [(m.session_date, m.equity) for m in closes]
 
@@ -86,30 +93,16 @@ def flow_adjusted_return_pct(
         elif points[-1][0] == as_of_date:
             points[-1] = (as_of_date, live_equity)
 
-    if len(points) >= 2:
-        growth = Decimal(1)
-        for (d0, eq0), (d1, eq1) in zip(points, points[1:], strict=False):
-            if eq0 <= ZERO:
-                return None
-            interval_flow = sum(
-                (f.amount for f in flows if f.kind in DEPOSIT_KINDS and d0 < f.date <= d1),
-                ZERO,
-            )
-            growth *= (eq1 - interval_flow) / eq0
-        return ((growth - Decimal(1)) * Decimal(100)).quantize(Decimal("0.01"))
-
-    # Fewer than 2 close points (e.g. Day 1 after cut-over): compare terminal equity to net deposits
-    terminal_eq = live_equity if live_equity is not None else (points[-1][1] if points else None)
-    if terminal_eq is None:
+    if len(points) < 2:
+        # No trusted starting mark: the return is unavailable. ``fallback_starting_capital``
+        # is accepted for compatibility but never used to invent a baseline.
         return None
-    dep = net_deposits(flows, as_of_date)
-    if dep > ZERO and (start_date is None or start_date <= LAUNCH_DATE):
-        return _pct_change(terminal_eq, dep)
-    if dep == ZERO and fallback_starting_capital and fallback_starting_capital > ZERO and (
-        start_date is None or start_date <= LAUNCH_DATE
-    ):
-        return _pct_change(terminal_eq, fallback_starting_capital)
-    return None
+    growth = Decimal(1)
+    for (d0, eq0), (d1, eq1) in zip(points, points[1:], strict=False):
+        if eq0 <= ZERO:
+            return None
+        growth *= (eq1 - flows_between(flows, d0, d1)) / eq0
+    return ((growth - Decimal(1)) * Decimal(100)).quantize(Decimal("0.01"))
 
 
 @dataclass(frozen=True)
@@ -128,6 +121,8 @@ class SymbolBenchmark:
     mark_source: str  # daily_bar_close | live_quote | missing
     stale: bool
     stale_reason: str = ""
+    prev_session_date: date | None = None   # session the session return is measured from
+    week_anchor_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +143,8 @@ class BenchmarkSnapshot:
     realized_vol_ann_pct: Decimal | None
     beta_to_qqq: Decimal | None
     information_ratio_vs_qqq: Decimal | None
+    stats_early: bool = True   # paired sample below MATURE_PAIRED_SESSIONS: label vol/beta/IR "early"
+    active_vs_qqq_week_pct: Decimal | None = None
 
 
 class BenchmarkTracker:
@@ -186,7 +183,8 @@ class BenchmarkTracker:
                 )
                 bars_by_sym = dict(raw_bars or {})
             except Exception as e:
-                logger.warning("Benchmark daily bars fetch failed (%s): %s", type(e).__name__, e)
+                # type only: provider errors can echo request URLs that carry credentials
+                logger.warning("Benchmark daily bars fetch failed (%s)", type(e).__name__)
 
             # Fetch live/brief quotes whenever today's daily close bar is not yet settled
             need_quotes = [
@@ -200,9 +198,27 @@ class BenchmarkTracker:
                     quotes_by_sym = dict(getattr(qres, "quotes", {}) or {})
                     missing_quotes = dict(getattr(qres, "missing", {}) or {})
                 except Exception as e:
-                    logger.warning("Benchmark quote fetch failed (%s): %s", type(e).__name__, e)
+                    logger.warning("Benchmark quote fetch failed (%s)", type(e).__name__)
                     for sym in need_quotes:
                         missing_quotes[sym] = f"{type(e).__name__}"
+
+        # Trusted close marks and the windows they define. Every bot-vs-benchmark comparison
+        # uses the SAME session dates on both sides (anchor mark date -> as_of_date).
+        sorted_closes = sorted(
+            (m for m in marks if m.quality == "close" and m.session_date <= as_of_date),
+            key=lambda m: m.session_date,
+        )
+        prev_mark = previous_close(sorted_closes, as_of_date)
+        today_close = next((m for m in sorted_closes if m.session_date == as_of_date), None)
+        effective_eq = today_close.equity if today_close is not None else live_equity
+
+        week_anchor_date: date | None = None
+        if len(sorted_closes) >= 6:
+            week_anchor_date = sorted_closes[-6].session_date
+        elif len(sorted_closes) >= 2:
+            week_anchor_date = sorted_closes[0].session_date
+        cut_marks = [m for m in sorted_closes if cutover_date is not None and m.session_date <= cutover_date]
+        cutover_anchor = cut_marks[-1].session_date if cut_marks else None
 
         qqq_bm = self._build_symbol_benchmark(
             "QQQ",
@@ -210,7 +226,8 @@ class BenchmarkTracker:
             bars=bars_by_sym.get("QQQ", []),
             quote=quotes_by_sym.get("QQQ"),
             missing_reason=missing_quotes.get("QQQ", ""),
-            cutover_date=cutover_date,
+            cutover_date=cutover_anchor,
+            week_anchor_date=week_anchor_date,
         )
         spy_bm = self._build_symbol_benchmark(
             "SPY",
@@ -218,68 +235,47 @@ class BenchmarkTracker:
             bars=bars_by_sym.get("SPY", []),
             quote=quotes_by_sym.get("SPY"),
             missing_reason=missing_quotes.get("SPY", ""),
-            cutover_date=cutover_date,
+            cutover_date=cutover_anchor,
+            week_anchor_date=week_anchor_date,
         )
 
-        # Portfolio session return vs previous trusted close mark
-        prev_mark = previous_close(marks, as_of_date)
-        today_close = next((m for m in marks if m.quality == "close" and m.session_date == as_of_date), None)
-        effective_eq = today_close.equity if today_close is not None else live_equity
-        port_session_pct = _pct_change(effective_eq, prev_mark.equity) if (effective_eq is not None and prev_mark is not None) else None
+        # Session: same convention as performance.day_pnl (flows dated after the previous
+        # close and on/before today are removed, so a deposit is never a gain).
+        port_session_pct: Decimal | None = None
+        if effective_eq is not None and prev_mark is not None and prev_mark.equity > ZERO:
+            flow = flows_between(flows, prev_mark.session_date, as_of_date)
+            port_session_pct = _pct_change(effective_eq - flow, prev_mark.equity)
 
-        # Week start: 5 close marks back
-        sorted_closes = sorted((m for m in marks if m.quality == "close" and m.session_date <= as_of_date), key=lambda m: m.session_date)
-        week_anchor_date: date | None = None
-        if len(sorted_closes) >= 6:
-            week_anchor_date = sorted_closes[-6].session_date
-        elif len(sorted_closes) >= 2:
-            week_anchor_date = sorted_closes[0].session_date
-
-        port_week_pct = (
-            flow_adjusted_return_pct(
-                marks,
-                flows,
-                start_date=week_anchor_date,
-                as_of_date=as_of_date,
-                live_equity=effective_eq,
+        def window(anchor: date | None) -> Decimal | None:
+            if anchor is None:
+                return None
+            return flow_adjusted_return_pct(
+                marks, flows, start_date=anchor, as_of_date=as_of_date, live_equity=effective_eq
             )
-            if week_anchor_date is not None
-            else None
-        )
-        port_cutover_pct = (
-            flow_adjusted_return_pct(
-                marks,
-                flows,
-                start_date=cutover_date,
-                as_of_date=as_of_date,
-                live_equity=effective_eq,
-            )
-            if cutover_date is not None
-            else None
-        )
-        port_launch_pct = flow_adjusted_return_pct(
-            marks,
-            flows,
-            start_date=self.launch_baseline_date,
-            as_of_date=as_of_date,
-            live_equity=effective_eq,
-            fallback_starting_capital=fallback_starting_capital,
-        )
 
-        active_sess = (
-            (port_session_pct - qqq_bm.session_return_pct).quantize(Decimal("0.01"))
-            if port_session_pct is not None and qqq_bm.session_return_pct is not None
-            else None
+        port_week_pct = window(week_anchor_date)
+        port_cutover_pct = window(cutover_anchor)
+        launch_marks = [m for m in sorted_closes if m.session_date <= self.launch_baseline_date]
+        launch_anchor = launch_marks[-1].session_date if launch_marks else None
+        port_launch_pct = window(launch_anchor)
+
+        def active(port: Decimal | None, bench: Decimal | None, same_window: bool, sym: SymbolBenchmark):
+            if port is None or bench is None or not same_window or sym.stale:
+                return None
+            return (port - bench).quantize(Decimal("0.01"))
+
+        active_sess = active(
+            port_session_pct,
+            qqq_bm.session_return_pct,
+            prev_mark is not None and qqq_bm.prev_session_date == prev_mark.session_date,
+            qqq_bm,
         )
-        active_qqq_launch = (
-            (port_launch_pct - qqq_bm.since_launch_return_pct).quantize(Decimal("0.01"))
-            if port_launch_pct is not None and qqq_bm.since_launch_return_pct is not None
-            else None
+        active_week = active(port_week_pct, qqq_bm.week_return_pct, qqq_bm.week_anchor_date == week_anchor_date, qqq_bm)
+        active_qqq_launch = active(
+            port_launch_pct, qqq_bm.since_launch_return_pct, qqq_bm.baseline_date == launch_anchor, qqq_bm
         )
-        active_spy_launch = (
-            (port_launch_pct - spy_bm.since_launch_return_pct).quantize(Decimal("0.01"))
-            if port_launch_pct is not None and spy_bm.since_launch_return_pct is not None
-            else None
+        active_spy_launch = active(
+            port_launch_pct, spy_bm.since_launch_return_pct, spy_bm.baseline_date == launch_anchor, spy_bm
         )
 
         paired_n, vol_ann, beta_qqq, ir_qqq = self._compute_paired_stats(
@@ -303,6 +299,8 @@ class BenchmarkTracker:
             realized_vol_ann_pct=vol_ann,
             beta_to_qqq=beta_qqq,
             information_ratio_vs_qqq=ir_qqq,
+            stats_early=paired_n < MATURE_PAIRED_SESSIONS,
+            active_vs_qqq_week_pct=active_week,
         )
 
     def _build_symbol_benchmark(
@@ -314,24 +312,33 @@ class BenchmarkTracker:
         quote: Any | None,
         missing_reason: str,
         cutover_date: date | None,
+        week_anchor_date: date | None = None,
     ) -> SymbolBenchmark:
         ordered = sorted(
             (b for b in bars if getattr(b, "session_date", None) is not None and b.session_date <= as_of_date),
             key=lambda b: b.session_date,
         )
+        by_date = {b.session_date: b for b in ordered}
+
+        def close_on(d: date | None) -> Decimal | None:
+            bar = by_date.get(d) if d is not None else None
+            return Decimal(str(bar.close)) if bar is not None else None
 
         cur_price: Decimal | None = None
         prev_close: Decimal | None = None
+        prev_date: date | None = None
         mark_source = "missing"
         stale = False
         stale_reason = ""
 
         if ordered and ordered[-1].session_date == as_of_date:
             cur_price = Decimal(str(ordered[-1].close))
-            prev_close = Decimal(str(ordered[-2].close)) if len(ordered) >= 2 else None
+            if len(ordered) >= 2:
+                prev_close, prev_date = Decimal(str(ordered[-2].close)), ordered[-2].session_date
             mark_source = "daily_bar_close"
         elif quote is not None and getattr(quote, "price", None) is not None and Decimal(str(quote.price)) > ZERO:
             cur_price = Decimal(str(quote.price))
+            prev_date = ordered[-1].session_date if ordered else None
             prev_close = (
                 Decimal(str(quote.prev_close))
                 if getattr(quote, "prev_close", None)
@@ -339,8 +346,9 @@ class BenchmarkTracker:
             )
             mark_source = f"live_quote:{getattr(quote, 'source', 'provider')}"
         elif ordered:
+            # Latest bar is from an earlier session: it is NOT today's price. Window returns
+            # below are "as of that bar" and flagged stale; there is no session return.
             cur_price = Decimal(str(ordered[-1].close))
-            prev_close = Decimal(str(ordered[-2].close)) if len(ordered) >= 2 else None
             mark_source = "prior_bar_close"
             stale = True
             stale_reason = f"latest bar is {ordered[-1].session_date.isoformat()}" + (
@@ -364,21 +372,18 @@ class BenchmarkTracker:
             stale = True
             stale_reason = stale_reason or f"history starts {ordered[0].session_date.isoformat()}, after launch baseline {self.launch_baseline_date.isoformat()}"
 
-        # Week-ago close (5 completed sessions back)
-        week_bar = None
-        prior_bars = [b for b in ordered if b.session_date < as_of_date]
-        if len(prior_bars) >= 5:
-            week_bar = prior_bars[-5]
-        elif prior_bars:
-            week_bar = prior_bars[0]
-        week_close = Decimal(str(week_bar.close)) if week_bar is not None else None
+        # Week: the portfolio's week anchor session when there is one (identical window),
+        # else 5 completed sessions back.
+        if week_anchor_date is not None:
+            week_dt = week_anchor_date
+            week_close = close_on(week_anchor_date)
+        else:
+            prior_bars = [b for b in ordered if b.session_date < as_of_date]
+            week_bar = prior_bars[-5] if len(prior_bars) >= 5 else (prior_bars[0] if prior_bars else None)
+            week_dt = week_bar.session_date if week_bar is not None else None
+            week_close = Decimal(str(week_bar.close)) if week_bar is not None else None
 
-        # Cut-over close
-        cutover_close: Decimal | None = None
-        if cutover_date is not None:
-            cut_bars = [b for b in ordered if b.session_date <= cutover_date]
-            if cut_bars:
-                cutover_close = Decimal(str(cut_bars[-1].close))
+        cutover_close = close_on(cutover_date)
 
         return SymbolBenchmark(
             symbol=symbol,
@@ -388,13 +393,15 @@ class BenchmarkTracker:
             baseline_date=baseline_dt,
             week_ago_close=week_close,
             cutover_close=cutover_close,
-            session_return_pct=_pct_change(cur_price, prev_close),
+            session_return_pct=None if stale else _pct_change(cur_price, prev_close),
             week_return_pct=_pct_change(cur_price, week_close),
             cutover_return_pct=_pct_change(cur_price, cutover_close),
             since_launch_return_pct=_pct_change(cur_price, baseline_close),
             mark_source=mark_source,
             stale=stale,
             stale_reason=stale_reason,
+            prev_session_date=None if stale else prev_date,
+            week_anchor_date=week_dt if week_close is not None else None,
         )
 
     @staticmethod
@@ -403,31 +410,29 @@ class BenchmarkTracker:
         flows: Sequence[CashFlow],
         qqq_bars: Sequence[Any],
     ) -> tuple[int, Decimal | None, Decimal | None, Decimal | None]:
+        """Pair one-session portfolio returns with QQQ over the SAME two sessions.
+
+        An interval is used only when both marks' sessions have QQQ bars and they are
+        consecutive QQQ sessions (a missing mark leaves a gap, which is skipped rather
+        than paired with a one-day QQQ move)."""
         if len(closes) < 2 or len(qqq_bars) < 2:
             return 0, None, None, None
 
         qqq_ordered = sorted(qqq_bars, key=lambda b: b.session_date)
-        qqq_ret_by_date: dict[date, float] = {}
-        for b0, b1 in zip(qqq_ordered, qqq_ordered[1:], strict=False):
-            c0, c1 = float(b0.close), float(b1.close)
-            if c0 > 0:
-                qqq_ret_by_date[b1.session_date] = (c1 - c0) / c0
+        prev_session = {b1.session_date: b0.session_date for b0, b1 in zip(qqq_ordered, qqq_ordered[1:], strict=False)}
+        qclose = {b.session_date: float(b.close) for b in qqq_ordered}
 
         paired: list[tuple[float, float]] = []
         for m0, m1 in zip(closes, closes[1:], strict=False):
-            if m0.equity <= ZERO:
+            d0, d1 = m0.session_date, m1.session_date
+            if m0.equity <= ZERO or prev_session.get(d1) != d0 or qclose.get(d0, 0.0) <= 0:
                 continue
-            f = sum(
-                (x.amount for x in flows if x.kind in DEPOSIT_KINDS and m0.session_date < x.date <= m1.session_date),
-                ZERO,
-            )
-            rp = float((m1.equity - f) / m0.equity - Decimal(1))
-            rq = qqq_ret_by_date.get(m1.session_date)
-            if rq is not None:
-                paired.append((rp, rq))
+            rp = float((m1.equity - flows_between(flows, d0, d1)) / m0.equity - Decimal(1))
+            rq = (qclose[d1] - qclose[d0]) / qclose[d0]
+            paired.append((rp, rq))
 
         n = len(paired)
-        if n < 5:
+        if n < MIN_PAIRED_VOL:
             return n, None, None, None
 
         rp_vals = [p[0] for p in paired]
@@ -439,10 +444,10 @@ class BenchmarkTracker:
         cov_pq = sum((x - mean_p) * (y - mean_q) for x, y in paired) / (n - 1)
 
         vol_ann = _q4(math.sqrt(max(var_p, 0.0)) * math.sqrt(252.0) * 100.0)
-        beta = _q4(cov_pq / var_q) if var_q > 1e-12 else None
+        beta = _q4(cov_pq / var_q) if n >= MIN_PAIRED_BETA and var_q > 1e-12 else None
 
         ir: Decimal | None = None
-        if n >= 20:
+        if n >= MIN_PAIRED_IR:
             active = [x - y for x, y in paired]
             mean_act = sum(active) / n
             var_act = sum((a - mean_act) ** 2 for a in active) / (n - 1)
@@ -450,7 +455,6 @@ class BenchmarkTracker:
                 ir = _q4((mean_act / math.sqrt(var_act)) * math.sqrt(252.0))
 
         return n, vol_ann, beta, ir
-
 
 __all__ = [
     "BENCHMARK_SYMBOLS",

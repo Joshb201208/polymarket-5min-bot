@@ -26,7 +26,7 @@ import logging
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -37,7 +37,11 @@ logger = logging.getLogger(__name__)
 ZERO = Decimal("0")
 DEPOSIT_KINDS = frozenset({"JNLC", "CSD", "CSW", "JNL"})
 OPTION_CLOSE_AT_ZERO = frozenset({"OPEXP", "OPASN", "OPEXC", "OPXRC"})
-SHADOW_RECENT_DAYS = 30
+# Closed positions keep being replayed (as "what if still held") for this many calendar
+# days after the close, so the 20-session post-stop check can mature (20 sessions plus
+# weekends/holidays fits comfortably inside 45 calendar days).
+SHADOW_RECENT_DAYS = 45
+SHADOW_POST_STOP_SESSIONS = 20
 
 DailyBars = Callable[[str, date, date], Awaitable[Sequence[Any]]]
 
@@ -62,12 +66,21 @@ def previous_close(marks: Sequence[EquityMark], before: date) -> EquityMark | No
     return max(prior, key=lambda m: m.session_date) if prior else None
 
 
-def day_pnl(marks: Sequence[EquityMark], equity: Decimal, session_date: date) -> tuple[Decimal | None, Decimal | None]:
-    """(P&L, %) versus the previous trusted close mark; (None, None) if there is none."""
+def flows_between(flows: Iterable[CashFlow], after: date, through: date) -> Decimal:
+    """External deposits/withdrawals dated in ``(after, through]`` (the interval-end convention)."""
+    return sum((f.amount for f in flows if f.kind in DEPOSIT_KINDS and after < f.date <= through), ZERO)
+
+
+def day_pnl(marks: Sequence[EquityMark], equity: Decimal, session_date: date,
+            flows: Iterable[CashFlow] = ()) -> tuple[Decimal | None, Decimal | None]:
+    """(P&L, %) versus the previous trusted close mark; (None, None) if there is none.
+
+    External cash flows dated after the previous close and on/before ``session_date``
+    are removed, so a deposit is never reported as a gain (same convention as ``twr``)."""
     prev = previous_close(marks, session_date)
     if prev is None:
         return None, None
-    pnl = equity - prev.equity
+    pnl = equity - prev.equity - flows_between(flows, prev.session_date, session_date)
     return pnl, _pct(pnl, prev.equity)
 
 
@@ -114,6 +127,31 @@ class Realised:
     dividends: Decimal = ZERO
     fees: Decimal = ZERO
     unmatched: list[str] = field(default_factory=list)   # closes with no opening lot in the history
+    # one row per closing match: (symbol, activity transaction_time, realised P&L of that lot)
+    lots: list[tuple[str, str, Decimal]] = field(default_factory=list)
+
+    def between(self, symbol: str, start: datetime | None = None, end: datetime | None = None) -> Decimal | None:
+        """Realised P&L of ``symbol`` lots closed in ``[start, end]`` (None if none closed).
+
+        Use this for one position or one period; ``by_symbol`` is lifetime and must not
+        be re-used for every close of a symbol that was traded more than once."""
+        hits = [pnl for sym, ts, pnl in self.lots if sym == symbol and _in_window(ts, start, end)]
+        return sum(hits, ZERO) if hits else None
+
+
+def _ts(x: Any) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _in_window(ts: str, start: datetime | None, end: datetime | None) -> bool:
+    t = _ts(ts)
+    if t is None:
+        return False
+    return (start is None or t >= start) and (end is None or t <= end)
 
 
 def realised_fifo(activities: Iterable[dict]) -> Realised:
@@ -128,7 +166,7 @@ def realised_fifo(activities: Iterable[dict]) -> Realised:
     lots: dict[str, deque[list[Decimal]]] = defaultdict(deque)   # symbol -> [qty(signed), price]
     out = Realised()
 
-    def trade(sym: str, qty: Decimal, price: Decimal) -> None:
+    def trade(sym: str, qty: Decimal, price: Decimal, ts: str = "") -> None:
         mult = Decimal(100) if _is_option(sym) else Decimal(1)
         q = lots[sym]
         remaining = qty
@@ -139,6 +177,7 @@ def realised_fifo(activities: Iterable[dict]) -> Realised:
             pnl = (price - lot[1]) * take * sign * mult
             out.by_symbol[sym] = out.by_symbol.get(sym, ZERO) + pnl
             out.total += pnl
+            out.lots.append((sym, ts, pnl))
             lot[0] -= take * sign
             remaining += take * sign
             if lot[0] == 0:
@@ -149,19 +188,20 @@ def realised_fifo(activities: Iterable[dict]) -> Realised:
     for a in acts:
         t = a.get("activity_type")
         sym = str(a.get("symbol") or "")
+        when = str(a.get("transaction_time") or a.get("date") or "")
         if t in ("FILL", "OPTRD"):
             qty, price = _d(a.get("qty")), _d(a.get("price"))
             if not sym or qty is None or price is None:
                 continue
             side = str(a.get("side") or "")
             signed = (-abs(qty) if side.startswith("sell") else abs(qty)) if t == "FILL" or side else qty
-            trade(sym, signed, price)
+            trade(sym, signed, price, when)
         elif t in OPTION_CLOSE_AT_ZERO and sym:
             held = sum((lot[0] for lot in lots[sym]), ZERO)
             if held == 0:
                 out.unmatched.append(f"{t} {sym}")
                 continue
-            trade(sym, -held, ZERO)
+            trade(sym, -held, ZERO, when)
         elif t == "DIV":
             out.dividends += _d(a.get("net_amount")) or ZERO
         elif t == "FEE":
@@ -220,7 +260,9 @@ async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars
         if pid not in open_ids and pid not in closed:
             continue
         key = _anchor_key(r)
-        end = min(session_date, closed.get(pid) or session_date)
+        # replay through today even after the position closed (bounded by SHADOW_RECENT_DAYS):
+        # the post-stop comparison needs sessions AFTER the stop/close
+        end = session_date
         if done.get(key) and done[key] >= end.isoformat():
             continue
         try:
@@ -263,7 +305,12 @@ async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars
                               closed=pid in closed, results=[{
                                   "variant": x.variant, "stopped": x.stopped, "exit_session": x.exit_session,
                                   "price": x.price, "return_fraction": x.return_fraction, "pnl": x.pnl,
-                                  "through_session": x.through_session} for x in results])
+                                  "through_session": x.through_session,
+                                  # completed trading sessions (from the bar calendar) after the exit
+                                  "sessions_after_exit": (sum(1 for b in bars if x.exit_session < b.session_date
+                                                              <= x.through_session)
+                                                          if x.exit_session is not None else None)}
+                                 for x in results])
         done[key] = end.isoformat()
         rows += 1
     ledger.store.kv_set("shadow.stop.done", done)
@@ -310,9 +357,9 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
         if quality != "close":
             warnings.append(f"snapshot quality {snapshot.quality}: mark stored as indicative")
         ledger.record_equity_mark(session_date, quality, snapshot)
-    pnl, pnl_pct = day_pnl(marks_before, equity, session_date)
-    marks = ledger.equity_marks("close")
     flows = ledger.cash_flows()
+    pnl, pnl_pct = day_pnl(marks_before, equity, session_date, flows)
+    marks = ledger.equity_marks("close")
     dep = net_deposits(flows, session_date)
     dd, hwm = drawdown(marks)
     acts = [json.loads(r[0]) for r in ledger.store.query("SELECT raw_json FROM broker_activities")]
@@ -338,5 +385,5 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
     return rep
 
 
-__all__ = ["CloseReport", "Realised", "close_session", "day_pnl", "drawdown", "net_deposits", "previous_close",
+__all__ = ["CloseReport", "Realised", "close_session", "day_pnl", "drawdown", "flows_between", "net_deposits", "previous_close",
            "realised_fifo", "shadow_stops", "twr"]
