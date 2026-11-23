@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
@@ -20,6 +20,10 @@ from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
 _PRE_INFERENCE = {"auth", "quota", "model_unavailable", "rate_limit", "budget"}
+
+
+class SourceUnavailable(RuntimeError):
+    """A required data request failed rather than returning a healthy empty result."""
 
 @dataclass(frozen=True)
 class NewsEvent:
@@ -51,6 +55,8 @@ class Sources(Protocol):
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]: ...
 
     async def market(self, now: datetime) -> tuple[SecurityInputs, ...]: ...
+
+    async def background(self, symbols: tuple[str, ...]) -> dict[str, tuple[Evidence, ...]]: ...
 
 
 @dataclass(frozen=True)
@@ -127,7 +133,11 @@ class ResearchPipeline:
         # Avoid overlapping scheduled/news windows superseding a thesis
         # during its independent review. Broker protection has its own lane.
         async with self._analysis_lock:
-            return await self._run(kind, snapshot)
+            try:
+                return await self._run(kind, snapshot)
+            except SourceUnavailable:
+                intents, ideas = self._recover()
+                return JobOutcome(JobStatus.FAILED, intents, {"reason": "required_source_unavailable"}, ideas)
 
     async def _run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
         now = self.clock()
@@ -138,7 +148,6 @@ class ResearchPipeline:
         focus = tuple(self.focus(now=now))
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
-        collected = []
         if kind in {"news", "earnings"}:
             gathered = await (self.sources.news(symbols, now) if kind == "news" else self.sources.releases(symbols, now))
             as_of = self.clock()
@@ -162,6 +171,13 @@ class ResearchPipeline:
                 for row in securities.values()
             ])
             chosen = tuple(dict.fromkeys((*held, *focus, *(r["symbol"] for r in ranked[:8]))))
+            background = getattr(self.sources, "background", None)
+            if background is not None:
+                stories = await background(chosen)
+                for symbol in chosen:
+                    if symbol in securities:
+                        row = securities[symbol]
+                        securities[symbol] = replace(row, evidence=(*stories.get(symbol, ()), *row.evidence))
             work = [(sym, f"{kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
         failed = attempted = deferred = 0
@@ -187,20 +203,25 @@ class ResearchPipeline:
                     retry_at=self.clock() + timedelta(minutes=15 if kind == "news" else 5)
                     if pre_inference else None,
                 )
+        collected, ideas = self._recover()
+        incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
+        status = JobStatus.FAILED if incomplete else JobStatus.DONE
+        return JobOutcome(status, collected, {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
+
+    def _recover(self) -> tuple[tuple[NewIntent, ...], tuple[OptionIdea, ...]]:
+        collected = []
+        now = self.clock()
         for proposal in self.store.unqueued_proposals():
             intent = _reconstitute(proposal)
-            if intent.expires_at and intent.expires_at > self.clock():
+            if intent.expires_at and intent.expires_at > now:
                 collected.append(intent)
             else:
                 # Record the expired opportunity as a refused intent so recovery
                 # never rescans the same expired proposal forever.
                 collected.append(NewIntent(intent.symbol, intent.side, intent.dedupe_key,
                                            status=IntentStatus.SKIPPED, last_error="research_proposal_expired"))
-        ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(self.clock()))
-        incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
-        status = JobStatus.FAILED if incomplete else JobStatus.DONE
-        return JobOutcome(status, tuple(collected),
-                          {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
+        ideas = tuple(OptionIdea.from_payload(row) for row in self.store.pending_option_ideas(now))
+        return tuple(collected), ideas
 
     def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
         """Scheduler calls after the options manager has durably handled each story."""
@@ -213,7 +234,8 @@ class ResearchPipeline:
         changes = {}
         for row in rows:
             change = row.metrics.get("session_return")
-            if (row.symbol in {"SPY", "QQQ"} and _fresh_quote(row, now) and type(change) in (int, float)
+            if (row.symbol in {"SPY", "QQQ"} and _fresh_quote(row, now, max_age=timedelta(seconds=90))
+                    and type(change) in (int, float)
                     and math.isfinite(change)):
                 changes[row.symbol] = change
         if changes.keys() != {"SPY", "QQQ"}:
@@ -363,7 +385,7 @@ class ResearchPipeline:
             health_reasons = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
                               "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
             if not fresh_quote:
-                return ("quote_stale_or_unavailable",)
+                return ("quote_stale_or_unavailable",) if session.opens_at <= self.clock() < session.closes_at else ()
             if gate is not None:
                 return tuple(reason for reason in gate.reasons if reason in health_reasons)
         return ()
@@ -377,9 +399,9 @@ class ResearchPipeline:
         )
 
 
-def _fresh_quote(row: SecurityInputs, now: datetime) -> bool:
+def _fresh_quote(row: SecurityInputs, now: datetime, *, max_age: timedelta = timedelta(minutes=20)) -> bool:
     price, quoted = row.price, row.quote_at
     return (
         price is not None and math.isfinite(price) and price > 0 and quoted is not None
-        and quoted.utcoffset() is not None and now - timedelta(minutes=20) <= quoted <= now
+        and quoted.utcoffset() is not None and now - max_age <= quoted <= now
     )
