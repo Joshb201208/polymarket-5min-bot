@@ -170,3 +170,14 @@ def test_resolve_base_url_prefers_settings_property():
     cfg = SimpleNamespace(settings=SimpleNamespace(trading_base_url="https://paper-api.alpaca.markets/"),
                           ALPACA_BASE_URL="https://other.example", MODE="PAPER")
     assert resolve_base_url(cfg) == "https://paper-api.alpaca.markets"
+
+
+def test_client_uses_security_config_urls():
+    from types import SimpleNamespace
+
+    from stock_agent.broker import AlpacaClient
+
+    cfg = SimpleNamespace(trading_base_url="https://paper-api.alpaca.markets",
+                          market_data_url="https://data.alpaca.markets/", ALPACA_DATA_URL="https://x.example")
+    c = AlpacaClient(key_id="k", secret="s", config=cfg)
+    assert c.base_url == "https://paper-api.alpaca.markets" and c.data_url == "https://data.alpaca.markets"
