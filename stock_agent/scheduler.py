@@ -4,7 +4,6 @@ import logging
 import sqlite3
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -250,8 +249,11 @@ class StockAgentScheduler:
     def _risk_controls(self) -> RiskControls:
         commitments = getattr(self.options, "risk_commitments", None)
         return RiskControls(pause_new_buys=self._manually_paused(),
-                            drawdown=DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY)),
+                            drawdown=self._drawdown_state(),
                             option_commitments=commitments() if commitments is not None else ())
+
+    def _drawdown_state(self) -> DrawdownState:
+        return DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY), config=self.config)
 
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
@@ -553,31 +555,33 @@ class StockAgentScheduler:
         mark = next((item for item in marks if item.session_date == session.date), None)
         if mark is None:
             self._last_close_report = await close_session(self.ledger, snapshot, session.date)
-        risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
         try:
-            state = DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
+            state = self._drawdown_state()
         except ValueError:
             await self._alert("critical", "Invalid persisted drawdown",
                               "Existing high-water record retained; entries stay blocked.",
                               key="invalid-drawdown")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_record_invalid"})
+        risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
         updated = update_drawdown(state, session.date.isoformat(), mark.equity if mark else snapshot.equity,
-                                  previous_session=previous.date.isoformat())
+                                  previous_session=previous.date.isoformat(), config=self.config)
         if updated == state:
             return risk_result
         self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
-        if (state.alert, state.throttled, state.paused) != (updated.alert, updated.throttled, updated.paused):
+        before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
+        alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
+        if before != (alert, throttled, updated.paused):
             await self._alert(
-                "critical" if updated.paused else "warning" if updated.alert else "info",
+                "critical" if updated.paused else "warning" if alert else "info",
                 "Drawdown controls changed",
-                f"Drawdown: {updated.drawdown:.1%}; throttled: {updated.throttled}; paused: {updated.paused}.",
+                f"Drawdown: {updated.drawdown:.1%}; throttled: {throttled}; paused: {updated.paused}.",
                 key=f"drawdown:{session.date}",
             )
         return risk_result
 
     async def _evaluate_close_limits(self, snapshot, session_date: date, previous_session: date):
         controls = self._risk_controls()
-        breaches = self.risk.evaluate_portfolio(snapshot, controls=controls)
+        breaches = self.risk.evaluate_portfolio(snapshot, controls=controls, include_pending=False)
         if any(breach.kind == "invalid_risk_input" for breach in breaches):
             return JobOutcome(JobStatus.FAILED, detail={"reason": "close_risk_input_unverified"})
         key = "a6.close_drift"
@@ -586,11 +590,7 @@ class StockAgentScheduler:
         day = session_date.isoformat()
         if state.get("session") != day:
             previous = counts if state.get("session") == previous_session.isoformat() else {}
-            band = Decimal(str(self.config.RISK_DRIFT_BUFFER_PCT))
-            counts = {
-                (b.kind, b.key): previous.get((b.kind, b.key), 0) + 1 for b in breaches
-                if (b.value < b.cap - band if b.kind == "cash_floor" else b.value > b.cap + band)
-            }
+            counts = self.risk.advance_drift_counters(breaches, previous)
             self.ledger.risk_state_set(key, {"session": day, "counts": [
                 [kind, scope, n] for (kind, scope), n in sorted(counts.items())
             ]})
@@ -637,7 +637,8 @@ class StockAgentScheduler:
             return
         deliveries = self.store.query(
             "SELECT activity_id, symbol, ts FROM broker_activities WHERE activity_type='OPTRD'"
-            " AND qty>0 AND ts>=? ORDER BY ts, activity_id", (previous.date.isoformat(),),
+            " AND qty>0 AND LOWER(COALESCE(side,'')) NOT LIKE 'sell%'"
+            " AND ts>=? ORDER BY ts, activity_id", (previous.date.isoformat(),),
         )
         if not deliveries:
             return
@@ -652,7 +653,9 @@ class StockAgentScheduler:
         if snapshot.quality != "live" or self.ledger.trading_block() or snapshot.equity <= 0:
             return
         controls = self._risk_controls()
-        if any(b.kind == "invalid_risk_input" for b in self.risk.evaluate_portfolio(snapshot, controls=controls)):
+        if any(b.kind == "invalid_risk_input" for b in self.risk.evaluate_portfolio(
+            snapshot, controls=controls, include_pending=False,
+        )):
             return
         for row in pending:
             activity, symbol, ts = row["activity_id"], row["symbol"], row["ts"]
@@ -817,7 +820,8 @@ class StockAgentScheduler:
         if self._shutdown:
             return
         try:
-            await self._queue_delivery_trims(_now_et())
+            async with asyncio.timeout(8):
+                await self._queue_delivery_trims(_now_et())
         except Exception as exc:
             await self._alert("warning", "Option delivery risk check did not complete",
                               type(exc).__name__, key="option-delivery-check")
@@ -1381,7 +1385,7 @@ class StockAgentScheduler:
 
             # Available slots and firepower
             open_slots = self.config.MAX_POSITIONS - len(self.portfolio.state.positions)
-            if open_slots > 0 and alpaca_account:
+            if open_slots > 0 and book:
                 outlook_lines.append(f"**Open Slots:** {open_slots} positions available")
                 outlook_lines.append(f"**Buying Power:** ${cash:,.0f} ready to deploy")
             elif open_slots <= 0:
