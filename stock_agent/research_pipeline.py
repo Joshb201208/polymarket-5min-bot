@@ -17,7 +17,7 @@ from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent,
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_notes import load_notes, research_notes_payload
-from stock_agent.research_schemas import Direction, Evidence, ResearchTask
+from stock_agent.research_schemas import Direction, Evidence, ResearchTask, utc_datetime
 from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
@@ -302,7 +302,8 @@ class ResearchPipeline:
             evidence = {story.evidence.evidence_id: story.evidence, **evidence}
         context = self.context()
         market = self.store.store.kv_get("research_market_regime") or {}
-        if market.get("as_of") and now - timedelta(days=1) <= datetime.fromisoformat(market["as_of"]) <= now:
+        market_at = utc_datetime(market.get("as_of"))
+        if market_at is not None and timedelta() <= now - market_at <= timedelta(days=1):
             context = {**context, **market}
         approved_notes = research_notes_payload(symbol, load_notes(
             enabled=getattr(self.config, "RESEARCH_SHARE_NOTES", False),
