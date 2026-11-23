@@ -25,7 +25,9 @@ from typing import Any
 from tests.fakes.clock import ET
 
 RESEARCH_SYMBOLS = ("AAA", "BBB", "CCC", "DDD")
-SECTORS = {"AAA": "Technology", "BBB": "Industrials", "CCC": "Technology", "DDD": "Industrials"}
+SECTORS = {"AAA": "Technology", "BBB": "Industrials", "CCC": "Technology", "DDD": "Industrials",
+           "EEE": "Health Care"}
+OPTION_UNIVERSE = ("CCC",)
 
 
 def research_settings(**overrides):
@@ -185,9 +187,42 @@ class WeekAgent:
                                       HttpPrices(self.broker), alert=self._alert, now=now)
         self.analyst = Analyst(LLMClient(self.rconfig, spend=self.research_store, now=now))
         gate = ResearchGate(self.ledger, SimpleNamespace(research_entry_blockers=lambda *_: ()), self.rconfig)
+        self.gate = gate
         self.pipeline = ResearchPipeline(self.rconfig, self.ledger, self.calendar, self.analyst,
                                          self.research_store, HttpSources(self.broker), gate,
                                          clock=now, focus=lambda **_: ())
+        self._wire_options(now)
+
+    def _wire_options(self, now):
+        """OptionsManager wired the way StockAgentScheduler.__init__ does (scheduler.py:140-150)."""
+        import asyncio
+
+        from stock_agent.options_book import KvOptionsStore
+        from stock_agent.options_manager import OptionsManager
+        from stock_agent.risk_manager import RiskControls
+
+        self.prices = HttpPrices(self.broker)
+        self.capital_lock = asyncio.Lock()
+        self.engine._capital_lock = self.capital_lock
+        self._options_scanned: set = set()
+
+        async def snapshot():
+            return await self.ledger.refresh("option entry recheck")
+
+        async def spot(symbol):
+            return (await self.prices.get_quotes([symbol], purpose="order_sizing")).quotes.get(symbol)
+
+        def controls():
+            return RiskControls(option_commitments=self.options.risk_commitments())
+
+        self.options = OptionsManager(
+            broker=self.broker, store=KvOptionsStore(self.store), gate=self.gate, risk=self.engine.risk,
+            snapshot=snapshot, calendar=self.calendar, market_gate=self.calendar.market_gate, spot=spot,
+            cover_short=getattr(self.engine, "cover_short", None), universe=lambda: OPTION_UNIVERSE,
+            risk_controls=controls, journal=self.journal, alerts=SimpleNamespace(alert=self._alert),
+            now=now, capital_lock=self.capital_lock, defer_load=True,
+        )
+        self.engine.options = self.options
 
     # alerts from every component land here (and in the fake Discord? not yet wired)
     def _alert_sync(self, severity, title, body, key=None):
@@ -197,8 +232,36 @@ class WeekAgent:
         self._alert_sync(severity, title, body, key)
 
     async def startup(self):
+        """Same order as StockAgentScheduler.startup after scheduler_deploy's R-03 fix:
+        order recovery (client-id lookup) before the first reconcile."""
+        self.options.load_state()
+        self.ledger.mark_submitting_ambiguous()
         await self.calendar.refresh()
         await self.engine.resume()
+        await self.ledger.refresh("startup")
+        await self.options.reconcile(self.world.clock.now())
+
+    async def options_tick(self, now_et, session):
+        """scheduler._run_options_lane + once-per-session _run_options_scan (open+15 .. 15:00)."""
+        from stock_agent.options_manager import OptionCandidate
+        from stock_agent.research_pipeline import OptionIdea
+
+        now = self.world.clock.now()
+        await self.options.monitor(now)
+        ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        if ideas and (await self.calendar.market_gate("entry")).allowed:
+            outs = await self.options.scan(now, candidates=[OptionCandidate(
+                i.symbol, source="news", story_id=i.story_id, direction_hint=i.direction.value) for i in ideas])
+            self.log.append(f"{now_et:%a %H:%M} options news scan {[(o.symbol, o.reason) for o in outs]}")
+            handled = self.options.handled_story_ids(i.story_id for i in ideas)
+            if handled:
+                self.research_store.acknowledge_options(tuple(sorted(handled)))
+        day = now_et.date()
+        if (day not in self._options_scanned and session.opens_at + timedelta(minutes=15) <= now_et
+                < min(now_et.replace(hour=15, minute=0), session.closes_at - timedelta(minutes=10))):
+            self._options_scanned.add(day)
+            outs = await self.options.scan(now)
+            self.log.append(f"{now_et:%a %H:%M} options scan {[(o.symbol, o.reason) for o in outs]}")
 
     async def step(self, now_et: datetime):
         market = await self.calendar.refresh()
@@ -206,6 +269,8 @@ class WeekAgent:
         in_session = session is not None and session.opens_at <= now_et < session.closes_at
         if in_session or self.engine._norm_state().get("state") is None:
             await self.engine.monitor_tick()
+        if in_session and self.engine.normalised:
+            await self.options_tick(now_et, session)
         if in_session and now_et.minute % self.news_every_min == 0:
             out = await self.pipeline.run("news", await self.ledger.refresh("news"))
             if out.intents:
