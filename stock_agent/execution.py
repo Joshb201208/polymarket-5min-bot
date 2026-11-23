@@ -906,12 +906,14 @@ class ExecutionEngine:
         except Exception as e:
             logger.warning("margin controls unavailable, using entry controls: %s", e)
             controls = self._risk_controls()
-        plan = planner(snap, controls=controls, force=True)
-        for rec in plan or ():
-            if rec.kind == TradeKind.SELL and str(rec.symbol).upper() == intent.symbol.upper():
-                qty = float(rec.qty)
-                return qty if qty > 0 else "fresh margin plan sells nothing of this symbol"
-        return "margin trim no longer needed for this symbol on the fresh book"
+        plan = tuple(planner(snap, controls=controls, force=True) or ())
+        if not plan:
+            return "margin trim no longer needed on the fresh book"
+        rec = plan[0]  # weakest first: only the fresh plan's FIRST leg may sell now
+        if rec.kind != TradeKind.SELL or str(rec.symbol).upper() != intent.symbol.upper():
+            return f"fresh margin plan now trims {rec.symbol} first, not this leg"
+        qty = float(rec.qty)
+        return qty if qty > 0 else "fresh margin plan sells nothing of this symbol"
 
     async def exit(self, intent: OrderIntent) -> ExecResult:
         """Sell (part of) a long. Cancel our stop, confirm, sell, re-protect any rest."""
