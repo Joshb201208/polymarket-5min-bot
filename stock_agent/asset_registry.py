@@ -12,6 +12,7 @@ import httpx
 
 from stock_agent.config import Config
 from stock_agent.risk_manager import CanonicalSector, classify_symbol
+from stock_agent.state_store import StateUnavailable
 
 if TYPE_CHECKING:
     from stock_agent.state_store import StateStore
@@ -86,6 +87,7 @@ class AssetRegistry:
         report: HealthReport | None = None,
         on_rename: Callable[[SymbolRenameEvent], Awaitable[None] | None] | None = None,
         now: Callable[[], datetime] | None = None,
+        defer_load: bool = False,
     ):
         """Inject a shared async HTTP client; the registry does not own it."""
         self.http, self.config, self.store = http, config, store
@@ -96,12 +98,15 @@ class AssetRegistry:
         self._aliases: dict[str, SymbolRenameEvent] = {}
         self._announced: set[str] = set()
         self._fetched_at: datetime | None = None
-        self._load_cache()
+        self._cache_loaded = False
+        if not defer_load:
+            self.load_state()
 
     async def refresh(
         self, symbols: Iterable[str] = (), *, force: bool = False,
     ) -> tuple[SymbolRenameEvent, ...]:
         """Refresh the active universe and check requested inactive symbols."""
+        self.load_state()
         now = self.now()
         if force or self._fetched_at is None or now - self._fetched_at >= timedelta(hours=24):
             if not await self._refresh_active(now):
@@ -136,6 +141,11 @@ class AssetRegistry:
                            canonical_sector=self._sectors.get(resolved, target.canonical_sector))
         return replace(meta, canonical_sector=self._sectors.get(symbol, classify_symbol(symbol).sector))
 
+    def active_symbols(self) -> tuple[str, ...]:
+        """Return a stable, sorted list of the currently tradable active equities."""
+        self.load_state()
+        return tuple(sorted(symbol for symbol, meta in self._active.items() if meta.tradable))
+
     def resolve_symbol(self, symbol: str) -> str | None:
         """Return the pollable broker symbol, or None for known inactive symbols."""
         symbol = _symbol(symbol)
@@ -151,6 +161,7 @@ class AssetRegistry:
 
     def set_sector(self, symbol: str, sector: str | None) -> CanonicalSector:
         """Attach provider sector metadata using the canonical risk vocabulary."""
+        self.load_state()
         symbol = self.resolve_symbol(symbol) or _symbol(symbol)
         result = classify_symbol(symbol, sector).sector
         if result != CanonicalSector.UNKNOWN or symbol not in self._sectors:
@@ -252,11 +263,13 @@ class AssetRegistry:
             tokens.add(token)
             params["page_token"] = token
 
-    def _load_cache(self) -> None:
-        if self.store is None:
+    def load_state(self) -> None:
+        """Restore the cached registry once the state store is available."""
+        if self.store is None or self._cache_loaded:
             return
         try:
             cache = self.store.kv_get(_CACHE_KEY, {})
+            self._cache_loaded = True
             if not cache:
                 return
             active = {row["symbol"]: AssetMeta(**{**row, "canonical_sector": CanonicalSector(
@@ -274,9 +287,12 @@ class AssetRegistry:
             self._inactive, self._announced = set(cache["inactive"]), set(cache["announced"])
         except (ValueError, TypeError, KeyError):
             return
+        except StateUnavailable:
+            # Scheduler can construct before boot opens the state DB.
+            return
 
     def _save_cache(self) -> None:
-        if self.store is not None:
+        if self.store is not None and self._cache_loaded:
             self.store.kv_set(_CACHE_KEY, {
                 "fetched_at": self._fetched_at, "active": [asdict(meta) for meta in self._active.values()],
                 "inactive": sorted(self._inactive), "announced": sorted(self._announced),

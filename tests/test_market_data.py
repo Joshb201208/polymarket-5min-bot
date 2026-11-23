@@ -41,6 +41,7 @@ async def test_primary_quote_keeps_timestamp_and_fallback_rejects_bad_prices(wor
     assert reports[-1] == ("price_service", "live_quotes", False, "unresolved_quotes")
     assert prices.last_quote("alfa") == alfa
 
+    world.alpaca.behaviour.quotes_stay_fresh_in_session = False
     world.clock.advance(seconds=91)
     stale = await prices.get_quotes(["ALFA"], purpose="order_sizing")
     assert not stale.quotes and "alpaca_iex_stale_or_future" in stale.missing["ALFA"]
@@ -114,6 +115,28 @@ async def test_daily_history_never_bridges_gap_or_mixes_split_basis(world, tmp_p
     ]
     uncached = PriceService(now=world.clock.now)
     assert (await uncached.get_daily_bars(["ALFA"], sessions=20))["ALFA"] == []
+    store.close()
+
+
+@run_async
+async def test_registry_defers_state_until_scheduler_opens_store(world, tmp_path):
+    world.alpaca.add_asset("ALFA")
+    world.alpaca.add_asset("BETA", tradable=False)
+    path = tmp_path / "assets.db"
+    store = StateStore(path)
+    registry = AssetRegistry(store=store, now=world.clock.now)
+    assert not registry.active_symbols()
+    store.open()
+    await registry.refresh()
+    assert registry.active_symbols() == ("ALFA",)
+    store.close()
+
+    store = StateStore(path)
+    deferred = AssetRegistry(store=store, now=world.clock.now, defer_load=True)
+    assert not deferred.active_symbols()
+    store.open()
+    deferred.load_state()
+    assert deferred.active_symbols() == ("ALFA",)
     store.close()
 
 

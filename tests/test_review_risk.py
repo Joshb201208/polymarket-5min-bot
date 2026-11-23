@@ -1,4 +1,4 @@
-"""Cross-family review findings for risk_manager.py (RV-K-xx), pinned strict-xfail.
+"""Regression tests for cross-family risk review findings (RV-K-xx).
 
 Helpers are reused from tests/test_risk_projection.py so the book shapes match
 the owner's own tests.
@@ -6,17 +6,11 @@ the owner's own tests.
 
 from decimal import Decimal as D
 
-import pytest
-
 from stock_agent.config import Config
 from stock_agent.risk_manager import RiskManager, TradeKind
 from tests.test_risk_projection import option, snapshot, stock
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "RV-K-01: risk_manager.py _evaluate_option (CASH_SECURED_PUT branch) checks only the "
-    "issuer cap for the assignment shares; sector and cluster caps are never projected, so a "
-    "put whose assignment would lift a sector from 39% to 49% (cap 40%) is approved"))
 def test_cash_secured_put_assignment_respects_sector_cap():
     risk = RiskManager(Config())
     book = snapshot(stock("BETA", 130, "Industrials"), stock("GAMA", 130, "Industrials"),
