@@ -19,9 +19,8 @@ Rotate or revoke each item below in its provider dashboard:
    - If you use Telegram alerts, paste the replacement token into `TELEGRAM_BOT_TOKEN` on the server; otherwise leave it unset (Discord alerts run independently via `DISCORD_BOT_TOKEN`).
 2. **Perplexity MCP proxy token** — *previously committed in `.mcp.json` line 13 (file deleted and gitignored)*
    - Revoke or delete that bearer token in the MCP proxy / provider console where it was generated.
-3. **TipRanks API credentials (`TIPRANKS_API_KEY`, `TIPRANKS_API_TOKEN`)** — *previously committed in `stock_agent/config.py` lines 194–195 and `stock_agent/tipranks_client.py` lines 18–19*
-   - Rotate or revoke both credentials in your TipRanks account dashboard.
-   - TipRanks enrichment is optional; if `TIPRANKS_API_KEY` and `TIPRANKS_API_TOKEN` are unset, the screener skips TipRanks cleanly.
+3. **TipRanks API credentials (`TIPRANKS_API_KEY`, `TIPRANKS_API_TOKEN`)** — *previously committed in `stock_agent/config.py` lines 194–195 and the now-removed `stock_agent/tipranks_client.py` lines 18–19*
+   - Rotate or revoke both credentials in your TipRanks account dashboard (`tipranks_client.py` has been retired from `stock_agent`, so no replacement key is needed on the server).
 4. **Financial Modeling Prep & Finnhub API keys (`FMP_API_KEY`, `FINNHUB_API_KEY`)** — *previously echoed in request query URLs inside server logs*
    - Regenerate `FMP_API_KEY` in the Financial Modeling Prep dashboard and `FINNHUB_API_KEY` in the Finnhub dashboard.
    - Update both values in `/root/polymarket-bot/.env` on the droplet and run `systemctl restart stock-agent`.
@@ -99,7 +98,7 @@ None of these need to be added unless you want to override a default:
 
 | Setting Name | Default | What It Controls |
 | :--- | :--- | :--- |
-| `OPTIONS_MODE` | `defined_risk` | Allows defined-risk vertical debit spreads, protective puts, and covered calls against settled shares; blocks naked shorts and cash-secured puts. Set `OPTIONS_MODE=off` to disable options completely. |
+| `OPTIONS_MODE` | `defined_risk` | Valid values: `off`, `close_only`, `defined_risk`. `defined_risk` allows vertical debit spreads, protective puts, and covered calls against settled shares while blocking naked shorts and cash-secured puts; `close_only` manages and exits existing contracts without opening new ones; `off` disables options completely. |
 | `STOCK_TRADING_PAUSED` | `false` | Entry-only kill switch: blocks new equity/option openings while exits, stop-loss repairs, reconciliation, and alerts continue. Creating `/root/polymarket-bot/data/PAUSED` (or `data/stock_agent/PAUSED`) pauses entries immediately without restarting the service. |
 | `STOCK_LOG_LEVEL` | `INFO` | Application log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). `httpx`/`httpcore` request logs remain clamped at `WARNING`, and rotating logs are written under `data/stock_agent/logs/stock_agent.log` (10 MB x 12 files). |
 | `HEARTBEAT_PING_URL` | *(empty)* | Optional dead-man's-switch URL (e.g. Healthchecks.io or Uptime Kuma) pinged periodically so an external monitor alerts you if the droplet goes offline. |

@@ -389,7 +389,29 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "STOCK_AGENT_LIVE_CONFIRMED",
         "STOCK_TRADING_PAUSED",
         "OPTIONS_MODE",
+        "close_only",
+        "owner_focus.json",
     ):
         assert required_readme in readme, f"README.md missing {required_readme}"
+
+    env_example_text = (repo_root / ".env.example").read_text(encoding="utf-8")
+    assert "close_only" in env_example_text
+    assert "`legacy`" not in env_example_text
+    assert "`legacy`" not in readme
+
+    for deleted_module in (
+        "data_feed.py",
+        "tipranks_client.py",
+        "news_feed.py",
+        "sentiment.py",
+        "analyst_trends.py",
+        "options_data.py",
+        "options_engine.py",
+        "options_executor.py",
+        "options_models.py",
+        "options_portfolio.py",
+    ):
+        assert deleted_module not in readme, f"README.md still references {deleted_module}"
+
 
 
