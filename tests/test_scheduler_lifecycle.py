@@ -1,15 +1,22 @@
 """Scheduler orchestration tests; all brokers, research and time are offline."""
 
 import asyncio
+import shutil
+import signal
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
 from stock_agent.config import Config
 from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from tests.exec_helpers import FakePrices, enqueue
 
 
 class CalendarStub:
@@ -89,14 +96,126 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
         sched.store.open()
         assert not (await sched.market_gate("entry")).allowed
         assert (await sched.market_gate("exit")).allowed
+        assert (await sched.market_gate("exit", rule="cover_short")).allowed
+        assert (await sched.market_gate("protection")).allowed
         sched._normalised = sched._reconciled = True
         assert (await sched.market_gate("entry")).allowed
         sched.pause_file.touch()
         assert not (await sched.market_gate("entry")).allowed
         assert (await sched.market_gate("exit")).allowed
+        sched.pause_file.unlink()
+        monkeypatch.setattr(sched.config, "STOCK_TRADING_PAUSED", True, raising=False)
+        assert not (await sched.market_gate("entry")).allowed
+        assert (await sched.market_gate("exit", rule="hard_stop")).allowed
         sched.shutdown()
         assert not (await sched.market_gate("exit")).allowed
         assert (await sched.market_gate("protection")).allowed
+        await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_entrypoint_flock_excludes_second_scheduler_and_sigterm_stops_first(tmp_path, monkeypatch):
+    async def check():
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        instances = []
+
+        class Agent:
+            def __init__(self, config):
+                instances.append(self)
+
+            async def run(self):
+                started.set()
+                await stopped.wait()
+
+            def shutdown(self):
+                stopped.set()
+
+        monkeypatch.setattr(entrypoint, "StockAgentScheduler", Agent)
+        config = SimpleNamespace(DATA_DIR=tmp_path)
+        first = asyncio.create_task(entrypoint._serve(config))
+        await asyncio.wait_for(started.wait(), 1)
+        with pytest.raises(SystemExit, match="state directory lock"):
+            await entrypoint._serve(config)
+        assert len(instances) == 1
+        signal.raise_signal(signal.SIGTERM)
+        await asyncio.wait_for(first, 1)
+        assert stopped.is_set()
+        await entrypoint._serve(config)
+        assert len(instances) == 2
+
+    asyncio.run(check())
+
+
+def test_sigterm_drain_retains_stop_for_inflight_real_buy(world, monkeypatch):
+    async def check():
+        world.clock.set_et(2026, 11, 23, 11, 0)
+        world.price("AAA", 50, spread=0.02)
+        watchdog = asyncio.Event()
+        submitted, release = asyncio.Event(), asyncio.Event()
+        sched = module.StockAgentScheduler(services=SimpleNamespace(prices=FakePrices(world)))
+        wait_terminal = sched.broker.wait_terminal
+
+        async def delayed_confirmation(*args, **kwargs):
+            submitted.set()
+            await release.wait()
+            return await wait_terminal(*args, **kwargs)
+
+        def sd_notify(message):
+            if message == "WATCHDOG=1":
+                watchdog.set()
+
+        monkeypatch.setattr(module, "notify_systemd", sd_notify)
+        monkeypatch.setattr(sched.broker, "wait_terminal", delayed_confirmation)
+        await sched.startup()
+        sched.store.kv_set(sched.engine.NORMALISE_KEY, {"state": "done"})
+        sched._normalised = True
+        intent = enqueue(sched.engine, "AAA", "buy", ref=50)
+        task = asyncio.create_task(sched.run())
+        await asyncio.wait_for(submitted.wait(), 2)
+        await asyncio.wait_for(watchdog.wait(), 2)
+        sched.shutdown()
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, 3)
+        buys = [order for order in world.alpaca.orders.values() if order.side == "buy"]
+        stops = [order for order in world.alpaca.open_orders("AAA") if order.type == "stop"]
+        assert len(buys) == len(stops) == 1
+        assert buys[0].client_order_id == intent.client_order_id
+        assert stops[0].qty == world.alpaca.position("AAA").qty
+        assert stops[0].time_in_force == "gtc"
+
+    asyncio.run(check())
+
+
+def test_unit_uses_existing_root_path_watchdog_and_bounded_stop():
+    unit = (Path(__file__).resolve().parents[1] / "deploy/stock-agent.service").read_text()
+    assert "User=root" in unit
+    assert "WorkingDirectory=/root/polymarket-bot" in unit
+    assert "EnvironmentFile=/root/polymarket-bot/.env" in unit
+    assert "ExecStart=/root/polymarket-bot/venv/bin/python -m stock_agent" in unit
+    assert "ExecStartPre" not in unit
+    assert "Type=notify" in unit and "WatchdogSec=180" in unit
+    stop = next(line for line in unit.splitlines() if line.startswith("TimeoutStopSec="))
+    assert int(stop.split("=", 1)[1]) > module.SHUTDOWN_DRAIN_SECONDS + 10
+
+
+def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
+    async def check():
+        legacy = Path(__file__).parent / "fixtures/state_v0/portfolio.json"
+        dest = world.data_dir / "portfolio.json"
+        shutil.copyfile(legacy, dest)
+        world.clock.set_et(2026, 11, 26, 11, 0)  # Thanksgiving
+        sched = world.scheduler()
+        await sched.startup()
+        assert sched._state_ready and sched._reconciled
+        assert sched.calendar.state.status is MarketStatus.CLOSED
+        assert not sched.engine.normalised and not (await sched.market_gate("entry")).allowed
+        assert sched.store.get_meta("migrated_v0_at")
+        assert (world.data_dir / "legacy_v0/portfolio.json").read_bytes() == legacy.read_bytes()
+        assert dest.read_bytes() == legacy.read_bytes()
+        world.assert_no_orders()
         await sched._cleanup()
 
     asyncio.run(check())
