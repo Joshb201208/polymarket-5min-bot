@@ -9,6 +9,18 @@ from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot
 
 DRAWDOWN_STATE_KEY = "drawdown"
+_ZERO = Decimal(0)
+# Known leveraged ETFs/ETPs; never infer leverage from ticker suffixes.
+_LEVERAGED_2X = frozenset("""
+    AGQ BOIL CONL DDM DIG DUG DXD EUO GLL KOLD LTL MSTU MSTX NVDL NVDU
+    NVDX QLD QID ROM RXL SDS SSO SRS TSLI TSLL TSLT TSLQ
+    TWM UCO UGL USD URE UWM UVIX YCS ZSL
+""".split())
+_LEVERAGED_3X = frozenset("""
+    BULZ BNKU CURE DPST DRN DRV DUSL EDZ EDC FAS FAZ FNGU FNGD GUSH HIBL HIBS
+    LABU LABD MIDU NAIL RETL SOXL SOXS SPXL SPXS SQQQ TECL TECS TMF TMV TNA TQQQ
+    TZA UDOW UMDD UPRO URTY USLV UTSL WEBL WEBS YANG YINN
+""".split())
 
 
 class TradeKind(StrEnum):
@@ -141,6 +153,16 @@ class RiskControls:
     drawdown: DrawdownState = field(default_factory=DrawdownState)
     option_commitments: tuple[OptionCommitment, ...] = ()
     pending_sectors: Mapping[str, str] = field(default_factory=dict)
+    holding_convictions: Mapping[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MarginStatus:
+    equity: Decimal
+    maintenance_margin: Decimal
+    excess_pct: Decimal
+    needs_trim: bool
+    margin_call: bool
 
 
 @dataclass(frozen=True)
@@ -154,6 +176,8 @@ class PortfolioTotals:
     positions: int
     option_max_loss: Decimal
     option_structures: int
+    overnight_buying_power: Decimal | None = None
+    maintenance_margin: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +224,17 @@ class _Projection:
     option_count: int = 0
     unknown_pending: Decimal = Decimal(0)
     unpriced: dict[str, Decimal] = field(default_factory=dict)
+    regt_buying_power: Decimal | None = None
+    options_buying_power: Decimal | None = None
+    maintenance: Decimal | None = None
+    margin_call: bool = False
+
+    def reserve(self, amount: Decimal) -> None:
+        self.cash -= amount
+        if self.regt_buying_power is not None:
+            self.regt_buying_power -= amount
+        if self.options_buying_power is not None:
+            self.options_buying_power -= amount
 
     def totals(self) -> PortfolioTotals:
         by_issuer: dict[str, Decimal] = {}
@@ -220,13 +255,26 @@ class _Projection:
         return PortfolioTotals(
             self.equity, self.cash, sum(by_issuer.values(), Decimal(0)),
             by_issuer, by_sector, by_cluster, len(symbols),
-            self.option_loss, self.option_count,
+            self.option_loss, self.option_count, self.regt_buying_power, self.maintenance,
         )
 
-    def add_buy(self, symbol: str, c: Classification, qty: Decimal, price: Decimal) -> None:
+    def add_buy(self, symbol: str, c: Classification, qty: Decimal, price: Decimal, mark: Decimal) -> None:
         prior = self.pending_values.get(symbol)
-        self.pending_values[symbol] = (c, qty * price + (prior[1] if prior else 0))
-        self.cash -= qty * price
+        notional = qty * max(price, mark)
+        self.pending_values[symbol] = (c, notional + (prior[1] if prior else 0))
+        self.reserve(qty * price)
+        if self.maintenance is not None:
+            self.maintenance += notional * _maintenance_rate(symbol, min(price, mark))
+
+
+def _maintenance_rate(symbol: str, price: Decimal) -> Decimal:
+    if price < Decimal("2.50"):
+        return Decimal(1)
+    if symbol in _LEVERAGED_3X:
+        return Decimal(".75")
+    if symbol in _LEVERAGED_2X:
+        return Decimal(".50")
+    return Decimal(".30")
 
 
 class DailyBar(Protocol):
@@ -509,7 +557,7 @@ class RiskManager:
             if kind == TradeKind.COVERED_CALL:
                 return RiskVerdict(False, ("covered_calls_deferred",))
             if kind in {TradeKind.SELL, TradeKind.BUY_TO_COVER, TradeKind.OPTION_CLOSE}:
-                return self._check_reduction(snapshot, kind, symbol, qty, price, fee, intent, controls)
+                return self._check_reduction(snapshot, kind, symbol, qty, price, intent)
             reasons = self._entry_reasons(snapshot, intent, kind, now, controls)
             if reasons:
                 return RiskVerdict(False, tuple(reasons))
@@ -537,15 +585,15 @@ class RiskManager:
                 return RiskVerdict(False, ("invalid_mark",))
             before = self._breaches(projection)
             equity_before = projection.equity
-            projection.add_buy(symbol, c, qty, price)
-            if mark > price:
-                extra = (mark - price) * qty
-                projection.pending_values[symbol] = (c, projection.pending_values[symbol][1] + extra)
-            projection.cash -= fee
+            projection.add_buy(symbol, c, qty, price, mark)
+            projection.reserve(fee)
             # Known fee and a fill at the unfavorable bound erode marked equity.
             projection.equity -= fee + qty * max(Decimal(0), price - mark)
             if projection.equity <= 0:
                 return RiskVerdict(False, ("nonpositive_projected_equity",))
+            if (self.config.MARGIN_ENABLED and controls.drawdown.is_throttled(self.config)
+                    and projection.cash < 0):
+                return RiskVerdict(False, ("drawdown_no_new_borrowing",), projection.totals())
             stop_distance = _decimal(self.config.STOP_LOSS_PCT if intent.stop_distance is None
                                      else intent.stop_distance)
             loss_budget = projection.equity * self._ratio("MAX_INITIAL_STOP_RISK_PCT")
@@ -689,6 +737,77 @@ class RiskManager:
             raise ValueError(f"invalid risk setting {name}")
         return ratio
 
+    def margin_status(self, snapshot: BookSnapshot) -> MarginStatus | None:
+        """Calculate actual account excess (no unfilled orders or assumptions about future fills)."""
+        if not self.config.MARGIN_ENABLED:
+            return None
+        try:
+            book = self._project_book(snapshot, RiskControls(), include_pending=False, allow_unpriced=True)
+            return self._margin_status(book)
+        except (ValueError, TypeError, ArithmeticError, AttributeError):
+            return None
+
+    def _margin_status(self, book: _Projection) -> MarginStatus | None:
+        if book.maintenance is None:
+            return None
+        excess = (book.equity - book.maintenance) / book.equity
+        return MarginStatus(book.equity, book.maintenance, excess,
+                            book.margin_call or excess < self._ratio("MARGIN_TRIM_EXCESS_PCT"),
+                            book.margin_call)
+
+    def plan_margin_trim(
+        self, snapshot: BookSnapshot, *, controls: RiskControls | None = None, force: bool = False,
+    ) -> tuple[TradeIntent, ...]:
+        """Plan whole-share sales toward target; caller reconciles before each next sale."""
+        if not self.config.MARGIN_ENABLED:
+            return ()
+        controls = controls or RiskControls()
+        try:
+            book = self._project_book(snapshot, RiskControls(), include_pending=False, allow_unpriced=True)
+            status = self._margin_status(book)
+            if status is None or not (status.needs_trim or force):
+                return ()
+            required = status.maintenance_margin - status.equity * (1 - self._ratio("MARGIN_MIN_EXCESS_PCT"))
+            if required <= 0:
+                return ()
+            ranked = []
+            for stock in book.stocks.values():
+                if stock.qty <= 0:
+                    continue
+                holding = snapshot.holding(stock.symbol)
+                assert holding is not None
+                meta = holding.meta
+                grade = controls.holding_convictions.get(stock.symbol)
+                if grade is None and meta is not None:
+                    grade = meta.notes.get("effective_conviction")
+                grade = grade if type(grade) is int and 1 <= grade <= 10 else 0
+                ranked.append((grade, (stock.mark - _decimal(holding.avg_cost)) * stock.qty, stock.symbol))
+            plan = []
+            for _, _, symbol in sorted(ranked):
+                stock = book.stocks[symbol]
+                meta = self._metadata(snapshot, symbol)
+                stop_id = getattr(meta, "stop_order_id", None)
+                # The exit executor can cancel its own stop and re-protect the remainder.
+                # Other working sell orders and any pledged shares stay unavailable.
+                own_stop_qty = sum(
+                    (_decimal(order.remaining_qty) for order in snapshot.open_orders_for(symbol)
+                     if stop_id and order.order_id == stop_id and order.side == "sell"
+                     and order.type in {"stop", "stop_limit"}), _ZERO,
+                )
+                pledged = self._covered_shares(snapshot, symbol)
+                available = min(stock.qty - pledged, stock.available + own_stop_qty)
+                relief = stock.mark * _maintenance_rate(symbol, stock.mark)
+                qty = min(Decimal(max(0, int(available))),
+                          (required / relief).to_integral_value(rounding=ROUND_CEILING))
+                if qty > 0:
+                    plan.append(TradeIntent(TradeKind.SELL, symbol, qty, stock.mark, reason="margin_buffer"))
+                    required -= qty * relief
+                if required <= 0:
+                    break
+            return tuple(plan)
+        except (ValueError, TypeError, ArithmeticError, AttributeError):
+            return ()
+
     @staticmethod
     def _metadata(snapshot: "BookSnapshot", symbol: str) -> object | None:
         stock = snapshot.holding(symbol)
@@ -702,6 +821,20 @@ class RiskManager:
         if equity <= 0:
             raise ValueError("nonpositive broker equity")
         book = _Projection(equity, cash)
+        guess_maintenance = False
+        if self.config.MARGIN_ENABLED:
+            regt = getattr(snapshot, "regt_buying_power", None)
+            book.regt_buying_power = max(_ZERO, cash) if regt is None else _decimal(regt)
+            option_bp = getattr(snapshot, "options_buying_power", None)
+            if option_bp is None:
+                option_bp = getattr(snapshot, "non_marginable_buying_power", None)
+            book.options_buying_power = max(_ZERO, cash) if option_bp is None else _decimal(option_bp)
+            maintenance = getattr(snapshot, "maintenance_margin", None)
+            guess_maintenance = maintenance is None
+            book.maintenance = _ZERO if guess_maintenance else _decimal(maintenance)
+            if book.maintenance < 0:
+                raise ValueError("invalid broker maintenance margin")
+            book.margin_call = getattr(snapshot, "margin_call", None) is True
         commitments: set[str] = set()
         reserved_orders: set[str] = set()
         for option in controls.option_commitments:
@@ -713,7 +846,7 @@ class RiskManager:
             commitments.add(option.structure_id)
             reserved_orders.update(option.order_ids)
             book.option_loss += loss
-            book.cash -= reserved
+            book.reserve(reserved)
         book.option_count = len(commitments)
         for stock in snapshot.holdings:
             symbol = stock.symbol.strip().upper()
@@ -730,6 +863,9 @@ class RiskManager:
                 if not allow_unpriced:
                     raise ValueError("invalid holding mark")
                 book.unpriced[symbol] = qty
+                if guess_maintenance and qty > 0:
+                    conservative_value = max(_ZERO, _decimal(stock.market_value), qty * _decimal(stock.avg_cost))
+                    book.maintenance += conservative_value  # Unknown mark: no discount to the fallback.
                 continue
             meta = self._metadata(snapshot, symbol)
             sector = getattr(meta, "sector", None) or getattr(stock, "sector", None)
@@ -738,6 +874,8 @@ class RiskManager:
                 symbol, qty, mark, classify_symbol(symbol, sector),
                 _decimal(getattr(stock, "qty_available", qty)), _decimal(stop) if stop else None,
             )
+            if guess_maintenance and qty > 0:
+                book.maintenance += qty * mark * _maintenance_rate(symbol, mark)
         if include_pending:
             seen: set[str] = set()
             for order in snapshot.open_orders:
@@ -767,7 +905,7 @@ class RiskManager:
                         if limit <= 0:
                             raise ValueError("open option debit has no executable upper bound")
                         reserve = quantity * limit * 100
-                        book.cash -= reserve
+                        book.reserve(reserve)
                         if not closing:
                             book.option_loss += reserve
                             book.option_count += 1
@@ -778,19 +916,15 @@ class RiskManager:
                     raise ValueError("open stock buy has no symbol")
                 held = book.stocks.get(symbol)
                 if position_intent == "buy_to_close" or (held is not None and held.qty < 0):
-                    book.cash -= quantity * limit
+                    book.reserve(quantity * limit)
                     continue
                 meta = self._metadata(snapshot, symbol)
                 c = held.classification if held else classify_symbol(
                     symbol, controls.pending_sectors.get(symbol) or getattr(meta, "sector", None),
                 )
-                book.add_buy(symbol, c, quantity, limit)
+                book.add_buy(symbol, c, quantity, limit, held.mark if held else limit)
                 if c.sector == CanonicalSector.UNKNOWN:
                     book.unknown_pending += quantity * limit
-                if held is not None and held.mark > limit:
-                    book.pending_values[symbol] = (
-                        c, book.pending_values[symbol][1] + (held.mark - limit) * quantity,
-                    )
         return book
 
     def _breaches(self, book: _Projection, *, include_at_limit: bool = False) -> tuple[Breach, ...]:
@@ -803,12 +937,24 @@ class RiskManager:
             breached.append(Breach("unpriced_holding", symbol, abs(qty), Decimal(0)))
             if qty < 0:
                 breached.append(Breach("unexpected_short", symbol, -qty, Decimal(0)))
-        cash_pct = totals.free_cash / totals.equity
-        if cash_pct < self._ratio("MIN_FREE_CASH_PCT"):
-            breached.append(Breach("cash_floor", "", cash_pct, self._ratio("MIN_FREE_CASH_PCT")))
+        floor_amount, floor_key = totals.free_cash, "cash_floor"
+        if self.config.MARGIN_ENABLED:
+            floor_amount, floor_key = book.regt_buying_power, "buying_power_floor"
+            status = self._margin_status(book)
+            margin_min = self._ratio("MARGIN_MIN_EXCESS_PCT")
+            if status is not None:
+                if status.excess_pct < margin_min:
+                    breached.append(Breach("margin_buffer", "", status.excess_pct, margin_min))
+                if status.margin_call:
+                    breached.append(Breach("margin_call", "", _ZERO, _ZERO))
+        floor = _decimal(self.config.MIN_FREE_CASH_PCT)
+        floor_pct = floor_amount / totals.equity
+        if floor_pct < floor:
+            breached.append(Breach(floor_key, "", floor_pct, floor))
         gross_pct = totals.gross_exposure / totals.equity
-        if gross_pct > self._ratio("MAX_TOTAL_EXPOSURE"):
-            breached.append(Breach("gross_cap", "", gross_pct, self._ratio("MAX_TOTAL_EXPOSURE")))
+        gross_cap = _decimal(self.config.effective_max_gross_exposure_pct)
+        if gross_pct > gross_cap:
+            breached.append(Breach("gross_cap", "", gross_pct, gross_cap))
         if totals.positions > self.config.MAX_POSITIONS:
             breached.append(Breach("position_count", "", Decimal(totals.positions),
                                    Decimal(self.config.MAX_POSITIONS)))
@@ -945,7 +1091,7 @@ class RiskManager:
             return RiskVerdict(False, ("missing_or_duplicate_structure_id",))
         before = self._breaches(book)
         equity_before = book.equity
-        book.cash -= debit + fee
+        book.reserve(debit + fee)
         book.equity -= fee
         book.option_loss += max_loss
         book.option_count += 1
@@ -964,7 +1110,9 @@ class RiskManager:
             mark = strike if intent.mark_price is None else _decimal(intent.mark_price)
             if shares != qty * 100 or min(strike, mark) <= 0:
                 return RiskVerdict(False, ("invalid_assignment",))
-            book.cash -= shares * strike
+            book.reserve(shares * strike)
+            if self.config.MARGIN_ENABLED and book.cash < 0:
+                reasons.append("cash_secured_put_unfunded")
             # Only a cash-secured put projects assigned shares at entry. Do
             # not double-count the reserved collateral in its cash check.
             symbol = intent.symbol.strip().upper()
@@ -978,6 +1126,8 @@ class RiskManager:
             pending = dict(book.pending_values)
             pending[symbol] = (c, shares * max(strike, mark) + (prior[1] if prior else 0))
             exposure = replace(book, pending_values=pending)
+        if self.config.MARGIN_ENABLED and book.options_buying_power < 0:
+            reasons.append("options_buying_power")
         after = self._breaches(exposure)
         tolerated = self._unchanged_breaches(before, after, equity_before, exposure.equity)
         reasons.extend(b.kind for b in after if b.kind != "option_budget" and b not in tolerated)
@@ -1018,15 +1168,15 @@ class RiskManager:
 
     def _check_reduction(
         self, snapshot: "BookSnapshot", kind: TradeKind, symbol: str, qty: Decimal,
-        price: Decimal, fee: Decimal, intent: TradeIntent, controls: RiskControls,
+        price: Decimal, intent: TradeIntent,
     ) -> RiskVerdict:
         if kind == TradeKind.OPTION_CLOSE:
             if not any(symbol in {leg.underlying, leg.occ_symbol}
                        and abs(leg.qty) >= qty for leg in snapshot.legs):
                 return RiskVerdict(False, ("no_option_to_close",))
             debit = _decimal(intent.option_cash_debit)
-            if debit < 0 or (debit + fee > 0 and debit + fee > self._reduction_cash(snapshot, controls)):
-                return RiskVerdict(False, ("close_requires_cash",))
+            if debit < 0:
+                return RiskVerdict(False, ("invalid_close_debit",))
             return RiskVerdict(True)
         stock = next((held for held in snapshot.holdings if held.symbol == symbol), None)
         if stock is None:
@@ -1035,34 +1185,10 @@ class RiskManager:
         if kind == TradeKind.BUY_TO_COVER:
             if held >= 0 or qty > -held:
                 return RiskVerdict(False, ("cover_exceeds_short",))
-            if price <= 0 or qty * price + fee > self._reduction_cash(snapshot, controls):
-                return RiskVerdict(False, ("cover_requires_funded_limit",))
+            if price <= 0:
+                return RiskVerdict(False, ("invalid_limit",))
             return RiskVerdict(True)
         if held <= 0 or qty > min(held, _decimal(getattr(stock, "qty_available", held)),
                                    max(Decimal(0), held - self._covered_shares(snapshot, symbol))):
             return RiskVerdict(False, ("sell_exceeds_available_shares",))
         return RiskVerdict(True)
-
-    @staticmethod
-    def _reduction_cash(snapshot: "BookSnapshot", controls: RiskControls) -> Decimal:
-        """No borrowing to close, even if market data is otherwise unavailable."""
-        cash = _decimal(snapshot.cash)
-        seen = set()
-        for option in controls.option_commitments:
-            cash -= _decimal(option.cash_reserved)
-            seen.update(option.order_ids)
-        for order in snapshot.open_orders:
-            key = order.order_id or order.client_order_id
-            if key in seen or order.client_order_id in seen:
-                continue
-            if key:
-                seen.add(key)
-            if order.side != "buy" and order.order_class != "mleg":
-                continue
-            limit = _decimal(order.limit_price)
-            quantity = _decimal(order.remaining_qty)
-            if quantity > 0:
-                cash -= quantity * max(limit, Decimal(0)) * (
-                    100 if order.order_class == "mleg" or order.asset_class == "us_option" else 1
-                )
-        return cash
