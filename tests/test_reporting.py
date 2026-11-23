@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -589,3 +590,140 @@ def test_scheduler_morning_brief_and_friday_summary_emit_weekly_scorecard(
             sched.store.close()
 
     asyncio.run(_run())
+
+
+def test_nullable_close_marks_rendered_cutover_persisted_drawdown_and_degrade(
+    world: FakeWorld, tmp_path: Path, caplog: Any, monkeypatch: Any
+) -> None:
+    from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path / "null_marks"
+        ledger = make_ledger(tmp_path / "null_marks", world)
+
+        # 1) Persisted latched DrawdownState in DRAWDOWN_STATE_KEY ("drawdown") is honored
+        # even when current equity marks alone would show -10% (recovery_closes=2 < 5).
+        latched = DrawdownState(
+            high_water=Decimal("100000"),
+            drawdown=Decimal("0.10"),
+            paused=True,
+            recovery_closes=2,
+            last_session="2026-11-23",
+            last_equity=Decimal("90000"),
+        )
+        ledger.risk_state_set(DRAWDOWN_STATE_KEY, latched.to_record())
+
+        # 2) Nullable EquityMark breakdown fields must never raise in daily or weekly builders
+        nullable_mark_0 = EquityMark(
+            session_date=date(2026, 11, 20),
+            quality="close",
+            equity=Decimal("100000"),
+            cash=None,
+            long_mv=None,
+            short_mv=None,
+            options_mv=None,
+            taken_at=datetime(2026, 11, 20, 21, 5, tzinfo=timezone.utc),
+        )
+        nullable_mark_1 = EquityMark(
+            session_date=date(2026, 11, 23),
+            quality="close",
+            equity=Decimal("90000"),
+            cash=None,
+            long_mv=None,
+            short_mv=None,
+            options_mv=None,
+            taken_at=datetime(2026, 11, 23, 21, 5, tzinfo=timezone.utc),
+        )
+        ledger.equity_marks = lambda *_: [nullable_mark_0, nullable_mark_1]  # type: ignore[method-assign]
+
+        ps = StubPriceService(
+            bars={
+                "QQQ": [
+                    _bar("QQQ", date(2026, 11, 20), 600.0),
+                    _bar("QQQ", date(2026, 11, 23), 606.0),
+                ],
+                "SPY": [
+                    _bar("SPY", date(2026, 11, 20), 605.0),
+                    _bar("SPY", date(2026, 11, 23), 611.05),
+                ],
+            }
+        )
+        rb = ReportBuilder(
+            cfg,
+            ledger=ledger,
+            price_service=ps,
+            clock=lambda: datetime(2026, 11, 23, 21, 10, tzinfo=timezone.utc),
+        )
+
+        daily_embeds = await rb.build_daily_summary(snapshot=None)
+        daily_txt = str(daily_embeds)
+        assert "Daily Close Summary" in daily_txt
+        assert "20% Drawdown Stop" in daily_txt
+        assert "2/5 recovery closes recorded" in daily_txt
+
+        wk_embeds, sc = await rb.build_weekly_scorecard(
+            snapshot=None, cutover_date=date(2026, 11, 20)
+        )
+        wk_txt = str(wk_embeds)
+        assert sc["account"]["drawdown_tier"] == "halt_20pct"
+        assert sc["account"]["drawdown_pct"] == -10.0
+        assert sc["account"]["peak_cash_pct"] is None
+        assert sc["account"]["peak_exposure_pct"] is None
+        # 3) Rendered weekly scorecard includes the cut-over series
+        assert "**Since Cut-Over (Nov 20):**" in wk_txt
+
+        # 4) Unhandled failure inside builder degrades to "report unavailable: <reason>" with secret redaction
+        def _boom(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("https://fixture.invalid/data?apikey=synthetic-report-secret")
+
+        monkeypatch.setattr(rb, "_daily_decisions_summary", _boom)
+        degraded = await rb.build_daily_summary(snapshot=None)
+        assert "report unavailable:" in degraded[0]["description"]
+        assert "synthetic-report-secret" not in degraded[0]["description"]
+        assert "synthetic-report-secret" not in caplog.text
+
+        # 5) BenchmarkTracker failure never logs query credentials
+        class _BrokenPrice:
+            async def get_daily_bars(self, *_a: Any, **_kw: Any) -> list[Any]:
+                raise RuntimeError("https://fixture.invalid/bars?apikey=synthetic-bm-secret")
+
+        await BenchmarkTracker(_BrokenPrice()).compute(
+            as_of_date=date(2026, 11, 23), marks=[], flows=[]
+        )
+        assert "synthetic-bm-secret" not in caplog.text
+
+        # 6) Scheduler routes daily report to daily_pnl (not risk) and contains simultaneous report + alert failures
+        cfg_sched = Config()
+        cfg_sched.DATA_DIR = tmp_path / "sched_route"
+        cfg_sched.DISCORD_BOT_TOKEN = "test-discord"
+        cfg_sched.TELEGRAM_BOT_TOKEN = ""
+        cfg_sched.DISCORD_CHANNELS = {"daily_pnl": "daily-pnl-chan", "risk": "risk-chan"}
+        sched = StockAgentScheduler(cfg_sched)
+        sched.store.open()
+        try:
+            await sched._send_daily_summary()
+            routed = [m for m in world.discord.messages if "Daily" in str(m.get("embeds"))]
+            assert routed and {m["channel"] for m in routed} == {"daily-pnl-chan"}
+        finally:
+            await sched.http.aclose()
+            sched.store.close()
+
+        def _fail_os(*_a: Any, **_kw: Any) -> Any:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ReportBuilder, "build_daily_summary", _fail_os)
+        broken_alerts = SimpleNamespace(alert_unhandled_exception=_fail_os, alert=_fail_os, flush=_fail_os)
+        stub_sched = SimpleNamespace(
+            config=Config(),
+            ledger=SimpleNamespace(last_snapshot=lambda: None),
+            alerts=broken_alerts,
+            discord=None,
+        )
+        await StockAgentScheduler._send_daily_summary(stub_sched)  # type: ignore[arg-type]
+        await StockAgentScheduler._send_morning_brief(stub_sched)  # type: ignore[arg-type]
+
+        ledger.store.close()
+
+    asyncio.run(_run())
+

@@ -22,7 +22,7 @@ import logging
 import statistics
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -32,6 +32,7 @@ from stock_agent.alerts import redact_secrets_in_text
 from stock_agent.benchmark import MIN_PAIRED_IR, BenchmarkSnapshot, BenchmarkTracker
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, EquityMark, Holding, Ledger
+from stock_agent.logging_setup import redact_text
 from stock_agent.performance import (
     SHADOW_POST_STOP_SESSIONS,
     day_pnl,
@@ -41,6 +42,7 @@ from stock_agent.performance import (
     realised_fifo,
     twr,
 )
+from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +87,83 @@ def _safe_dec(val: Any) -> Decimal | None:
         return None
 
 
-def describe_drawdown_tier(drawdown_pct: Decimal | float | None, ledger: Ledger | None = None) -> tuple[str, str]:
-    """Map current drawdown (%) to PAPER_TEST control tier and plain-English label."""
-    halted = bool(ledger.risk_state_get("drawdown_halted", False)) if ledger is not None else False
+def _safe_report_reason(exc: BaseException, config: Any | None = None) -> str:
+    """Return a short, secret-scrubbed reason suitable for an owner fallback message."""
+    raw = str(exc).strip()
+    secrets = (
+        config.secret_values()
+        if config is not None and hasattr(config, "secret_values")
+        else ()
+    )
+    cleaned = redact_text(raw, secrets) if raw else ""
+    cleaned = redact_secrets_in_text(cleaned).strip()
+    label = f"{type(exc).__name__}: {cleaned}" if cleaned else type(exc).__name__
+    return label[:180]
+
+
+def _read_persisted_drawdown(ledger: Any | None, config: Any = Config) -> DrawdownState | None:
+    """Read the persisted DrawdownState record from risk_state[DRAWDOWN_STATE_KEY] if present."""
+    if ledger is None or not hasattr(ledger, "risk_state_get"):
+        return None
+    try:
+        raw = ledger.risk_state_get(DRAWDOWN_STATE_KEY)
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        st = DrawdownState.from_record(raw, config=config)
+    except Exception:
+        return None
+    if st.last_session is None and not st.paused and st.high_water <= ZERO and st.drawdown <= ZERO:
+        return None
+    return st
+
+
+def describe_drawdown_tier(
+    drawdown_pct: Decimal | float | None,
+    ledger: Ledger | None = None,
+    *,
+    config: Any = Config,
+    persisted: DrawdownState | None = None,
+) -> tuple[str, str]:
+    """Map persisted drawdown state/latch (or fallback drawdown %) to control tier and label."""
+    st = persisted if persisted is not None else _read_persisted_drawdown(ledger, config=config)
+    rec_target = int(getattr(config, "DRAWDOWN_RECOVERY_SESSIONS", 5))
+    if st is not None:
+        if st.paused or st.drawdown >= Decimal(str(getattr(config, "DRAWDOWN_PAUSE_PCT", "0.20"))):
+            rec_note = (
+                f" ({st.recovery_closes}/{rec_target} recovery closes recorded)"
+                if st.paused and st.recovery_closes > 0
+                else ""
+            )
+            return (
+                "halt_20pct",
+                f"20% Drawdown Stop — new entries paused until drawdown stays above -15% for {rec_target} closes{rec_note}",
+            )
+        if st.is_throttled(config=config):
+            return (
+                "throttle_15pct",
+                "15% Drawdown Guard — new stock sizes cut in half; new option trades paused",
+            )
+        if st.should_alert(config=config):
+            return (
+                "alert_10pct",
+                "10% Drawdown Watch — normal rules active with heightened monitoring",
+            )
+        return ("normal", "Normal — all safety rules clear")
+
+    halted = False
+    if ledger is not None and hasattr(ledger, "risk_state_get"):
+        try:
+            halted = bool(ledger.risk_state_get("drawdown_halted", False))
+        except Exception:
+            halted = False
     dd = float(drawdown_pct) if drawdown_pct is not None else 0.0
     if halted or dd <= -20.0:
         return (
             "halt_20pct",
-            "20% Drawdown Stop — new entries paused until drawdown stays above -15% for 5 closes",
+            f"20% Drawdown Stop — new entries paused until drawdown stays above -15% for {rec_target} closes",
         )
     if dd <= -15.0:
         return (
@@ -123,7 +194,7 @@ def format_input_health_table(health_registry: Any | None) -> tuple[str, list[di
                 for st in statuses.values()
             ]
     except Exception as e:
-        logger.warning("Could not read input health rows: %s", e)
+        logger.warning("Could not read input health rows (%s)", type(e).__name__)
         return ("Could not read data-source health status.", [])
 
     if not rows:
@@ -282,7 +353,7 @@ class ReportBuilder:
                 if isinstance(structs, list):
                     return list(structs)
         except Exception as e:
-            logger.warning("Could not read options structures for report: %s", e)
+            logger.warning("Could not read options structures for report (%s)", type(e).__name__)
             self._options_store_failed = True
         return []
 
@@ -367,7 +438,63 @@ class ReportBuilder:
         d = _safe_dec(raw)
         return d if d and d > ZERO else Decimal("100000")
 
-    def _benchmark_lines(self, bm: BenchmarkSnapshot, *, include_week: bool = False) -> str:
+    def _resolve_cutover_date(self, explicit: date | None, marks: Sequence[EquityMark]) -> date | None:
+        if explicit is not None:
+            return explicit
+        for attr in ("CUTOVER_DATE", "REVAMP_CUTOVER_DATE"):
+            val = getattr(self.config, attr, None)
+            if isinstance(val, date):
+                return val
+            if isinstance(val, str) and val.strip():
+                try:
+                    return date.fromisoformat(val.strip()[:10])
+                except ValueError:
+                    pass
+        if self.ledger is not None and hasattr(self.ledger, "risk_state_get"):
+            try:
+                stored = self.ledger.risk_state_get("cutover_date")
+                if isinstance(stored, str) and stored.strip():
+                    return date.fromisoformat(stored.strip()[:10])
+            except Exception:
+                pass
+        close_dates = sorted(m.session_date for m in marks if m.quality == "close")
+        return close_dates[0] if close_dates else None
+
+    def _persisted_or_computed_drawdown(
+        self,
+        marks: Sequence[EquityMark],
+        ret_eq: Decimal | None,
+    ) -> tuple[Decimal | None, Decimal | None, str, str]:
+        """Read persisted DrawdownState (risk_manager.DRAWDOWN_STATE_KEY) first; fall back to marks."""
+        st = _read_persisted_drawdown(self.ledger, config=self.config)
+        calc_dd, calc_hwm = drawdown(marks, ret_eq)
+        if st is not None:
+            dd_pct = (-st.drawdown * Decimal(100)).quantize(Decimal("0.01"))
+            hwm = st.high_water if st.high_water > ZERO else calc_hwm
+            tier, label = describe_drawdown_tier(dd_pct, self.ledger, config=self.config, persisted=st)
+            return dd_pct, hwm, tier, label
+        tier, label = describe_drawdown_tier(calc_dd, self.ledger, config=self.config)
+        return calc_dd, calc_hwm, tier, label
+
+    def _unavailable_embed(self, title: str, exc: BaseException) -> list[dict[str, Any]]:
+        reason = _safe_report_reason(exc, self.config)
+        logger.warning("Report degraded to unavailable (%s)", type(exc).__name__)
+        return [
+            {
+                "title": title,
+                "description": f"report unavailable: {reason}",
+                "color": 0xEF4444,
+            }
+        ]
+
+    def _benchmark_lines(
+        self,
+        bm: BenchmarkSnapshot,
+        *,
+        include_week: bool = False,
+        include_cutover: bool = False,
+        cutover_date: date | None = None,
+    ) -> str:
         parts: list[str] = []
         qqq_s = _fmt_pct(bm.qqq.session_return_pct)
         spy_s = _fmt_pct(bm.spy.session_return_pct)
@@ -378,6 +505,14 @@ class ReportBuilder:
             parts.append(
                 f"**This Week:** Portfolio {_fmt_pct(bm.portfolio_week_pct)} "
                 f"vs QQQ {_fmt_pct(bm.qqq.week_return_pct)} | SPY {_fmt_pct(bm.spy.week_return_pct)}"
+            )
+
+        if include_cutover:
+            cut_dt = cutover_date or getattr(bm, "cutover_date", None)
+            cut_lbl = f" ({cut_dt.strftime('%b %d')})" if isinstance(cut_dt, date) else ""
+            parts.append(
+                f"**Since Cut-Over{cut_lbl}:** Portfolio {_fmt_pct(bm.portfolio_cutover_pct)} "
+                f"vs QQQ {_fmt_pct(bm.qqq.cutover_return_pct)} | SPY {_fmt_pct(bm.spy.cutover_return_pct)}"
             )
 
         parts.append(
@@ -402,7 +537,25 @@ class ReportBuilder:
         as_of: datetime | None = None,
         macro_embed: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Build plain-English morning brief embeds from reconciled state."""
+        """Build plain-English morning brief embeds from reconciled state; never raises."""
+        now_et = as_of.astimezone(ET) if as_of else self._now_et()
+        title = f"☕ Morning Brief — {now_et.strftime('%A, %B %d, %Y')}"
+        try:
+            return await self._build_morning_brief_inner(
+                snapshot=snapshot,
+                as_of=as_of,
+                macro_embed=macro_embed,
+            )
+        except Exception as e:
+            return self._unavailable_embed(title, e)
+
+    async def _build_morning_brief_inner(
+        self,
+        *,
+        snapshot: BookSnapshot | None = None,
+        as_of: datetime | None = None,
+        macro_embed: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
         today_label = now_et.strftime("%A, %B %d, %Y")
@@ -433,8 +586,7 @@ class ReportBuilder:
         overnight_pnl, overnight_pct = (
             day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None)
         )
-        dd_pct, hwm = drawdown(marks, ret_eq)
-        _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
+        dd_pct, hwm, _, dd_desc = self._persisted_or_computed_drawdown(marks, ret_eq)
 
         bm = await self.benchmark.compute(
             as_of_date=session_date,
@@ -695,7 +847,25 @@ class ReportBuilder:
         close_report: Any | None = None,
         as_of: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Build honest end-of-day summary embeds from close mark & reconciled book."""
+        """Build honest end-of-day summary embeds from close mark & reconciled book; never raises."""
+        now_et = as_of.astimezone(ET) if as_of else self._now_et()
+        title = f"📊 Daily Close Summary — {now_et.strftime('%b %d, %Y (%a)')}"
+        try:
+            return await self._build_daily_summary_inner(
+                snapshot=snapshot,
+                close_report=close_report,
+                as_of=as_of,
+            )
+        except Exception as e:
+            return self._unavailable_embed(title, e)
+
+    async def _build_daily_summary_inner(
+        self,
+        *,
+        snapshot: BookSnapshot | None = None,
+        close_report: Any | None = None,
+        as_of: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
         date_label = now_et.strftime("%b %d, %Y (%a)")
@@ -715,9 +885,26 @@ class ReportBuilder:
             ]
 
         equity = today_mark.equity if today_mark is not None else snap.equity  # type: ignore[union-attr]
-        cash = today_mark.cash if today_mark is not None else snap.cash  # type: ignore[union-attr]
-        long_mv = today_mark.long_mv if today_mark is not None else snap.long_mv  # type: ignore[union-attr]
-        opt_mv = today_mark.options_mv if today_mark is not None else snap.options_mv  # type: ignore[union-attr]
+        cash = (
+            today_mark.cash
+            if (today_mark is not None and today_mark.cash is not None)
+            else (snap.cash if snap is not None else None)
+        )
+        long_mv = (
+            today_mark.long_mv
+            if (today_mark is not None and today_mark.long_mv is not None)
+            else (snap.long_mv if snap is not None else None)
+        )
+        short_mv = (
+            today_mark.short_mv
+            if (today_mark is not None and today_mark.short_mv is not None)
+            else (snap.short_mv if snap is not None else None)
+        )
+        opt_mv = (
+            today_mark.options_mv
+            if (today_mark is not None and today_mark.options_mv is not None)
+            else (snap.options_mv if snap is not None else None)
+        )
         mark_quality = "trusted close" if today_mark is not None else f"{snap.quality} snapshot (close mark pending)"  # type: ignore[union-attr]
 
         # equity used for any return/drawdown: today's trusted close, else a LIVE snapshot only
@@ -734,8 +921,7 @@ class ReportBuilder:
             and ret_eq is not None
             else (day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None))
         )
-        dd_pct, hwm = drawdown(marks, ret_eq)
-        _, dd_desc = describe_drawdown_tier(dd_pct, self.ledger)
+        dd_pct, hwm, _, dd_desc = self._persisted_or_computed_drawdown(marks, ret_eq)
         twr_pct = twr(marks, flows)
         dep = net_deposits(flows, session_date)
         total_ret_pct = (
@@ -774,7 +960,14 @@ class ReportBuilder:
 
         color = 0x16A34A if (sess_pnl is None or sess_pnl >= ZERO) else 0xDC2626
         eq_f = float(equity)
-        exp_pct = (float(long_mv + abs(opt_mv)) / eq_f * 100.0) if eq_f > 0 else 0.0
+        has_mv_breakdown = any(v is not None for v in (long_mv, short_mv, opt_mv))
+        exp_pct: float | None = (
+            float((long_mv or ZERO) + abs(short_mv or ZERO) + abs(opt_mv or ZERO)) / eq_f * 100.0
+            if eq_f > 0 and has_mv_breakdown
+            else None
+        )
+        exp_str = f"{exp_pct:.1f}%" if exp_pct is not None else "N/A"
+        net_ret_val = total_ret_pct if total_ret_pct is not None else bm.portfolio_since_launch_pct
 
         summary_fields = [
             {"name": "Closing Account Value", "value": f"**{_fmt_money(equity, decimals=2)}** ({mark_quality})", "inline": True},
@@ -789,10 +982,10 @@ class ReportBuilder:
             },
             {
                 "name": "Flow-Adjusted Return",
-                "value": f"TWR {_fmt_pct(twr_pct)} | Net vs Deposits {_fmt_pct(total_ret_pct or bm.portfolio_since_launch_pct)}",
+                "value": f"TWR {_fmt_pct(twr_pct)} | Net vs Deposits {_fmt_pct(net_ret_val)}",
                 "inline": True,
             },
-            {"name": "Cash & Exposure", "value": f"Cash {_fmt_money(cash)} | Invested {exp_pct:.1f}%", "inline": True},
+            {"name": "Cash & Exposure", "value": f"Cash {_fmt_money(cash)} | Invested {exp_str}", "inline": True},
             {
                 "name": "Stocks Sleeve",
                 "value": f"Value {_fmt_money(long_mv)} | Open Unrealized {_fmt_money(stock_unreal, signed=True)}",
@@ -934,7 +1127,35 @@ class ReportBuilder:
         build_id: str = "revamp",
         cutover_date: date | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build the weekly paper-test scorecard embeds and structured breakdown dict."""
+        """Build the weekly paper-test scorecard embeds and structured breakdown dict; never raises."""
+        now_et = as_of.astimezone(ET) if as_of else self._now_et()
+        title = f"📈 Weekly Paper-Test Scorecard — {now_et.strftime('%b %d, %Y')}"
+        try:
+            return await self._build_weekly_scorecard_inner(
+                snapshot=snapshot,
+                as_of=as_of,
+                build_id=build_id,
+                cutover_date=cutover_date,
+            )
+        except Exception as e:
+            embeds = self._unavailable_embed(title, e)
+            return embeds, {
+                "error": _safe_report_reason(e, self.config),
+                "account": {
+                    "mode": str(getattr(self.config, "MODE", "PAPER")),
+                    "build_id": build_id,
+                    "as_of_date": now_et.date().isoformat(),
+                },
+            }
+
+    async def _build_weekly_scorecard_inner(
+        self,
+        *,
+        snapshot: BookSnapshot | None = None,
+        as_of: datetime | None = None,
+        build_id: str = "revamp",
+        cutover_date: date | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
         snap = snapshot or (self.ledger.last_snapshot() if self.ledger else None)
@@ -945,29 +1166,36 @@ class ReportBuilder:
         ret_live_eq = _return_equity(snap, session_date, now_et) if snap is not None else None
         if ret_live_eq is not None and ret_live_eq <= ZERO:
             ret_live_eq = None
-        cash_now = snap.cash if snap is not None else (marks[-1].cash if marks else ZERO)
-        gross_exp_pct = (
-            float(snap.gross_exposure_pct * 100)
-            if snap is not None
-            else (
-                float((marks[-1].long_mv + abs(marks[-1].short_mv)) / marks[-1].equity * 100)
-                if marks and marks[-1].equity > ZERO
-                else 0.0
+        cash_now: Decimal | None = snap.cash if snap is not None else (marks[-1].cash if marks else None)
+        gross_exp_pct: float | None
+        if snap is not None:
+            gross_exp_pct = float(snap.gross_exposure_pct * 100)
+        elif (
+            marks
+            and marks[-1].equity > ZERO
+            and marks[-1].long_mv is not None
+            and marks[-1].short_mv is not None
+        ):
+            gross_exp_pct = float(
+                (marks[-1].long_mv + abs(marks[-1].short_mv) + abs(marks[-1].options_mv or ZERO))
+                / marks[-1].equity
+                * 100
             )
-        )
+        else:
+            gross_exp_pct = None
 
+        resolved_cutover = self._resolve_cutover_date(cutover_date, marks)
         bm = await self.benchmark.compute(
             as_of_date=session_date,
             marks=marks,
             flows=flows,
             live_equity=ret_live_eq,
-            cutover_date=cutover_date,
+            cutover_date=resolved_cutover,
             fallback_starting_capital=self._fallback_starting_capital(),
         )
 
-        # Drawdown & HWM dates
-        dd_now, hwm = drawdown(marks, ret_live_eq)
-        dd_tier, dd_label = describe_drawdown_tier(dd_now, self.ledger)
+        # Persisted drawdown state/latch first; fallback to marks
+        dd_now, hwm, dd_tier, dd_label = self._persisted_or_computed_drawdown(marks, ret_live_eq)
         hwm_date: str | None = None
         max_dd_pct: Decimal | None = None
         max_dd_date: str | None = None
@@ -986,11 +1214,13 @@ class ReportBuilder:
                     max_dd_pct = cur_dd
                     max_dd_date = m.session_date.isoformat()
             if m.equity > ZERO:
-                cp = float(m.cash / m.equity * 100)
-                ep = float((m.long_mv + abs(m.short_mv) + abs(m.options_mv)) / m.equity * 100)
-                peak_cash_pct = cp if peak_cash_pct is None else max(peak_cash_pct, cp)
-                min_cash_pct = cp if min_cash_pct is None else min(min_cash_pct, cp)
-                peak_exp_pct = ep if peak_exp_pct is None else max(peak_exp_pct, ep)
+                if m.cash is not None:
+                    cp = float(m.cash / m.equity * 100)
+                    peak_cash_pct = cp if peak_cash_pct is None else max(peak_cash_pct, cp)
+                    min_cash_pct = cp if min_cash_pct is None else min(min_cash_pct, cp)
+                if m.long_mv is not None and m.short_mv is not None and m.options_mv is not None:
+                    ep = float((m.long_mv + abs(m.short_mv) + abs(m.options_mv)) / m.equity * 100)
+                    peak_exp_pct = ep if peak_exp_pct is None else max(peak_exp_pct, ep)
 
         # Sleeves & Orders breakdown
         sleeves, options_by_origin, by_conviction, orders_stats = self._compile_sleeves_and_orders(snap)
@@ -1019,10 +1249,11 @@ class ReportBuilder:
                 "as_of_date": session_date.isoformat(),
                 "sessions_recorded": len([m for m in marks if m.quality == "close"]),
                 "equity": float(live_eq),
-                "cash": float(cash_now),
-                "cash_pct": round(float(cash_now / live_eq * 100), 2) if live_eq > ZERO else 0.0,
-                "gross_exposure_pct": round(gross_exp_pct, 2),
+                "cash": float(cash_now) if cash_now is not None else None,
+                "cash_pct": round(float(cash_now / live_eq * 100), 2) if (cash_now is not None and live_eq > ZERO) else None,
+                "gross_exposure_pct": round(gross_exp_pct, 2) if gross_exp_pct is not None else None,
                 "net_deposits": float(net_deposits(flows, session_date)),
+                "cutover_date": resolved_cutover.isoformat() if resolved_cutover else None,
                 "week_return_pct": float(bm.portfolio_week_pct) if bm.portfolio_week_pct is not None else None,
                 "cutover_return_pct": float(bm.portfolio_cutover_pct) if bm.portfolio_cutover_pct is not None else None,
                 "since_launch_return_pct": float(bm.portfolio_since_launch_pct) if bm.portfolio_since_launch_pct is not None else None,
@@ -1556,6 +1787,10 @@ class ReportBuilder:
         wl = sc["what_we_learned"]
 
         # Embed 1: Account, Benchmarks & Drawdown
+        cash_pct_s = f"{acc['cash_pct']:.1f}%" if acc.get("cash_pct") is not None else "N/A"
+        exp_pct_s = f"{acc['gross_exposure_pct']:.1f}%" if acc.get("gross_exposure_pct") is not None else "N/A"
+        cut_iso = acc.get("cutover_date")
+        cut_dt = date.fromisoformat(cut_iso) if isinstance(cut_iso, str) and cut_iso else None
         e1 = {
             "title": f"📈 Weekly Paper-Test Scorecard — {now_et.strftime('%b %d, %Y')}",
             "description": (
@@ -1564,8 +1799,8 @@ class ReportBuilder:
             ),
             "color": 0x2563EB,
             "fields": [
-                {"name": "Account Value & Cash", "value": f"**{_fmt_money(acc['equity'], decimals=2)}** (Cash {acc['cash_pct']:.1f}%, Gross Exp {acc['gross_exposure_pct']:.1f}%)", "inline": False},
-                {"name": "Returns vs QQQ & SPY", "value": self._benchmark_lines(bm, include_week=True), "inline": False},
+                {"name": "Account Value & Cash", "value": f"**{_fmt_money(acc['equity'], decimals=2)}** (Cash {cash_pct_s}, Gross Exp {exp_pct_s})", "inline": False},
+                {"name": "Returns vs QQQ & SPY", "value": self._benchmark_lines(bm, include_week=True, include_cutover=True, cutover_date=cut_dt), "inline": False},
                 {
                     "name": "Drawdown & Risk Controls",
                     "value": (

@@ -644,7 +644,18 @@ class AlertService:
             if not any(x.event.event_id == ev.event_id for x in self.outbox):
                 continue
 
-            ch_id = self.discord.channels.get(ev.channel_key) or self.discord.channels.get("risk", "")
+            if ev.channel_key in ("daily_pnl", "daily_summary", "weekly_eli5", "announcements"):
+                ch_id = (
+                    self.discord.channels.get(ev.channel_key)
+                    or (
+                        self.discord.channels.get("daily_pnl")
+                        if ev.channel_key in ("daily_summary", "weekly_eli5")
+                        else ""
+                    )
+                    or self.discord.channels.get("announcements", "")
+                )
+            else:
+                ch_id = self.discord.channels.get(ev.channel_key) or self.discord.channels.get("risk", "")
             has_discord = bool(self.discord.token and ch_id)
             want_telegram = bool(
                 self.telegram.enabled

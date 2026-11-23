@@ -1055,16 +1055,25 @@ class StockAgentScheduler:
     async def _send_daily_summary(self):
         """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""
         try:
-            from stock_agent.reporting import ReportBuilder
+            from stock_agent.reporting import ReportBuilder, _safe_report_reason
 
             now = _now_et()
-            self._daily_summary_sent_today = now.strftime("%Y-%m-%d")
+            day_key = now.strftime("%Y-%m-%d")
+            self._daily_summary_sent_today = day_key
             snap = self.ledger.last_snapshot() if self.ledger is not None else None
-            if snap is None and self.ledger is not None:
+            snap_stale = (
+                snap is None
+                or snap.as_of.astimezone(ET).date() != now.date()
+                or (now - snap.as_of.astimezone(ET)) > timedelta(minutes=15)
+            )
+            if snap_stale and self.ledger is not None and hasattr(self.ledger, "refresh"):
                 try:
                     snap = await self.ledger.refresh("daily_summary")
                 except Exception as exc:
-                    logger.warning("Daily summary refresh fallback failed: %s", exc)
+                    logger.warning("Daily summary refresh fallback failed (%s)", type(exc).__name__)
+
+            raw_cr = getattr(self, "_last_close_report", None)
+            close_report = raw_cr if getattr(raw_cr, "session_date", None) == now.date() else None
 
             builder = ReportBuilder(
                 self.config,
@@ -1076,57 +1085,134 @@ class StockAgentScheduler:
                 research_store=getattr(self, "research_store", None),
                 clock=_now_utc,
             )
-            embeds = await builder.build_daily_summary(
-                snapshot=snap,
-                close_report=getattr(self, "_last_close_report", None),
-                as_of=now,
-            )
 
-            if self.alerts is not None:
-                self.alerts.alert(
-                    "info",
-                    f"Daily Summary — {now.strftime('%Y-%m-%d')}",
-                    "",
-                    key=f"daily_summary:{now.strftime('%Y-%m-%d')}",
-                    channel_key="daily_summary",
-                    embeds=embeds,
+            daily_status = "skipped"
+            try:
+                embeds = await builder.build_daily_summary(
+                    snapshot=snap,
+                    close_report=close_report,
+                    as_of=now,
                 )
-            elif self.discord is not None:
-                ch = self.discord.channels.get("daily_summary") or self.discord.channels.get("announcements", "")
-                if ch:
-                    await self.discord._send_multi_embed(ch, embeds)
+                if self.alerts is not None:
+                    enq = self.alerts.alert(
+                        "info",
+                        f"Daily Summary — {day_key}",
+                        "",
+                        key=f"daily_summary:{day_key}",
+                        channel_key="daily_pnl",
+                        embeds=embeds,
+                    )
+                    daily_status = "enqueued" if enq else "suppressed"
+                elif self.discord is not None:
+                    ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                    if ch:
+                        ok = await self.discord._send_multi_embed(ch, embeds)
+                        daily_status = "delivered" if ok else "delivery_failed"
+            except Exception as e:
+                daily_status = f"degraded:{type(e).__name__}"
+                reason = _safe_report_reason(e, self.config)
+                logger.error("Daily summary failed (%s)", type(e).__name__)
+                fallback_embeds = [
+                    {
+                        "title": f"📊 Daily Summary — {day_key}",
+                        "description": f"report unavailable: {reason}",
+                        "color": 0xEF4444,
+                    }
+                ]
+                try:
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "warning",
+                            f"Daily Summary — {day_key}",
+                            f"report unavailable: {reason}",
+                            key=f"daily_summary_unavailable:{day_key}",
+                            channel_key="daily_pnl",
+                            embeds=fallback_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, fallback_embeds)
+                except Exception as alert_err:
+                    logger.warning("Daily summary fallback alert failed (%s)", type(alert_err).__name__)
 
             # Emit the weekly paper-test scorecard on Friday (or if Friday is a holiday, Thursday)
             is_week_end = now.weekday() == 4
-            if not is_week_end and now.weekday() == 3 and getattr(self, "calendar", None) is not None:
+            cal = getattr(self, "calendar", None)
+            if not is_week_end and now.weekday() == 3 and cal is not None:
                 try:
-                    is_week_end = self.calendar.session_on(now.date() + timedelta(days=1)) is None
+                    is_week_end = cal.session_on(now.date() + timedelta(days=1)) is None
                 except Exception:
                     is_week_end = False
+
             if is_week_end:
-                wk_embeds, _ = await builder.build_weekly_scorecard(snapshot=snap, as_of=now)
-                if self.alerts is not None:
-                    self.alerts.alert(
-                        "info",
-                        f"Weekly Scorecard — {now.strftime('%Y-%m-%d')}",
-                        "",
-                        key=f"weekly_scorecard:{now.strftime('%Y-%W')}",
-                        channel_key="daily_summary",
-                        embeds=wk_embeds,
-                    )
-                elif self.discord is not None:
-                    ch = self.discord.channels.get("daily_summary") or self.discord.channels.get("announcements", "")
-                    if ch:
-                        await self.discord._send_multi_embed(ch, wk_embeds)
+                try:
+                    wk_embeds, _ = await builder.build_weekly_scorecard(snapshot=snap, as_of=now)
+                    if wk_embeds and cal is not None and hasattr(cal, "session_on"):
+                        try:
+                            sess = cal.session_on(now.date())
+                            if sess is not None and now < sess.closes_at.astimezone(ET) + timedelta(minutes=16):
+                                wk_embeds[0] = dict(wk_embeds[0])
+                                wk_embeds[0]["description"] = (
+                                    str(wk_embeds[0].get("description") or "")
+                                    + " Note: generated before post-close shadow replay (+16m) window completed."
+                                ).strip()
+                        except Exception:
+                            pass
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "info",
+                            f"Weekly Scorecard — {day_key}",
+                            "",
+                            key=f"weekly_scorecard:{now.strftime('%Y-%W')}",
+                            channel_key="daily_pnl",
+                            embeds=wk_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, wk_embeds)
+                except Exception as wk_err:
+                    reason = _safe_report_reason(wk_err, self.config)
+                    logger.error("Weekly scorecard failed (%s)", type(wk_err).__name__)
+                    wk_fallback = [
+                        {
+                            "title": f"📈 Weekly Scorecard — {day_key}",
+                            "description": f"report unavailable: {reason}",
+                            "color": 0xEF4444,
+                        }
+                    ]
+                    try:
+                        if self.alerts is not None:
+                            self.alerts.alert(
+                                "warning",
+                                f"Weekly Scorecard — {day_key}",
+                                f"report unavailable: {reason}",
+                                key=f"weekly_scorecard_unavailable:{now.strftime('%Y-%W')}",
+                                channel_key="daily_pnl",
+                                embeds=wk_fallback,
+                            )
+                        elif self.discord is not None:
+                            ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                            if ch:
+                                await self.discord._send_multi_embed(ch, wk_fallback)
+                    except Exception as alert_err:
+                        logger.warning("Weekly scorecard fallback alert failed (%s)", type(alert_err).__name__)
 
             if self.alerts is not None:
-                await self.alerts.flush()
-            logger.info("Daily summary sent (%d embeds)", len(embeds))
-        except Exception as e:
-            logger.exception("Daily summary failed: %s", e)
-            if self.alerts is not None:
-                self.alerts.alert_unhandled_exception("daily_summary", e)
-                await self.alerts.flush()
+                try:
+                    sent = await self.alerts.flush()
+                    logger.info(
+                        "Daily summary outcome=%s (outbox flushed=%s)",
+                        daily_status,
+                        sent,
+                    )
+                except Exception as flush_err:
+                    logger.warning("Daily summary outbox flush failed (%s)", type(flush_err).__name__)
+            else:
+                logger.info("Daily summary outcome=%s", daily_status)
+        except Exception as outer_err:
+            logger.error("Daily summary outer guard caught %s", type(outer_err).__name__)
 
     async def _run_options_scan(self):
         """Once-per-session options entry scan via OptionsManager.
@@ -1173,16 +1259,21 @@ class StockAgentScheduler:
     async def _send_morning_brief(self):
         """Honest morning brief posted to #announcements from reconciled state."""
         try:
-            from stock_agent.reporting import ReportBuilder
+            from stock_agent.reporting import ReportBuilder, _safe_report_reason
 
             now = _now_et()
-            self._morning_brief_done_today = now.strftime("%Y-%m-%d")
+            day_key = now.strftime("%Y-%m-%d")
+            self._morning_brief_done_today = day_key
             snap = self.ledger.last_snapshot() if self.ledger is not None else None
-            if snap is None and self.ledger is not None:
+            snap_stale = (
+                snap is None
+                or (now - snap.as_of.astimezone(ET)) > timedelta(minutes=15)
+            )
+            if snap_stale and self.ledger is not None and hasattr(self.ledger, "refresh"):
                 try:
                     snap = await self.ledger.refresh("morning_brief")
                 except Exception as exc:
-                    logger.warning("Morning brief refresh fallback failed: %s", exc)
+                    logger.warning("Morning brief refresh fallback failed (%s)", type(exc).__name__)
 
             macro_embed: dict | None = None
             macro_svc = getattr(self, "macro", None)
@@ -1195,7 +1286,7 @@ class StockAgentScheduler:
                         macro_embed = macro_svc.format_discord_brief(macro_snap)
                         macro_embed["title"] = "\U0001f30d Market Conditions"
                 except Exception as exc:
-                    logger.warning("Could not fetch macro data for morning brief: %s", exc)
+                    logger.warning("Could not fetch macro data for morning brief (%s)", type(exc).__name__)
 
             builder = ReportBuilder(
                 self.config,
@@ -1207,33 +1298,71 @@ class StockAgentScheduler:
                 research_store=getattr(self, "research_store", None),
                 clock=_now_utc,
             )
-            embeds = await builder.build_morning_brief(
-                snapshot=snap,
-                as_of=now,
-                macro_embed=macro_embed,
-            )
 
-            if self.alerts is not None:
-                self.alerts.alert(
-                    "info",
-                    f"Morning Brief — {now.strftime('%Y-%m-%d')}",
-                    "",
-                    key=f"morning_brief:{now.strftime('%Y-%m-%d')}",
-                    channel_key="announcements",
-                    embeds=embeds,
+            brief_status = "skipped"
+            try:
+                embeds = await builder.build_morning_brief(
+                    snapshot=snap,
+                    as_of=now,
+                    macro_embed=macro_embed,
                 )
-                await self.alerts.flush()
-            elif self.discord is not None:
-                ch = self.discord.channels.get("announcements", "")
-                if ch:
-                    await self.discord._send_multi_embed(ch, embeds)
+                if self.alerts is not None:
+                    enq = self.alerts.alert(
+                        "info",
+                        f"Morning Brief — {day_key}",
+                        "",
+                        key=f"morning_brief:{day_key}",
+                        channel_key="announcements",
+                        embeds=embeds,
+                    )
+                    brief_status = "enqueued" if enq else "suppressed"
+                elif self.discord is not None:
+                    ch = self.discord.channels.get("announcements", "")
+                    if ch:
+                        ok = await self.discord._send_multi_embed(ch, embeds)
+                        brief_status = "delivered" if ok else "delivery_failed"
+            except Exception as e:
+                brief_status = f"degraded:{type(e).__name__}"
+                reason = _safe_report_reason(e, self.config)
+                logger.error("Morning brief failed (%s)", type(e).__name__)
+                fallback_embeds = [
+                    {
+                        "title": f"☕ Morning Brief — {day_key}",
+                        "description": f"report unavailable: {reason}",
+                        "color": 0xEF4444,
+                    }
+                ]
+                try:
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "warning",
+                            f"Morning Brief — {day_key}",
+                            f"report unavailable: {reason}",
+                            key=f"morning_brief_unavailable:{day_key}",
+                            channel_key="announcements",
+                            embeds=fallback_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, fallback_embeds)
+                except Exception as alert_err:
+                    logger.warning("Morning brief fallback alert failed (%s)", type(alert_err).__name__)
 
-            logger.info("Morning brief sent — %d embeds", len(embeds))
-        except Exception as e:
-            logger.exception("Morning brief failed: %s", e)
             if self.alerts is not None:
-                self.alerts.alert_unhandled_exception("morning_brief", e)
-                await self.alerts.flush()
+                try:
+                    sent = await self.alerts.flush()
+                    logger.info(
+                        "Morning brief outcome=%s (outbox flushed=%s)",
+                        brief_status,
+                        sent,
+                    )
+                except Exception as flush_err:
+                    logger.warning("Morning brief outbox flush failed (%s)", type(flush_err).__name__)
+            else:
+                logger.info("Morning brief outcome=%s", brief_status)
+        except Exception as outer_err:
+            logger.error("Morning brief outer guard caught %s", type(outer_err).__name__)
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
