@@ -86,7 +86,8 @@ Key environment variables (see [`.env.example`](.env.example) for the full templ
 ## Deployment & CI
 
 - **CI (`.github/workflows/ci.yml`):** Runs Python 3.12 syntax check, `ruff check .`, full `pytest` suite, and Gitleaks secret scanning (`gitleaks/gitleaks-action@v3` with `.gitleaks.toml`) on every pull request and push to `master`.
-- **In-place VPS updater (`deploy/update_release.py`):** Triggered by cron via `deploy/auto_update.sh`. Verifies that GitHub Actions CI passed for the exact target `master` commit SHA before fast-forwarding, installing `requirements.txt`, running preflight checks, and restarting `stock-agent.service` (with automatic rollback on failure).
+- **In-place VPS updater (`deploy/update_release.py`):** Cron verifies CI for the exact target `master` commit and confirms the market is closed with at least 30 minutes before the next open. It updates the checkout and verifies the restarted service's readiness, rolling back if an update to a running service fails.
+- **Recovery after a failed update:** If systemd shows the bot as `failed`, pushing a new fix or revert to `master` lets cron attempt recovery at the next closed-market check after CI passes. Cron will not keep retrying the failed SHA. Stopping the bot on purpose with `systemctl stop` leaves it `inactive`; cron does not start an inactive service.
 - **Fresh VPS bootstrap (`deploy/setup.sh`):** One-time provisioning script for a clean Ubuntu 24.04 droplet (refuses to overwrite an existing installation).
 
 ---
