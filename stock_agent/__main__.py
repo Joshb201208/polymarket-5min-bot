@@ -28,7 +28,7 @@ async def _serve(config: Settings) -> None:
 
 def main() -> None:
     try:
-        settings = load_settings(load_dotenv_file=True, require_runtime_secrets=True)
+        settings = load_settings(load_dotenv_file=True, require_runtime_secrets=True, warn_retired=True)
     except SettingsError as exc:
         raise SystemExit(str(exc)) from None
     configure_logging(settings)

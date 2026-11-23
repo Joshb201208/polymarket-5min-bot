@@ -38,7 +38,11 @@ def test_default_broker_endpoint_is_the_paper_endpoint():
 
 def test_equity_limit_values():
     assert Config.MAX_POSITION_PCT == 0.15
-    assert Config.MAX_TOTAL_EXPOSURE == 1.00
+    assert Config.MARGIN_ENABLED is True
+    assert Config.MAX_GROSS_EXPOSURE_PCT == 2.00
+    assert Config.MARGIN_MIN_EXCESS_PCT == 0.25
+    assert Config.MARGIN_TRIM_EXCESS_PCT == 0.15
+    assert Config.MARGIN_INTEREST_RATE_PCT == 6.5
     assert Config.MAX_POSITIONS == 20
     assert Config.MAX_SECTOR_PCT == 0.40
     assert Config.MAX_CLUSTER_PCT == 0.48

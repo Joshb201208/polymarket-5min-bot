@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -66,7 +66,136 @@ def option(*, loss="3000", debit="3000", **kwargs):
 
 @pytest.fixture
 def risk():
-    return RiskManager(Config())
+    return RiskManager(Config(MARGIN_ENABLED=False))
+
+
+@dataclass(frozen=True)
+class _MarginBook(BookSnapshot):
+    # These match the ledger's broker-mapped margin fields.
+    regt_buying_power: Decimal | None = None
+    maintenance_margin: Decimal | None = None
+    options_buying_power: Decimal | None = None
+    non_marginable_buying_power: Decimal | None = None
+    margin_call: bool | None = None
+
+
+def margin_book(*holdings, regt="25000", maintenance=None, **kwargs):
+    return _MarginBook(**(vars(snapshot(*holdings, **kwargs)) | {
+        "regt_buying_power": D(regt) if regt is not None else None,
+        "maintenance_margin": D(maintenance) if maintenance is not None else None,
+    }))
+
+
+def test_margin_allows_negative_cash_with_reserved_overnight_buying_power():
+    risk = RiskManager(Config())
+    controls = RiskControls(option_commitments=(OptionCommitment("pending-opt", D(400), D(400)),))
+    pending = order("BETA", qty="20", done="10")
+    book = margin_book(cash="100", regt="4400", orders=(pending, pending))
+    verdict = risk.evaluate_trade(book, buy(), controls=controls)
+    assert verdict.ok and verdict.after.free_cash == D(-2300)
+    assert verdict.after.overnight_buying_power == D(2000)
+    assert risk.evaluate_trade(book, buy(qty="11"), controls=controls).reasons == ("buying_power_floor",)
+    assert risk.propose_equity_qty(book, buy(), controls=controls) == 10
+    assert risk.evaluate_trade(replace(book, regt_buying_power=None), buy()).reasons == ("buying_power_floor",)
+
+
+def test_margin_gross_cap_and_cash_only_kill_switch():
+    holdings = tuple(
+        stock(f"HOLD{i:02d}", qty, sector)
+        for i, (qty, sector) in enumerate(
+            [(140, sector) for sector in ("Energy", "Materials", "Industrials",
+                                         "Financials", "Health Care", "Technology", "Utilities") for _ in range(2)]
+        )
+    )
+    book = margin_book(*holdings, cash="50000", maintenance="60000")
+    risk = RiskManager(Config())
+    assert risk.evaluate_trade(book, buy(qty="40")).ok
+    assert risk.evaluate_trade(book, buy(qty="41")).reasons == ("gross_cap",)
+    cash_only = RiskManager(Config(MARGIN_ENABLED=False))
+    assert cash_only.evaluate_trade(book, buy(qty="40")).reasons == ("gross_cap",)
+    assert cash_only.margin_status(book) is None
+    assert not cash_only.plan_margin_trim(book, force=True)
+
+
+def test_margin_buffer_uses_broker_base_and_projected_pending_and_trade():
+    risk = RiskManager(Config())
+    pending = order("BETA", qty="10", done="0")
+    book = margin_book(maintenance="74400", orders=(pending,))
+    assert risk.margin_status(book).excess_pct == D(".256")
+    verdict = risk.evaluate_trade(book, buy())
+    assert verdict.ok and verdict.after.maintenance_margin == D(75000)
+    refused = risk.evaluate_trade(book, buy(qty="11"))
+    assert refused.reasons == ("margin_buffer",)
+
+
+def test_margin_fallback_rates_for_ordinary_cheap_and_leveraged_holdings():
+    risk = RiskManager(Config())
+    book = margin_book(stock("AAPL", 10, "Technology"), stock("CHEAP", 1000, "Utilities", price="2"),
+                       stock("QLD", 10, None), stock("TQQQ", 10, None))
+    assert risk.margin_status(book).maintenance_margin == D(3550)
+
+
+def test_margin_trim_ranks_by_conviction_then_loss_and_never_sells_pledged_shares():
+    risk = RiskManager(Config())
+    weakest = replace(stock("WEAK", 140, "Industrials", available=40), avg_cost=D(120))
+    tied_loss = replace(stock("LOSS", 200, "Financials", available=0), avg_cost=D(150))
+    tied_loss = replace(tied_loss, meta=replace(tied_loss.meta, stop_order_id="owned-stop"))
+    owned_stop = replace(order("LOSS", qty="200", done="0", order_id="owned-stop"),
+                         side="sell", type="stop", time_in_force="gtc")
+    strong = replace(stock("STRONG", 400, "Utilities"), avg_cost=D(300))
+    book = margin_book(weakest, tied_loss, strong, orders=(owned_stop,), legs=(leg("WEAK", -1),),
+                       maintenance="86000")
+    controls = RiskControls(holding_convictions={"WEAK": 6, "LOSS": 6, "STRONG": 9})
+    assert risk.margin_status(book).needs_trim
+    assert [(t.symbol, t.qty, t.reason) for t in risk.plan_margin_trim(book, controls=controls)] == [
+        ("LOSS", D(200), "margin_buffer"), ("WEAK", D(40), "margin_buffer"),
+        ("STRONG", D(127), "margin_buffer"),
+    ]
+    improving = replace(book, maintenance_margin=D(80000))
+    assert not risk.plan_margin_trim(improving, controls=controls)
+    assert risk.plan_margin_trim(improving, controls=controls, force=True)[0].qty == D(167)
+    assert risk.plan_margin_trim(replace(improving, margin_call=True), controls=controls)
+
+
+def test_margin_drawdown_throttle_never_adds_to_debit_but_can_trade_at_zero_cash():
+    risk = RiskManager(Config())
+    book = margin_book(cash="1000")
+    controls = RiskControls(drawdown=DrawdownState(drawdown=D(".15")))
+    permitted = risk.evaluate_trade(book, buy(), controls=controls)
+    assert permitted.ok and permitted.after.free_cash == 0
+    assert risk.evaluate_trade(book, buy(qty="11"), controls=controls).reasons == (
+        "drawdown_no_new_borrowing",
+    )
+    assert risk.propose_equity_qty(book, buy(), controls=controls) == 10
+
+
+def test_margin_options_use_nonmarginable_funds_and_short_cover_ignores_cash():
+    risk = RiskManager(Config())
+    book = margin_book(cash="-100")
+    assert risk.evaluate_trade(book, option()).reasons == ("options_buying_power",)
+    nonmargin = replace(book, non_marginable_buying_power=D(4000))
+    assert risk.evaluate_trade(nonmargin, option()).ok
+    assert risk.evaluate_trade(replace(nonmargin, regt_buying_power=D(0)), option()).reasons == (
+        "buying_power_floor",
+    )
+    assert risk.evaluate_trade(replace(nonmargin, options_buying_power=D(2999)), option()).reasons == (
+        "options_buying_power",
+    )
+    short = replace(book, holdings=(stock("SHORT", -20, "Energy"),), margin_call=True)
+    cover = TradeIntent(TradeKind.BUY_TO_COVER, "SHORT", D(20), D(100))
+    assert risk.evaluate_trade(short, cover, controls=RiskControls(pause_new_buys=True)).ok
+    assert risk.evaluate_trade(short, replace(cover, qty=D(21))).reasons == ("cover_exceeds_short",)
+
+
+@pytest.mark.parametrize("margin_enabled", [False, True])
+def test_debit_close_never_checks_cash_or_buying_power(margin_enabled):
+    risk = RiskManager(Config(MARGIN_ENABLED=margin_enabled))
+    short_call = replace(leg("ALFA", -1), occ_symbol="ALFA261218C00100000")
+    book = replace(margin_book(cash="-100", regt="0", legs=(short_call,)), options_buying_power=D(0))
+    close = TradeIntent(TradeKind.OPTION_CLOSE, short_call.occ_symbol, D(1),
+                        option_cash_debit=D(500), fee=D(1))
+    assert risk.evaluate_trade(book, close, controls=RiskControls(pause_new_buys=True)).ok
+    assert risk.evaluate_trade(book, replace(close, qty=D(2))).reasons == ("no_option_to_close",)
 
 
 def test_projected_full_order_cash_floor_ignores_buying_power(risk):
@@ -294,14 +423,14 @@ def test_hedging_long_call_is_not_counted_as_stock_coverage(risk):
     assert not risk.evaluate_trade(book, TradeIntent(TradeKind.SELL, "ALFA", D(21))).ok
 
 
-def test_any_unexpected_short_blocks_buys_but_not_funded_cover(risk):
+def test_any_unexpected_short_blocks_buys_but_not_cover_even_in_cash_only_mode(risk):
     book = snapshot(stock("ALFA", -2, "Industrials"), cash="250")
     assert risk.evaluate_trade(book, buy("BETA")).reasons == ("unexpected_short",)
     repair, = risk.plan_remediation(book)
     assert repair.kind == TradeKind.BUY_TO_COVER and repair.qty == 2
     assert risk.evaluate_trade(book, repair, controls=RiskControls(pause_new_buys=True)).ok
     assert not risk.evaluate_trade(book, replace(repair, qty=D(3))).ok
-    assert not risk.evaluate_trade(book, replace(repair, price=D(130))).ok
+    assert risk.evaluate_trade(book, replace(repair, price=D(130))).ok
 
 
 def test_unknown_broker_or_unbounded_pending_order_denies_new_entries(risk):

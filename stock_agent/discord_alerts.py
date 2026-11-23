@@ -466,7 +466,8 @@ class DiscordReporter:
             {"name": "Mode", "value": f"`{mode}`", "inline": True},
             {"name": "Available Cash", "value": f"${cash:,.0f}", "inline": True},
             {"name": "Max Position", "value": f"{self.config.MAX_POSITION_PCT:.0%}", "inline": True},
-            {"name": "Max Exposure", "value": f"{self.config.MAX_TOTAL_EXPOSURE:.0%}", "inline": True},
+            {"name": "Max Gross Exposure", "value": f"{self.config.effective_max_gross_exposure_pct:.0%}",
+             "inline": True},
             {"name": "Stop Protection", "value": stop_desc, "inline": True},
             {"name": "Min Conviction", "value": f"{min_conv}/10", "inline": True},
         ]
