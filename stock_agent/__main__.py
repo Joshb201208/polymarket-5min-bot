@@ -1,9 +1,9 @@
 import asyncio
 import fcntl
-import logging
 import signal
 
-from stock_agent.config import Settings, SettingsError, load_settings
+from stock_agent.config import Config, Settings, SettingsError, load_settings
+from stock_agent.logging_setup import configure_logging
 from stock_agent.scheduler import StockAgentScheduler
 
 
@@ -31,9 +31,9 @@ def main() -> None:
         settings = load_settings(load_dotenv_file=True, require_runtime_secrets=True)
     except SettingsError as exc:
         raise SystemExit(str(exc)) from None
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(_serve(settings))
+    configure_logging(settings)
+    runtime_config = Config(**{name: getattr(settings, name) for name in Settings.model_fields})
+    asyncio.run(_serve(runtime_config))
 
 
 if __name__ == "__main__":
