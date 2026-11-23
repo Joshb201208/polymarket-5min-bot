@@ -90,6 +90,8 @@ class StockAgentScheduler:
         self.alerts = service("alerts", lambda: AlertService(
             self.config, discord=self.discord, telegram=self.telegram, journal=self.journal, clock=_now_utc,
         ))
+        if isinstance(self.alerts, AlertService) and hasattr(self.ledger, "set_exit_fill_handler"):
+            self.ledger.set_exit_fill_handler(self.alerts.alert_stop_filled)   # REQ-061: stop fills -> #trades
         self.heartbeat = service("heartbeat", lambda: HeartbeatClient(self.config, clock=_now_utc))
         self.http = service("http", lambda: DataHttpClient(self.config))
         self.risk = service("risk", lambda: RiskManager(self.config))

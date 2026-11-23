@@ -220,6 +220,42 @@ def _ingest_activities(ledger: Ledger, acts: list[dict]) -> list[dict]:
     return new
 
 
+def _alert_broker_exits(ledger: Ledger, new_acts: list[dict], open_meta: dict, now: datetime) -> int:
+    """Trade alert for newly seen exit fills of open stock positions that the bot
+    did not submit as an intent (a resting stop, or an order placed elsewhere).
+    Only new activities are considered, so a replayed reconcile never re-alerts."""
+    by_order: dict[str, list[dict]] = {}
+    for a in new_acts:
+        if a.get("activity_type") != "FILL" or not str(a.get("side", "")).startswith("sell"):
+            continue
+        sym = a.get("symbol")
+        meta = open_meta.get(sym)
+        when = _dt(_activity_ts(a))
+        if meta is None or meta.asset_class != "us_equity" or when is None or now - when > timedelta(days=3):
+            continue
+        by_order.setdefault(str(a.get("order_id") or a.get("id")), []).append(a)
+    prev = ledger.last_snapshot()
+    n = 0
+    for oid, rows in by_order.items():
+        if ledger.store.query("SELECT 1 FROM order_intents WHERE broker_order_id=?", (oid,)):
+            continue        # the bot's own exit: execution reports it
+        sym = str(rows[0]["symbol"])
+        meta = open_meta[sym]
+        qty = sum((abs(_dec(r.get("qty")) or ZERO) for r in rows), ZERO)
+        if qty <= 0:
+            continue
+        price = sum((abs(_dec(r.get("qty")) or ZERO) * (_dec(r.get("price")) or ZERO) for r in rows), ZERO) / qty
+        held = prev.holding(sym) if prev is not None else None
+        pnl = ((price - held.avg_cost) * qty).quantize(Decimal("0.01")) if held is not None and held.qty > 0 else None
+        last = max((_dt(_activity_ts(r)) for r in rows), default=None)
+        days = (last.date() - meta.opened_at.date()).days if last and meta.opened_at else None
+        kind = "stop" if meta.stop_order_id and oid == str(meta.stop_order_id) else "broker_exit"
+        ledger._raise_exit_fill(symbol=sym, qty=qty, fill_price=price.quantize(Decimal("0.0001")), kind=kind,
+                                realized_pnl=pnl, hold_days=days, order_id=oid)
+        n += 1
+    return n
+
+
 def _rescale_stops_for_splits(ledger: Ledger, new_acts: list[dict]) -> list[Diff]:
     """Recorded stops are in pre-split dollars after a split. Rescale them for
     newly seen split activity, unless the execution engine keeps its own basis
@@ -447,6 +483,8 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     new_acts = _ingest_activities(ledger, acts)
     diffs.extend(_rescale_stops_for_splits(ledger, new_acts))
     await _link_own_orders(ledger, broker, acts)
+    if ledger.last_reconcile() is not None:      # never alert history on the very first reconcile
+        _alert_broker_exits(ledger, new_acts, open_meta, now)
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())

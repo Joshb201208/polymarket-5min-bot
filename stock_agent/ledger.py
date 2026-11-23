@@ -443,6 +443,7 @@ class Ledger:
         self._refresh_starts = 0
         self._alert_tasks: set = set()
         self._listeners: list[Callable[[BookSnapshot], Any]] = []
+        self._exit_fill_handler: Callable[..., Any] | None = None
         self._snapshot_start_seq = -1
 
     def now(self) -> datetime:
@@ -490,6 +491,42 @@ class Ledger:
         self.store.kv_set("symbol_aliases", aliases)
         self.journal.append("state_event", event="symbol_alias", old=old, new=new, source=source,
                             effective=effective)
+
+    def set_exit_fill_handler(self, fn: Callable[..., Any] | None) -> None:
+        """Trade alert for broker stop fills the bot did not submit in this process.
+
+        Called as ``fn(symbol, qty, fill_price, *, realized_pnl, hold_days, order_id)``,
+        the shape of ``AlertService.alert_stop_filled``. Without a handler the
+        generic ledger alert path is used (WARNING, key ``stop_filled:SYM:order``); other
+        broker-side exits (orders placed outside the bot) always use the generic path."""
+        self._exit_fill_handler = fn
+
+    def _raise_exit_fill(self, *, symbol: str, qty: Decimal, fill_price: Decimal, kind: str,
+                         realized_pnl: Decimal | None, hold_days: int | None, order_id: str | None) -> None:
+        self.journal.append("exit.broker_fill", symbol=symbol, qty=qty, fill_price=fill_price, exit_kind=kind,
+                            realized_pnl=realized_pnl, hold_days=hold_days, order_id=order_id)
+        q = int(qty) if qty == qty.to_integral_value() else float(qty)
+        pnl = None if realized_pnl is None else float(realized_pnl)
+        if self._exit_fill_handler is not None and kind == "stop":
+            try:
+                res = self._exit_fill_handler(symbol, q, float(fill_price), realized_pnl=pnl, hold_days=hold_days,
+                                              order_id=order_id)
+                if inspect.isawaitable(res):
+                    task = asyncio.get_running_loop().create_task(res)
+                    self._alert_tasks.add(task)
+                    task.add_done_callback(self._alert_tasks.discard)
+                return
+            except Exception as e:  # fall back to the generic path
+                logger.error("exit fill alert failed: %s", e)
+        what = "stop filled" if kind == "stop" else "broker-side exit filled"
+        body = f"{what}: sold {q} {symbol} at {float(fill_price):.2f}."
+        if pnl is not None:
+            body += f" Realised P&L {pnl:+.2f}."
+        if hold_days is not None:
+            body += f" Held {hold_days} days."
+        self._raise_alert(Severity.WARNING, f"Stop-loss triggered on {symbol}" if kind == "stop"
+                          else f"Position reduced at the broker: {symbol}", body,
+                          key=f"stop_filled:{symbol}:{order_id}" if order_id else None)
 
     def add_snapshot_listener(self, fn: Callable[[BookSnapshot], Any]) -> None:
         """Call ``fn(snapshot)`` after every successful refresh (e.g. the legacy

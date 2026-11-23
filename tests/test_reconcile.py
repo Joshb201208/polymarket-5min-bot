@@ -99,7 +99,9 @@ def test_reconcile_close_explained_by_stop_fill(tmp_path):
     snap = run(led.refresh("after stop"))
     [d] = [d for d in snap.diffs if d.kind == DiffKind.CLOSED]
     assert d.severity == Severity.INFO and "sell fill" in d.explanation
-    assert not any(a[0] in ("warning", "critical") for a in alerts)
+    assert not any(a[1].startswith("Books") for a in alerts)          # the books are fine
+    [trade] = [a for a in alerts if "AAA" in a[1]]                     # but the owner hears about the exit
+    assert "92.00" in trade[2]
 
 
 def test_reconcile_unexplained_close_is_critical(tmp_path):
@@ -394,7 +396,7 @@ def test_small_book_stop_fill_is_not_mass_close(tmp_path):
     del b.positions["BBB"]
     snap = run(led.refresh("stop"))
     assert not any(d.kind == DiffKind.MASS_CLOSE for d in snap.diffs)
-    assert alerts == []
+    assert [a[3] for a in alerts] == ["stop_filled:BBB:o0"]       # only the trade alert, no books alarm
 
 
 def test_own_filled_buy_opens_position_with_its_thesis(tmp_path):
@@ -544,3 +546,81 @@ def test_legacy_ssp_unknown_ratio_clears_recorded_stop(tmp_path):
     assert led.open_position_meta("AAA").stop_price is None
     assert led.open_position_meta("AAA").position_id == m.position_id
     assert not any(d.kind == DiffKind.IMPORTED for d in snap.diffs)
+
+
+def _stop_setup(tmp_path, alerts):
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-16T15:00:00Z")
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    run(led.refresh("first", rebuild=True))
+    m = led.open_position_meta("AAA")
+    led.set_stop(m.position_id, 93, "stop-ord-1")
+    return b, led
+
+
+def test_broker_stop_fill_raises_trade_alert_once(tmp_path):
+    alerts = []
+    b, led = _stop_setup(tmp_path, alerts)
+    calls = []
+    led.set_exit_fill_handler(lambda *a, **k: calls.append((a, k)))
+    a = b.fill("AAA", "sell", 10, 92.5, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "stop-ord-1"
+    del b.positions["AAA"]
+    run(led.refresh("after stop"))
+    [(args, kw)] = calls
+    assert args == ("AAA", 10, 92.5) and kw["order_id"] == "stop-ord-1"
+    assert kw["realized_pnl"] == pytest.approx(-75.0) and kw["hold_days"] == 7
+    [row] = list(led.journal.read(kinds={"exit.broker_fill"}))
+    assert row["exit_kind"] == "stop"
+    run(led.refresh("replay", rebuild=True))
+    assert len(calls) == 1                                    # replay does not re-alert
+
+
+def test_broker_exit_fill_without_handler_uses_ledger_alert(tmp_path):
+    alerts = []
+    b, led = _stop_setup(tmp_path, alerts)
+    b.fill("AAA", "sell", 4, 110, ts="2026-11-23T15:00:00Z")    # sold elsewhere, partial
+    b.pos("AAA", 6, 100)
+    run(led.refresh("after manual sell"))
+    hits = [x for x in alerts if "AAA" in str(x)]
+    assert hits and any("110" in str(x) for x in hits)
+
+
+def test_own_exit_and_history_do_not_alert(tmp_path):
+    from stock_agent.ledger import IntentStatus, NewIntent
+
+    alerts = []
+    b = StubBroker()
+    b.fill("AAA", "buy", 10, 100, ts="2026-11-16T15:00:00Z")
+    b.fill("AAA", "sell", 2, 99, ts="2026-11-17T15:00:00Z")        # history before first reconcile
+    b.pos("AAA", 8, 100)
+    led = make_ledger(tmp_path, broker=b, alerts=alerts)
+    calls = []
+    led.set_exit_fill_handler(lambda *a, **k: calls.append(a))
+    run(led.refresh("first", rebuild=True))
+    [iid] = led.enqueue_intents([NewIntent(symbol="AAA", side="sell", dedupe_key="sell:AAA")])
+    led.claim_intent(iid)
+    led.ack_intent(iid, IntentStatus.SUBMITTED, broker_order_id="own-1")
+    a = b.fill("AAA", "sell", 8, 105, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "own-1"
+    del b.positions["AAA"]
+    run(led.refresh("own exit"))
+    assert calls == []
+
+
+def test_stop_fill_reaches_alert_service_trades_channel(tmp_path):
+    from stock_agent.alerts import AlertService
+    from stock_agent.config import Config
+
+    alerts = []
+    b, led = _stop_setup(tmp_path, alerts)
+    svc = AlertService(Config, journal=led.journal, outbox_path=tmp_path / "outbox.json")
+    led.set_exit_fill_handler(svc.alert_stop_filled)
+    a = b.fill("AAA", "sell", 10, 92.5, ts="2026-11-23T15:00:00Z")
+    a["order_id"] = "stop-ord-1"
+    del b.positions["AAA"]
+    run(led.refresh("after stop"))
+    [item] = [i for i in svc.outbox if "AAA" in i.event.title]
+    assert item.event.channel_key == "trades" and "92.50" in item.event.body
+    assert "Realized loss: $75.00" in item.event.body
