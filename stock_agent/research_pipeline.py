@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 from dataclasses import dataclass, field, replace
@@ -32,6 +33,15 @@ class NewsEvent:
     story_id: str
     evidence: Evidence
     materiality: int
+
+    def payload(self) -> dict:
+        return {"symbol": self.symbol, "story_id": self.story_id, "materiality": self.materiality,
+                "evidence": self.evidence.model_dump(mode="json")}
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> NewsEvent:
+        return cls(payload["symbol"], payload["story_id"],
+                   Evidence.model_validate_json(json.dumps(payload["evidence"])), payload["materiality"])
 
 
 @dataclass(frozen=True)
@@ -152,16 +162,22 @@ class ResearchPipeline:
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
         if kind in {"news", "earnings"}:
-            live = getattr(self.sources, "live_news", None)
-            if kind == "news" and live is not None:
-                gathered = await live(tuple(held), focus, universe, now)
-            else:
-                gathered = await (self.sources.news(symbols, now) if kind == "news"
-                                  else self.sources.releases(symbols, now))
+            retried = tuple(NewsEvent.from_payload(row) for row in self.store.retry_story_payloads(now, kind))
+            try:
+                live = getattr(self.sources, "live_news", None)
+                if kind == "news" and live is not None:
+                    gathered = await live(tuple(held), focus, universe, now)
+                else:
+                    gathered = await (self.sources.news(symbols, now) if kind == "news"
+                                      else self.sources.releases(symbols, now))
+            except SourceUnavailable:
+                if not retried:
+                    raise
+                gathered = ()
             as_of = self.clock()
             seen = set()
             stories = []
-            for item in sorted(gathered, key=lambda event: (
+            for item in sorted((*gathered, *retried), key=lambda event: (
                 event.symbol not in held, -event.materiality, event.symbol, event.story_id,
             )):
                 if item.symbol not in symbols or item.story_id in seen or not self._fresh_story(item, as_of):
@@ -208,7 +224,10 @@ class ResearchPipeline:
                     deferred += 1
                 self.store.finish_work(
                     key, "retry" if can_retry else "unavailable",
-                    detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
+                    detail={
+                        "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts], "kind": kind,
+                        "story": story.payload() if can_retry and story else None,
+                    },
                     retry_at=self.clock() + timedelta(minutes=2 if kind == "news" else 5) if can_retry else None,
                 )
         collected, ideas = self._recover()
@@ -344,10 +363,12 @@ class ResearchPipeline:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
         if direction is not Direction.EXIT_PROPOSED or not position_id:
             if entry_blockers and self.alerts is not None:
-                await self.alerts.alert(
+                alert = self.alerts.alert(
                     "warning", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
                     key=f"research_entry_inputs:{symbol}:{':'.join(entry_blockers)}",
                 )
+                if inspect.isawaitable(alert):
+                    await alert
             return
         if confirmation_requested:
             await self._confirm(key, holding)

@@ -1068,7 +1068,7 @@ class StockAgentScheduler:
         change = await research.observe_regime()
         if change is not None:
             before, after = change
-            await self.alerts.alert(
+            await self._alert(
                 "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
                 key=f"market_regime_{before}_{after}",
             )
