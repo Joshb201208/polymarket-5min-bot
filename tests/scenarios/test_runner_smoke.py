@@ -5,7 +5,6 @@ from datetime import date, datetime, time
 import pytest
 
 from tests.fakes import ET
-from tests.fakes.bot import position
 from tests.scenarios import ScenarioRunner
 
 
@@ -23,21 +22,25 @@ def test_runner_steps_a_quiet_day_minute_by_minute(world):
 
 
 def test_runner_fires_events_and_restarts_with_same_data_dir(world):
-    seen = []
+    seen, ids = [], []
     world.price("AAA", 100.0)
     world.alpaca.seed_position("AAA", 10, 100.0)
     runner = ScenarioRunner(world)
 
-    def seed_ledger(w, r):
-        r.agent.portfolio.add_position(position("AAA", 10, 100.0))
+    def capture(w, r):
+        meta = r.agent.ledger.open_position_meta("AAA")
+        ids.append(meta.position_id if meta else None)
 
-    runner.at(et(2026, 11, 23, 10, 5), seed_ledger, "seed ledger")
+    runner.at(et(2026, 11, 23, 10, 5), capture, "position id before restart")
     runner.at(et(2026, 11, 23, 10, 10), lambda w, r: seen.append(w.clock.now_et()), "probe")
     runner.at(et(2026, 11, 23, 10, 20), runner.restart, "restart")
+    runner.at(et(2026, 11, 23, 10, 25), capture, "position id after restart")
     runner.run_until(et(2026, 11, 23, 10, 30))
     assert seen == [et(2026, 11, 23, 10, 10)]
     assert runner.builds == 2
-    assert runner.agent.portfolio.get_position("AAA") is not None  # reloaded from DATA_DIR
+    assert ids[0] is not None and ids == [ids[0], ids[0]]       # same ledger row, reloaded from DATA_DIR
+    holding = runner.agent.ledger.snapshot().holding("AAA")
+    assert holding is not None and holding.qty == 10
     kinds = [e.kind for e in runner.timeline]
     assert kinds.count("restart") == 1
 
