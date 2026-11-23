@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -12,14 +13,14 @@ from typing import Any, Protocol
 
 from stock_agent.analyst import Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, ThesisRole
-from stock_agent.llm_client import ProviderUnavailable
+from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_notes import load_notes, research_notes_payload
 from stock_agent.research_schemas import Direction, Evidence, ResearchTask
 from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
-_PRE_INFERENCE = {"auth", "quota", "model_unavailable", "rate_limit", "budget"}
+_RETRYABLE = {"auth", "quota", "model_unavailable", "rate_limit", "budget", "transport", "upstream"}
 
 
 class SourceUnavailable(RuntimeError):
@@ -145,11 +146,18 @@ class ResearchPipeline:
         if session is None:
             return JobOutcome(JobStatus.SKIPPED, detail={"reason": "no_execution_session"})
         held = {row.symbol: row for row in (snapshot or self.ledger.snapshot()).holdings if row.qty > 0}
+        for pending in self.store.due_confirmations(now):
+            await self._confirm(pending["work_key"], held.get(pending["symbol"]))
         focus = tuple(self.focus(now=now))
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
         if kind in {"news", "earnings"}:
-            gathered = await (self.sources.news(symbols, now) if kind == "news" else self.sources.releases(symbols, now))
+            live = getattr(self.sources, "live_news", None)
+            if kind == "news" and live is not None:
+                gathered = await live(tuple(held), focus, universe, now)
+            else:
+                gathered = await (self.sources.news(symbols, now) if kind == "news"
+                                  else self.sources.releases(symbols, now))
             as_of = self.clock()
             seen = set()
             stories = []
@@ -194,14 +202,14 @@ class ResearchPipeline:
                 await self._review(kind, key, item, held.get(symbol), story, session, as_of)
             except ProviderUnavailable as exc:
                 failed += 1
-                pre_inference = all(err.kind in _PRE_INFERENCE for err in exc.attempts)
-                if pre_inference:
+                state = self.store.work_state(key)
+                can_retry = state["attempts"] < 3 and _can_retry(exc)
+                if can_retry:
                     deferred += 1
                 self.store.finish_work(
-                    key, "retry" if pre_inference else "unavailable",
+                    key, "retry" if can_retry else "unavailable",
                     detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
-                    retry_at=self.clock() + timedelta(minutes=15 if kind == "news" else 5)
-                    if pre_inference else None,
+                    retry_at=self.clock() + timedelta(minutes=2 if kind == "news" else 5) if can_retry else None,
                 )
         collected, ideas = self._recover()
         incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
@@ -300,11 +308,13 @@ class ResearchPipeline:
         payload = record.model_dump(mode="json") | {"inputs": result.inputs, "job": kind}
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
         entry_blockers = ()
+        confirmation_requested = False
         with self.store.store.transaction():
+            exit_pending = self.store.has_unqueued_exit(symbol, now) or self.store.has_pending_confirmation(symbol, now)
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=not self.store.has_unqueued_exit(symbol, now),
+                activate=not exit_pending,
             )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
                 entry_blockers = self._record_entry(
@@ -317,19 +327,55 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
+            elif not exit_pending:
+                current = self.clock()
+                expiration = current + timedelta(minutes=30)
+                if story and story.evidence.published_at:
+                    expiration = min(expiration, story.evidence.published_at + timedelta(hours=24))
+                self.store.schedule_confirmation(
+                    key, symbol, position_id, current, expiration, {
+                        "thesis_id": thesis_id, "inputs": result.inputs, "provider": result.result.route.provider,
+                        "model": result.result.route.model, "evidence_ids": evidence_ids, "kind": kind,
+                        "story_id": story.story_id if story else None,
+                    },
+                )
+                confirmation_requested = True
+            else:
+                self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
         if direction is not Direction.EXIT_PROPOSED or not position_id:
             if entry_blockers and self.alerts is not None:
                 await self.alerts.alert(
-                    "WARN", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
+                    "warning", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
                     key=f"research_entry_inputs:{symbol}:{':'.join(entry_blockers)}",
                 )
             return
+        if confirmation_requested:
+            await self._confirm(key, holding)
+
+    async def _confirm(self, key: str, holding) -> None:
+        row = self.store.claim_confirmation(key, self.clock())
+        if row is None:
+            return
+        request = json.loads(row["payload_json"])
+        thesis_id, symbol, position_id = request["thesis_id"], row["symbol"], row["position_id"]
+        if not holding or not holding.meta or holding.meta.position_id != position_id:
+            with self.store.store.transaction():
+                self.store.finish_confirmation(key, "abandoned")
+                self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "position_changed"})
+            return
+        data = ResearchInput.from_payload(request["inputs"])
+        primary = ModelRoute(request["provider"], request["model"])
         try:
-            confirmation = await self.analyst.confirm_exit(data, result.result.route)
+            confirmation = await self.analyst.confirm_exit(data, primary)
         except ProviderUnavailable as exc:
-            self.store.finish_work(key, "confirmation_unavailable", thesis_id=thesis_id, detail={
-                "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts],
-            })
+            with self.store.store.transaction():
+                if row["attempts"] < 3 and _can_retry(exc):
+                    self.store.finish_confirmation(key, "waiting", retry_at=self.clock() + timedelta(minutes=2))
+                else:
+                    self.store.finish_confirmation(key, "unavailable")
+                    self.store.finish_work(key, "confirmation_unavailable", thesis_id=thesis_id, detail={
+                        "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts],
+                    })
             return
 
         with self.store.store.transaction():
@@ -345,16 +391,18 @@ class ResearchPipeline:
             execution_session = self._session(self.clock())
             if (confirmation.approved and execution_session
                     and self.store.reserve_exit(execution_session.date.isoformat(), position_id)):
-                ids = tuple(dict.fromkeys((*evidence_ids, *confirmation.result.value.evidence_ids)))
+                ids = tuple(dict.fromkeys((*request["evidence_ids"], *confirmation.result.value.evidence_ids)))
+                price = Decimal(str(data.price)) if data.price is not None else None
                 intent = self._intent(key, symbol, "sell", position_id, (thesis_id, conf_id),
-                                      price if fresh_quote else None, ids, kind, execution_session)
+                                      price, ids, request["kind"], execution_session)
                 self.store.record_proposal(key, thesis_id, intent)
             else:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id)
-        if story:
+            self.store.finish_confirmation(key, "complete")
+        if request["story_id"]:
             self.ledger.journal.append(
-                "news_reaction", story_id=story.story_id, symbol=symbol,
-                thesis_id=thesis_id, confirmation_thesis_id=conf_id, direction=direction,
+                "news_reaction", story_id=request["story_id"], symbol=symbol,
+                thesis_id=thesis_id, confirmation_thesis_id=conf_id, direction=Direction.EXIT_PROPOSED,
                 confirmed=confirmation.approved, degraded=confirmation.result.degraded_confirmation,
             )
 
@@ -367,12 +415,19 @@ class ResearchPipeline:
             gate is not None and gate.ok and gate.thesis_id == thesis_id and security.tradable
             and record.raw_conviction >= 7 and record.effective_conviction >= floor
         )
-        if qualifies and direction is Direction.BUY and (not holding or position_id and baseline
-                                                         and record.draft.thesis_change == "strengthened"):
+        baseline_grade = baseline.payload.get("effective_conviction") if baseline else None
+        strengthened = (
+            position_id is not None and baseline is not None and type(baseline_grade) is int
+            and record.effective_conviction >= baseline_grade and record.draft.thesis_change == "strengthened"
+        )
+        if qualifies and direction is Direction.BUY and (not holding or strengthened):
             intent = self._intent(key, symbol, "buy", position_id, (thesis_id,), price, evidence_ids, kind, session,
                                   {"raw_conviction": record.raw_conviction,
                                    "effective_conviction": record.effective_conviction,
+                                   "minimum_conviction": floor,
+                                   "last_filled_conviction": baseline_grade,
                                    "sector": security.sector, "thesis_change": record.draft.thesis_change,
+                                   "signal_at": record.generated_at.isoformat(),
                                    "baseline_thesis_id": baseline.thesis_id if baseline else None})
             self.store.record_proposal(key, thesis_id, intent)
         else:
@@ -405,3 +460,7 @@ def _fresh_quote(row: SecurityInputs, now: datetime, *, max_age: timedelta = tim
         price is not None and math.isfinite(price) and price > 0 and quoted is not None
         and quoted.utcoffset() is not None and now - max_age <= quoted <= now
     )
+
+
+def _can_retry(error: ProviderUnavailable) -> bool:
+    return all(attempt.kind in _RETRYABLE for attempt in error.attempts)

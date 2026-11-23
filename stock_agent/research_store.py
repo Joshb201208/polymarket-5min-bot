@@ -48,12 +48,23 @@ def _migrate_retry(conn) -> None:
     )""")
 
 
+def _migrate_confirmation(conn) -> None:
+    conn.execute("ALTER TABLE research_work ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
+    conn.execute("""CREATE TABLE research_confirmations (
+        work_key TEXT PRIMARY KEY, symbol TEXT NOT NULL, position_id TEXT NOT NULL,
+        due_at_s INTEGER NOT NULL, expires_at_s INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'waiting',
+        payload_json TEXT NOT NULL
+    )""")
+
+
 class ResearchStore:
     def __init__(self, store: StateStore, config):
         self.store = store
         self.config = config
         store.register_migration(1, "research", _migrate)
         store.register_migration(2, "research", _migrate_retry)
+        store.register_migration(3, "research", _migrate_confirmation)
 
     def available_budget(self, now: datetime) -> dict:
         rows = self.store.query(
@@ -112,20 +123,22 @@ class ResearchStore:
             )
 
     def claim_work(self, work_key: str, symbol: str, now: datetime) -> bool:
-        # Only a known pre-inference rejection permits reopening work. An
-        # ambiguous crash leaves the status 'started' and is never redrawn.
+        # An observed retryable failure can reopen work, with a hard cap.
+        # An ambiguous process crash leaves 'started' and is never redrawn.
         with self.store.transaction() as conn:
             return bool(conn.execute(
                 """INSERT INTO research_work(work_key,symbol,claimed_at,status)
                 VALUES(?,?,?,'started') ON CONFLICT(work_key) DO UPDATE SET
-                    claimed_at=excluded.claimed_at,status='started',retry_after_s=NULL
-                WHERE status='retry' AND retry_after_s<=?""",
+                    claimed_at=excluded.claimed_at,status='started',retry_after_s=NULL,attempts=attempts+1
+                WHERE status='retry' AND attempts<3 AND retry_after_s<=?""",
                 (work_key, symbol, now.isoformat(), int(now.timestamp())),
             ).rowcount)
 
     def ready(self, work_key: str, now: datetime) -> bool:
         row = self.work_state(work_key)
-        return row is None or (row["status"] == "retry" and row["retry_after_s"] <= int(now.timestamp()))
+        return row is None or (
+            row["status"] == "retry" and row["attempts"] < 3 and row["retry_after_s"] <= int(now.timestamp())
+        )
 
     def work_state(self, work_key: str):
         rows = self.store.query("SELECT * FROM research_work WHERE work_key=?", (work_key,))
@@ -136,7 +149,7 @@ class ResearchStore:
         with self.store.transaction() as conn:
             conn.execute(
                 """UPDATE research_work SET status=?, thesis_id=?, details_json=?, retry_after_s=?
-                WHERE work_key=? AND status='started'""",
+                WHERE work_key=? AND status IN ('started','confirmation_pending')""",
                 (status, thesis_id, json.dumps(detail or {}, default=str),
                  int(retry_at.timestamp()) if retry_at is not None else None, work_key),
             )
@@ -164,6 +177,49 @@ class ResearchStore:
             if intent["side"] == "sell" and datetime.fromisoformat(intent["expires_at"]) > now:
                 return True
         return False
+
+    def has_pending_confirmation(self, symbol: str, now: datetime) -> bool:
+        return bool(self.store.query(
+            """SELECT 1 FROM research_confirmations
+            WHERE symbol=? AND status IN ('waiting','checking') AND expires_at_s>? LIMIT 1""",
+            (symbol, int(now.timestamp())),
+        ))
+
+    def schedule_confirmation(self, work_key: str, symbol: str, position_id: str, now: datetime,
+                              expires_at: datetime, payload: dict) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO research_confirmations(work_key,symbol,position_id,due_at_s,expires_at_s,payload_json)
+                VALUES(?,?,?,?,?,?)""",
+                (work_key, symbol, position_id, int(now.timestamp()), int(expires_at.timestamp()),
+                 json.dumps(payload, default=str)),
+            )
+            self.finish_work(work_key, "confirmation_pending", thesis_id=payload["thesis_id"])
+
+    def due_confirmations(self, now: datetime):
+        at = int(now.timestamp())
+        return self.store.query(
+            """SELECT * FROM research_confirmations
+            WHERE status='waiting' AND due_at_s<=? AND expires_at_s>? ORDER BY due_at_s LIMIT 4""",
+            (at, at),
+        )
+
+    def claim_confirmation(self, key: str, now: datetime):
+        at = int(now.timestamp())
+        with self.store.transaction() as conn:
+            return conn.execute(
+                """UPDATE research_confirmations SET status='checking',attempts=attempts+1
+                WHERE work_key=? AND status='waiting' AND due_at_s<=? AND expires_at_s>? RETURNING *""",
+                (key, at, at),
+            ).fetchone()
+
+    def finish_confirmation(self, key: str, status: str, *, retry_at: datetime | None = None) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """UPDATE research_confirmations SET status=?, due_at_s=COALESCE(?, due_at_s)
+                WHERE work_key=? AND status IN ('waiting','checking')""",
+                (status, int(retry_at.timestamp()) if retry_at is not None else None, key),
+            )
 
     def reserve_exit(self, session: str, position_id: str) -> bool:
         with self.store.transaction() as conn:

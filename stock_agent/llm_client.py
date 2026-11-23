@@ -80,6 +80,7 @@ class LLMRequest(Generic[T]):
     primary: ModelRoute | None = None
     domains: tuple[str, ...] = ()
     validate: Callable[[T, tuple[Evidence, ...]], None] | None = None
+    exit_work: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,13 +119,14 @@ class LLMClient:
     def __init__(
         self, config, *, client: httpx.AsyncClient | None = None, spend: SpendStore | None = None,
         on_failure: Callable[[ProviderError], Awaitable[None]] | None = None,
-        now: Callable[[], datetime] | None = None,
+        now: Callable[[], datetime] | None = None, health=None,
     ):
         self.config = config
         self._client = client
         self._owns_client = client is None
         self.spend = spend
         self.on_failure = on_failure
+        self.health = health
         self.now = now or (lambda: datetime.now(UTC))
         self._health = _Health()
         self._lock = asyncio.Lock()
@@ -190,6 +192,9 @@ class LLMClient:
                     actual = ModelRoute(route.provider, response.model or route.model)
                     if request.primary and actual.underlying == request.primary.underlying:
                         raise ValueError("same underlying confirmation model")
+                    report_ok = getattr(self.health, "record_llm_ok", None)
+                    if report_ok is not None:
+                        report_ok(route.provider, at=self.now())
                     return LLMResult(
                         value=value, route=actual, evidence=response.evidence, attempts=tuple(attempts),
                         input_hash=digest, raw_output=response.text, completed_at=self.now(),
@@ -221,6 +226,9 @@ class LLMClient:
         persist = getattr(self.spend, "set_cooldown", None)
         if until is not None and persist is not None:
             persist(route, until, provider_wide=provider_wide)
+        report_failure = getattr(self.health, "record_llm_failure", None)
+        if report_failure is not None and error.kind not in {"budget", "input_limit"}:
+            report_failure(route.provider, summary=error.kind, status_code=error.status, at=now)
         logger.warning("Research %s route failed (%s, %s)", route.provider, error.kind, error.status)
         if self.on_failure is not None:
             try:
@@ -318,7 +326,7 @@ class LLMClient:
         ceiling = int(billed_input * in_rate + _OUTPUT * out_rate + search_calls * _FEES[route.provider]) + 1
         request_id = uuid4().hex
         if self.spend is not None and not self.spend.reserve(
-            request_id, self.now(), ceiling, exit_work=request.task is ResearchTask.CONFIRM_EXIT,
+            request_id, self.now(), ceiling, exit_work=request.exit_work or request.task is ResearchTask.CONFIRM_EXIT,
         ):
             raise ProviderError(route.provider, route.model, "budget")
         cost = None

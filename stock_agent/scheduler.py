@@ -1069,7 +1069,7 @@ class StockAgentScheduler:
         if change is not None:
             before, after = change
             await self.alerts.alert(
-                "WARN", "Market regime changed", f"{before} to {after}; no trade triggered",
+                "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
                 key=f"market_regime_{before}_{after}",
             )
 

@@ -1,9 +1,7 @@
 """Cross-family review findings for the research pipeline (RV-R-xx).
 
-Each test states the behaviour the bot needs when OpenAI is the only
-configured research provider, and is pinned strict-xfail until the
-owner fixes it in their branch (build protocol: fixer flips the xfail).
-Everything is offline: httpx.MockTransport stands in for the provider.
+These tests exercise a single configured provider and run entirely offline.
+HTTPX MockTransport stands in for OpenAI.
 """
 
 import asyncio
@@ -13,7 +11,6 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
-import pytest
 
 from stock_agent.analyst import Analyst
 from stock_agent.journal import Journal
@@ -108,19 +105,26 @@ class Rig:
         self.gate = gate
         self.endpoint = endpoint
 
-    def passes(self, count, every=timedelta(minutes=5)):
+    def passes(self, count, every=timedelta(minutes=5), *, restart=False):
         """Run `count` news passes `every` apart; return all intents produced."""
         out = []
 
         async def go():
             async with httpx.AsyncClient(transport=httpx.MockTransport(self.endpoint)) as http:
-                analyst = Analyst(LLMClient(self.config, client=http, spend=self.spend, now=lambda: self.now))
-                pipe = ResearchPipeline(self.config, self.ledger, SimpleNamespace(
-                    session_on=lambda _: Session(START.date(), START - timedelta(minutes=30),
-                                                 START + timedelta(hours=6)),
-                    next_session=lambda _: None), analyst, self.spend, self.sources, self.gate,
-                    focus=lambda **_: ())
-                for _ in range(count):
+                def pipeline():
+                    analyst = Analyst(LLMClient(self.config, client=http, spend=self.spend, now=lambda: self.now))
+                    return ResearchPipeline(self.config, self.ledger, SimpleNamespace(
+                        session_on=lambda _: Session(START.date(), START - timedelta(minutes=30),
+                                                     START + timedelta(hours=6)),
+                        next_session=lambda _: None), analyst, self.spend, self.sources, self.gate,
+                        focus=lambda **_: ())
+
+                pipe = pipeline()
+                for index in range(count):
+                    if index and restart:
+                        self.state.close()
+                        self.state.open()
+                        pipe = pipeline()
                     outcome = await pipe.run("news", self.snapshot)
                     # Unqueued proposals replay each pass until enqueued; count each once.
                     out.extend(i for i in outcome.intents if i.dedupe_key not in {o.dedupe_key for o in out})
@@ -131,10 +135,6 @@ class Rig:
         return out
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "RV-R-01: research_pipeline.py:160-164 marks a story 'unavailable' after one transient "
-    "provider failure and :136 filters it out forever; with OpenAI only, a single 503 "
-    "means a held position's bad news is never reviewed"))
 def test_held_bad_news_is_retried_after_transient_provider_failure(tmp_path):
     def respond(body, n):
         return httpx.Response(503, json={}) if n == 1 else _ok(body)
@@ -143,25 +143,18 @@ def test_held_bad_news_is_retried_after_transient_provider_failure(tmp_path):
     assert [i.side for i in intents] == ["sell"], "bad news must be re-reviewed once the provider recovers"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "RV-R-02: research_pipeline.py:266-272 finishes the work as 'confirmation_unavailable' "
-    "when the blind confirmation hits a transient 429; the confirmed-break exit is "
-    "dropped for good instead of retrying the confirmation"))
 def test_exit_confirmation_is_retried_after_transient_rate_limit(tmp_path):
     def respond(body, n):
         if body["model"] == "gpt-5.6-luna" and n == 2:
             return httpx.Response(429, json={"error": {"type": "rate_limit"}})
         return _ok(body)
 
-    intents = Rig(tmp_path, respond).passes(4)
+    rig = Rig(tmp_path, respond)
+    intents = rig.passes(4, restart=True)
     assert [i.side for i in intents] == ["sell"], "confirmation must be retried after the rate limit clears"
+    assert rig.calls == ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.6-luna"], "do not redraw the primary result"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "RV-R-03: the exit budget reserve (research_store.py:61-71) is only usable by "
-    "ResearchTask.CONFIRM_EXIT (llm_client.py _post exit_work=...). The primary review of "
-    "a HELD position's news is metered as entry spend, so once entry spend reaches 80% "
-    "the bot cannot even propose an exit and the 20% reserve sits unused"))
 def test_exit_reserve_covers_primary_review_of_held_position_news(tmp_path):
     rig = Rig(tmp_path, lambda body, n: _ok(body))
     # Entry spend for the week sits exactly at the 80% entry cap (USD 12 of 15).

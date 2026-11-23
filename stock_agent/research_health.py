@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from stock_agent.ledger import StaleBook
+from stock_agent.research_schemas import utc_datetime
 
 InputCheck = Callable[[str, datetime], bool]
 
@@ -35,3 +36,11 @@ class ResearchInputHealth:
         if self.research_store is not None and self.research_store.has_unqueued_exit(symbol, now):
             blockers.append("confirmed_exit_pending")
         return tuple(blockers)
+
+    def extra_conviction_floor(self, now: datetime) -> int:
+        if self.research_store is not None:
+            market = self.research_store.store.kv_get("research_market_regime") or {}
+            stamp = utc_datetime(market.get("as_of"))
+            if stamp is not None and timedelta() <= now - stamp <= timedelta(days=1) and market.get("regime") == "cautious":
+                return 8
+        return 7
