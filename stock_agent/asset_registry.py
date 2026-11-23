@@ -99,8 +99,7 @@ class AssetRegistry:
         self._announced: set[str] = set()
         self._fetched_at: datetime | None = None
         self._cache_loaded = False
-        if not defer_load:
-            self.load_state()
+        self._load_on_lookup = not defer_load
 
     async def refresh(
         self, symbols: Iterable[str] = (), *, force: bool = False,
@@ -132,6 +131,8 @@ class AssetRegistry:
 
     def get_asset_meta(self, symbol: str) -> AssetMeta:
         """Return metadata, or non-tradable/unknown metadata without a verified record."""
+        if self._load_on_lookup:
+            self.load_state()
         symbol = _symbol(symbol)
         meta = self._active.get(symbol, AssetMeta(symbol))
         resolved = self.resolve_symbol(symbol)
@@ -143,11 +144,14 @@ class AssetRegistry:
 
     def active_symbols(self) -> tuple[str, ...]:
         """Return a stable, sorted list of the currently tradable active equities."""
-        self.load_state()
+        if self._load_on_lookup:
+            self.load_state()
         return tuple(sorted(symbol for symbol, meta in self._active.items() if meta.tradable))
 
     def resolve_symbol(self, symbol: str) -> str | None:
         """Return the pollable broker symbol, or None for known inactive symbols."""
+        if self._load_on_lookup:
+            self.load_state()
         symbol = _symbol(symbol)
         seen: set[str] = set()
         while symbol not in self._active and symbol in self._aliases:

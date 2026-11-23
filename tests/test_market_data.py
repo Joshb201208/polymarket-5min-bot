@@ -119,12 +119,17 @@ async def test_daily_history_never_bridges_gap_or_mixes_split_basis(world, tmp_p
 
 
 @run_async
-async def test_registry_defers_state_until_scheduler_opens_store(world, tmp_path):
+async def test_registry_defers_state_until_scheduler_opens_store(world, tmp_path, monkeypatch):
     world.alpaca.add_asset("ALFA")
     world.alpaca.add_asset("BETA", tradable=False)
     path = tmp_path / "assets.db"
     store = StateStore(path)
-    registry = AssetRegistry(store=store, now=world.clock.now)
+    with monkeypatch.context() as isolated:
+        def unexpected_cache_read(*args):
+            raise AssertionError("cache read during scheduler construction")
+        isolated.setattr(store, "kv_get", unexpected_cache_read)
+        registry = AssetRegistry(store=store, now=world.clock.now)
+        PriceService(store=store, now=world.clock.now)
     assert not registry.active_symbols()
     store.open()
     await registry.refresh()
