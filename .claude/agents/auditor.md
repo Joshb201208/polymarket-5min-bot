@@ -21,6 +21,10 @@ Read, in this order:
 2. `docs/revamp/audit/PLAYBOOK.md` (rules, evidence standard, severity scale,
    and the exact findings file format)
 3. Your area brief
+4. Every file in `docs/revamp/audit/evidence/`, if there are any. These are
+   measurements of the running bot. Each file says which observations belong
+   to your area. Explain those from the code, or say that the code does not
+   explain them. Follow "Evidence on file" in the playbook.
 
 ## How to work
 

@@ -25,6 +25,14 @@ Only Josh moves the phase forward. Never edit `docs/revamp/PHASE` unless he
 says so in the current conversation. The process is in `docs/revamp/README.md`;
 the audit method is in `docs/revamp/audit/PLAYBOOK.md`.
 
+## Evidence from the running bot
+
+`docs/revamp/audit/evidence/` holds measurements of what the bot actually did
+in production (results against an index, ledger against broker, limits in
+practice, failed inputs). Read it before auditing, planning, or changing
+anything that touches money. It records what happened, not why. It follows
+the public-repository rules: percentages and counts only.
+
 ## Deployment: read this before any git push
 
 - The droplet runs `deploy/auto_update.sh` from cron every 10 minutes. When

@@ -8,11 +8,25 @@ What the bot has actually done since it started: its trades, its results, and
 its behaviour in production, compared with what the code and the strategy say
 it should do.
 
-**This area needs a droplet snapshot.** Josh produces it by running
-`scripts/vps_snapshot.sh` on the server and uploading the archive to the
-session. If no snapshot has been provided, do the code-only parts below, list
-exactly what is missing under "Could not verify", and stop. Do not estimate
-results and do not use any other source for account data.
+**This area needs facts from the running server.** There are two sources:
+
+1. **Evidence on file.** Read every file in `docs/revamp/audit/evidence/`
+   first. Those files hold measurements already taken from a droplet snapshot
+   and the broker's records, written to this repository's privacy rules. Use
+   them to answer the questions below, cite the file and section, and mark
+   each such answer "Observed (evidence on file)". You cannot re-derive them,
+   so do not restate them with more precision than the file gives.
+2. **A droplet snapshot uploaded to the session.** Josh produces it by running
+   `scripts/vps_snapshot.sh` on the server. If one is available, use it to
+   check and extend the evidence on file, and say where the two disagree.
+
+If neither exists, do the code-only parts below, list exactly what is missing
+under "Could not verify", and stop. Do not estimate results and do not use any
+other source for account data.
+
+For every observation in the evidence files, say which part of the code
+explains it (with a handoff to the owning area) or that nothing in the code
+explains it.
 
 ## Why it matters
 
