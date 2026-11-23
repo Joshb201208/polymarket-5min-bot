@@ -395,6 +395,13 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "OPTIONS_MODE",
         "STOCK_TRADING_PAUSED",
         "STOCK_AGENT_LIVE_CONFIRMED",
+        "MARGIN_ENABLED",
+        "MAX_GROSS_EXPOSURE_PCT",
+        "MARGIN_MIN_EXCESS_PCT",
+        "MARGIN_TRIM_EXCESS_PCT",
+        "MARGIN_INTEREST_RATE_PCT",
+        "MAX_TOTAL_EXPOSURE_PCT",
+        "clean_server_env.py",
     ):
         assert required_term in checklist, f"OWNER_CHECKLIST.md missing {required_term}"
 
@@ -405,6 +412,13 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "OPTIONS_MODE",
         "close_only",
         "owner_focus.json",
+        "MARGIN_ENABLED",
+        "MAX_GROSS_EXPOSURE_PCT",
+        "MARGIN_MIN_EXCESS_PCT",
+        "MARGIN_TRIM_EXCESS_PCT",
+        "MARGIN_INTEREST_RATE_PCT",
+        "MAX_TOTAL_EXPOSURE_PCT",
+        "clean_server_env.py",
     ):
         assert required_readme in readme, f"README.md missing {required_readme}"
 
@@ -412,6 +426,14 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
     assert "close_only" in env_example_text
     assert "`legacy`" not in env_example_text
     assert "`legacy`" not in readme
+    for margin_var in (
+        "MARGIN_ENABLED=true",
+        "MAX_GROSS_EXPOSURE_PCT=2.0",
+        "MARGIN_MIN_EXCESS_PCT=0.25",
+        "MARGIN_TRIM_EXCESS_PCT=0.15",
+        "MARGIN_INTEREST_RATE_PCT=6.5",
+    ):
+        assert margin_var in env_example_text
 
     for deleted_module in (
         "data_feed.py",
@@ -424,6 +446,7 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "options_executor.py",
         "options_models.py",
         "options_portfolio.py",
+        "portfolio.py",
     ):
         assert deleted_module not in readme, f"README.md still references {deleted_module}"
 
