@@ -19,7 +19,8 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +30,7 @@ from stock_agent.performance import flows_between, previous_close
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
+ET = ZoneInfo("America/New_York")
 LAUNCH_DATE = date(2026, 3, 30)
 LAUNCH_BASELINE_DATE = date(2026, 3, 27)
 BENCHMARK_SYMBOLS = ("QQQ", "SPY")
@@ -104,6 +106,16 @@ def flow_adjusted_return_pct(
         growth *= (eq1 - flows_between(flows, d0, d1)) / eq0
     return ((growth - Decimal(1)) * Decimal(100)).quantize(Decimal("0.01"))
 
+
+
+def _quote_session(quote: Any) -> date | None:
+    """ET session date a quote belongs to (None if it carries no timestamp)."""
+    ts = getattr(quote, "as_of", None)
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(ET).date()
 
 @dataclass(frozen=True)
 class SymbolBenchmark:
@@ -247,7 +259,10 @@ class BenchmarkTracker:
             port_session_pct = _pct_change(effective_eq - flow, prev_mark.equity)
 
         def window(anchor: date | None) -> Decimal | None:
-            if anchor is None:
+            # The terminal point must be dated as_of_date (today's close mark or live
+            # equity); never end the bot's window on an older mark while the benchmark
+            # side ends today.
+            if anchor is None or effective_eq is None:
                 return None
             return flow_adjusted_return_pct(
                 marks, flows, start_date=anchor, as_of_date=as_of_date, live_equity=effective_eq
@@ -336,7 +351,12 @@ class BenchmarkTracker:
             if len(ordered) >= 2:
                 prev_close, prev_date = Decimal(str(ordered[-2].close)), ordered[-2].session_date
             mark_source = "daily_bar_close"
-        elif quote is not None and getattr(quote, "price", None) is not None and Decimal(str(quote.price)) > ZERO:
+        elif (
+            quote is not None
+            and getattr(quote, "price", None) is not None
+            and Decimal(str(quote.price)) > ZERO
+            and _quote_session(quote) == as_of_date
+        ):
             cur_price = Decimal(str(quote.price))
             prev_date = ordered[-1].session_date if ordered else None
             prev_close = (
@@ -346,8 +366,9 @@ class BenchmarkTracker:
             )
             mark_source = f"live_quote:{getattr(quote, 'source', 'provider')}"
         elif ordered:
-            # Latest bar is from an earlier session: it is NOT today's price. Window returns
-            # below are "as of that bar" and flagged stale; there is no session return.
+            # Latest bar is from an earlier session (and no quote dated today): it is NOT
+            # today's price. Window returns are "as of that bar", flagged stale, and never
+            # used for bot-vs-benchmark comparisons; there is no session return.
             cur_price = Decimal(str(ordered[-1].close))
             mark_source = "prior_bar_close"
             stale = True
@@ -357,6 +378,8 @@ class BenchmarkTracker:
         else:
             stale = True
             stale_reason = missing_reason or ("price_service_unwired" if self.price_service is None else "no_bars_or_quote")
+        if quote is not None and mark_source in ("prior_bar_close", "missing") and _quote_session(quote) != as_of_date:
+            stale_reason += f"; quote not dated {as_of_date.isoformat()}"
 
         # Launch baseline: bar on or closest on/before launch_baseline_date; never silently substitute a much later bar without flagging
         baseline_bar = None
