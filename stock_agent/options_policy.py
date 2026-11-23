@@ -41,6 +41,19 @@ _DIRECTION_ALIASES = {
     "bullish": Direction.BULLISH, "buy": Direction.BULLISH, "long": Direction.BULLISH, "bull": Direction.BULLISH,
     "bearish": Direction.BEARISH, "sell": Direction.BEARISH, "short": Direction.BEARISH, "bear": Direction.BEARISH,
 }
+# Research directions that contradict an open structure (research_schemas.Direction values).
+_BREAKS = {
+    Direction.BULLISH: {"bearish", "exit_proposed", "avoid", "sell"},
+    Direction.BEARISH: {"buy", "bullish"},
+}
+
+
+def breaks_thesis(structure: Direction | None, research_direction: object) -> bool:
+    """True when the current research view contradicts the structure's direction.
+    HOLD, INSUFFICIENT_EVIDENCE, a stale or a missing thesis never break it."""
+    if structure is None or research_direction is None:
+        return False
+    return str(getattr(research_direction, "value", research_direction)).strip().lower() in _BREAKS[structure]
 
 
 def parse_direction(raw: object) -> Direction | None:
@@ -314,9 +327,7 @@ class ExitInputs:
     width: float | None
     value_now: float | None  # per share, bid-side value to close (long bid - short ask)
     trading_days_left: int | None
-    thesis_direction: Direction | None
-    structure_direction: Direction | None
-    thesis_conviction: int | None
+    thesis_broken: bool = False
     short_call_strike: float | None = None
     short_call_extrinsic: float | None = None
     spot: float | None = None
@@ -346,10 +357,7 @@ def exit_reason(x: ExitInputs, s: OptionsSettings) -> ExitReason | None:
             return ExitReason.PROFIT_TARGET
         if x.entry_debit - x.value_now >= s.loss_limit_frac * x.entry_debit:
             return ExitReason.LOSS_LIMIT
-    if x.structure_direction is not None and x.thesis_direction is not None:
-        if x.thesis_direction is not x.structure_direction:
-            return ExitReason.THESIS_BREAK
-    if x.thesis_conviction is not None and x.thesis_conviction < 7:
+    if x.thesis_broken:
         return ExitReason.THESIS_BREAK
     return None
 
