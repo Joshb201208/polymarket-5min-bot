@@ -16,7 +16,6 @@ from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
-from stock_agent.executor import Executor
 from stock_agent.execution import ExecutionEngine
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
@@ -35,7 +34,7 @@ from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
-from stock_agent.performance import close_session, shadow_stops
+from stock_agent.performance import close_session
 from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
@@ -51,11 +50,6 @@ from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
-from stock_agent.options_data import OptionsDataFeed
-from stock_agent.options_engine import OptionsEngine
-from stock_agent.options_executor import OptionsExecutor
-from stock_agent.options_portfolio import OptionsPortfolio
-from stock_agent.options_models import OptionSide, OptionOrderType
 from stock_agent.tipranks_client import (
     build_tipranks_lookup,
     adjust_conviction_with_tipranks,
@@ -189,13 +183,7 @@ class StockAgentScheduler:
         self.screener = Screener(self.config)
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
-        self.risk_manager = self.risk
-        self.executor = Executor(self.config)
         self.macro = MacroMonitor(self.config)
-        self.options_data = OptionsDataFeed(self.config)
-        self.options_engine = OptionsEngine(self.config, self.macro, self.options_data)
-        self.options_executor = OptionsExecutor(self.config)
-        self.options_portfolio = OptionsPortfolio(self.config, self.options_data)
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
@@ -281,6 +269,8 @@ class StockAgentScheduler:
             report(provider, capability, ok, error)
 
     async def _on_asset_rename(self, event: SymbolRenameEvent) -> None:
+        self.ledger.register_symbol_alias(event.old_symbol, event.new_symbol, source="asset_registry",
+                                          effective=event.process_date)
         await self._alert(
             "warning", "Broker confirmed a symbol change",
             f"{event.old_symbol} now trades as {event.new_symbol}; a fresh thesis is needed for new entries.",
@@ -296,8 +286,17 @@ class StockAgentScheduler:
         ]))
 
     async def _refresh_assets(self, *, force: bool = False):
+        if isinstance(self.assets, AssetRegistry) and not (
+            self.config.ALPACA_API_KEY and self.config.ALPACA_SECRET_KEY
+        ):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "assets_credentials_missing"})
         async with self._asset_lock:
-            await self.assets.refresh(self._tracked_symbols(), force=force)
+            symbols = (*self._tracked_symbols(), *(m.symbol for m in self.ledger.all_open_meta()
+                                                   if m.asset_class == "us_equity"))
+            await self.assets.refresh(tuple(dict.fromkeys(symbols)), force=force)
+        if not self.assets.active_symbols():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "active_assets_unavailable"})
+        return None
 
     async def _list_universe(self) -> tuple[str, ...]:
         return self._option_universe()[:self.config.UNIVERSE_SIZE]
@@ -383,6 +382,14 @@ class StockAgentScheduler:
                               "The previous state was quarantined; new entries stay blocked until recovery.")
         self.ledger.mark_submitting_ambiguous()
         await self.calendar.refresh()
+        # Resolve aliases for yesterday's book before reconcile can archive an old ticker.
+        if not self._shutdown and self.ledger.all_open_meta():
+            try:
+                async with asyncio.timeout(8):
+                    await self._refresh_assets()
+            except Exception as exc:
+                await self._alert("warning", "Startup asset refresh pending", type(exc).__name__,
+                                  key="assets-startup")
         if not self._shutdown:
             await self._reconcile_scheduler("startup")
         if self._shutdown:
@@ -596,17 +603,19 @@ class StockAgentScheduler:
             following = self.calendar.next_session(session_date)
             if following is None:
                 return JobOutcome(JobStatus.FAILED, detail={"reason": "trim_session_unverified"})
-            self._enqueue_trims(
+            intents = self._trim_intents(
                 snapshot, plans, "limit_drift", day, following,
                 consecutive_closes=[[kind, scope, n] for (kind, scope), n in sorted(counts.items())],
             )
+            return JobOutcome(JobStatus.DONE, intents=intents)
         return None
 
-    def _enqueue_trims(self, snapshot, plans, source: str, event: str, session, **proof) -> None:
+    def _trim_intents(self, snapshot, plans, source: str, event: str, session, **proof) -> tuple[NewIntent, ...]:
+        intents = []
         for plan in plans:
             if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
                 continue
-            self.ledger.enqueue_intents([NewIntent(
+            intents.append(NewIntent(
                 symbol=plan.symbol, side="sell", kind="trim", origin=source,
                 dedupe_key=f"a6:{source}:{event}:{plan.symbol}",
                 position_id=holding.meta.position_id if holding.meta else None,
@@ -615,7 +624,8 @@ class StockAgentScheduler:
                 expires_at=session.closes_at,
                 meta={"rule": "assignment" if source == "option_delivery" else "risk_limit",
                       "qty": str(plan.qty), "reason": plan.reason, **proof},
-            )])
+            ))
+        return tuple(intents)
 
     async def _queue_delivery_trims(self, now: datetime) -> None:
         session = self.calendar.session_on(now.date())
@@ -658,8 +668,10 @@ class StockAgentScheduler:
             if symbol and (holding := snapshot.holding(symbol)) and holding.qty > 0:
                 plans = self.risk.plan_remediation(snapshot, broker_action=True, broker_symbol=symbol,
                                                    controls=controls)
-                self._enqueue_trims(snapshot, plans, "option_delivery", activity, session, delivery_symbol=symbol)
-                if any(plan.kind is TradeKind.SELL for plan in plans):
+                intents = self._trim_intents(snapshot, plans, "option_delivery", session.date.isoformat(), session,
+                                            delivery_symbol=symbol)
+                if intents:
+                    self.ledger.enqueue_intents(intents)
                     await self._alert("warning", f"Option delivery triggered a trim for {symbol}",
                                       "Queued for execution against the reconciled book.",
                                       key=f"option-delivery:{activity}")
@@ -677,7 +689,7 @@ class StockAgentScheduler:
 
     def _should_run_shadow_close(self, now: datetime) -> bool:
         session = self.calendar.session_on(now.date())
-        return bool(session and now >= session.closes_at + timedelta(minutes=17))
+        return bool(session and now >= session.closes_at + timedelta(minutes=16))
 
     def _should_refresh_assets(self, now: datetime) -> bool:
         session = self.calendar.session_on(now.date())
@@ -687,10 +699,15 @@ class StockAgentScheduler:
         return await self._refresh_assets(force=True)
 
     async def _run_shadow_close(self):
-        warnings: list[str] = []
-        rows = await shadow_stops(self.ledger, _now_et().date(), self._shadow_bars, warnings)
-        status = JobStatus.FAILED if warnings else JobStatus.DONE
-        return JobOutcome(status, detail={"shadow_rows": rows, "warnings": len(warnings)})
+        day = _now_et().date()
+        snapshot = self.ledger.last_snapshot()
+        if snapshot is None or not any(m.session_date == day for m in self.ledger.equity_marks("close", since=day)):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "trusted_close_pending"})
+        report = await close_session(self.ledger, snapshot, day, daily_bars=self._shadow_bars)
+        self._last_close_report = report
+        missing = sum(w.startswith("shadow stop") for w in report.warnings)
+        return JobOutcome(JobStatus.FAILED if missing else JobStatus.DONE,
+                          detail={"shadow_rows": report.shadow_rows, "warnings": missing})
 
     def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
         if self._shutdown or name in self._job_tasks:
@@ -1204,14 +1221,16 @@ class StockAgentScheduler:
             embeds: list[dict] = []
 
             # ── 1. PORTFOLIO STATUS ──────────────────────────────
-            # Sync from Alpaca for accurate data
-            alpaca_account = await self.executor.get_account()
-            alpaca_positions = await self.executor.get_positions()
-
-            if alpaca_account:
-                equity = float(alpaca_account.get("equity", 0))
-                cash = float(alpaca_account.get("cash", 0))
-                last_equity = float(alpaca_account.get("last_equity", 0))
+            book = self.ledger.last_snapshot()
+            if book:
+                equity, cash = float(book.equity), float(book.cash)
+                marks = [mark for mark in self.ledger.equity_marks("close") if mark.session_date < now.date()]
+                last_equity = float(marks[-1].equity) if marks else equity
+                alpaca_positions = [{
+                    "symbol": h.symbol, "unrealized_pl": (h.price - h.avg_cost) * h.qty if h.price else 0,
+                    "unrealized_plpc": h.price / h.avg_cost - 1 if h.price and h.avg_cost else 0,
+                    "current_price": h.price or 0, "market_value": h.market_value,
+                } for h in book.holdings]
                 day_pnl = equity - last_equity
                 day_pnl_pct = (day_pnl / last_equity * 100) if last_equity > 0 else 0
                 starting = self.portfolio.state.starting_capital
@@ -1219,10 +1238,6 @@ class StockAgentScheduler:
                 total_pnl_pct = (total_pnl / starting * 100) if starting > 0 else 0
                 invested = equity - cash
                 exposure_pct = (invested / equity * 100) if equity > 0 else 0
-
-                # Also sync internal portfolio
-                if alpaca_positions:
-                    self.portfolio.sync_from_alpaca(alpaca_positions, alpaca_account)
 
                 pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
                 day_emoji = "\u2705" if day_pnl >= 0 else "\u274c"
@@ -1497,8 +1512,8 @@ class StockAgentScheduler:
                 task.cancel()
 
         seen = set()
-        dynamic = ("data_feed", "screener", "executor", "telegram", "discord", "macro",
-                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
+        dynamic = ("data_feed", "screener", "telegram", "discord", "macro",
+                   "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:
