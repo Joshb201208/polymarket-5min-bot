@@ -61,7 +61,7 @@ def _ok(body, held=True):
 class Rig:
     """One held position with a bad-news story, OpenAI as the only provider."""
 
-    def __init__(self, tmp_path, respond, config=None):
+    def __init__(self, tmp_path, respond, config=None, only_first_news=False):
         self.now = START
         self.config = config or openai_only()
         clock = lambda: self.now  # noqa: E731
@@ -87,10 +87,15 @@ class Rig:
         rig = self
 
         class Sources:
+            polls = 0
+
             async def universe(self, now):
                 return ("ABC",)
 
             async def news(self, symbols, now):
+                self.polls += 1
+                if only_first_news and self.polls > 1:
+                    return ()
                 return (event,)
 
             async def securities(self, symbols, now):
@@ -139,8 +144,10 @@ def test_held_bad_news_is_retried_after_transient_provider_failure(tmp_path):
     def respond(body, n):
         return httpx.Response(503, json={}) if n == 1 else _ok(body)
 
-    intents = Rig(tmp_path, respond).passes(4)
+    rig = Rig(tmp_path, respond, only_first_news=True)
+    intents = rig.passes(4, restart=True)
     assert [i.side for i in intents] == ["sell"], "bad news must be re-reviewed once the provider recovers"
+    assert rig.calls == ["gpt-6-luna", "gpt-6-luna", "gpt-5.6-luna"]
 
 
 def test_exit_confirmation_is_retried_after_transient_rate_limit(tmp_path):
