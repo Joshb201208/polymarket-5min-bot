@@ -191,6 +191,11 @@ class OptionsStateError(RuntimeError):
     pass
 
 
+class OptionsStoreUnavailable(RuntimeError):
+    """The backing store could not be read at all (e.g. not opened yet). Nothing is
+    rebuilt or overwritten; the caller retries later."""
+
+
 class KvOptionsStore:
     """The same book kept as one JSON value in the shared SQLite store (state_ledger)."""
 
@@ -203,8 +208,8 @@ class KvOptionsStore:
     def load(self) -> tuple[list[Structure], dict[str, Cooldown], dict[str, Any]]:
         try:
             raw = self.store.kv_get(self.key, None)
-        except Exception as e:
-            raise OptionsStateError(f"options book unreadable ({e})") from e
+        except Exception as e:  # the store itself is unavailable: not a corrupt book
+            raise OptionsStoreUnavailable(f"options store unavailable ({e})") from e
         if not raw:
             return [], {}, {}
         try:

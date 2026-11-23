@@ -254,3 +254,28 @@ def test_pending_structure_reserves_cash(world, tmp_path):
     m.structures.append(st)
     (c,) = m.risk_commitments()
     assert float(c.max_loss) == 140.0 and float(c.cash_reserved) == 140.0 and "sa-opt-open-x" in c.order_ids
+
+
+def test_deferred_load(world, tmp_path):
+    from stock_agent.options_manager import OptionsError
+
+    class NotOpen:
+        ready = False
+        data = None
+
+        def kv_get(self, key, default=None):
+            if not self.ready:
+                raise RuntimeError("store not open")
+            return self.data
+
+        def kv_set(self, key, value):
+            self.data = value
+
+    kv = NotOpen()
+    m = make_manager(world, tmp_path, store=KvOptionsStore(kv), defer_load=True)
+    assert m.open_blocker() == "options book not loaded"
+    with pytest.raises(OptionsError):
+        m.commitments()
+    kv.ready = True
+    m.load_state()
+    assert m.commitments() == () and m.open_blocker() is None
