@@ -80,11 +80,13 @@ class OptionCommitment:
 
 @dataclass(frozen=True)
 class DrawdownState:
+    # The high water is measured on a flow-adjusted index in first-close units.
     high_water: Decimal = Decimal(0)
     drawdown: Decimal = Decimal(0)
     paused: bool = False
     recovery_closes: int = 0
     last_session: str | None = None
+    last_equity: Decimal | None = None
 
     @property
     def throttled(self) -> bool:
@@ -101,31 +103,36 @@ class DrawdownState:
         return self.drawdown >= _decimal(config.DRAWDOWN_ALERT_PCT)
 
     def to_record(self) -> dict[str, str | bool | int | None]:
-        return {
-            "version": 1,
+        record = {
+            "version": 2 if self.last_equity is not None else 1,
             "high_water": str(self.high_water),
             "drawdown": str(self.drawdown),
             "paused": self.paused,
             "recovery_closes": self.recovery_closes,
             "last_session": self.last_session,
         }
+        if self.last_equity is not None:
+            record["last_equity"] = str(self.last_equity)
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping | None, *, config=Config) -> "DrawdownState":
         if record is None:
             return cls()
-        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] != 1:
+        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] not in (1, 2):
             raise ValueError("unrecognized drawdown record")
         high, loss = _decimal(record.get("high_water")), _decimal(record.get("drawdown"))
         paused, closes = record.get("paused"), record.get("recovery_closes")
         session = record.get("last_session")
+        last_equity = _decimal(record.get("last_equity")) if record["version"] == 2 else None
         if (high < 0 or not 0 <= loss < 1 or type(paused) is not bool or type(closes) is not int
                 or not 0 <= closes < config.DRAWDOWN_RECOVERY_SESSIONS
                 or (not paused and (closes or loss >= _decimal(config.DRAWDOWN_PAUSE_PCT)))
                 or (session is None and (high or loss or paused or closes))
-                or (session is not None and (high <= 0 or _session_id(session) != session))):
+                or (session is not None and (high <= 0 or _session_id(session) != session))
+                or (last_equity is not None and (session is None or last_equity <= 0))):
             raise ValueError("invalid drawdown record")
-        return cls(high, loss, paused, closes, session)
+        return cls(high, loss, paused, closes, session, last_equity)
 
 
 @dataclass(frozen=True)
@@ -428,9 +435,16 @@ def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
 def update_drawdown(
     state: DrawdownState, session: str, close_equity: Decimal, *,
     previous_session: str | None = None,
+    net_external_flow: Decimal = Decimal(0),
     config=Config,
 ) -> DrawdownState:
-    """Apply one trusted (flow-adjusted when applicable) close, once."""
+    """Chain trusted close returns, treating signed outside flows as interval-end.
+
+    ``net_external_flow`` includes only external deposits (+) and withdrawals
+    (-) after the last applied close. Cut-over equity starts a new index;
+    legacy v1 state used raw equity, so its implied prior index is also its
+    prior raw equity. Replayed sessions do not apply a flow twice.
+    """
     session = _session_id(session)
     if previous_session is not None:
         previous_session = _session_id(previous_session)
@@ -441,8 +455,16 @@ def update_drawdown(
     close_equity = _decimal(close_equity)
     if close_equity <= 0:
         raise ValueError("drawdown requires positive trusted equity")
-    high_water = max(close_equity, state.high_water)
-    drawdown = (high_water - close_equity) / high_water
+    adjusted_close = close_equity
+    if state.last_session is not None:
+        prior_adjusted = state.high_water * (1 - state.drawdown)
+        prior_raw = state.last_equity if state.last_equity is not None else prior_adjusted
+        period_end = close_equity - _decimal(net_external_flow)
+        if min(prior_adjusted, prior_raw, period_end) <= 0:
+            raise ValueError("drawdown requires a positive flow-adjusted close interval")
+        adjusted_close = prior_adjusted * period_end / prior_raw
+    high_water = max(adjusted_close, state.high_water)
+    drawdown = (high_water - adjusted_close) / high_water
     paused = state.paused or drawdown >= _decimal(config.DRAWDOWN_PAUSE_PCT)
     recovering = paused and drawdown < _decimal(config.DRAWDOWN_THROTTLE_PCT)
     streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session
@@ -450,7 +472,7 @@ def update_drawdown(
     closes = streak + 1 if recovering else 0
     if closes >= config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
-    return DrawdownState(high_water, drawdown, paused, closes, session)
+    return DrawdownState(high_water, drawdown, paused, closes, session, close_equity)
 
 
 def _session_id(day: str) -> str:
