@@ -469,7 +469,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         "cash": str(cash), "blocked": sorted(blocked),
         "fractional": sorted(h.symbol for h in holdings if h.is_fractional), "at": now.isoformat()})
     for d in diffs:
-        journal.append("reconcile_diff", run_id=run_id, kind=d.kind.value, symbol=d.symbol,
+        journal.append("reconcile_diff", run_id=run_id, diff_kind=d.kind.value, symbol=d.symbol,
                        severity=d.severity.value, ledger=d.ledger, broker=d.broker,
                        explanation=d.explanation, action=d.action)
         if d.severity != Severity.INFO:
