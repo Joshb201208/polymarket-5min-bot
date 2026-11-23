@@ -86,7 +86,11 @@ def test_restart_after_lost_order_rebuilds_agent(world):
     runner.restart_after_lost_order()
 
     def place(w, r):  # the order reaches the broker; the reply is lost
-        return r.agent.executor.place_buy("AAA", 5, 47.0)
+        from stock_agent.broker import OrderRequest
+
+        return r.agent.broker.submit_order(OrderRequest(symbol="AAA", side="buy", qty=5, type="limit",
+                                                        limit_price=50.5, time_in_force="day",
+                                                        client_order_id="smoke-lost-1", position_intent="buy_to_open"))
 
     runner.at(et(2026, 11, 23, 10, 2), place, "buy AAA")
     runner.run_until(et(2026, 11, 23, 10, 10))
