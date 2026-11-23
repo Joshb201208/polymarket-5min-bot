@@ -326,6 +326,7 @@ class ExecutionEngine:
         except Exception as e:
             await self.alert("critical", "Order recovery failed", f"Could not read the intent queue: {e}")
             return
+        await self._bind_recovery_order_ids()
         for it in self.ledger.list_intents([IntentStatus.AMBIGUOUS, IntentStatus.SUBMITTED,
                                             IntentStatus.PARTIALLY_FILLED]):
             try:
@@ -335,6 +336,24 @@ class ExecutionEngine:
                                  f"Could not look up order {it.client_order_id} at the broker ({e}). "
                                  "No new order for this intent until it is resolved.",
                                  key=f"resume-{it.intent_id}")
+
+    async def _bind_recovery_order_ids(self) -> int:
+        """Pass 1 of start-up recovery: bind every AMBIGUOUS intent to the broker order
+        id(s) found under its client ids, without waiting or refreshing, so the first
+        reconcile links all of the bot's own fills (R-03). A failed read leaves the
+        intent AMBIGUOUS (fail closed); pass 2 alerts on it."""
+        bound = 0
+        for it in self.ledger.list_intents([IntentStatus.AMBIGUOUS]):
+            try:
+                for cid in self._order_ids_for(it):
+                    o = await self.broker.get_order_by_client_id(cid)
+                    if o is not None:
+                        self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=o.id)
+                        bound += 1
+                        break
+            except BrokerError as e:
+                logger.warning("recovery bind for %s failed: %s", it.intent_id, e)
+        return bound
 
     @staticmethod
     def _order_ids_for(it: OrderIntent) -> list[str]:
@@ -747,6 +766,14 @@ class ExecutionEngine:
         meta = self.ledger.open_position_meta(intent.symbol)
         if intent.position_id and meta is not None and meta.position_id != intent.position_id:
             return self._skip(intent, "position changed since the decision (position_id mismatch)")
+        if rule == "model" and intent.origin in self.RESEARCH_ORIGINS:
+            # Research exits are re-checked at submission (not protective or risk exits).
+            if intent.position_id and meta is None:
+                return self._skip(intent, "position metadata missing; the research exit is stale")
+            if intent.thesis_ids:
+                cur = self.ledger.current_thesis(intent.symbol)
+                if cur is None or cur.thesis_id != intent.thesis_ids[0]:
+                    return self._skip(intent, "a newer thesis replaced the one this exit was made from")
         want = (intent.meta or {}).get("qty")
         want_qty = float(want) if want is not None else pos.qty
         want_qty = min(want_qty, pos.qty)

@@ -763,3 +763,71 @@ def test_normalise_plan_and_result_go_to_the_notifier(world, tmp_path, monkeypat
     world.clock.set_et(2026, 11, 23, 9, 36)
     assert run(eng.normalise_step()).state == "done"
     assert sent[-1] == ("result", True)
+
+
+def _research_exit(eng, sym, thesis_ids, position_id=None):
+    from stock_agent.ledger import NewIntent
+
+    ids = eng.ledger.enqueue_intents([NewIntent(
+        symbol=sym, side="sell", dedupe_key=f"rx:{sym}:{thesis_ids[0]}", origin="news",
+        position_id=position_id, thesis_ids=tuple(thesis_ids), meta={"rule": "model"})])
+    return eng.ledger.get_intent(ids[0])
+
+
+def test_research_exit_skipped_when_a_newer_thesis_exists(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    old = eng.ledger.record_thesis("AAA", {"view": "sell"}, "held_review", activate=True)
+    conf = eng.ledger.record_thesis("AAA", {"view": "confirm"}, "exit_confirmation")
+    it = _research_exit(eng, "AAA", [old, conf])
+    eng.ledger.record_thesis("AAA", {"view": "hold"}, "held_review", activate=True)  # newer research
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.SKIPPED and "newer thesis" in res.reason
+    assert a.position("AAA").qty == 10
+    assert not [o for o in a.orders.values() if o.side == "sell" and o.type != "stop"]
+
+
+def test_research_exit_runs_when_its_thesis_is_current(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    th = eng.ledger.record_thesis("AAA", {"view": "sell"}, "held_review", activate=True)
+    pid = eng.ledger.open_position_meta("AAA").position_id
+    res = run(eng.execute_intent(_research_exit(eng, "AAA", [th], position_id=pid)))
+    assert res.status == IntentStatus.FILLED and a.position("AAA") is None
+
+
+def test_resume_binds_every_ambiguous_order_before_resolving(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    its = []
+    for s in ("AAA", "BBB"):
+        world.price(s, 50, spread=0.02)
+        it = enqueue(eng, s, "buy", ref=50)
+        c = eng.ledger.claim_intent(it.intent_id)
+        a.submit({"symbol": s, "side": "buy", "qty": "5", "type": "market", "time_in_force": "day",
+                  "client_order_id": c.client_order_id})
+        its.append(it)
+    world.clock.advance(seconds=5)
+    eng.ledger.mark_submitting_ambiguous()
+    seen = []
+    orig = eng.ledger.refresh
+
+    async def spy(*args, **kw):
+        seen.append([eng.ledger.get_intent(i.intent_id).broker_order_id for i in its])
+        return await orig(*args, **kw)
+
+    eng.ledger.refresh = spy
+    run(eng.resume())
+    assert seen and all(all(ids) for ids in seen)  # every fill was bound before the first reconcile
+    for it in its:
+        assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
+        assert len(_stops(a, it.symbol)) == 1
