@@ -278,6 +278,7 @@ class Updater:
         old_unit = self.unit_path.read_bytes()
         changed_deps = bool({"requirements.txt", "requirements.lock"} & set(paths))
         changed_unit = False
+        activation_attempted = False
         try:
             self.git("reset", "--hard", new)
             self.dependencies()
@@ -287,6 +288,8 @@ class Updater:
             if candidate_unit != old_unit:
                 changed_unit = True
                 self.install_unit(candidate_unit)
+            self.eligible()
+            activation_attempted = True
             self.systemctl("try-restart", UNIT, timeout=210)
             if not self.wait_healthy(new, old_pid):
                 raise RuntimeError("candidate did not reconcile and report healthy")
@@ -301,12 +304,19 @@ class Updater:
                 # If stopped concurrently, restore disk but do not resurrect the unit.
                 unit_state = self.active_state()
                 failing_pid = self.pid()
-                if not self.hold.exists() and unit_state == "active" and failing_pid != old_pid:
+                if unit_state == "active" and failing_pid != old_pid:
                     self.systemctl("try-restart", UNIT, timeout=210)
                     if not self.wait_healthy(old, failing_pid):
                         raise RuntimeError("previous release did not become healthy")
-                elif unit_state not in {"active", "inactive"}:
-                    say(f"restored checkout but service is {unit_state}; not starting inactive service")
+                elif activation_attempted and unit_state == "activating":
+                    # Restart=on-failure may already be launching the restored code.
+                    if not self.wait_healthy(old, failing_pid):
+                        raise RuntimeError("previous release did not recover")
+                elif activation_attempted and unit_state == "failed" and self.active_state() == "failed":
+                    # Only recover a failed candidate, never an inactive or stopping unit.
+                    self.systemctl("restart", "--job-mode=fail", UNIT, timeout=210)
+                    if not self.wait_healthy(old, failing_pid):
+                        raise RuntimeError("previous release did not recover")
             finally:
                 if not isinstance(exc, Deferred):
                     state["failed_sha"] = new
