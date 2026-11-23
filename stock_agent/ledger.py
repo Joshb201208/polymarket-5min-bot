@@ -166,6 +166,7 @@ class OpenOrder:
     submitted_at: datetime | None
     expires_at: datetime | None = None
     order_class: str = ""
+    position_intent: str | None = None   # buy_to_open | buy_to_close | sell_to_open | sell_to_close
     legs: tuple["OpenOrder", ...] = ()
 
 
