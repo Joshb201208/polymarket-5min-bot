@@ -291,7 +291,7 @@ class MarketCalendar:
         if not session.opens_at <= now < session.closes_at:
             return GateDecision(False, "regular session boundary crossed", market.next_open)
         if now < session.opens_at + timedelta(minutes=5) and (
-            purpose == "entry" or rule not in {"hard_stop", "cover_short"}
+            purpose == "entry" or rule not in {"hard_stop", "cover_short", "margin_buffer"}
         ):
             return GateDecision(False, "opening buffer", session.opens_at + timedelta(minutes=5))
         if purpose == "entry" and now >= session.closes_at - timedelta(minutes=10):
