@@ -346,25 +346,26 @@ def test_resume_counts_market_fallback_fills_and_does_not_resell(world, tmp_path
     assert len(_stops(a, "AAA")) == 1
 
 
-def test_cover_refused_when_it_would_need_borrowing(world, tmp_path, monkeypatch):
+def test_cover_goes_through_without_cash_under_margin(world, tmp_path, monkeypatch):
+    """A13i: covering an accidental short always reduces risk and need not be paid from cash."""
     a = world.alpaca
     world.clock.set_et(2026, 11, 23, 10, 0)
     world.price("PPP", 100, spread=0.02)
+    world.price("LLL", 100, spread=0.02)
+    a.seed_position("LLL", 400, 100)
     a.seed_position("PPP", -85, 100)
+    a.cash = -1000.0  # debit balance: no cash to pay for the buy-back
     eng = make_engine(world, tmp_path, monkeypatch)
 
-    class NoCash:
+    class NoCash:  # a cash-only risk check would refuse; the cover must not consult it
         def evaluate_trade(self, *a, **k):
             from stock_agent.risk_manager import RiskVerdict
             return RiskVerdict(False, ("insufficient_cash",))
 
     eng.risk = NoCash()
-    try:
-        run(eng.cover_short("PPP"))
-    except Exception:
-        pass
-    assert a.position("PPP").qty == -85
-    assert any(sev == "critical" for sev, _, _ in eng.alerts)
+    o = run(eng.cover_short("PPP"))
+    assert o is not None and float(o.filled_qty) == 85
+    assert a.position("PPP") is None and _no_shorts(a)
 
 
 def test_clean_account_unlocks_entries_without_waiting(world, tmp_path, monkeypatch):
@@ -956,3 +957,171 @@ def test_normalise_plan_lists_short_buyback_before_no_shorting(world, tmp_path, 
     plan = run(eng.plan_normalise())
     buy_back = next(i for i, s in enumerate(plan) if s.startswith("buy back the short in PPP"))
     assert buy_back < plan.index("turn shorting off at the broker (no_shorting) and read it back")
+
+
+def _funnel(eng):
+    return [e for e in eng.ledger.journal.read({"execution.buy_funnel"})]
+
+
+def test_insufficient_buying_power_is_a_clean_skip_without_retry(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    a.fail("/v2/orders", "status", method="POST", status=403,
+           body={"code": 40310000, "message": "insufficient buying power"})
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.SKIPPED and res.code == "insufficient_buying_power"
+    cur = eng.ledger.get_intent(it.intent_id)
+    assert cur.meta["skip_code"] == "insufficient_buying_power" and cur.meta["passed_risk"] is True
+    assert cur.next_attempt_at is None and cur.status == IntentStatus.REJECTED  # terminal: no retry loop
+    posts = len([r for r in world.orders_sent() if r.method == "POST"])
+    world.clock.advance(minutes=10)
+    run(eng.execute_due())
+    assert len([r for r in world.orders_sent() if r.method == "POST"]) == posts
+    stages = [(e["stage"], e.get("code")) for e in _funnel(eng)]
+    assert ("passed_risk", None) in stages and ("skipped", "insufficient_buying_power") in stages
+
+
+def test_every_skipped_or_held_buy_records_a_funnel_code(world, tmp_path, monkeypatch):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    world.price("BBB", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    held = enqueue(eng, "AAA", "buy", ref=50)
+    r = run(eng.execute_intent(held))
+    assert r.code == "cleanup_pending"
+    assert eng.ledger.get_intent(held.intent_id).meta["skip_code"] == "cleanup_pending"
+    eng.ledger.store.kv_set(eng.NORMALISE_KEY, {"state": "done"})
+    ran = enqueue(eng, "BBB", "buy", ref=40)  # price ran away from the analysed 40
+    r = run(eng.execute_intent(ran))
+    assert r.status == IntentStatus.SKIPPED and r.code == "price_ran_away"
+    assert eng.ledger.get_intent(ran.intent_id).meta["skip_code"] == "price_ran_away"
+    ok = enqueue(eng, "AAA", "buy", ref=50, key="t:AAA:ok")
+    r = run(eng.execute_intent(ok))
+    assert r.status == IntentStatus.FILLED
+    stages = [e["stage"] for e in _funnel(eng) if e["intent_id"] == ok.intent_id]
+    assert stages == ["passed_risk", "ordered", "filled"]
+    assert set(eng.SKIP_CODES) >= {e["code"] for e in _funnel(eng) if e.get("code")}
+
+
+def test_research_gate_outage_degrades_to_ledger_thesis(world, tmp_path, monkeypatch):
+    """A14a: a broken submit-time recheck must not block every buy."""
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+
+    class Broken:
+        def is_entry_eligible(self, *a, **k):
+            raise RuntimeError("gate down")
+
+    eng._research_gate = Broken()
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    from types import SimpleNamespace
+
+    from dataclasses import replace
+    it = replace(it, origin="weekly", thesis_ids=("th-1",))
+    monkeypatch.setattr(eng.ledger, "current_thesis", lambda s: SimpleNamespace(thesis_id="th-1"))
+    assert run(eng._research_recheck(it, None)) is None
+    monkeypatch.setattr(eng.ledger, "current_thesis", lambda s: SimpleNamespace(thesis_id="th-2"))
+    assert "newer thesis" in run(eng._research_recheck(it, None))
+
+
+def test_margin_trim_sells_fresh_qty_never_call_backed_shares_and_restops(world, tmp_path, monkeypatch):
+    """A13e: margin_buffer trims go through exit(): replanned, stop resized, A6-locked shares kept."""
+    from datetime import date
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from stock_agent.risk_manager import TradeKind
+    from tests.fakes import occ_symbol
+
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("JJJ", 100, spread=0.02)
+    a.add_option_contract("JJJ", date(2026, 12, 18), "call", 120)
+    occ = occ_symbol("JJJ", date(2026, 12, 18), "call", 120)
+    world.price(occ, 1.0, spread=0.02)
+    a.seed_position("JJJ", 160, 90)
+    a.seed_position(occ, -1, 1.0)  # locks 100 shares
+    eng = make_engine(world, tmp_path, monkeypatch)
+    from stock_agent.broker import OrderRequest
+    ext = run(eng.broker.submit_order(OrderRequest(  # someone else's resting sell: never touched
+        symbol="JJJ", side="sell", qty=10, type="limit", time_in_force="gtc", limit_price=200,
+        client_order_id="manual-ext-1", position_intent="sell_to_close")))
+    run(eng.ledger.refresh("t"))
+    run(eng.ensure_protection())
+    seen = {}
+
+    def plan_margin_trim(snap, *, controls=None, force=False):
+        seen["force"] = force
+        return (SimpleNamespace(kind=TradeKind.SELL, symbol="JJJ", qty=Decimal(80)),)
+
+    monkeypatch.setattr(eng.risk, "plan_margin_trim", plan_margin_trim, raising=False)
+    eng._margin_controls = lambda snap: eng._risk_controls()
+    for _ in range(5):  # uncapped: the model-exit cap does not apply
+        eng._count_model_exit()
+    it = enqueue(eng, "JJJ", "sell", rule="margin_buffer", qty=120)
+    from dataclasses import replace
+    it = replace(it, kind="trim", origin="margin_buffer")
+    res = run(eng.exit(it))
+    assert seen["force"] is True
+    assert res.status == IntentStatus.FILLED and res.filled_qty == 50  # min(80 fresh, 120 queued, 50 free)
+    assert a.position("JJJ").qty == 110 and a.position(occ) is not None
+    assert run(eng.broker.get_order(ext.id)).status in ("new", "accepted")
+    stops = _stops(a, "JJJ")
+    assert len(stops) <= 1 and all(o.qty <= 100 for o in stops)
+    assert a.position("JJJ").qty > 0
+
+
+def _margin_setup(world, tmp_path, monkeypatch, qty=10, plan_qty=3):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from stock_agent.risk_manager import TradeKind
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 100, spread=0.02)
+    world.alpaca.seed_position("AAA", qty, 90)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    monkeypatch.setattr(eng.risk, "plan_margin_trim", lambda snap, *, controls=None, force=False: (
+        SimpleNamespace(kind=TradeKind.SELL, symbol="AAA", qty=Decimal(plan_qty)),), raising=False)
+    return eng
+
+
+def _margin_intent(eng, **meta):
+    from dataclasses import replace
+
+    it = enqueue(eng, "AAA", "sell", rule="margin_buffer", **meta)
+    return replace(it, kind="trim", origin="margin_buffer")
+
+
+def test_margin_trim_keeps_external_sell_and_protects_the_free_rest(world, tmp_path, monkeypatch):
+    from stock_agent.broker import OrderRequest
+
+    a = world.alpaca
+    eng = _margin_setup(world, tmp_path, monkeypatch)
+    ext = run(eng.broker.submit_order(OrderRequest(
+        symbol="AAA", side="sell", qty=2, type="limit", time_in_force="gtc", limit_price=150,
+        client_order_id="manual-ext-2", position_intent="sell_to_close")))
+    run(eng.ledger.refresh("t"))
+    run(eng.ensure_protection())
+    assert [o.qty for o in _stops(a, "AAA")] == [8]  # protected beside the external order
+    res = run(eng.exit(_margin_intent(eng)))
+    assert res.status == IntentStatus.FILLED and res.filled_qty == 3
+    assert a.position("AAA").qty == 7
+    assert run(eng.broker.get_order(ext.id)).status in ("new", "accepted")
+    assert [o.qty for o in _stops(a, "AAA")] == [5]  # 7 held - 2 reserved by the external sell
+
+
+def test_stale_margin_trim_from_an_earlier_episode_is_skipped(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    eng = _margin_setup(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    eng._kv_set(eng.MARGIN_EPISODE_KEY, {"opened_at": "2026-11-23T15:00:00+00:00"})
+    res = run(eng.exit(_margin_intent(eng, margin_episode="2026-11-20T15:00:00+00:00")))
+    assert res.status == IntentStatus.SKIPPED and "earlier margin episode" in res.reason
+    assert a.position("AAA").qty == 10
+    res = run(eng.exit(_margin_intent(eng, margin_episode="2026-11-23T15:00:00+00:00")))
+    assert res.status == IntentStatus.FILLED and a.position("AAA").qty == 7
