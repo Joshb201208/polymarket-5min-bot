@@ -161,6 +161,35 @@ def test_drawdown_pauses_throttles_and_automatically_recovers():
     assert state.high_water == 101 and not state.alert
 
 
+def test_drawdown_uses_returns_not_deposits_or_withdrawals_across_restarts():
+    state = update_drawdown(DrawdownState(), "2026-11-23", Decimal(100),
+                            net_external_flow=Decimal(100))
+    # The first close is the cut-over baseline even if the account was funded then.
+    assert state.high_water == 100 and not state.drawdown
+    state = update_drawdown(state, "2026-11-24", Decimal(140), net_external_flow=Decimal(40))
+    assert state.last_equity == 140 and state.high_water == 100
+    restored = DrawdownState.from_record(state.to_record())
+    assert restored == state
+    assert update_drawdown(restored, "2026-11-24", Decimal(140), net_external_flow=Decimal(40)) == state
+
+    withdrawal = update_drawdown(restored, "2026-11-25", Decimal(90), net_external_flow=Decimal(-50))
+    assert withdrawal.high_water == 100 and not withdrawal.drawdown and not withdrawal.paused
+    gain = update_drawdown(withdrawal, "2026-11-27", Decimal(99))
+    assert gain.high_water == 110 and not gain.drawdown
+    # A real 20% loss still pauses entries even though a cash deposit raised raw equity.
+    loss = update_drawdown(gain, "2026-11-30", Decimal("109.20"), net_external_flow=Decimal(30))
+    assert loss.drawdown == Decimal("0.20") and loss.paused
+
+
+def test_legacy_drawdown_record_uses_implied_raw_equity_for_first_adjusted_interval():
+    old = DrawdownState(Decimal(100), Decimal("0.10"), last_session="2026-11-23")
+    assert old.to_record()["version"] == 1
+    restored = DrawdownState.from_record(old.to_record())
+    next_close = update_drawdown(restored, "2026-11-24", Decimal(60), net_external_flow=Decimal(-30))
+    assert next_close.high_water == 100 and next_close.drawdown == Decimal("0.10")
+    assert next_close.to_record()["version"] == 2 and next_close.last_equity == 60
+
+
 def test_missing_expected_close_breaks_drawdown_recovery_streak():
     state = DrawdownState(Decimal(100), Decimal(".14"), True, 4, "2026-10-14")
     result = update_drawdown(state, "2026-10-16", Decimal(86), previous_session="2026-10-15")
