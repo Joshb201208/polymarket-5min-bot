@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 from dataclasses import dataclass, field, replace
@@ -11,7 +12,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
-from stock_agent.analyst import Analyst, ResearchInput
+from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, ThesisRole
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
@@ -33,6 +34,15 @@ class NewsEvent:
     evidence: Evidence
     materiality: int
 
+    def payload(self) -> dict:
+        return {"symbol": self.symbol, "story_id": self.story_id, "materiality": self.materiality,
+                "evidence": self.evidence.model_dump(mode="json")}
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> NewsEvent:
+        return cls(payload["symbol"], payload["story_id"],
+                   Evidence.model_validate_json(json.dumps(payload["evidence"])), payload["materiality"])
+
 
 @dataclass(frozen=True)
 class SecurityInputs:
@@ -44,6 +54,7 @@ class SecurityInputs:
     tradable: bool = False
     metrics: dict = field(default_factory=dict)
     evidence: tuple[Evidence, ...] = ()
+    metric_provenance: dict = field(default_factory=dict)
 
 
 class Sources(Protocol):
@@ -152,16 +163,22 @@ class ResearchPipeline:
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
         if kind in {"news", "earnings"}:
-            live = getattr(self.sources, "live_news", None)
-            if kind == "news" and live is not None:
-                gathered = await live(tuple(held), focus, universe, now)
-            else:
-                gathered = await (self.sources.news(symbols, now) if kind == "news"
-                                  else self.sources.releases(symbols, now))
+            retried = tuple(NewsEvent.from_payload(row) for row in self.store.retry_story_payloads(now, kind))
+            try:
+                live = getattr(self.sources, "live_news", None)
+                if kind == "news" and live is not None:
+                    gathered = await live(tuple(held), focus, universe, now)
+                else:
+                    gathered = await (self.sources.news(symbols, now) if kind == "news"
+                                      else self.sources.releases(symbols, now))
+            except SourceUnavailable:
+                if not retried:
+                    raise
+                gathered = ()
             as_of = self.clock()
             seen = set()
             stories = []
-            for item in sorted(gathered, key=lambda event: (
+            for item in sorted((*gathered, *retried), key=lambda event: (
                 event.symbol not in held, -event.materiality, event.symbol, event.story_id,
             )):
                 if item.symbol not in symbols or item.story_id in seen or not self._fresh_story(item, as_of):
@@ -208,7 +225,10 @@ class ResearchPipeline:
                     deferred += 1
                 self.store.finish_work(
                     key, "retry" if can_retry else "unavailable",
-                    detail={"failures": [f"{err.provider}:{err.kind}" for err in exc.attempts]},
+                    detail={
+                        "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts], "kind": kind,
+                        "story": story.payload() if can_retry and story else None,
+                    },
                     retry_at=self.clock() + timedelta(minutes=2 if kind == "news" else 5) if can_retry else None,
                 )
         collected, ideas = self._recover()
@@ -293,19 +313,27 @@ class ResearchPipeline:
         price = security.price
         quote_at = security.quote_at
         fresh_quote = _fresh_quote(security, now)
+        metrics = dict(security.metrics)
+        if security.metric_provenance:
+            metrics["point_in_time_provenance"] = security.metric_provenance
         data = ResearchInput(
             symbol, now, security.name, security.sector, float(price) if fresh_quote else None,
-            quote_at if fresh_quote else None, security.metrics, tuple(evidence.values())[:24],
+            quote_at if fresh_quote else None, metrics, tuple(evidence.values())[:24],
             (story.evidence.evidence_id,) if story else (), _safe_previous(entry),
             _safe_previous(baseline or current), {"held": True, "opened_at": holding.meta.opened_at.isoformat()
                                                if holding.meta and holding.meta.opened_at else None}
             if holding else None, context,
         )
-        result = await self.analyst.evaluate(data, task=ResearchTask.NEWS if story else ResearchTask.THESIS)
+        task = ResearchTask.NEWS if story else ResearchTask.REVIEW if holding else ResearchTask.THESIS
+        result = await self.analyst.evaluate(data, task=task)
         record = result.record
         direction = record.draft.direction
         role = ThesisRole.HELD_REVIEW if holding else ThesisRole.ENTRY_CANDIDATE
-        payload = record.model_dump(mode="json") | {"inputs": result.inputs, "job": kind}
+        payload = record.model_dump(mode="json") | {
+            "inputs": result.inputs, "job": kind, "fallbacks": [
+                f"{err.provider}:{err.kind}" for err in result.result.attempts
+            ],
+        }
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
         entry_blockers = ()
         confirmation_requested = False
@@ -344,10 +372,12 @@ class ResearchPipeline:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
         if direction is not Direction.EXIT_PROPOSED or not position_id:
             if entry_blockers and self.alerts is not None:
-                await self.alerts.alert(
+                alert = self.alerts.alert(
                     "warning", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
                     key=f"research_entry_inputs:{symbol}:{':'.join(entry_blockers)}",
                 )
+                if inspect.isawaitable(alert):
+                    await alert
             return
         if confirmation_requested:
             await self._confirm(key, holding)
@@ -383,6 +413,8 @@ class ResearchPipeline:
                 symbol, confirmation.result.value.model_dump(mode="json") | {
                     "inputs": confirmation.inputs,
                     "degraded": confirmation.result.degraded_confirmation,
+                    "prompt_version": EXIT_PROMPT_VERSION,
+                    "input_hash": confirmation.result.input_hash,
                 },
                 ThesisRole.EXIT_CONFIRMATION,
                 source=f"{confirmation.result.route.provider}/{confirmation.result.route.model}",

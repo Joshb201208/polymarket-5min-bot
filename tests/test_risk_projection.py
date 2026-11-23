@@ -8,7 +8,7 @@ from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, Holding, OpenOrder, OptionLeg, PositionMeta
 from stock_agent.risk_manager import (
     CanonicalSector, DrawdownState, OptionCommitment, RiskControls, RiskManager,
-    TradeIntent, TradeKind,
+    TradeIntent, TradeKind, update_drawdown,
 )
 
 
@@ -75,6 +75,53 @@ def test_projected_full_order_cash_floor_ignores_buying_power(risk):
     fits = risk.evaluate_trade(book, buy(qty="5"))
     assert fits.ok and fits.after.free_cash == D(2000)
     assert risk.evaluate_trade(book, buy(qty="6")).reasons == ("cash_floor",)
+
+
+def test_drawdown_state_and_order_projection_use_configured_thresholds():
+    class TightDrawdown(Config):
+        DRAWDOWN_ALERT_PCT = .03
+        DRAWDOWN_THROTTLE_PCT = .05
+        DRAWDOWN_PAUSE_PCT = .12
+        DRAWDOWN_RECOVERY_SESSIONS = 2
+
+    cfg = TightDrawdown()
+    risk = RiskManager(cfg)
+    initial = update_drawdown(DrawdownState(), "2026-11-23", D(100), config=cfg)
+    throttled = update_drawdown(initial, "2026-11-24", D(94), config=cfg)
+    assert throttled.should_alert(cfg) and throttled.is_throttled(cfg)
+    assert not throttled.throttled  # The compatibility property uses the default policy.
+    controls = RiskControls(drawdown=throttled)
+    assert risk.propose_equity_qty(snapshot(), buy(), controls=controls) == 50
+    assert risk.evaluate_trade(snapshot(), option(), controls=controls).reasons == ("drawdown_pause",)
+    paused = update_drawdown(throttled, "2026-11-25", D(87), config=cfg)
+    assert paused.paused and DrawdownState.from_record(paused.to_record(), config=cfg) == paused
+    recovering = update_drawdown(paused, "2026-11-27", D(97), config=cfg)
+    assert recovering.paused
+    assert not update_drawdown(recovering, "2026-11-30", D(97), config=cfg).paused
+
+
+def test_unpriced_holding_is_reported_without_suppressing_known_trim(risk):
+    book = snapshot(stock("ALFA", 200, "Industrials"),
+                    stock("BLND", 100, "Technology", price=None))
+    breaches = risk.evaluate_portfolio(book, include_pending=False)
+    assert {(b.kind, b.key) for b in breaches} == {("issuer_cap", "ALFA"), ("unpriced_holding", "BLND")}
+    first = risk.advance_drift_counters(breaches, {})
+    assert first == {("issuer_cap", "ALFA"): 1}
+    assert not risk.plan_remediation(book, consecutive_closes=first)
+    second = risk.advance_drift_counters(breaches, first)
+    (trim,) = risk.plan_remediation(book, consecutive_closes=second)
+    assert (trim.symbol, trim.qty, trim.reason) == ("ALFA", D(70), "issuer_cap")
+    assert risk.advance_drift_counters((), second) == {}
+    assert not risk.evaluate_trade(book, buy("NEW")).ok  # Entries still fail closed.
+
+
+def test_broker_delivery_repairs_only_attributable_exposure(risk):
+    unrelated = snapshot(stock("ALFA", 200, "Industrials"),
+                         stock("BETA", 100, "Technology"))
+    assert not risk.plan_remediation(unrelated, broker_action=True, broker_symbol="BETA")
+    delivered = replace(unrelated, holdings=(unrelated.holdings[0], stock("BETA", 180, "Technology")))
+    (trim,) = risk.plan_remediation(delivered, broker_action=True, broker_symbol="BETA")
+    assert (trim.symbol, trim.qty, trim.reason) == ("BETA", D(30), "issuer_cap")
 
 
 def test_limit_bound_and_marked_slippage_are_conservative(risk):

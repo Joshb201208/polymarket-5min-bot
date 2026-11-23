@@ -123,3 +123,15 @@ def test_shadow_waits_for_the_session_bar(tmp_path):
     assert rep.shadow_rows == 0 and any("no completed bar" in w for w in rep.warnings)
     have.append(ShadowDailyBar(date(2026, 11, 23), *(Decimal(x) for x in (100, 101, 99, 100))))
     assert run(close_session(led, snap, date(2026, 11, 23), daily_bars=bars)).shadow_rows == 1
+
+
+def test_close_session_retry_keeps_mark_and_journal(tmp_path):
+    b = StubBroker(cash=1000)
+    led = make_ledger(tmp_path, broker=b)
+    snap = run(led.refresh("close"))
+    run(close_session(led, snap, date(2026, 11, 23)))
+    b.cash = 999
+    snap2 = run(led.refresh("later"))
+    rep = run(close_session(led, snap2, date(2026, 11, 23)))
+    assert rep.equity == Decimal("1000") and led.equity_marks("close")[0].equity == Decimal("1000")
+    assert len(list(led.journal.read(kinds={"performance.close"}))) == 1

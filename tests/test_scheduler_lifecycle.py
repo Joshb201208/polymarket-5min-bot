@@ -210,6 +210,9 @@ def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
         dest = world.data_dir / "portfolio.json"
         shutil.copyfile(legacy, dest)
         world.clock.set_et(2026, 11, 26, 11, 0)  # Thanksgiving
+        for symbol, quantity, cost in (("AAA", 10, 100), ("BBB", 20, 50), ("HHH", 5, 200)):
+            world.price(symbol, cost)
+            world.alpaca.seed_position(symbol, quantity, cost)
         sched = world.scheduler()
         await sched.startup()
         assert sched._state_ready and sched._reconciled
@@ -219,6 +222,23 @@ def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
         assert (world.data_dir / "legacy_v0/portfolio.json").read_bytes() == legacy.read_bytes()
         assert dest.read_bytes() == legacy.read_bytes()
         world.assert_no_orders()
+        await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
+    async def check():
+        sched = world.scheduler()
+        assert sched.ledger.broker is sched.calendar.broker is sched.broker
+        assert sched.engine.broker is sched.options.broker is sched.broker
+        assert sched.engine.ledger is sched.ledger
+        assert sched.engine.risk is sched.options.risk is sched.risk
+        assert sched.engine.prices is sched.prices
+        assert sched.engine.options is sched.options
+        assert sched.engine._capital_lock is sched.options._capital_lock is sched.capital_lock
+        assert sched.engine._research_gate is sched.options.gate is sched.research_gate
+        assert sched.options_store.store is sched.ledger.store is sched.research_store.store
         await sched._cleanup()
 
     asyncio.run(check())
