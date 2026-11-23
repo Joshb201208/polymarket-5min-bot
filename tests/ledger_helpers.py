@@ -66,6 +66,7 @@ class StubBroker:
 
     async def get_account(self):
         self._check("get_account")
+        await asyncio.sleep(0)          # yield like a real request, so concurrency is exercised
         long_mv = sum(float(p["market_value"]) for p in self.positions.values()
                       if p["asset_class"] == "us_equity" and float(p["qty"]) > 0)
         short_mv = sum(float(p["market_value"]) for p in self.positions.values()

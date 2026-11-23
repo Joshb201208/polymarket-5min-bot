@@ -1,0 +1,268 @@
+{
+  "positions": [
+    {
+      "symbol": "AAA",
+      "shares": 10,
+      "entry_price": 100.0,
+      "entry_date": "2026-04-01T14:30:00.000000Z",
+      "current_price": 100.0,
+      "market_value": 1000.0,
+      "unrealized_pnl": 0.0,
+      "unrealized_pnl_pct": 0.0,
+      "stop_loss": 90.0,
+      "thesis": {
+        "symbol": "AAA",
+        "direction": "BUY",
+        "conviction": 8,
+        "summary": "Synthetic thesis for AAA.",
+        "bull_case": "Invented.",
+        "bear_case": "Invented.",
+        "catalysts": [
+          "c1"
+        ],
+        "risks": [
+          "r1"
+        ],
+        "target_price": null,
+        "stop_loss_price": null,
+        "time_horizon": "3-6 months",
+        "sources": [
+          "synthetic"
+        ],
+        "generated_at": "2026-10-05T22:00:00.000000Z"
+      },
+      "sector": "Technology",
+      "last_updated": "2026-11-20T13:00:00.000000Z"
+    },
+    {
+      "symbol": "BBB",
+      "shares": 20,
+      "entry_price": 50.0,
+      "entry_date": "2026-05-04T14:30:00.000000Z",
+      "current_price": 50.0,
+      "market_value": 1000.0,
+      "unrealized_pnl": 0.0,
+      "unrealized_pnl_pct": 0.0,
+      "stop_loss": 45.0,
+      "thesis": {
+        "symbol": "BBB",
+        "direction": "BUY",
+        "conviction": 8,
+        "summary": "Synthetic thesis for BBB.",
+        "bull_case": "Invented.",
+        "bear_case": "Invented.",
+        "catalysts": [
+          "c1"
+        ],
+        "risks": [
+          "r1"
+        ],
+        "target_price": null,
+        "stop_loss_price": null,
+        "time_horizon": "3-6 months",
+        "sources": [
+          "synthetic"
+        ],
+        "generated_at": "2026-10-05T22:00:00.000000Z"
+      },
+      "sector": "Healthcare",
+      "last_updated": "2026-11-20T13:00:00.000000Z"
+    },
+    {
+      "symbol": "HHH",
+      "shares": 5,
+      "entry_price": 200.0,
+      "entry_date": "2026-09-02T14:30:00.000000Z",
+      "current_price": 200.0,
+      "market_value": 1000.0,
+      "unrealized_pnl": 0.0,
+      "unrealized_pnl_pct": 0.0,
+      "stop_loss": 180.0,
+      "thesis": {
+        "symbol": "HHH",
+        "direction": "HOLD",
+        "conviction": 0,
+        "summary": "Imported from Alpaca — awaiting re-analysis.",
+        "bull_case": "Invented.",
+        "bear_case": "Invented.",
+        "catalysts": [
+          "c1"
+        ],
+        "risks": [
+          "r1"
+        ],
+        "target_price": null,
+        "stop_loss_price": null,
+        "time_horizon": "3-6 months",
+        "sources": [
+          "synthetic"
+        ],
+        "generated_at": "2026-10-05T22:00:00.000000Z"
+      },
+      "sector": "Industrials",
+      "last_updated": "2026-11-20T13:00:00.000000Z"
+    }
+  ],
+  "trade_history": [
+    {
+      "symbol": "AAA",
+      "action": "BUY",
+      "shares": 10,
+      "price": 100.0,
+      "timestamp": "2026-04-01T14:30:00.000000Z",
+      "reason": "synthetic",
+      "pnl": null,
+      "pnl_pct": null,
+      "hold_days": null
+    },
+    {
+      "symbol": "CCC",
+      "action": "SELL",
+      "shares": 3,
+      "price": 30.0,
+      "timestamp": "2026-06-01T14:30:00.000000Z",
+      "reason": "synthetic",
+      "pnl": 3.0,
+      "pnl_pct": 0.03,
+      "hold_days": 10
+    }
+  ],
+  "daily_summaries": [
+    {
+      "date": "Apr 01, 2026 (Wed)",
+      "portfolio_value": 10000.0,
+      "cash": 1000.0,
+      "total_exposure": 9000.0,
+      "exposure_pct": 0.9,
+      "num_positions": 3,
+      "day_pnl": 0.0,
+      "day_pnl_pct": 0.0,
+      "total_pnl": 0.0,
+      "total_pnl_pct": 0.0,
+      "trades_today": [],
+      "positions": [
+        {
+          "symbol": "AAA",
+          "shares": 10
+        }
+      ],
+      "signals": []
+    },
+    {
+      "date": "Apr 02, 2026 (Thu)",
+      "portfolio_value": 10050.0,
+      "cash": 1000.0,
+      "total_exposure": 9050.0,
+      "exposure_pct": 0.9,
+      "num_positions": 3,
+      "day_pnl": 0.0,
+      "day_pnl_pct": 0.0,
+      "total_pnl": 50.0,
+      "total_pnl_pct": 0.0,
+      "trades_today": [],
+      "positions": [
+        {
+          "symbol": "AAA",
+          "shares": 10
+        }
+      ],
+      "signals": []
+    },
+    {
+      "date": "Apr 02, 2026 (Thu)",
+      "portfolio_value": 10060.0,
+      "cash": 1000.0,
+      "total_exposure": 9060.0,
+      "exposure_pct": 0.9,
+      "num_positions": 3,
+      "day_pnl": 0.0,
+      "day_pnl_pct": 0.0,
+      "total_pnl": 60.0,
+      "total_pnl_pct": 0.0,
+      "trades_today": [],
+      "positions": [
+        {
+          "symbol": "AAA",
+          "shares": 10
+        }
+      ],
+      "signals": []
+    }
+  ],
+  "cash": 1000.0,
+  "starting_capital": 10000.0,
+  "last_universe_refresh": "2026-11-16T12:00:00.000000Z",
+  "universe": [
+    "AAA",
+    "BBB",
+    "HHH",
+    "DDD"
+  ],
+  "active_theses": {
+    "AAA": {
+      "symbol": "AAA",
+      "direction": "HOLD",
+      "conviction": 7,
+      "summary": "Synthetic thesis for AAA.",
+      "bull_case": "Invented.",
+      "bear_case": "Invented.",
+      "catalysts": [
+        "c1"
+      ],
+      "risks": [
+        "r1"
+      ],
+      "target_price": null,
+      "stop_loss_price": null,
+      "time_horizon": "3-6 months",
+      "sources": [
+        "synthetic"
+      ],
+      "generated_at": "2026-10-05T22:00:00.000000Z"
+    },
+    "DDD": {
+      "symbol": "DDD",
+      "direction": "BUY",
+      "conviction": 8,
+      "summary": "Synthetic thesis for DDD.",
+      "bull_case": "Invented.",
+      "bear_case": "Invented.",
+      "catalysts": [
+        "c1"
+      ],
+      "risks": [
+        "r1"
+      ],
+      "target_price": null,
+      "stop_loss_price": null,
+      "time_horizon": "3-6 months",
+      "sources": [
+        "synthetic"
+      ],
+      "generated_at": "2026-10-05T22:00:00.000000Z"
+    },
+    "HHH": {
+      "symbol": "HHH",
+      "direction": "HOLD",
+      "conviction": 0,
+      "summary": "Imported from Alpaca — awaiting re-analysis.",
+      "bull_case": "Invented.",
+      "bear_case": "Invented.",
+      "catalysts": [
+        "c1"
+      ],
+      "risks": [
+        "r1"
+      ],
+      "target_price": null,
+      "stop_loss_price": null,
+      "time_horizon": "3-6 months",
+      "sources": [
+        "synthetic"
+      ],
+      "generated_at": "2026-10-05T22:00:00.000000Z"
+    }
+  },
+  "last_weekly_analysis": "2026-11-15T23:00:00.000000Z",
+  "last_daily_check": "2026-11-19T20:30:00.000000Z"
+}
