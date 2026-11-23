@@ -709,21 +709,24 @@ class StockAgentScheduler:
     # ── Shared helpers ───────────────────────────────────────────────
 
     async def _sync_portfolio_from_alpaca(self) -> None:
-        """Pull live positions + account from Alpaca and overwrite local state.
+        """Reconcile the ledger with the broker and mirror it into the legacy view.
 
-        This makes Alpaca the source of truth for share counts, avg entry
-        prices, and cash (including margin balances). Runs at the top of
-        every weekly / mid-week cycle so risk checks see real weights.
+        The ledger is the source of truth. A failed or malformed broker read
+        raises inside ``refresh`` and leaves both the ledger and the legacy
+        ``portfolio`` view untouched (never read as "no positions").
         """
+        if self.ledger is None:
+            logger.error("Broker sync: ledger not wired; legacy view left unchanged")
+            return
         try:
-            account = await self.executor.get_account()
-            positions = await self.executor.get_positions()
-            if account is None and not positions:
-                logger.warning("Alpaca sync: no account + no positions returned — skipping")
-                return
-            self.portfolio.sync_from_alpaca(positions or [], account)
+            snapshot = await self.ledger.refresh("portfolio sync")
         except Exception as exc:
-            logger.exception("Alpaca sync failed — continuing with local state: %s", exc)
+            logger.error("Broker sync failed; ledger and legacy view unchanged: %s", exc)
+            return
+        try:
+            self.portfolio.sync_from_snapshot(snapshot)
+        except Exception as exc:
+            logger.error("Legacy portfolio view update failed: %s", exc)
 
     async def _load_tipranks_data(self) -> dict:
         """Fetch TipRanks Smart Score data via API screener."""
@@ -1210,34 +1213,34 @@ class StockAgentScheduler:
     # ── Sector backfill ──────────────────────────────────────────────
 
     async def _backfill_sectors(self):
-        """Backfill sectors on positions marked 'Unknown'.
+        """Fill a missing or unrecognised sector on open ledger positions.
 
-        Uses Config.SECTOR_MAP first (fast, deterministic) then falls back to
-        FMP for symbols we haven't hardcoded.
+        Order: risk_limits' issuer overrides / SECTOR_MAP, then FMP. Stored in
+        the ledger (canonical names), so sector caps see the same value.
         """
+        if self.ledger is None:
+            return
+        from stock_agent.risk_manager import CanonicalSector, classify_symbol
+
         sector_map = getattr(self.config, "SECTOR_MAP", {}) or {}
         updated = 0
-        for pos in self.portfolio.state.positions:
-            if pos.sector and pos.sector != "Unknown":
+        for meta in self.ledger.all_open_meta():
+            if meta.asset_class != "us_equity":
                 continue
-            # 1. Hardcoded map (fast path)
-            mapped = sector_map.get(pos.symbol)
-            if mapped:
-                pos.sector = mapped
+            if classify_symbol(meta.symbol, meta.sector).sector != CanonicalSector.UNKNOWN:
+                continue
+            found = classify_symbol(meta.symbol, sector_map.get(meta.symbol)).sector
+            if found == CanonicalSector.UNKNOWN:
+                try:
+                    company = await self.data_feed.get_company_fundamentals(meta.symbol)
+                    found = classify_symbol(meta.symbol, getattr(company, "sector", None)).sector
+                except Exception as e:
+                    logger.warning("Sector backfill failed for %s: %s", meta.symbol, e)
+                    continue
+            if found != CanonicalSector.UNKNOWN:
+                self.ledger.set_sector(meta.position_id, found.value)
                 updated += 1
-                logger.info("Backfilled sector for %s from SECTOR_MAP: %s", pos.symbol, mapped)
-                continue
-            # 2. FMP lookup for unknowns
-            try:
-                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                if company and company.sector and company.sector != "Unknown":
-                    pos.sector = company.sector
-                    updated += 1
-                    logger.info("Backfilled sector for %s from FMP: %s", pos.symbol, company.sector)
-            except Exception as e:
-                logger.warning("Sector backfill failed for %s: %s", pos.symbol, e)
         if updated:
-            self.portfolio._save()
             logger.info("Backfilled sectors for %d positions", updated)
 
     # ── Cleanup ──────────────────────────────────────────────────────
