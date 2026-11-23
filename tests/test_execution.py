@@ -506,9 +506,11 @@ def test_crash_after_buy_filled_resume_places_stop(world, tmp_path, monkeypatch)
 
 
 def test_confirmed_partial_is_protected_when_cancel_refused(world, tmp_path, monkeypatch):
+    """Transient cancel refusal: retried at once, so the 3 filled are stopped in the same call."""
     from stock_agent.execution import ExecSettings
 
     a = world.alpaca
+    assert a.behaviour.wash_trade_check  # the broker's default wash protection stays on
     world.clock.set_et(2026, 11, 23, 10, 0)
     world.price("AAA", 50, spread=0.02)
     a.script_partial_fills("AAA", [3])
@@ -516,17 +518,37 @@ def test_confirmed_partial_is_protected_when_cancel_refused(world, tmp_path, mon
     a.fail("/v2/orders/*", "status", method="DELETE", status=403, body={"code": 40310000, "message": "no"})
     it = enqueue(eng, "AAA", "buy", ref=50)
     res = run(eng.execute_intent(it))
-    assert res.status != IntentStatus.REJECTED
-    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.SUBMITTED
-    assert any(s == "critical" for s, _, _ in eng.alerts)
-    run(eng.monitor_tick())  # resolves the accepted order: cancels the rest, protects the 3
-    cur = eng.ledger.get_intent(it.intent_id)
-    assert cur.status == IntentStatus.FILLED
-    pos = a.position("AAA")
+    assert res.status == IntentStatus.FILLED and res.filled_qty == 3
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
     assert [o for o in a.open_orders("AAA") if o.side == "buy"] == []
     stops = _stops(a, "AAA")
-    assert len(stops) == 1 and stops[0].qty == pos.qty
+    assert len(stops) == 1 and stops[0].qty == a.position("AAA").qty == 3
 
+
+def test_partial_with_persistent_cancel_refusal_is_loud_then_recovers(world, tmp_path, monkeypatch):
+    """Unavoidable gap: while the broker refuses both the cancel and (wash trade) the stop,
+    the filled shares cannot be protected. The bot alerts critical and retries each tick."""
+    from stock_agent.execution import ExecSettings
+
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.script_partial_fills("AAA", [3])
+    eng = make_engine(world, tmp_path, monkeypatch, settings=ExecSettings(fill_wait_seconds=10))
+    f = a.fail("/v2/orders/*", "status", method="DELETE", status=403, times=None,
+               body={"code": 40310000, "message": "no"})
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.SUBMITTED
+    assert any(s == "critical" and "unprotected" in t for s, t, _ in eng.alerts)
+    run(eng.monitor_tick())
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.SUBMITTED  # still refusing
+    a.faults.remove(f)
+    run(eng.monitor_tick())
+    assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
+    assert [o for o in a.open_orders("AAA") if o.side == "buy"] == []
+    stops = _stops(a, "AAA")
+    assert len(stops) == 1 and stops[0].qty == a.position("AAA").qty
 
 def test_split_rescales_recorded_stop_instead_of_flattening(world, tmp_path, monkeypatch):
     a = world.alpaca
