@@ -555,6 +555,12 @@ class AlpacaClient:
             raise
         return self._parse(BrokerPosition, data, path)
 
+    async def free_shares(self, symbol: str) -> int:
+        """Whole long shares not reserved by open orders (stops) or covered
+        calls, read fresh from the broker. 0 when there is no long."""
+        pos = await self.get_position(symbol)
+        return pos.free_whole_qty if pos is not None and pos.is_long else 0
+
     # ------------------------------------------------------------ orders
 
     async def list_orders(
