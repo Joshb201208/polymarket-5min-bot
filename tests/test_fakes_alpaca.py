@@ -526,3 +526,41 @@ def test_seeded_daily_bars(env):
     bars = c.get(f"{DATA}/v2/stocks/BBB/bars", params={"timeframe": "1Day"}).json()["bars"]
     assert [b["c"] for b in bars] == [10, 11, 12, 13, 14]
     assert bars[0]["h"] == pytest.approx(10.1) and bars[-1]["t"].startswith("2026-11-20")
+
+
+# ------------------------------------------------------------------ screener
+# Shapes and limits: https://docs.alpaca.markets/us/openapi/market-data-api.json
+def test_most_actives_ranked_by_volume_or_trades(env):
+    _, alpaca, _, c = env
+    alpaca.set_most_actives([("AAA", 500, 90), ("BBB", 900, 10), ("CCC", 100, 50)])
+    r = c.get(f"{DATA}/v1beta1/screener/stocks/most-actives", params={"top": 2}).json()
+    assert [x["symbol"] for x in r["most_actives"]] == ["BBB", "AAA"] and r["last_updated"]
+    assert set(r["most_actives"][0]) == {"symbol", "volume", "trade_count"}
+    r = c.get(f"{DATA}/v1beta1/screener/stocks/most-actives", params={"by": "trades"}).json()
+    assert [x["symbol"] for x in r["most_actives"]] == ["AAA", "CCC", "BBB"]
+
+
+def test_most_actives_plain_symbols_keep_order_and_default_top_is_10(env):
+    _, alpaca, _, c = env
+    alpaca.set_most_actives([f"S{i}" for i in range(12)])
+    r = c.get(f"{DATA}/v1beta1/screener/stocks/most-actives").json()
+    assert [x["symbol"] for x in r["most_actives"]] == [f"S{i}" for i in range(10)]
+
+
+def test_movers_shape_and_top(env):
+    _, alpaca, _, c = env
+    alpaca.set_movers(gainers=["AAA", ("PENNY", 0.05, 80.0)], losers=[("BBB", 9.0, -10.0)])
+    r = c.get(f"{DATA}/v1beta1/screener/stocks/movers", params={"top": 1}).json()
+    assert r["market_type"] == "stocks" and r["last_updated"]
+    assert r["gainers"] == [{"symbol": "AAA", "price": 100.0, "change": 9.0909, "percent_change": 10.0}]
+    assert r["losers"][0]["symbol"] == "BBB" and r["losers"][0]["change"] == -1.0
+    assert set(r["gainers"][0]) == {"symbol", "price", "change", "percent_change"}
+
+
+def test_screener_top_over_documented_max_is_a_switch(env):
+    _, alpaca, _, c = env
+    alpaca.set_most_actives(["AAA"])
+    assert c.get(f"{DATA}/v1beta1/screener/stocks/most-actives", params={"top": 101}).status_code == 400
+    assert c.get(f"{DATA}/v1beta1/screener/stocks/movers", params={"top": 51}).status_code == 400
+    alpaca.behaviour.screener_top_over_max = "clamp"
+    assert c.get(f"{DATA}/v1beta1/screener/stocks/movers", params={"top": 51}).status_code == 200
