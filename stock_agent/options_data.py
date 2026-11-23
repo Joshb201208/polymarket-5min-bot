@@ -25,8 +25,6 @@ from stock_agent.options_models import (
 logger = logging.getLogger(__name__)
 
 # Alpaca API endpoints
-_TRADING_BASE = "https://paper-api.alpaca.markets"
-_DATA_BASE = "https://data.alpaca.markets"
 
 
 class OptionsDataFeed:
@@ -115,7 +113,7 @@ class OptionsDataFeed:
         if max_expiry is not None:
             params["expiration_date_lte"] = max_expiry.isoformat()
 
-        url = f"{_TRADING_BASE}/v2/options/contracts"
+        url = f"{Config.trading_base_url}/v2/options/contracts"
         all_contracts: list[OptionsContract] = []
         page_token: Optional[str] = None
 
@@ -183,7 +181,7 @@ class OptionsDataFeed:
         """
         client = await self._get_client()
         symbol_clean = symbol.replace("-", ".")
-        url = f"{_DATA_BASE}/v2/stocks/{symbol_clean}/snapshot"
+        url = f"{Config.market_data_url}/v2/stocks/{symbol_clean}/snapshot"
         try:
             resp = await client.get(url, headers=self._auth_headers())
             resp.raise_for_status()
@@ -236,7 +234,7 @@ class OptionsDataFeed:
                 "symbols": ",".join(batch),
                 "feed": feed,
             }
-            url = f"{_DATA_BASE}/v1beta1/options/snapshots"
+            url = f"{Config.market_data_url}/v1beta1/options/snapshots"
 
             try:
                 resp = await client.get(url, params=params, headers=self._auth_headers())

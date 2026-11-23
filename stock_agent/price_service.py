@@ -23,6 +23,8 @@ QuotePurpose = Literal["order_sizing", "stop_check", "valuation", "brief"]
 _ET = ZoneInfo("America/New_York")
 _QUOTE_AGES = {"order_sizing": 90, "stop_check": 300, "valuation": 900, "brief": 900}
 _MAX_HISTORY = 504
+_BAR_CACHE_AGE = timedelta(hours=2)
+_REGULAR_OPEN = time(9, 30)
 
 
 @dataclass(frozen=True)
@@ -140,7 +142,7 @@ class PriceService:
             if start_date is None:
                 days = days[-sessions:]
             if days:
-                bars = await self._bars_for_sessions(list(effective), days, cutoff, today)
+                bars = await self._bars_for_sessions(list(effective), days, cutoff, now)
                 for symbol, requested in effective.items():
                     complete = self._contiguous_tail(bars.get(symbol, {}), days)
                     if (start_date is not None and len(complete) != len(days)
@@ -284,11 +286,11 @@ class PriceService:
         self._calendar = start, end, today, closes
         return {day: close for day, close in closes.items() if start <= day <= end}
 
-    async def _bars_for_sessions(self, symbols, days, cutoff, today):
+    async def _bars_for_sessions(self, symbols, days, cutoff, now):
         collected, requests = {}, {}
         for symbol in symbols:
             cached_at, cached = self._read_cache(symbol)
-            if cached_at == today and all(day in cached for day in days):
+            if _same_bar_basis_window(cached_at, now) and all(day in cached for day in days):
                 collected[symbol] = cached
                 continue
             missing = [day for day in days if day not in cached]
@@ -303,10 +305,11 @@ class PriceService:
             rebase = []
             for symbol in subset:
                 cached, recent = collected[symbol], fetched[symbol]
-                changed = any((old.open, old.high, old.low, old.close) !=
-                              (recent[day].open, recent[day].high, recent[day].low, recent[day].close)
-                              for day, old in cached.items() if day in recent)
-                if changed:
+                overlap = {day for day in days if day >= query_from and day in cached}
+                # A missing overlap cannot verify the cache's split basis. A
+                # paginated retry of the whole window must stand on its own.
+                changed_or_unverified = any(day not in recent or cached[day] != recent[day] for day in overlap)
+                if changed_or_unverified or (cached and not overlap):
                     collected[symbol] = recent
                     if query_from > days[0]:
                         rebase.append(symbol)
@@ -315,7 +318,7 @@ class PriceService:
             if rebase:
                 collected.update(await self._fetch_bars(rebase, days[0], days[-1], cutoff, set(days)))
             for symbol in subset:
-                self._write_cache(symbol, today, collected[symbol])
+                self._write_cache(symbol, now, collected[symbol])
         return collected
 
     async def _fetch_bars(self, symbols, start, end, cutoff, session_days):
@@ -360,17 +363,25 @@ class PriceService:
                 data = self.store.kv_get(f"market_data:split_bars:v1:{symbol}", {})
                 if data:
                     rows = (_daily_bar(symbol, row) for row in data["bars"])
-                    return _date(data["as_of"]), {bar.session_date: bar for bar in rows if bar}
+                    return _timestamp(data["as_of"]), {bar.session_date: bar for bar in rows if bar}
             except (ValueError, TypeError, KeyError):
                 pass
         return None, {}
 
-    def _write_cache(self, symbol, today, bars):
+    def _write_cache(self, symbol, now, bars):
         if self.store is not None:
             self.store.kv_set(f"market_data:split_bars:v1:{symbol}", {
-                "as_of": today,
+                "as_of": now,
                 "bars": [asdict(bars[day]) for day in sorted(bars)[-_MAX_HISTORY:]],
             })
+
+
+def _same_bar_basis_window(cached_at, now):
+    if cached_at is None or not timedelta(0) <= now - cached_at < _BAR_CACHE_AGE:
+        return False
+    cached_et, now_et = cached_at.astimezone(_ET), now.astimezone(_ET)
+    return (cached_et.date() == now_et.date()
+            and (cached_et.time() < _REGULAR_OPEN) == (now_et.time() < _REGULAR_OPEN))
 
 
 def _number(value) -> Decimal | None:
