@@ -88,11 +88,17 @@ class DrawdownState:
 
     @property
     def throttled(self) -> bool:
-        return self.paused or self.drawdown >= _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+        return self.is_throttled()
 
     @property
     def alert(self) -> bool:
-        return self.drawdown >= _decimal(Config.DRAWDOWN_ALERT_PCT)
+        return self.should_alert()
+
+    def is_throttled(self, config=Config) -> bool:
+        return self.paused or self.drawdown >= _decimal(config.DRAWDOWN_THROTTLE_PCT)
+
+    def should_alert(self, config=Config) -> bool:
+        return self.drawdown >= _decimal(config.DRAWDOWN_ALERT_PCT)
 
     def to_record(self) -> dict[str, str | bool | int | None]:
         return {
@@ -105,7 +111,7 @@ class DrawdownState:
         }
 
     @classmethod
-    def from_record(cls, record: Mapping | None) -> "DrawdownState":
+    def from_record(cls, record: Mapping | None, *, config=Config) -> "DrawdownState":
         if record is None:
             return cls()
         if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] != 1:
@@ -114,8 +120,8 @@ class DrawdownState:
         paused, closes = record.get("paused"), record.get("recovery_closes")
         session = record.get("last_session")
         if (high < 0 or not 0 <= loss < 1 or type(paused) is not bool or type(closes) is not int
-                or not 0 <= closes < Config.DRAWDOWN_RECOVERY_SESSIONS
-                or (not paused and (closes or loss >= _decimal(Config.DRAWDOWN_PAUSE_PCT)))
+                or not 0 <= closes < config.DRAWDOWN_RECOVERY_SESSIONS
+                or (not paused and (closes or loss >= _decimal(config.DRAWDOWN_PAUSE_PCT)))
                 or (session is None and (high or loss or paused or closes))
                 or (session is not None and (high <= 0 or _session_id(session) != session))):
             raise ValueError("invalid drawdown record")
@@ -186,6 +192,7 @@ class _Projection:
     option_loss: Decimal = Decimal(0)
     option_count: int = 0
     unknown_pending: Decimal = Decimal(0)
+    unpriced: dict[str, Decimal] = field(default_factory=dict)
 
     def totals(self) -> PortfolioTotals:
         by_issuer: dict[str, Decimal] = {}
@@ -202,6 +209,7 @@ class _Projection:
                 by_cluster[cluster] = by_cluster.get(cluster, Decimal(0)) + value
         symbols = {stock.symbol for stock in self.stocks.values() if stock.qty > 0}
         symbols.update(self.pending_values)
+        symbols.update(symbol for symbol, qty in self.unpriced.items() if qty > 0)
         return PortfolioTotals(
             self.equity, self.cash, sum(by_issuer.values(), Decimal(0)),
             by_issuer, by_sector, by_cluster, len(symbols),
@@ -420,6 +428,7 @@ def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
 def update_drawdown(
     state: DrawdownState, session: str, close_equity: Decimal, *,
     previous_session: str | None = None,
+    config=Config,
 ) -> DrawdownState:
     """Apply one trusted (flow-adjusted when applicable) close, once."""
     session = _session_id(session)
@@ -434,12 +443,12 @@ def update_drawdown(
         raise ValueError("drawdown requires positive trusted equity")
     high_water = max(close_equity, state.high_water)
     drawdown = (high_water - close_equity) / high_water
-    paused = state.paused or drawdown >= _decimal(Config.DRAWDOWN_PAUSE_PCT)
-    recovering = paused and drawdown < _decimal(Config.DRAWDOWN_THROTTLE_PCT)
+    paused = state.paused or drawdown >= _decimal(config.DRAWDOWN_PAUSE_PCT)
+    recovering = paused and drawdown < _decimal(config.DRAWDOWN_THROTTLE_PCT)
     streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session
               else 0)
     closes = streak + 1 if recovering else 0
-    if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
+    if closes >= config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
     return DrawdownState(high_water, drawdown, paused, closes, session)
 
@@ -518,7 +527,7 @@ class RiskManager:
             stop_distance = _decimal(self.config.STOP_LOSS_PCT if intent.stop_distance is None
                                      else intent.stop_distance)
             loss_budget = projection.equity * self._ratio("MAX_INITIAL_STOP_RISK_PCT")
-            if controls.drawdown.throttled:
+            if controls.drawdown.is_throttled(self.config):
                 loss_budget *= self._ratio("DRAWDOWN_THROTTLE_SCALE")
             if (held + qty * price) * stop_distance > loss_budget:
                 return RiskVerdict(False, ("stop_risk_budget",), projection.totals())
@@ -562,13 +571,33 @@ class RiskManager:
 
     def evaluate_portfolio(
         self, snapshot: "BookSnapshot", *, controls: RiskControls | None = None,
+        include_pending: bool = True,
     ) -> tuple[Breach, ...]:
+        """Report proven breaches and separately identify holdings without usable marks."""
         try:
             return self._breaches(
-                self._project_book(snapshot, controls or RiskControls()), include_at_limit=True,
+                self._project_book(snapshot, controls or RiskControls(),
+                                   include_pending=include_pending, allow_unpriced=True),
+                include_at_limit=True,
             )
         except (ValueError, TypeError, ArithmeticError, AttributeError):
             return (Breach("invalid_risk_input", "", Decimal(0), Decimal(0)),)
+
+    def advance_drift_counters(
+        self, breaches: Sequence[Breach], previous: Mapping[tuple[str, str], int],
+    ) -> dict[tuple[str, str], int]:
+        """Compute one close's consecutive counters. Caller owns session idempotence."""
+        return {
+            (b.kind, b.key): previous.get((b.kind, b.key), 0) + 1
+            for b in breaches if self._outside_drift_band(b)
+        }
+
+    def _outside_drift_band(self, breach: Breach) -> bool:
+        buffer = _decimal(self.config.RISK_DRIFT_BUFFER_PCT)
+        if breach.kind == "cash_floor":
+            return breach.value < breach.cap - buffer
+        return (breach.kind in {"issuer_cap", "sector_cap", "cluster_cap", "gross_cap"}
+                and breach.value > breach.cap + buffer)
 
     def plan_remediation(
         self, snapshot: "BookSnapshot", *,
@@ -579,25 +608,29 @@ class RiskManager:
         """Recommend one executable next action. Reconcile before doing another."""
         controls = controls or RiskControls()
         try:
-            # One unpriced unrelated holding cannot suppress a funded short cover.
-            for held in snapshot.holdings:
-                if held.qty < 0 and held.price_ok and held.price is not None and held.price > 0:
-                    return (TradeIntent(TradeKind.BUY_TO_COVER, held.symbol, -held.qty,
-                                        held.price, reason="unexpected_short"),)
-            book = self._project_book(snapshot, controls, include_pending=False)
+            book = self._project_book(snapshot, controls, include_pending=False, allow_unpriced=True)
+            delivered = book.stocks.get(broker_symbol.strip().upper()) if broker_symbol else None
+            if broker_action and broker_symbol and delivered is None:
+                return ()  # Do not repair unrelated holdings when the delivery's mark is unavailable.
+            for stock in book.stocks.values():
+                if stock.qty < 0 and (delivered is None or stock == delivered):
+                    return (TradeIntent(TradeKind.BUY_TO_COVER, stock.symbol, -stock.qty,
+                                        stock.mark, reason="unexpected_short"),)
             breaches = self._breaches(book)
             if not breaches:
                 return ()
             counters = consecutive_closes or {}
             headroom = _decimal(self.config.RISK_TRIM_HEADROOM_PCT)
-            buffer = _decimal(self.config.RISK_DRIFT_BUFFER_PCT)
             for breach in breaches:
+                if broker_action and delivered is not None and not self._contributes(delivered, breach):
+                    continue
                 if breach.kind == "position_count" and broker_action:
                     # Prefer the newly delivered name if fully saleable.
                     candidates = [
                         stock for stock in book.stocks.values()
                         if stock.qty > 0 and stock.qty == stock.qty.to_integral_value()
                         and self._covered_shares(snapshot, stock.symbol) == 0
+                        and (delivered is None or stock == delivered)
                     ]
                     candidates.sort(key=lambda s: (s.symbol != broker_symbol, s.qty * s.mark, s.symbol))
                     if candidates:
@@ -607,14 +640,12 @@ class RiskManager:
                 if breach.kind not in {"issuer_cap", "sector_cap", "cluster_cap", "gross_cap", "cash_floor"}:
                     continue
                 if not broker_action:
-                    if breach.kind == "cash_floor":
-                        beyond_band = breach.value < breach.cap - buffer
-                    else:
-                        beyond_band = breach.value > breach.cap + buffer
-                    if not beyond_band or counters.get((breach.kind, breach.key), 0) < self.config.RISK_DRIFT_CONFIRM_SESSIONS:
+                    if (not self._outside_drift_band(breach)
+                            or counters.get((breach.kind, breach.key), 0) < self.config.RISK_DRIFT_CONFIRM_SESSIONS):
                         continue
                 candidates = [s for s in book.stocks.values()
-                              if s.qty > 0 and self._contributes(s, breach)]
+                              if s.qty > 0 and self._contributes(s, breach)
+                              and (not broker_action or delivered is None or s == delivered)]
                 candidates.sort(key=lambda s: (s.symbol != broker_symbol, -s.qty * s.mark, s.symbol))
                 cushion = Decimal(0) if broker_action else headroom
                 distance = (breach.cap + cushion - breach.value if breach.kind == "cash_floor"
@@ -643,7 +674,7 @@ class RiskManager:
 
     def _project_book(
         self, snapshot: "BookSnapshot", controls: RiskControls, *,
-        include_pending: bool = True,
+        include_pending: bool = True, allow_unpriced: bool = False,
     ) -> _Projection:
         equity, cash = _decimal(snapshot.equity), _decimal(snapshot.cash)
         if equity <= 0:
@@ -667,9 +698,17 @@ class RiskManager:
             qty = _decimal(stock.qty)
             if qty == 0:
                 continue
-            mark = _decimal(stock.price)
-            if not stock.price_ok or mark <= 0 or symbol in book.stocks:
-                raise ValueError("invalid holding or mark")
+            if not symbol or symbol in book.stocks or symbol in book.unpriced:
+                raise ValueError("missing or duplicate holding symbol")
+            try:
+                mark = _decimal(stock.price) if stock.price_ok else Decimal(0)
+            except ValueError:
+                mark = Decimal(0)
+            if mark <= 0:
+                if not allow_unpriced:
+                    raise ValueError("invalid holding mark")
+                book.unpriced[symbol] = qty
+                continue
             meta = self._metadata(snapshot, symbol)
             sector = getattr(meta, "sector", None) or getattr(stock, "sector", None)
             stop = getattr(meta, "stop_price", None)
@@ -738,6 +777,10 @@ class RiskManager:
         for symbol, stock in book.stocks.items():
             if stock.qty < 0:
                 breached.append(Breach("unexpected_short", symbol, -stock.qty, Decimal(0)))
+        for symbol, qty in book.unpriced.items():
+            breached.append(Breach("unpriced_holding", symbol, abs(qty), Decimal(0)))
+            if qty < 0:
+                breached.append(Breach("unexpected_short", symbol, -qty, Decimal(0)))
         cash_pct = totals.free_cash / totals.equity
         if cash_pct < self._ratio("MIN_FREE_CASH_PCT"):
             breached.append(Breach("cash_floor", "", cash_pct, self._ratio("MIN_FREE_CASH_PCT")))
@@ -796,7 +839,7 @@ class RiskManager:
         option = kind in {TradeKind.OPTION_OPEN, TradeKind.CASH_SECURED_PUT}
         if controls.pause_new_buys or self.config.RISK_PAUSE_NEW_BUYS:
             reasons.append("entries_paused")
-        if controls.drawdown.paused or (option and controls.drawdown.throttled):
+        if controls.drawdown.paused or (option and controls.drawdown.is_throttled(self.config)):
             reasons.append("drawdown_pause")
         if (intent.symbol.strip().upper() in snapshot.blocked_symbols
                 or any(snapshot.account_flags.get(x) is True for x in
@@ -847,7 +890,7 @@ class RiskManager:
         pct = min(self._ratio("MAX_POSITION_PCT"), _decimal(tier),
                   self._ratio("MAX_INITIAL_STOP_RISK_PCT") / stop_distance)
         target = pct * book.equity
-        if controls.drawdown.throttled:
+        if controls.drawdown.is_throttled(self.config):
             target *= self._ratio("DRAWDOWN_THROTTLE_SCALE")
         held = book.totals().issuer_values.get(sector.issuer, Decimal(0))
         stock = book.stocks.get(intent.symbol.strip().upper())
