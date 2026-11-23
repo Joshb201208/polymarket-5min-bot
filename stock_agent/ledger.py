@@ -473,6 +473,24 @@ class Ledger:
                     logger.error("snapshot listener failed: %s", e)
             return snap
 
+    def register_symbol_alias(self, old: str, new: str, *, source: str, effective: date | None = None) -> None:
+        """Record a VERIFIED rename (e.g. AssetRegistry corporate action BK -> BNY).
+
+        The next reconcile moves the open position's metadata from ``old`` to
+        ``new`` only if: ``old`` is no longer held at the broker, ``new`` is
+        held, ``new`` has no open metadata of its own, and the quantity carried
+        over exactly. Otherwise nothing moves (normal import/close rules apply).
+        """
+        old, new = old.strip().upper(), new.strip().upper()
+        if not old or not new or old == new:
+            raise LedgerError("alias needs two different symbols")
+        aliases = dict(self.store.kv_get("symbol_aliases", {}) or {})
+        aliases[old] = {"new": new, "source": source, "effective": effective.isoformat() if effective else None,
+                        "registered_at": _iso(self.now())}
+        self.store.kv_set("symbol_aliases", aliases)
+        self.journal.append("state_event", event="symbol_alias", old=old, new=new, source=source,
+                            effective=effective)
+
     def add_snapshot_listener(self, fn: Callable[[BookSnapshot], Any]) -> None:
         """Call ``fn(snapshot)`` after every successful refresh (e.g. the legacy
         ``Portfolio.sync_from_snapshot`` view). Exceptions are logged, not raised."""
