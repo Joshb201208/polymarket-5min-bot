@@ -135,3 +135,28 @@ def test_close_session_retry_keeps_mark_and_journal(tmp_path):
     rep = run(close_session(led, snap2, date(2026, 11, 23)))
     assert rep.equity == Decimal("1000") and led.equity_marks("close")[0].equity == Decimal("1000")
     assert len(list(led.journal.read(kinds={"performance.close"}))) == 1
+
+
+def test_shadow_skips_when_bars_on_split_basis(tmp_path):
+    from stock_agent.risk_manager import ShadowDailyBar
+
+    b = StubBroker()
+    b.fill("AAA", "buy", 1, 400, ts="2026-11-16T15:00:00Z")
+    b.pos("AAA", 4, 100)
+    led = make_ledger(tmp_path, broker=b)
+    snap = run(led.refresh("x", rebuild=True))
+    led.journal.append("entry.filled", position_id=led.open_position_meta("AAA").position_id, symbol="AAA",
+                       session_date="2026-11-16", fill_price="400", qty="1", stop_fraction="0.07", fill_id="f")
+    # 4:1 split later: adjusted bars sit near 100 while the raw fill was 400
+    have = [ShadowDailyBar(date(2026, 11, d), *(Decimal(x) for x in (100, 101, 99, 100)))
+            for d in (16, 17, 18, 19, 20, 23)]
+
+    async def bars(sym, start, end):
+        return list(have)
+
+    rep = run(close_session(led, snap, date(2026, 11, 23), daily_bars=bars))
+    assert rep.shadow_rows == 0 and not list(led.journal.read(kinds={"shadow.stop"}))
+    [skip] = list(led.journal.read(kinds={"shadow.stop.skipped"}))
+    assert skip["reason"] == "price_basis_mismatch"
+    run(close_session(led, snap, date(2026, 11, 24), daily_bars=bars))
+    assert len(list(led.journal.read(kinds={"shadow.stop.skipped"}))) == 1
