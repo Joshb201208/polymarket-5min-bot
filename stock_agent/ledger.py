@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import uuid
@@ -440,6 +441,7 @@ class Ledger:
         self._snapshot: BookSnapshot | None = None
         self._refresh_lock: asyncio.Lock | None = None
         self._refresh_starts = 0
+        self._alert_tasks: set = set()
         self._snapshot_start_seq = -1
 
     def now(self) -> datetime:
@@ -483,12 +485,14 @@ class Ledger:
         return self.store.trading_block()
 
     def last_reconcile(self) -> Mapping[str, Any] | None:
-        rows = self.store.query("SELECT * FROM reconcile_runs ORDER BY at DESC LIMIT 1")
+        rows = self.store.query("SELECT * FROM reconcile_runs ORDER BY at DESC, rowid DESC LIMIT 1")
         if not rows:
             return None
         r = rows[0]
+        report = json.loads(r["report_json"])
+        # ok = the broker read succeeded; clean = no critical diff (other than per-symbol shorts)
         return {"run_id": r["run_id"], "at": _dt(r["at"]), "reason": r["reason"], "ok": bool(r["ok"]),
-                "n_diffs": r["n_diffs"], "report": json.loads(r["report_json"])}
+                "clean": bool(report.get("clean", True)), "n_diffs": r["n_diffs"], "report": report}
 
     # ------------------------------------------------------ position meta
     def _row_to_meta(self, r) -> PositionMeta:
@@ -884,7 +888,16 @@ class Ledger:
         self.journal.append("alert", severity=severity.value, title=title, body=body, key=key)
         if self._alert is not None:
             try:
-                self._alert(severity.value, title, body, key=key)
+                res = self._alert(severity.value, title, body, key=key)
+                if inspect.isawaitable(res):
+                    # an async alert callable is scheduled, never left un-awaited
+                    try:
+                        task = asyncio.get_running_loop().create_task(res)
+                        self._alert_tasks.add(task)
+                        task.add_done_callback(self._alert_tasks.discard)
+                    except RuntimeError:
+                        res.close() if hasattr(res, "close") else None
+                        logger.error("async alert dropped (no running loop): %s", title)
             except Exception as e:  # alerting must not break the books
                 logger.error("alert delivery failed: %s", e)
 

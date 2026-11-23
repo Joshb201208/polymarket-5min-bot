@@ -178,3 +178,24 @@ def test_equity_marks_and_risk_state(tmp_path):
     assert m.equity == 50000 and m.session_date == date(2026, 11, 23)
     led.risk_state_set("drawdown", {"hwm": "50000"})
     assert led.risk_state_get("drawdown") == {"hwm": "50000"}
+
+
+def test_async_alert_callable_is_awaited(tmp_path):
+    import asyncio
+
+    from stock_agent.ledger import Severity
+
+    got = []
+
+    async def alert(sev, title, body, key=None):
+        got.append(key)
+
+    led = make_ledger(tmp_path, alerts=None)
+    led._alert = alert
+
+    async def go():
+        led._raise_alert(Severity.WARNING, "t", "b", key="k1")
+        await asyncio.sleep(0)
+
+    run(go())
+    assert got == ["k1"]

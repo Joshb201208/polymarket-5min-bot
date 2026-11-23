@@ -300,6 +300,25 @@ def _new_meta(c, symbol: str, asset_class: str, opened_at: datetime | None, sour
     return pid
 
 
+def _validate_read(account: Any, positions: list) -> None:
+    """A successful HTTP read can still be unusable. Anything we cannot trust
+    aborts the reconcile (ledger untouched) instead of being read as zero/flat."""
+    for k in ("equity", "cash"):
+        if _dec(_g(account, k)) is None:
+            raise ReconcileError(f"account {k} missing or not a finite number")
+    seen: set[str] = set()
+    for p in positions:
+        sym = _g(p, "symbol")
+        if not sym or not str(sym).strip():
+            raise ReconcileError("position row without a symbol")
+        sym = str(sym)
+        if sym in seen:
+            raise ReconcileError(f"duplicate position row for {sym}")
+        seen.add(sym)
+        if _dec(_g(p, "qty")) is None:
+            raise ReconcileError(f"position {sym}: qty missing or not a finite number")
+
+
 async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> BookSnapshot:
     store, journal = ledger.store, ledger.journal
     broker = ledger.broker
@@ -310,6 +329,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     after = (cursor - timedelta(days=3)) if cursor else None
     try:
         account, positions, orders, acts = await _read_broker(broker, after)
+        _validate_read(account, positions)
     except ReconcileError as e:
         journal.append("reconcile", ok=False, reason=reason, error=str(e))
         raise
@@ -322,6 +342,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())
+            _validate_read(account, positions)
         except Exception as e:
             journal.append("reconcile", ok=False, reason=reason, error=f"re-read failed: {e}")
             raise ReconcileError(f"positions re-read failed: {e}") from e
@@ -512,7 +533,10 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         account_flags={k: _g(account, k) for k in ("shorting_enabled", "trading_blocked", "account_blocked",
                                                   "multiplier", "options_trading_level", "status")},
     )
-    report = {"diffs": [{"kind": d.kind.value, "symbol": d.symbol, "severity": d.severity.value,
+    # B1: resume only after a CLEAN reconcile. Shorts are blocked per symbol, not globally.
+    blocking = [d for d in diffs if d.severity == Severity.CRITICAL and d.kind != DiffKind.SHORT_STOCK]
+    clean = not blocking
+    report = {"clean": clean, "diffs": [{"kind": d.kind.value, "symbol": d.symbol, "severity": d.severity.value,
                          "ledger": d.ledger, "broker": d.broker, "explanation": d.explanation,
                          "action": d.action} for d in diffs],
               "n_holdings": len(holdings), "n_legs": len(legs), "quality": quality}
@@ -531,10 +555,9 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
             ledger._raise_alert(d.severity, f"Books: {d.kind.value} {d.symbol or ''}".strip(),
                                 f"ledger={d.ledger} broker={d.broker}. {d.explanation} {d.action}".strip(),
                                 key=f"reconcile:{d.kind.value}:{d.symbol}")
-    journal.append("reconcile", ok=True, run_id=run_id, reason=reason, n_diffs=len(diffs), quality=quality,
+    journal.append("reconcile", ok=True, clean=clean, run_id=run_id, reason=reason, n_diffs=len(diffs),
+                   quality=quality,
                    equity=str(equity), cash=str(cash), n_holdings=len(holdings), n_legs=len(legs))
-    # B1: resume only after a CLEAN reconcile. Shorts are blocked per symbol, not here.
-    blocking = [d for d in diffs if d.severity == Severity.CRITICAL and d.kind != DiffKind.SHORT_STOCK]
     if store.trading_block() and blocking:
         ledger._raise_alert(Severity.CRITICAL, "Books not clean; trading stays blocked",
                             "; ".join(f"{d.kind.value} {d.symbol or ''}".strip() for d in blocking[:10]),

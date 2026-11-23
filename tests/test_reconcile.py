@@ -353,3 +353,28 @@ def test_same_second_round_trip_detected_by_activity_id(tmp_path):
     b.fill("AAA", "buy", 10, 100, ts="2026-11-02T15:00:40Z")
     run(led.refresh("later"))
     assert led.open_position_meta("AAA").position_id != old
+
+
+@pytest.mark.parametrize("bad", [{"qty": "NaN"}, {"qty": None}, {"qty": "abc"}, {"symbol": ""}])
+def test_malformed_but_successful_positions_abort(tmp_path, bad):
+    b = StubBroker()
+    b.pos("AAA", 10, 100)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    b.positions["AAA"].update(bad)
+    with pytest.raises(ReconcileError):
+        run(led.refresh("malformed"))
+    assert led.open_position_meta("AAA") is not None
+
+
+def test_last_reconcile_reports_clean_separately(tmp_path):
+    b = StubBroker()
+    for s in ("AAA", "BBB", "CCC"):
+        b.pos(s, 10, 50)
+    led = make_ledger(tmp_path, broker=b)
+    run(led.refresh("first"))
+    assert led.last_reconcile()["clean"]
+    del b.positions["AAA"]
+    run(led.refresh("gone"))
+    lr = led.last_reconcile()
+    assert lr["ok"] and not lr["clean"]
