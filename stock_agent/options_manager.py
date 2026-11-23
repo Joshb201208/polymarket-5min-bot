@@ -25,7 +25,7 @@ import contextlib
 import hashlib
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -71,7 +71,8 @@ from stock_agent.risk_manager import OptionCommitment, RiskControls, TradeIntent
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
-OPTION_ACTIVITY_TYPES = ("FILL", "OPEXC", "OPASN", "OPEXP", "OPTRD")
+_EXPIRY_DRIVEN = frozenset({ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND})
+OPTION_ACTIVITY_TYPES = ("FILL", "OPEXC", "OPXRC", "OPASN", "OPEXP", "OPTRD")
 _FILLED = "filled"
 _DEAD = {"canceled", "expired", "rejected", "done_for_day", "replaced", "suspended", "stopped"}
 
@@ -631,9 +632,9 @@ class OptionsManager:
                 st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
                 self._save()
-            # sized at the ladder's top rung, so every rung's max loss is within the budget
+            # the reservation stays at the sized ceiling (top rung) until the order is
+            # terminal; _apply_open_order then sets max loss from the actual fill
             st.limit_debit = limit
-            st.max_loss = round(limit * MULTIPLIER * st.qty, 2)
             try:
                 order = await self.broker.submit_raw_order(self._open_body(st, limit))
             except BrokerError as e:
@@ -843,15 +844,21 @@ class OptionsManager:
                          now: datetime) -> None:
         """Some legs of `st` are gone at the broker. Close them only with evidence."""
         gone, remaining, values = [], [], {}
-        since = (st.opened_at or "")[:10]
+        opened = _parse_ts(st.opened_at) if st.opened_at else None
         for lg in st.legs:
             if broker_qty.get(lg.symbol, 0) == 0:
-                acts = [a for a in ev.get(lg.symbol, []) if str(a.get("transaction_time") or a.get("date") or "")[:10] >= since]
+                acts = [a for a in ev.get(lg.symbol, []) if _after_open(a, opened)]
                 v = leg_close_value(lg, acts)
                 if v is None:
-                    st.state = StructState.UNKNOWN.value
-                    st.note(f"{lg.symbol} gone at broker with no fill/expiry/exercise/assignment record")
-                    return
+                    if any(broker_qty.get(x.symbol, 0) != 0 for x in st.legs):
+                        # other legs are still held: never wait on a possibly naked leg,
+                        # close what is left under the repair rule
+                        v = (0.0, "unexplained")
+                        st.note(f"{lg.symbol} gone at broker with no record; repairing the rest")
+                    else:
+                        st.state = StructState.UNKNOWN.value
+                        st.note(f"{lg.symbol} gone at broker with no fill/expiry/exercise/assignment record")
+                        return
                 values[lg.symbol] = v
                 gone.append(lg)
             else:
@@ -877,7 +884,7 @@ class OptionsManager:
         if kinds <= {"fill", "expired"} and st.entry_debit is not None:
             credit = sum(lg.sign * lg.ratio * values[lg.symbol][0] for lg in st.legs)
             st.exit_credit = round(credit, 4)
-            st.realized_pnl = round((credit - st.entry_debit) * MULTIPLIER * st.qty, 2)
+            st.realized_pnl = st.final_pnl(credit)
             self._record_result(st, now)
         else:
             st.realized_pnl = None
@@ -969,7 +976,12 @@ class OptionsManager:
         days_left = self._trading_days(today, st.expiry_date)
         if days_left is None and st.expiry_date <= today:
             days_left = 0
-        quotes = await self._quotes([lg.symbol for lg in st.legs])
+        try:
+            quotes = await self._quotes([lg.symbol for lg in st.legs])
+        except BrokerError as e:  # no marks: the time exit and repairs still run
+            if e.uncertain or e.kind in ("auth",):
+                raise
+            quotes = {}
         bad = {lg.symbol: mark_problem(quotes.get(lg.symbol), now, s) for lg in st.legs}
         bad = {k: v for k, v in bad.items() if v}
         value_mid = None if bad else self._value(st, quotes, "mid")
@@ -1084,16 +1096,26 @@ class OptionsManager:
             limit: float | None = None
             natural = mid = None
             if frac is not None:
-                quotes = await self._quotes([lg.symbol for lg in st.legs])
+                try:
+                    quotes = await self._quotes([lg.symbol for lg in st.legs])
+                except BrokerError as e:
+                    if e.uncertain or e.kind == "auth":
+                        raise
+                    quotes = {}
                 natural = self._value(st, quotes, "natural")
                 mid = self._value(st, quotes, "mid")
                 if natural is not None and mid is not None:
                     limit = close_limit(natural, mid, frac)
                 if limit is None or limit <= 0:
-                    # no usable quote: don't send a market order on a bad mark unless urgent
-                    st.note("close skipped: no usable quote")
-                    self._save()
-                    return "no usable quote"
+                    if reason in _EXPIRY_DRIVEN:
+                        # nothing may be carried into expiry: without a usable quote, go market
+                        st.note("no usable quote for an expiry-driven exit; closing at market")
+                        limit = None
+                    else:
+                        # no usable quote: don't send a market order on a bad mark
+                        st.note("close skipped: no usable quote")
+                        self._save()
+                        return "no usable quote"
             st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + i)
             st.exit_reason = reason.value
             st.state = StructState.CLOSING.value
@@ -1134,7 +1156,7 @@ class OptionsManager:
             st.closed_at = now.isoformat()
             st.state = StructState.CLOSED.value
             if credit is not None and st.entry_debit is not None:
-                st.realized_pnl = round((credit - st.entry_debit) * MULTIPLIER * st.qty, 2)
+                st.realized_pnl = st.final_pnl(credit)
                 self._record_result(st, now)
             else:
                 st.note("fill prices missing; P&L not recorded")
@@ -1145,7 +1167,7 @@ class OptionsManager:
             return
         if filled > 0:
             # part of the structures closed: keep the rest open with the same entry debit
-            st.qty -= filled
+            st.close_part(filled, credit)
             st.note(f"closing order {order.status}: {filled} closed, {st.qty} left")
         if count_attempt:
             st.close_attempts += 1
@@ -1204,7 +1226,7 @@ class OptionsManager:
                     st.closed_at = now.isoformat()
                     st.exit_credit = -(order.filled_avg_price or 0.0)
                     if st.entry_debit is not None and order.filled_avg_price is not None:
-                        st.realized_pnl = round((st.exit_credit - st.entry_debit) * MULTIPLIER * st.qty, 2)
+                        st.realized_pnl = st.final_pnl(st.exit_credit)
             self._save()
             self._j("options.closed", contract=contract, reason="normalise_short_call", filled_qty=filled,
                     avg_price=order.filled_avg_price, status=order.status)
@@ -1228,6 +1250,19 @@ class OptionsManager:
                 pnl = "n/a" if st.realized_pnl is None else f"{st.realized_pnl:+.0f}"
                 lines.append(f"- closed {st.underlying} {st.strategy}: {st.exit_reason}, P&L {pnl}")
         return lines
+
+
+def _after_open(activity: Mapping[str, Any], opened: datetime | None) -> bool:
+    """Evidence must postdate the structure: fills by their timestamp; date-only
+    non-trade activities (expiry, exercise, assignment) by their date."""
+    if opened is None:
+        return True
+    tt = activity.get("transaction_time")
+    if tt:
+        t = _parse_ts(tt)
+        return t is not None and t >= opened
+    d = str(activity.get("date") or "")[:10]
+    return bool(d) and d >= opened.astimezone(timezone.utc).date().isoformat()
 
 
 @dataclass
