@@ -29,6 +29,10 @@ _OVERRIDES = (
     "TIPRANKS_MIN_SMART_SCORE",
     "TIPRANKS_UNIVERSE_LIMIT",
     "STOCK_LOG_LEVEL",
+    "OPTIONS_MODE",
+    "STOCK_AGENT_LIVE_CONFIRMED",
+    "STOCK_TRADING_PAUSED",
+    "RISK_PAUSE_NEW_BUYS",
 )
 # Credentials are blanked so no test can reach a real account by accident.
 _CREDENTIALS = (
@@ -41,6 +45,11 @@ _CREDENTIALS = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "DISCORD_BOT_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "TIPRANKS_API_KEY",
+    "TIPRANKS_API_TOKEN",
+    "TIPRANKS_EMAIL",
+    "TIPRANKS_PASSWORD",
 )
 
 for _name in _OVERRIDES:

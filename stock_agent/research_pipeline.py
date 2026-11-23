@@ -17,7 +17,7 @@ from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent,
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_notes import load_notes, research_notes_payload
-from stock_agent.research_schemas import Direction, Evidence, ResearchTask
+from stock_agent.research_schemas import Direction, Evidence, ResearchTask, utc_datetime
 from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
@@ -302,7 +302,8 @@ class ResearchPipeline:
             evidence = {story.evidence.evidence_id: story.evidence, **evidence}
         context = self.context()
         market = self.store.store.kv_get("research_market_regime") or {}
-        if market.get("as_of") and now - timedelta(days=1) <= datetime.fromisoformat(market["as_of"]) <= now:
+        market_at = utc_datetime(market.get("as_of"))
+        if market_at is not None and timedelta() <= now - market_at <= timedelta(days=1):
             context = {**context, **market}
         approved_notes = research_notes_payload(symbol, load_notes(
             enabled=getattr(self.config, "RESEARCH_SHARE_NOTES", False),
@@ -355,11 +356,15 @@ class ResearchPipeline:
                         direction=direction, raw_conviction=record.raw_conviction,
                         effective_conviction=record.effective_conviction,
                     )
+            elif kind == "news" and self.clock() >= session.closes_at:
+                self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "live_session_closed"})
             elif not exit_pending:
                 current = self.clock()
                 expiration = current + timedelta(minutes=30)
                 if story and story.evidence.published_at:
                     expiration = min(expiration, story.evidence.published_at + timedelta(hours=24))
+                if kind == "news":
+                    expiration = min(expiration, session.closes_at)
                 self.store.schedule_confirmation(
                     key, symbol, position_id, current, expiration, {
                         "thesis_id": thesis_id, "inputs": result.inputs, "provider": result.result.route.provider,
@@ -479,10 +484,11 @@ class ResearchPipeline:
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):
+        eligible_at = session.opens_at + (timedelta(minutes=5) if side == "sell" else timedelta())
         return NewIntent(
             symbol, side, key, decision_id=key, position_id=position_id, thesis_ids=thesis_ids,
             reference_price=price, evidence_ids=evidence_ids, origin=kind, sleeve="core",
-            session_date=session.date, expires_at=session.closes_at, next_attempt_at=session.opens_at, meta=meta or {},
+            session_date=session.date, expires_at=session.closes_at, next_attempt_at=eligible_at, meta=meta or {},
         )
 
 

@@ -1,0 +1,4 @@
+# Direct development & CI dependencies (not installed on the droplet).
+# Pin exact versions in requirements-dev.txt.
+pytest>=9.0,<10.0
+ruff>=0.17,<1.0

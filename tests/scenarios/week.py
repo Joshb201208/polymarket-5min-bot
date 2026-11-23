@@ -13,9 +13,15 @@ Script (ET):
   Tue 11:00  BBB falls 12 % through any reasonable stop (stop fill).
   Tue 13:00  negative news for AAA; Tue 13:20 a second, confirming story
              from another source (news-driven exit with confirmation).
-  Mon..Wed   CCC option chain, expiry Mon 2026-11-30. Two sessions before
-             expiry (T-2) is Wed 11-25, because Thu is a holiday and Fri is
-             T-1: a spread opened Mon/Tue must be closed by Wed's close.
+  Mon 07:00  the broker also holds a bull call spread on EEE (+1 C100 / -1 C105)
+             expiring Fri 2026-11-27 that the bot has never seen (adopted on
+             first run). Trading days left: Tue, Wed, Fri, so T-2 is Tue 11-24:
+             it must be closed as one mleg after Tue open + 5 minutes.
+  Mon 10:30  bearish news for CCC; CCC has a liquid chain expiring Thu
+             2026-12-24 (31 DTE, inside the 21-45 DTE entry window), so a
+             conviction-8 bearish thesis can open a defined-risk put spread.
+             Its own T-2 (Mon 12-21) is after this week; the test steps one
+             tick on that date after the week to check the close.
   Thu        holiday: the broker accepts orders but nothing fills.
   Fri 09:50  positive news for DDD; the next order's reply is lost and the
              agent restarts at the end of that step (restart mid-order); the
@@ -34,6 +40,7 @@ from typing import Callable
 
 from tests.fakes.clock import ET
 from tests.fakes.alpaca import occ_symbol
+from tests.options_support import seed_chain
 
 
 def _et(*a) -> datetime:
@@ -43,7 +50,8 @@ def _et(*a) -> datetime:
 @dataclass
 class E2EWeek:
     monday: date = date(2026, 11, 23)
-    option_expiry: date = date(2026, 11, 30)
+    option_expiry: date = date(2026, 12, 24)
+    adopted_expiry: date = date(2026, 11, 27)
     on_news: Callable | None = None  # on_news(world, symbol, headline) after each story
     times: dict[str, datetime] = field(default_factory=lambda: {
         "first_run": _et(2026, 11, 23, 7, 0),
@@ -51,17 +59,25 @@ class E2EWeek:
         "bbb_drop": _et(2026, 11, 24, 11, 0),
         "aaa_bad_news": _et(2026, 11, 24, 13, 0),
         "aaa_confirm": _et(2026, 11, 24, 13, 20),
-        "ccc_t_minus_2_close": _et(2026, 11, 25, 16, 0),
+        "ccc_news": _et(2026, 11, 23, 10, 30),
+        "eee_t_minus_2": _et(2026, 11, 24, 9, 35),
+        "ccc_t_minus_2": _et(2026, 12, 22, 9, 35),
         "holiday": _et(2026, 11, 26, 9, 30),
         "ddd_news": _et(2026, 11, 27, 9, 50),
         "early_close": _et(2026, 11, 27, 13, 0),
     })
     prices: dict[str, float] = field(default_factory=lambda: {
-        "AAA": 100.0, "BBB": 50.0, "CCC": 200.0, "DDD": 30.0, "ZZZ": 20.0,
+        "AAA": 100.0, "BBB": 50.0, "CCC": 100.0, "EEE": 100.0, "DDD": 30.0, "ZZZ": 20.0,
     })
 
     def ccc_contracts(self) -> dict[str, str]:
-        return {k: occ_symbol("CCC", self.option_expiry, "call", k_) for k, k_ in (("long", 200), ("short", 210))}
+        """Every CCC contract the bot could pick (puts and calls, 90..115)."""
+        return {f"{t}{k}": occ_symbol("CCC", self.option_expiry, t, k)
+                for t in ("call", "put") for k in (90, 95, 100, 105, 110, 115)}
+
+    def eee_legs(self) -> dict[str, str]:
+        return {"long": occ_symbol("EEE", self.adopted_expiry, "call", 100),
+                "short": occ_symbol("EEE", self.adopted_expiry, "call", 105)}
 
     def setup(self, world) -> None:
         """Broker and market state at Monday 07:00 (call before running)."""
@@ -71,10 +87,11 @@ class E2EWeek:
         a.seed_position("AAA", 50, 100.0)
         a.submit({"symbol": "ZZZ", "qty": "5", "side": "buy", "type": "limit", "limit_price": "15",
                   "time_in_force": "gtc"})
-        a.add_option_chain("CCC", self.option_expiry, [190, 200, 210, 220])
-        c = self.ccc_contracts()
-        a.set_option_quote(c["long"], 6.0, 6.2)
-        a.set_option_quote(c["short"], 2.4, 2.6)
+        seed_chain(world, "CCC", self.prices["CCC"], self.option_expiry)
+        seed_chain(world, "EEE", self.prices["EEE"], self.adopted_expiry)
+        legs = self.eee_legs()
+        a.seed_position(legs["long"], 1, 3.0)
+        a.seed_position(legs["short"], -1, 2.4)  # debit 0.60 = current mid value: no P&L exit
         a.seed_daily_bars("AAA", [100.0] * 30, end=date(2026, 11, 20))
         a.seed_daily_bars("BBB", [50.0] * 30, end=date(2026, 11, 20))
 
@@ -92,7 +109,7 @@ class E2EWeek:
         runner.at(t["bbb_drop"], lambda w, r: w.price("BBB", self.prices["BBB"] * 0.88, spread=0.02), "BBB -12%")
         runner.at(t["aaa_bad_news"], self._story("AAA", "AAA discloses regulator probe into accounting"))
         runner.at(t["aaa_confirm"], self._story("AAA", "Second report confirms AAA accounting probe", "reuters"))
-        runner.at(t["ccc_t_minus_2_close"], lambda w, r: None, "CCC T-2 close (checkpoint)")
+        runner.at(t["ccc_news"], self._story("CCC", "CCC warns of demand slowdown in core market"))
         runner.at(t["ddd_news"], self._story("DDD", "DDD wins multi-year government contract"))
         runner.at(t["ddd_news"], lambda w, r: r.restart_after_lost_order(lookup_down=True),
                     "arm lost order reply (lookup down) + restart")

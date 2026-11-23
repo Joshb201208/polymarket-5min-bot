@@ -198,12 +198,13 @@ class MarketCalendar:
         )
 
     async def _refresh_calendar(self, now: datetime, today: date) -> None:
-        if self._covered(today) and self._calendar_at and now - self._calendar_at < timedelta(hours=6):
+        start, end = today - timedelta(days=7), today + timedelta(days=120)
+        if (self._covered(today) and self._covered(end) and self._calendar_at
+                and self._calendar_at.astimezone(ET).date() == today):
             return
         if self._calendar_attempt_at and timedelta() <= now - self._calendar_attempt_at < timedelta(minutes=5):
             return
         self._calendar_attempt_at = now
-        start, end = today - timedelta(days=7), today + timedelta(days=14)
         try:
             async with asyncio.timeout(self.timeout):
                 days = await self.broker.get_calendar(start, end)

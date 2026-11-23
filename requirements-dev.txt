@@ -1,3 +1,8 @@
-# Development-only tools. Not installed on the droplet.
-pytest>=8.0
-ruff>=0.6
+# Locked development & CI dependencies (not installed on the droplet).
+# Direct sources live in `requirements-dev.in`.
+iniconfig==2.3.0
+packaging==26.0
+pluggy==1.6.0
+Pygments==2.19.2
+pytest==9.0.2
+ruff==0.17.6
