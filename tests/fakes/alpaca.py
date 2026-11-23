@@ -64,6 +64,17 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _iso_param(v: str) -> str:
+    """Normalise an RFC 3339 query value to the fake's Z form for comparisons."""
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return v
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return _iso(dt)
+
+
 def _err(status: int, code: int, message: str, **extra) -> httpx.Response:
     return json_response({"code": code, "message": message, **extra}, status)
 
@@ -130,6 +141,9 @@ class AlpacaBehaviour:
     # Evidence: the broker closed expiring spreads itself at 15:30 ET on
     # expiry day. None = do not emulate.
     expiry_day_liquidation_time: time | None = None
+    # Short calls lock the underlying shares (documented: qty_available excludes
+    # shares "locked for options covered call").
+    covered_call_locks_shares: bool = True
     # Buying power multiplier applied to short sales (docs: 102%-103% margin).
     short_sale_bp_factor: float = 1.03
 
@@ -300,6 +314,7 @@ class FakeAlpaca(FakeService):
         self.equity_history: list[tuple[datetime, float]] = []
         self.news: list[dict] = []
         self.fill_scripts: dict[str, list[list[float]]] = {}
+        self.greeks: dict[str, dict] = {}
         self._processed_until: datetime = clock.now()
         clock.on_advance(self._on_advance)
 
@@ -331,6 +346,68 @@ class FakeAlpaca(FakeService):
     def set_option_quote(self, symbol: str, bid: float, ask: float, last: float | None = None) -> None:
         self.set_price(symbol, last if last is not None else round((bid + ask) / 2, 4), bid=bid, ask=ask)
 
+    def set_option_greeks(self, symbol: str, delta: float, iv: float, *, gamma: float = 0.0, theta: float = 0.0,
+                          vega: float = 0.0, rho: float = 0.0) -> None:
+        """Greeks and implied volatility returned in option snapshots (default: null)."""
+        self.greeks[symbol] = {"greeks": {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "rho": rho},
+                               "iv": iv}
+
+    def assign_early(self, option_symbol: str, qty: float | None = None) -> list[dict]:
+        """Early assignment of a SHORT option before expiry: OPASN + OPTRD and the
+        share movement (short call -> deliver shares, which can leave short stock;
+        short put -> receive shares)."""
+        p = self.positions.get(option_symbol)
+        parsed = parse_occ(option_symbol)
+        if not p or p.qty >= 0 or not parsed:
+            raise ValueError(f"no short option position {option_symbol}")
+        und, _exp, kind, strike = parsed
+        n = abs(p.qty) if qty is None else float(qty)
+        p.qty += n
+        if abs(p.qty) < 1e-9:
+            del self.positions[option_symbol]
+        shares = n * 100
+        gets_shares = kind == "put"
+        out = [self._nta("OPASN", symbol=option_symbol, qty=n, net_amount=0.0)]
+        self._apply_to_position(und, shares if gets_shares else -shares, strike, "us_equity")
+        out.append(self._nta("OPTRD", symbol=und, qty=shares, price=strike, side="buy" if gets_shares else "sell",
+                             net_amount=round(-shares * strike if gets_shares else shares * strike, 2)))
+        return out
+
+    def corporate_action_cancel(self, symbol: str) -> list[str]:
+        """The broker cancels open orders on `symbol` (as it does around corporate
+        actions). Returns the cancelled order ids."""
+        ids = []
+        for o in self.open_orders(symbol):
+            self._finish(o, "canceled", self.now())
+            ids.append(o.id)
+        return ids
+
+    def seed_daily_bars(self, symbol: str, closes: list[float], *, end: date | None = None,
+                        high_low_pct: float = 0.01, volume: int = 1_000_000) -> None:
+        """History of daily bars ending the trading day before `end` (default: today),
+        one per trading day, high/low = close +/- high_low_pct. For ATR tests."""
+        end = end or self.now().astimezone(ET).date()
+        days: list[date] = []
+        d = end - timedelta(days=1)
+        while len(days) < len(closes):
+            if self.calendar.is_trading_day(d):
+                days.append(d)
+            d -= timedelta(days=1)
+        days.reverse()
+        hist = self.trades_history.setdefault(symbol, [])
+        pts = []
+        for day, c in zip(days, closes):
+            s = self.calendar.session(day)
+            pts.append((s.open, c, volume // 3))
+            pts.append((s.open + timedelta(hours=1), c * (1 + high_low_pct), volume // 3))
+            pts.append((s.open + timedelta(hours=2), c * (1 - high_low_pct), volume // 3))
+            pts.append((s.close - timedelta(minutes=1), c, 0))
+        hist[:0] = pts
+        if symbol not in self.quotes:
+            self.quotes[symbol] = Quote(bid=closes[-1], ask=closes[-1], last=closes[-1], at=self.now())
+        if symbol not in self.assets and not OCC_RE.match(symbol):
+            self.add_asset(symbol)
+
     def add_option_contract(self, underlying: str, expiration: date, type: str, strike: float, **kw) -> OptionContract:
         sym = occ_symbol(underlying, expiration, type, strike)
         c = OptionContract(symbol=sym, underlying=underlying, expiration=expiration, type=type, strike=strike, **kw)
@@ -357,6 +434,7 @@ class FakeAlpaca(FakeService):
 
     def add_news(self, symbols: list[str], headline: str, *, summary: str = "", source: str = "benzinga",
                  created_at: datetime | None = None) -> dict:
+        """Add a story. A future `created_at` stays invisible until the clock reaches it."""
         n = {
             "id": len(self.news) + 1, "headline": headline, "author": "fake", "summary": summary,
             "content": "", "url": f"https://example.invalid/news/{len(self.news) + 1}",
@@ -465,6 +543,35 @@ class FakeAlpaca(FakeService):
                 held += o.remaining
         return held + sum(groups.values())
 
+    def _held_for_options(self, underlying: str) -> float:
+        """Shares locked as cover for short calls (docs: qty_available is qty minus
+        open orders and shares "locked for options covered call"). Short calls
+        that a long call on the same underlying covers do not lock shares
+        (approximation). Switch: behaviour.covered_call_locks_shares."""
+        if not self.behaviour.covered_call_locks_shares:
+            return 0.0
+        short = long = 0.0
+        for p in self.positions.values():
+            parsed = parse_occ(p.symbol)
+            if parsed and parsed[0] == underlying and parsed[2] == "call":
+                if p.qty < 0:
+                    short += -p.qty
+                else:
+                    long += p.qty
+        for o in self.open_orders():
+            parsed = parse_occ(o.symbol)
+            if (parsed and parsed[0] == underlying and parsed[2] == "call" and o.side == "sell"
+                    and o.position_intent == "sell_to_open" and not o.parent_id):
+                short += o.remaining
+        pos = self.positions.get(underlying)
+        shares = pos.qty if pos and pos.qty > 0 else 0.0
+        return min(max(short - long, 0.0) * 100, shares)
+
+    def _underlying_available(self, underlying: str) -> float:
+        pos = self.positions.get(underlying)
+        shares = pos.qty if pos and pos.qty > 0 else 0.0
+        return max(shares - self._held_for_orders(underlying) - self._held_for_options(underlying), 0.0)
+
     def account_json(self) -> dict:
         lm, sm = self._market_values()
         eq = self.cash + lm + sm
@@ -497,7 +604,7 @@ class FakeAlpaca(FakeService):
         mv = p.qty * px * mult
         cost = p.qty * p.avg_entry_price * mult
         upl = mv - cost
-        held = self._held_for_orders(p.symbol) if p.qty > 0 else 0.0
+        held = (self._held_for_orders(p.symbol) + self._held_for_options(p.symbol)) if p.qty > 0 else 0.0
         lastday = p.lastday_price if p.lastday_price is not None else px
         side = "long" if p.qty > 0 else "short"
         return {
@@ -1040,22 +1147,58 @@ class FakeAlpaca(FakeService):
         opt = parse_occ(sym or "")
         info["asset_class"] = "us_option" if opt else "us_equity"
         if opt:
+            und, _exp, kind, strike = opt
+            if notional is not None:
+                return _err(422, 42210000, "notional orders are not supported for options trading"), info
             if sym not in self.contracts:
-                return _err(422, 40010001, f"asset {sym} not found"), info
+                return _err(422, 42210000, f'contract "{sym}" not found'), info
+            if self.contracts[sym].status != "active" or not self.contracts[sym].tradable:
+                return _err(422, 42210000, f'contract "{sym}" is not tradable'), info
             if qty_f is None or not float(qty_f).is_integer():
-                return _err(422, 40010001, "qty must be a whole number for options"), info
+                return _err(422, 42210000, "qty must be integer for options trading"), info
             if tif not in ("day", "gtc"):
-                return _err(422, 40010001, "options orders must be day or gtc"), info
+                return _err(422, 42210000, "invalid option time_in_force"), info
+            if typ not in ("market", "limit"):
+                return _err(422, 42210000, "invalid order type for options trading"), info
             if body.get("extended_hours"):
-                return _err(422, 40010001, "extended hours not supported for options"), info
+                return _err(422, 42210000, "extended hours is not supported for options trading"), info
             if typ == "market" and not self.calendar.is_open(self.now()):
                 return _err(422, 42210000, "options market orders are only allowed during market hours"), info
             if self.options_level < 1:
-                return _err(403, 40310000, "account not eligible to trade options"), info
+                return _err(403, 40310000, "account not authorized to trade options"), info
             p = self.positions.get(sym)
-            held_short = p is not None and p.qty < 0
-            if side == "sell" and (p is None or p.qty <= 0) and self.options_level < 3 and not held_short:
-                return _err(403, 40310000, "account not eligible to trade uncovered option contracts"), info
+            if side == "buy":
+                if (p is None or p.qty >= 0) and self.options_level < 2:
+                    return _err(403, 40310000, "account not eligible to trade long option contracts"), info
+                info["position_intent"] = "buy_to_close" if p is not None and p.qty < 0 else "buy_to_open"
+                cost = qty_f * 100 * float(body.get("limit_price") or (self.quotes[sym].ask if sym in self.quotes else 0))
+                if info["position_intent"] == "buy_to_open" and cost > self._options_buying_power() + 1e-6:
+                    return _err(403, 40310000, "insufficient options buying power (required: "
+                                f"{_f(round(cost, 2))}, available: {_f(round(self._options_buying_power(), 2))})"), info
+                return None, info
+            long_held = p.qty if p is not None and p.qty > 0 else 0.0
+            if qty_f <= long_held - self._held_for_orders(sym, exclude=exclude) + 1e-9:
+                info["position_intent"] = "sell_to_close"
+                return None, info
+            if long_held > 0:
+                avail = max(long_held - self._held_for_orders(sym, exclude=exclude), 0.0)
+                return _err(403, 40310000, f"insufficient qty available for order (requested: {_f(qty_f)}, "
+                            f"available: {_f(avail)})", available=_f(avail), existing_qty=_f(long_held),
+                            held_for_orders=_f(self._held_for_orders(sym, exclude=exclude)), symbol=sym), info
+            info["position_intent"] = "sell_to_open"
+            if kind == "call":
+                need = qty_f * 100
+                avail = self._underlying_available(und)
+                if need > avail + 1e-9:
+                    return _err(403, 40310000, "insufficient underlying qty available for covered call "
+                                f"(required: {_f(need)}, available: {_f(avail)})", available_qty=_f(avail),
+                                required_qty=_f(need), symbol=sym,
+                                underlying_asset_id=self.assets[und].id if und in self.assets else None), info
+            else:
+                need = qty_f * 100 * strike
+                if need > self._options_buying_power() + 1e-6:
+                    return _err(403, 40310000, f"insufficient options buying power (required: {_f(round(need, 2))}, "
+                                f"available: {_f(round(self._options_buying_power(), 2))})"), info
             return None, info
         asset = self.assets.get(sym)
         if asset is None:
@@ -1076,15 +1219,18 @@ class FakeAlpaca(FakeService):
             pos = self.positions.get(sym)
             long_qty = pos.qty if pos and pos.qty > 0 else 0.0
             held = self._held_for_orders(sym, exclude=exclude)
-            available = max(long_qty - held, 0.0)
+            held_opt = self._held_for_options(sym)
+            available = max(long_qty - held - held_opt, 0.0)
             want = qty_f if qty_f is not None else (notional / ref if ref else 0.0)
             if long_qty > 0:
-                if want > available + 1e-9 and (held > 0 or not b.allow_long_to_short_flip):
+                if want > available + 1e-9 and (held > 0 or held_opt > 0 or not b.allow_long_to_short_flip):
+                    extra = {"held_for_options": _f(held_opt)} if held_opt > 0 else {}
                     return _err(
                         403, 40310000,
                         f"insufficient qty available for order (requested: {_f(want)}, available: {_f(available)})",
                         available=_f(available), existing_qty=_f(long_qty), held_for_orders=_f(held), symbol=sym,
                         related_orders=[o.id for o in self.open_orders(sym) if o.side == "sell" and o.id != exclude],
+                        **extra,
                     ), info
                 if want > available + 1e-9:
                     info["position_intent"] = "sell_to_open_short"
@@ -1210,7 +1356,7 @@ class FakeAlpaca(FakeService):
         if not 2 <= len(legs) <= 4:
             return _err(422, 40010001, "mleg orders require 2 to 4 legs")
         if self.options_level < 3:
-            return _err(403, 40310000, "account not eligible for multi-leg options orders")
+            return _err(403, 40310000, "account not eligible to trade spreads or uncovered contracts")
         ratios = [int(leg.get("ratio_qty", 1)) for leg in legs]
         if math.gcd(*ratios) != 1:
             return _err(422, 40010001, "leg ratio_qty must be in simplest form")
@@ -1219,7 +1365,7 @@ class FakeAlpaca(FakeService):
             return _err(422, 42210000, "options market orders are only allowed during market hours")
         for leg in legs:
             if leg.get("symbol") not in self.contracts:
-                return _err(422, 40010001, f"asset {leg.get('symbol')} not found")
+                return _err(422, 42210000, f'contract "{leg.get("symbol")}" not found')
         qty = float(body.get("qty", 1))
         limit = float(body["limit_price"]) if body.get("limit_price") is not None else None
         if limit is not None and limit > 0 and limit * qty * 100 > self._options_buying_power():
@@ -1302,11 +1448,11 @@ class FakeAlpaca(FakeService):
         p = self.positions.get(sym)
         parsed = parse_occ(sym)
         if not p or p.qty <= 0 or not parsed:
-            return _err(422, 40010001, "position not found or not a long option position")
+            return _err(404, 40410000, f"long position not found: {sym}")
         now_et = self.now().astimezone(ET)
         s = self.calendar.session(now_et.date())
         if s and self.now() >= s.close:
-            return _err(403, 40310000, "exercise requests are not accepted between market close and midnight")
+            return _err(403, 40310000, "exercise requests are not accepted after market close until midnight")
         und, exp, kind, strike = parsed
         shares = p.qty * 100
         del self.positions[sym]
@@ -1422,8 +1568,9 @@ class FakeAlpaca(FakeService):
     def _option_snapshot_json(self, sym: str) -> dict | None:
         if sym not in self.quotes:
             return None
+        g = self.greeks.get(sym)
         return {"latestQuote": self._quote_json(sym), "latestTrade": self._trade_json(sym),
-                "greeks": None, "impliedVolatility": None}
+                "greeks": (g or {}).get("greeks"), "impliedVolatility": (g or {}).get("iv")}
 
     def _data(self, m: str, path: str, params: dict) -> httpx.Response:
         if m != "GET":
@@ -1453,11 +1600,20 @@ class FakeAlpaca(FakeService):
             if rest == ["bars"]:
                 return json_response({"symbol": sym, "bars": self._bars(sym, params), "next_page_token": None})
         if parts[:2] == ["v1beta1", "news"]:
-            out = self.news
+            now_iso = _iso(self.now())
+            out = [n for n in self.news if n["created_at"] <= now_iso]  # stories appear when the clock reaches them
             if syms:
                 out = [n for n in out if set(n["symbols"]) & set(syms)]
-            out = sorted(out, key=lambda n: n["created_at"], reverse=params.get("sort", "desc") == "desc")
-            return json_response({"news": out[: int(params.get("limit", 10))], "next_page_token": None})
+            if params.get("start"):
+                out = [n for n in out if n["created_at"] >= _iso_param(params["start"])]
+            if params.get("end"):
+                out = [n for n in out if n["created_at"] <= _iso_param(params["end"])]
+            out = sorted(out, key=lambda n: (n["created_at"], n["id"]), reverse=params.get("sort", "desc") == "desc")
+            start = int(params.get("page_token") or 0)
+            limit = min(int(params.get("limit", 10)), 50)
+            page = out[start:start + limit]
+            nxt = str(start + limit) if start + limit < len(out) else None
+            return json_response({"news": page, "next_page_token": nxt})
         if parts[:2] == ["v1beta1", "options"]:
             if parts[2:4] == ["quotes", "latest"]:
                 return json_response({"quotes": {s: self._quote_json(s) for s in syms if s in self.quotes}})
