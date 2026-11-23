@@ -14,12 +14,15 @@ import pytest
 from stock_agent import __main__ as entrypoint
 from stock_agent import scheduler as module
 from stock_agent.asset_registry import SymbolRenameEvent
+from stock_agent.broker import OrderRequest
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
+from stock_agent.news_service import NewsService
 from stock_agent.research_pipeline import OptionIdea
 from stock_agent.research_schemas import Direction
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from stock_agent.state_store import StateStore
 from tests.exec_helpers import FakePrices, enqueue
 
 
@@ -228,9 +231,43 @@ def test_closed_first_start_imports_legacy_files_without_order_or_unlock(world):
     asyncio.run(check())
 
 
-def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
+def test_startup_binds_unacknowledged_fill_before_reconciling(world):
     async def check():
-        sched = world.scheduler()
+        world.clock.set_et(2026, 11, 23, 10, 20)
+        world.price("ALFA", 100)
+        first = world.scheduler()
+        first.store.open()
+        intent = enqueue(first.engine, "ALFA", "buy", ref=100)
+        claimed = first.ledger.claim_intent(intent.intent_id, check_thesis=False)
+        order = await first.broker.submit_order(OrderRequest(
+            symbol="ALFA", side="buy", type="limit", time_in_force="day", qty=5, limit_price=101,
+            client_order_id=claimed.client_order_id, position_intent="buy_to_open",
+        ))
+        await first._cleanup()  # process stopped before it linked the broker reply
+
+        restarted = world.scheduler()
+        try:
+            await restarted.startup()
+            holding = restarted.ledger.snapshot().holding("ALFA")
+            assert holding.meta.opened_source == "bot"
+            assert holding.meta.entry_intent_id == intent.intent_id
+            persisted = restarted.ledger.get_intent(intent.intent_id)
+            assert persisted.broker_order_id == order.id and persisted.status.value == "filled"
+            assert not any("imported ALFA" in str(row) for row in restarted.ledger.journal.read(kinds={"alert"}))
+        finally:
+            await restarted._cleanup()
+
+    asyncio.run(check())
+
+
+def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world, monkeypatch):
+    async def check():
+        def unexpected_read(*args, **kwargs):
+            pytest.fail("a production service tried to read the unopened state store")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(StateStore, "kv_get", unexpected_read)
+            sched = world.scheduler()
         assert sched.ledger.broker is sched.calendar.broker is sched.broker
         assert sched.engine.broker is sched.options.broker is sched.broker
         assert sched.engine.ledger is sched.ledger
@@ -240,6 +277,15 @@ def test_scheduler_owns_one_broker_book_risk_gate_and_capital_lock(world):
         assert sched.engine._capital_lock is sched.options._capital_lock is sched.capital_lock
         assert sched.engine._research_gate is sched.options.gate is sched.research_gate
         assert sched.options_store.store is sched.ledger.store is sched.research_store.store
+        assert isinstance(sched.news, NewsService)
+        assert sched.news.http is sched.http
+        assert sched.news.assets is sched.assets
+        assert sched.news.store is sched.health.store is sched.macro.store is sched.store
+        assert sched.news.health is sched.llm.health is sched.research_sources.health is sched.health
+        assert sched.news is sched.research_sources.news_service
+        assert sched.prices is sched.macro.prices is sched.research_sources.prices
+        assert sched.research.sources is sched.research_sources
+        assert sched.research.gate is sched.research_gate
         await sched._cleanup()
 
     asyncio.run(check())
@@ -336,7 +382,7 @@ def test_readiness_follows_reconcile_and_shutdown_wakes_idle_loop(tmp_path, monk
         monkeypatch.setattr(sched, "_tick", tick)
         task = asyncio.create_task(sched.run())
         await asyncio.wait_for(ready.wait(), timeout=1)
-        assert events[:3] == ["startup", "resume", "READY=1"]
+        assert events[:3] == ["resume", "startup", "READY=1"]
         sched.shutdown()
         await asyncio.wait_for(task, timeout=2)
         assert events[-2:] == ["STOPPING=1", "drain"]

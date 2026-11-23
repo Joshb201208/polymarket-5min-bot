@@ -122,7 +122,7 @@ def week(tmp_path_factory):
     runner.when(inv, lambda w, r: None, "invariants", once=False)
     try:
         script.run(runner)
-        # The spread the bot opens on Monday expires 2026-12-24; its T-2 is Mon 12-21.
+        # The spread expires on Thu 12-24, a trading session; T-2 is Tue 12-22.
         # Step that one morning (overnight is not ticked) to observe the time exit.
         runner.run_day(script.times["ccc_t_minus_2"].date(), start=time(9, 30), end=time(9, 50))
     finally:
@@ -248,10 +248,6 @@ def test_own_fills_are_not_reported_as_imports(week):
     assert not noisy, noisy
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "R-03: after a lost order reply + restart, startup reconciles (scheduler.py:333-334 order, "
-    "mirrored by WeekAgent.startup) before engine.resume() acks the intent with its broker "
-    "order id, so the bot's own DDD fill is booked as an 'imported' position with a warning"))
 def test_own_fill_recovered_after_restart_is_not_an_import(week):
     world, *_ = week
     noisy = [a for a in world.e2e_shared["alerts"] if a[1] == "Books: imported DDD"]
@@ -266,22 +262,18 @@ def _mleg(world, underlying):
     return out
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "R-04: MarketCalendar only covers today-7..today+14 (market_calendar.py:200), so "
-    "trading_days_between(today, expiry) is None for every 21-45 DTE expiry and "
-    "pick_expiry (options_policy.py:219-221) rejects them all: 'no expiry fits the window'. "
-    "The options tests use a calendar adapter over the fake calendar, which hides this"))
 def test_option_spread_opened_atomically(week):
-    world, runner, script, *_ = week
+    world, _, script, *_ = week
     t = script.times
     opens = [(at, b) for at, b, q in _mleg(world, "CCC")
              if b["legs"][0].get("position_intent", "").endswith("to_open") and q.status < 300]
-    assert len(opens) == 1, [(at, b) for at, b in opens]
-    at, body = opens[0]
-    assert t["ccc_news"] <= at < t["ccc_news"].replace(hour=16), at
-    assert len(body["legs"]) == 2 and {leg["side"] for leg in body["legs"]} == {"buy", "sell"}
     contracts = set(script.ccc_contracts().values())
-    assert {leg["symbol"] for leg in body["legs"]} <= contracts
+    filled = {o.client_order_id for o in world.alpaca.orders.values() if o.filled_qty > 0}
+    assert sum(b["client_order_id"] in filled for _, b in opens) == 1, opens
+    for at, body in opens:  # cancelled limit attempts may be replaced, but never by single legs
+        assert t["ccc_news"] <= at < t["ccc_news"].replace(hour=16), at
+        assert len(body["legs"]) == 2 and {leg["side"] for leg in body["legs"]} == {"buy", "sell"}
+        assert {leg["symbol"] for leg in body["legs"]} <= contracts
     single = [b for _, b, _ in _orders(world) if b.get("symbol") in contracts]
     assert not single, "a spread leg was sent as a single order"
 
@@ -301,16 +293,15 @@ def test_adopted_spread_closed_as_one_order_at_t_minus_2(week):
     assert all(world.alpaca.position(occ) is None for occ in script.eee_legs().values())
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "R-04: MarketCalendar only covers today-7..today+14 (market_calendar.py:200), so "
-    "trading_days_between(today, expiry) is None for every 21-45 DTE expiry and "
-    "pick_expiry (options_policy.py:219-221) rejects them all: 'no expiry fits the window'. "
-    "The options tests use a calendar adapter over the fake calendar, which hides this"))
 def test_bot_opened_spread_closed_at_its_t_minus_2(week):
-    world, runner, script, *_ = week
+    world, _, script, *_ = week
     t = script.times
     contracts = set(script.ccc_contracts().values())
-    closes = [at for at, b, q in _mleg(world, "CCC")
+    closes = [(at, b) for at, b, q in _mleg(world, "CCC")
               if b["legs"][0].get("position_intent", "").endswith("to_close") and q.status < 300]
-    assert len(closes) == 1 and t["ccc_t_minus_2"] - timedelta(minutes=1) <= closes[0], closes
+    filled = {o.client_order_id for o in world.alpaca.orders.values() if o.filled_qty > 0}
+    assert sum(b["client_order_id"] in filled for _, b in closes) == 1, closes
+    for at, body in closes:
+        assert t["ccc_t_minus_2"] <= at < t["ccc_t_minus_2"] + timedelta(minutes=15), at
+        assert {leg["position_intent"] for leg in body["legs"]} == {"sell_to_close", "buy_to_close"}
     assert all(world.alpaca.position(occ) is None for occ in contracts)

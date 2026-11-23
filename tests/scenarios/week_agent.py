@@ -232,12 +232,13 @@ class WeekAgent:
         self._alert_sync(severity, title, body, key)
 
     async def startup(self):
-        """Same order as StockAgentScheduler.startup (scheduler.py:312-350)."""
+        """Same order as StockAgentScheduler.startup after scheduler_deploy's R-03 fix:
+        order recovery (client-id lookup) before the first reconcile."""
         self.options.load_state()
         self.ledger.mark_submitting_ambiguous()
         await self.calendar.refresh()
-        await self.ledger.refresh("startup")
         await self.engine.resume()
+        await self.ledger.refresh("startup")
         await self.options.reconcile(self.world.clock.now())
 
     async def options_tick(self, now_et, session):

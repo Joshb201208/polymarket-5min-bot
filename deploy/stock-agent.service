@@ -18,6 +18,7 @@ TimeoutStartSec=90
 TimeoutStopSec=105
 WatchdogSec=180
 Environment=PYTHONUNBUFFERED=1
+Environment=STOCK_AGENT_RUNTIME_STATUS=/root/polymarket-bot/data/runtime-health.json
 
 [Install]
 WantedBy=multi-user.target

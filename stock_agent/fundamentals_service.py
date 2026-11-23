@@ -37,6 +37,8 @@ import asyncio
 import logging
 import math
 import re
+import time as _time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -102,6 +104,40 @@ UNIVERSE_CATALOGUE: dict[CanonicalSector, tuple[str, ...]] = {
         "NEE", "SO", "DUK", "CEG", "AEP", "SRE", "D", "EXC",
     ),
 }
+
+_CATALOGUE_SECTOR = {s: sector for sector, names in UNIVERSE_CATALOGUE.items() for s in names}
+
+# Finnhub profile2 ``finnhubIndustry`` is an industry label, not a GICS sector.
+# Keyword mapping (labels observed in responses; no published list: unverified).
+_INDUSTRY_KEYWORDS: tuple[tuple[tuple[str, ...], CanonicalSector], ...] = (
+    (("bank", "insurance", "financial", "capital market"), CanonicalSector.FINANCIALS),
+    (("real estate", "reit"), CanonicalSector.REAL_ESTATE),
+    (("utilit",), CanonicalSector.UTILITIES),
+    (("oil", "gas", "energy", "coal"), CanonicalSector.ENERGY),
+    (("pharma", "biotech", "health", "life science", "medical"), CanonicalSector.HEALTH_CARE),
+    (("semiconductor", "technology", "software", "electronic", "communications equipment"),
+     CanonicalSector.INFORMATION_TECHNOLOGY),
+    (("media", "telecom", "entertainment"), CanonicalSector.COMMUNICATION_SERVICES),
+    (("chemical", "metals", "mining", "packaging", "construction material"), CanonicalSector.MATERIALS),
+    (("aerospace", "defense", "machinery", "airline", "logistics", "industrial", "building", "road",
+      "rail", "marine", "trading companies", "professional services", "commercial services"),
+     CanonicalSector.INDUSTRIALS),
+    (("beverage", "food", "tobacco", "personal products", "household"), CanonicalSector.CONSUMER_STAPLES),
+    (("retail", "auto", "hotel", "restaurant", "leisure", "textile", "apparel", "consumer"),
+     CanonicalSector.CONSUMER_DISCRETIONARY),
+)
+
+
+def finnhub_industry_sector(raw: str | None) -> CanonicalSector:
+    direct = normalize_sector(raw)
+    if direct != CanonicalSector.UNKNOWN or not raw:
+        return direct
+    low = raw.casefold()
+    for words, sector in _INDUSTRY_KEYWORDS:
+        if any(w in low for w in words):
+            return sector
+    return CanonicalSector.UNKNOWN
+
 
 # Finnhub metric key -> (our key, unit, scale). Finnhub reports margins,
 # growth, ROE and yield in percent; we store ratios. Market cap is in millions.
@@ -235,7 +271,7 @@ class FundamentalsService:
         self, http, *, health=None, assets=None, prices=None, config=Config,
         focus_symbols: Iterable[str] | Callable[[], Iterable[str]] = (),
         now: Callable[[], datetime] | None = None,
-        universe_size: int = 150, release_lookback_days: int = 3,
+        universe_size: int = 150, release_lookback_days: int = 3, finnhub_per_minute: int = 45,
     ):
         self.http, self.health, self.assets, self.prices, self.config = http, health, assets, prices, config
         self._focus = focus_symbols
@@ -243,6 +279,28 @@ class FundamentalsService:
         self.universe_size = universe_size
         self.release_lookback_days = release_lookback_days
         self._companies: dict[str, CompanySnapshot] = {}
+        # Finnhub free tier allows 60 calls/minute; stay under it, leaving room for news.
+        self.finnhub_per_minute = finnhub_per_minute
+        self._finnhub_calls: deque[float] = deque()
+        self._finnhub_lock = asyncio.Lock()
+
+    def cached_company(self, symbol: str, max_age: timedelta = timedelta(days=3)) -> CompanySnapshot | None:
+        """Last snapshot for ``symbol`` without any request; None if absent or older than ``max_age``."""
+        snap = self._companies.get(_norm(symbol))
+        if snap is None or snap.fetched_at is None or self.now() - snap.fetched_at > max_age:
+            return None
+        return snap
+
+    async def _finnhub_slot(self) -> None:
+        async with self._finnhub_lock:
+            while True:
+                t = _time.monotonic()
+                while self._finnhub_calls and t - self._finnhub_calls[0] >= 60.0:
+                    self._finnhub_calls.popleft()
+                if len(self._finnhub_calls) < self.finnhub_per_minute:
+                    self._finnhub_calls.append(t)
+                    return
+                await asyncio.sleep(min(5.0, 60.0 - (t - self._finnhub_calls[0]) + 0.05))
 
     # ------------------------------------------------------------ plumbing
     def _report(self, provider: str, capability: str, ok: bool, error: str | None = None, *,
@@ -265,6 +323,8 @@ class FundamentalsService:
     async def _json(self, provider: str, capability: str, url: str, *, params=None,
                     symbol: str | None = None) -> Any | None:
         """GET JSON; report health; None on any failure (status, transport, bad JSON)."""
+        if provider == "finnhub":
+            await self._finnhub_slot()
         try:
             resp = await self.http.get(url, params=params)
         except Exception as exc:
@@ -494,8 +554,11 @@ class FundamentalsService:
         name = (getattr(meta, "company_name", None) or profile.get("name") or fmp.get("companyName") or None)
         sector = getattr(meta, "canonical_sector", CanonicalSector.UNKNOWN) or CanonicalSector.UNKNOWN
         if sector == CanonicalSector.UNKNOWN:
-            raw = profile.get("finnhubIndustry") or fmp.get("sector") or fmp.get("industry")
-            sector = classify_symbol(symbol, raw).sector if raw else normalize_sector(None)
+            sector = _CATALOGUE_SECTOR.get(symbol, CanonicalSector.UNKNOWN)
+        if sector == CanonicalSector.UNKNOWN:
+            sector = classify_symbol(symbol, fmp.get("sector")).sector
+        if sector == CanonicalSector.UNKNOWN:
+            sector = finnhub_industry_sector(profile.get("finnhubIndustry"))
         snap = CompanySnapshot(
             symbol=symbol, company_name=name, canonical_sector=str(getattr(sector, "value", sector)),
             tradable=(bool(meta.tradable and not meta.renamed_to) if meta is not None else None),

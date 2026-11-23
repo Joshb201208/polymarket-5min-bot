@@ -97,7 +97,11 @@ Test helpers: `add_asset`, `set_price(sym, last, bid=, ask=, spread=)`,
 `seed_position`, `submit(body)`, `script_partial_fills`, `add_news`,
 `seed_daily_bars`, `pay_dividend`, `add_option_contract`, `add_option_chain`,
 `set_option_quote`, `set_option_greeks`, `settle_option_expiry`,
-`assign_early`, `corporate_action_cancel`.
+`assign_early`, `corporate_action_cancel`, `set_most_actives(rows)` and
+`set_movers(gainers=, losers=)` (data routes `/v1beta1/screener/stocks/most-actives`
+and `/v1beta1/screener/{stocks|crypto}/movers`; shapes and `top` limits from
+https://docs.alpaca.markets/us/openapi/market-data-api.json; `top` over the
+maximum is the switch `screener_top_over_max`, real response unverified).
 
 Rejections modelled: insufficient buying power; insufficient qty (403, with
 `held_for_orders`); potential wash trade (403, opposite side of an open order);

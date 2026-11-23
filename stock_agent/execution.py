@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import asyncio
 import contextlib
 import logging
 import math
@@ -141,6 +142,7 @@ class ExecutionEngine:
         market_gate: Callable[..., Awaitable[Any]] | None = None,
         capital_lock: Any = None,
         research_gate: Any = None,
+        notifier: Any = None,
         config: Any = Config,
         settings: ExecSettings | None = None,
         now: Callable[[], datetime] | None = None,
@@ -156,6 +158,7 @@ class ExecutionEngine:
         self._market_gate = market_gate
         self._capital_lock = capital_lock
         self._research_gate = research_gate
+        self._notifier = notifier  # AlertService-like: send_normalise_plan / send_normalise_result
         self.config = config
         self.s = settings or ExecSettings()
         self._alert_fn = alert
@@ -323,6 +326,7 @@ class ExecutionEngine:
         except Exception as e:
             await self.alert("critical", "Order recovery failed", f"Could not read the intent queue: {e}")
             return
+        await self._bind_recovery_order_ids()
         for it in self.ledger.list_intents([IntentStatus.AMBIGUOUS, IntentStatus.SUBMITTED,
                                             IntentStatus.PARTIALLY_FILLED]):
             try:
@@ -332,6 +336,24 @@ class ExecutionEngine:
                                  f"Could not look up order {it.client_order_id} at the broker ({e}). "
                                  "No new order for this intent until it is resolved.",
                                  key=f"resume-{it.intent_id}")
+
+    async def _bind_recovery_order_ids(self) -> int:
+        """Pass 1 of start-up recovery: bind every AMBIGUOUS intent to the broker order
+        id(s) found under its client ids, without waiting or refreshing, so the first
+        reconcile links all of the bot's own fills (R-03). A failed read leaves the
+        intent AMBIGUOUS (fail closed); pass 2 alerts on it."""
+        bound = 0
+        for it in self.ledger.list_intents([IntentStatus.AMBIGUOUS]):
+            try:
+                for cid in self._order_ids_for(it):
+                    o = await self.broker.get_order_by_client_id(cid)
+                    if o is not None:
+                        self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=o.id)
+                        bound += 1
+                        break
+            except BrokerError as e:
+                logger.warning("recovery bind for %s failed: %s", it.intent_id, e)
+        return bound
 
     @staticmethod
     def _order_ids_for(it: OrderIntent) -> list[str]:
@@ -744,6 +766,14 @@ class ExecutionEngine:
         meta = self.ledger.open_position_meta(intent.symbol)
         if intent.position_id and meta is not None and meta.position_id != intent.position_id:
             return self._skip(intent, "position changed since the decision (position_id mismatch)")
+        if rule == "model" and intent.origin in self.RESEARCH_ORIGINS:
+            # Research exits are re-checked at submission (not protective or risk exits).
+            if intent.position_id and meta is None:
+                return self._skip(intent, "position metadata missing; the research exit is stale")
+            if intent.thesis_ids:
+                cur = self.ledger.current_thesis(intent.symbol)
+                if cur is None or cur.thesis_id != intent.thesis_ids[0]:
+                    return self._skip(intent, "a newer thesis replaced the one this exit was made from")
         want = (intent.meta or {}).get("qty")
         want_qty = float(want) if want is not None else pos.qty
         want_qty = min(want_qty, pos.qty)
@@ -1166,9 +1196,10 @@ class ExecutionEngine:
                 self._kv_set(self.NORMALISE_KEY, {"state": "planned", "planned_at": self.now().isoformat(),
                                                   "steps": steps})
                 return await self.run_normalise()
-            await self.alert("warning", "Account clean-up plan",
-                             "Before new trades, at the next regular session open + 5 min the bot will:\n- "
-                             + "\n- ".join(steps), key="normalise-plan")
+            if not await self._notify("send_normalise_plan", steps):
+                await self.alert("warning", "Account clean-up plan",
+                                 "Before new trades, at the next regular session open + 5 min the bot will:\n- "
+                                 + "\n- ".join(steps), key="normalise-plan")
             self._kv_set(self.NORMALISE_KEY, {"state": "planned", "planned_at": self.now().isoformat(),
                                               "steps": steps})
             return NormaliseStatus("planned", steps=steps)
@@ -1194,7 +1225,7 @@ class ExecutionEngine:
                 pass
             await self.alert("critical", "Account clean-up stopped", f"{e}. Entries stay held; it will retry.",
                              key="normalise-failed")
-            return self._norm_fail(str(e), done)
+            return await self._norm_fail(str(e), done)
 
     async def _ensure_no_shorting(self, done: list[str]) -> bool:
         """Set no_shorting=true and read it back. A failure alerts and continues:
@@ -1227,7 +1258,7 @@ class ExecutionEngine:
             if not p.is_option and p.is_short:
                 o = await self.cover_short(p.symbol, reason="clean-up")
                 if o is None or _f(o.filled_qty) + 1e-9 < abs(p.qty):
-                    return self._norm_fail(f"short {p.symbol} not covered", done)
+                    return await self._norm_fail(f"short {p.symbol} not covered", done)
                 done.append(f"covered {p.symbol}")
                 await self.ledger.refresh("normalise: cover")
         await self._ensure_no_shorting(done)
@@ -1250,10 +1281,10 @@ class ExecutionEngine:
             if needs_trim:
                 for leg in await self._short_calls(sym):
                     if self.options is None:
-                        return self._norm_fail(f"{sym}: short call open and no options manager", done)
+                        return await self._norm_fail(f"{sym}: short call open and no options manager", done)
                     r = await self.options.close_short_call(leg.symbol)
                     if not getattr(r, "filled", False):
-                        return self._norm_fail(f"short call {leg.symbol} not closed", done)
+                        return await self._norm_fail(f"short call {leg.symbol} not closed", done)
                     done.append(f"closed short call on {sym}")
             p = await self.broker.get_position(sym)
             if p is None or not p.is_long:
@@ -1265,7 +1296,7 @@ class ExecutionEngine:
                 o = await self._place_and_wait(req)
                 if _D(o.filled_qty) < _D(p.fractional_qty):
                     await self._protect_symbol(sym)
-                    return self._norm_fail(f"fraction of {sym} not sold ({o.status})", done)
+                    return await self._norm_fail(f"fraction of {sym} not sold ({o.status})", done)
                 done.append(f"sold fractional {sym}")
                 await self.ledger.refresh("normalise: fraction")
                 p = await self.broker.get_position(sym)
@@ -1279,7 +1310,7 @@ class ExecutionEngine:
                 finally:
                     await self._protect_symbol(sym)
                 if filled < trim:
-                    return self._norm_fail(f"trim of {sym} filled {filled:g} of {trim}", done)
+                    return await self._norm_fail(f"trim of {sym} filled {filled:g} of {trim}", done)
                 done.append(f"trimmed {sym} by {trim}")
                 await self.ledger.refresh("normalise: trim")
             else:
@@ -1300,24 +1331,40 @@ class ExecutionEngine:
             if p.is_option:
                 continue
             if p.is_short:
-                return self._norm_fail(f"{p.symbol} is still short", done)
+                return await self._norm_fail(f"{p.symbol} is still short", done)
             if p.fractional_qty > 0:
-                return self._norm_fail(f"{p.symbol} still has a fractional share", done)
+                return await self._norm_fail(f"{p.symbol} still has a fractional share", done)
             if equity > 0 and _f(p.market_value) - _f(p.current_price) > cap * equity:
-                return self._norm_fail(f"{p.symbol} is still above {cap:.0%} of equity", done)
+                return await self._norm_fail(f"{p.symbol} is still above {cap:.0%} of equity", done)
         snap = await self.ledger.refresh("normalise", rebuild=True)
         bad = [d for d in getattr(snap, "diffs", ()) if str(getattr(d, "severity", "")) in ("error", "critical")]
         if bad or any(h.qty < 0 for h in snap.holdings):
-            return self._norm_fail("reconcile after clean-up was not clean: " + "; ".join(
+            return await self._norm_fail("reconcile after clean-up was not clean: " + "; ".join(
                 f"{d.kind} {d.symbol} {d.explanation}" for d in bad), done)
         st = self._norm_state()
         st.update(state="done", done_at=self.now().isoformat(), done=done)
         self._kv_set(self.NORMALISE_KEY, st)
+        await self._notify("send_normalise_result", list(done), all_clean=True)
         return NormaliseStatus("done", steps=done)
 
-    def _norm_fail(self, why: str, done: list[str]) -> NormaliseStatus:
+    async def _notify(self, method: str, *args: Any, **kw: Any) -> bool:
+        """Call the optional notifier; never lets a reporting failure touch trading."""
+        fn = getattr(self._notifier, method, None) if self._notifier is not None else None
+        if fn is None:
+            return False
+        try:
+            r = fn(*args, **kw)
+            if hasattr(r, "__await__"):
+                r = await r
+            return r is not False
+        except Exception:
+            logger.exception("notifier %s failed", method)
+            return False
+
+    async def _norm_fail(self, why: str, done: list[str]) -> NormaliseStatus:
         st = self._norm_state()
         st.update(state="planned", last_error=why, partial=done)
         self._kv_set(self.NORMALISE_KEY, st)
         logger.error("normalise: %s", why)
+        await self._notify("send_normalise_result", [*done, f"stopped: {why}"], all_clean=False)
         return NormaliseStatus("failed", why, done)

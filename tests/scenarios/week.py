@@ -61,7 +61,7 @@ class E2EWeek:
         "aaa_confirm": _et(2026, 11, 24, 13, 20),
         "ccc_news": _et(2026, 11, 23, 10, 30),
         "eee_t_minus_2": _et(2026, 11, 24, 9, 35),
-        "ccc_t_minus_2": _et(2026, 12, 21, 9, 36),
+        "ccc_t_minus_2": _et(2026, 12, 22, 9, 35),
         "holiday": _et(2026, 11, 26, 9, 30),
         "ddd_news": _et(2026, 11, 27, 9, 50),
         "early_close": _et(2026, 11, 27, 13, 0),
