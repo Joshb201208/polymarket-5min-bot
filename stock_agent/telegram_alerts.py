@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import logging
+import os
 from datetime import datetime
 
 import httpx
@@ -13,96 +16,139 @@ MAX_MESSAGE_LENGTH = 4000
 
 
 class TelegramReporter:
-    def __init__(self, config: Config):
-        self.config = config
+    """Optional secondary alert channel. Silent when credentials are empty."""
+
+    def __init__(self, config: Config | None = None):
+        self.config = config or Config()
         self._client: httpx.AsyncClient | None = None
+        self._disabled_logged = False
+
+    @property
+    def token(self) -> str:
+        return getattr(self.config, "TELEGRAM_BOT_TOKEN", "") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    @property
+    def chat_id(self) -> str:
+        return getattr(self.config, "TELEGRAM_CHAT_ID", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat_id)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=15.0)
         return self._client
 
-    async def close(self):
+    async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    async def send_message(self, text: str):
-        """Send a message to the configured Telegram chat, splitting if too long."""
-        if not self.config.TELEGRAM_BOT_TOKEN or not self.config.TELEGRAM_CHAT_ID:
-            logger.warning("Telegram not configured — skipping message")
-            return
+    def _redact(self, text: str) -> str:
+        tok = self.token
+        if tok and tok in text:
+            text = text.replace(tok, "[REDACTED]")
+        return text
+
+    async def send_message(self, text: str, *, parse_mode: str = "HTML") -> bool:
+        """Send a message to Telegram if configured. Returns True on success."""
+        if not self.enabled:
+            if not self._disabled_logged:
+                self._disabled_logged = True
+                logger.debug("Telegram not configured — optional mirror stays off")
+            return False
 
         chunks = _split_message(text)
+        all_ok = True
         for chunk in chunks:
-            await self._send_chunk(chunk)
+            if not await self._send_chunk(chunk, parse_mode=parse_mode):
+                all_ok = False
+        return all_ok
 
-    async def _send_chunk(self, text: str):
-        """Send a single message chunk to Telegram."""
+    async def _send_chunk(self, text: str, *, parse_mode: str = "HTML") -> bool:
         client = await self._get_client()
-        url = f"{TELEGRAM_API}/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": self.config.TELEGRAM_CHAT_ID,
+        url = f"{TELEGRAM_API}/bot{self.token}/sendMessage"
+        payload: dict[str, object] = {
+            "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
 
         try:
             resp = await client.post(url, json=payload)
+            if resp.status_code == 400 and parse_mode:
+                # Only retry without HTML on 400 malformed markup, never on 429/401/5xx
+                fallback_payload = dict(payload)
+                fallback_payload.pop("parse_mode", None)
+                resp2 = await client.post(url, json=fallback_payload)
+                resp2.raise_for_status()
+                return True
             resp.raise_for_status()
+            return True
         except httpx.HTTPStatusError as e:
-            logger.error("Telegram API error: %s — %s", e.response.status_code, e.response.text[:300])
-            # Retry without HTML parsing if it fails (malformed HTML)
-            try:
-                payload["parse_mode"] = ""
-                resp = await client.post(url, json=payload)
-                resp.raise_for_status()
-            except Exception:
-                logger.error("Telegram fallback also failed")
+            logger.error(
+                "Telegram API error (%s): %s",
+                e.response.status_code,
+                self._redact(e.response.text[:300]),
+            )
+            return False
         except Exception as e:
-            logger.error("Telegram send failed: %s", e)
+            logger.error("Telegram send failed (%s): %s", type(e).__name__, self._redact(str(e)))
+            return False
 
-    async def send_trade_alert(self, trade: Trade, thesis: Thesis | None = None):
-        """Send a formatted trade alert."""
+    async def send_trade_alert(
+        self,
+        trade: Trade,
+        thesis: Thesis | None = None,
+        *,
+        stop_verified: bool | None = None,
+    ) -> bool:
         arrow = "\U0001f4c8" if trade.action == "BUY" else "\U0001f4c9"
         cost = trade.price * trade.shares
+        sym = _escape_html(str(trade.symbol))
+        action = _escape_html(str(trade.action))
 
         lines = [
-            f"{arrow} <b>{trade.action}: {trade.symbol}</b>",
+            f"{arrow} <b>{action}: {sym}</b>",
             f"Shares: {trade.shares} @ ${trade.price:.2f}",
             f"Value: ${cost:,.0f}",
         ]
 
-        if trade.action == "BUY" and thesis:
-            stop_loss = thesis.stop_loss_price
-            if stop_loss:
-                pct = (stop_loss - trade.price) / trade.price
-                lines.append(f"Stop-Loss: ${stop_loss:.2f} ({pct:+.1%})")
-            lines.append("")
-            lines.append(f"<b>Thesis:</b> {thesis.summary}")
-            lines.append(f"Conviction: {thesis.conviction}/10")
+        if trade.action == "BUY":
+            if stop_verified is False:
+                lines.append("Stop-Loss: <b>MISSING AT BROKER (UNPROTECTED)</b>")
+            elif thesis and thesis.stop_loss_price:
+                pct = (thesis.stop_loss_price - trade.price) / trade.price if trade.price else 0.0
+                lines.append(f"Stop-Loss: ${thesis.stop_loss_price:.2f} ({pct:+.1%})")
+            if thesis:
+                lines.append("")
+                lines.append(f"<b>Why:</b> {_escape_html(thesis.summary)}")
+                lines.append(f"Conviction: {thesis.conviction}/10")
         elif trade.action == "SELL":
             if trade.pnl is not None:
                 emoji = "\u2705" if trade.pnl >= 0 else "\u274c"
-                lines.append(f"P&L: {emoji} ${trade.pnl:+,.0f} ({trade.pnl_pct:+.1%})" if trade.pnl_pct else f"P&L: {emoji} ${trade.pnl:+,.0f}")
+                if trade.pnl_pct is not None:
+                    lines.append(f"Result: {emoji} ${trade.pnl:+,.0f} ({trade.pnl_pct:+.1%})")
+                else:
+                    lines.append(f"Result: {emoji} ${trade.pnl:+,.0f}")
             if trade.hold_days is not None:
                 lines.append(f"Held: {trade.hold_days} days")
-            lines.append(f"Reason: {trade.reason}")
+            if trade.reason:
+                lines.append(f"Reason: {_escape_html(trade.reason)}")
 
-        await self.send_message("\n".join(lines))
+        return await self.send_message("\n".join(lines))
 
-    async def send_daily_summary(self, summary: DailySummary):
-        """Send end-of-day portfolio summary."""
+    async def send_daily_summary(self, summary: DailySummary) -> bool:
         day_emoji = "\U0001f4c8" if summary.day_pnl >= 0 else "\U0001f4c9"
-        total_emoji = "\U0001f4c8" if summary.total_pnl >= 0 else "\U0001f4c9"
-
         lines = [
             "\U0001f4ca <b>STOCK AGENT — Daily Summary</b>",
-            f"{summary.date}",
+            _escape_html(str(summary.date)),
             "",
-            f"\U0001f4b0 Portfolio: ${summary.portfolio_value:,.0f} ({summary.total_pnl_pct:+.2%})",
+            f"\U0001f4b0 Account Equity: ${summary.portfolio_value:,.2f} ({summary.total_pnl_pct:+.2%})",
             f"\U0001f4b5 Cash: ${summary.cash:,.0f} | Exposure: {summary.exposure_pct:.1%}",
-            f"{day_emoji} Day P&L: ${summary.day_pnl:+,.0f} ({summary.day_pnl_pct:+.2%})",
+            f"{day_emoji} Day Change: ${summary.day_pnl:+,.2f} ({summary.day_pnl_pct:+.2%})",
             "",
         ]
 
@@ -111,18 +157,22 @@ class TelegramReporter:
             for p in summary.positions:
                 arrow = "\u2b06\ufe0f" if p.unrealized_pnl >= 0 else "\u2b07\ufe0f"
                 lines.append(
-                    f"  \u2022 {p.symbol}: {p.unrealized_pnl_pct:+.1%} (${p.market_value:,.0f}) {arrow}"
+                    f"  \u2022 {_escape_html(p.symbol)}: {p.unrealized_pnl_pct:+.1%} "
+                    f"(${p.market_value:,.0f}) {arrow}"
                 )
             lines.append("")
 
         if summary.trades_today:
             lines.append(f"<b>Today's Trades ({len(summary.trades_today)}):</b>")
             for t in summary.trades_today:
-                lines.append(f"  \u2022 {t.action} {t.symbol} x{t.shares} @ ${t.price:.2f}")
+                lines.append(
+                    f"  \u2022 {_escape_html(t.action)} {_escape_html(t.symbol)} "
+                    f"x{t.shares} @ ${t.price:.2f}"
+                )
         else:
             lines.append("Today's Trades: None")
 
-        await self.send_message("\n".join(lines))
+        return await self.send_message("\n".join(lines))
 
     async def send_weekly_report(
         self,
@@ -131,12 +181,11 @@ class TelegramReporter:
         positions: list[Position],
         signals: list[Signal],
         stats: dict,
-    ):
-        """Send weekly analysis report."""
+    ) -> bool:
         lines = [
-            "\U0001f4cb <b>STOCK AGENT — Weekly Report</b>",
+            "\U0001f4cb <b>STOCK AGENT — Weekly Scorecard</b>",
             "",
-            f"\U0001f4b0 Portfolio Value: ${portfolio_value:,.0f}",
+            f"\U0001f4b0 Account Equity: ${portfolio_value:,.2f}",
             f"\U0001f4b5 Cash: ${cash:,.0f}",
             f"Positions: {len(positions)}",
             "",
@@ -145,7 +194,7 @@ class TelegramReporter:
         if stats:
             lines.append("<b>Performance:</b>")
             lines.append(f"  Win Rate: {stats.get('win_rate', 0):.0%}")
-            lines.append(f"  Total P&L: ${stats.get('total_pnl', 0):+,.0f}")
+            lines.append(f"  Total P&amp;L: ${stats.get('total_pnl', 0):+,.0f}")
             lines.append(f"  Closed Trades: {stats.get('closed_trades', 0)}")
             lines.append(f"  Max Drawdown: {stats.get('max_drawdown', 0):.1%}")
             lines.append("")
@@ -153,48 +202,50 @@ class TelegramReporter:
         if positions:
             lines.append("<b>Current Positions:</b>")
             for p in positions:
-                lines.append(f"  \u2022 {p.symbol}: {p.shares} shares @ ${p.entry_price:.2f} ({p.unrealized_pnl_pct:+.1%})")
+                lines.append(
+                    f"  \u2022 {_escape_html(p.symbol)}: {p.shares} shares "
+                    f"@ ${p.entry_price:.2f} ({p.unrealized_pnl_pct:+.1%})"
+                )
             lines.append("")
 
         if signals:
-            lines.append(f"<b>New Signals ({len(signals)}):</b>")
+            lines.append(f"<b>Queued Signals for Next Open ({len(signals)}):</b>")
             for s in signals:
-                lines.append(f"  \u2022 {s.action} {s.symbol} — Conv: {s.conviction}/10")
-                if s.thesis:
-                    lines.append(f"    {s.thesis.summary[:120]}")
+                lines.append(
+                    f"  \u2022 {_escape_html(s.action)} {_escape_html(s.symbol)} — Conv: {s.conviction}/10"
+                )
+                if s.thesis and s.thesis.summary:
+                    lines.append(f"    {_escape_html(s.thesis.summary[:120])}")
         else:
-            lines.append("New Signals: None this week")
+            lines.append("Queued Signals: None")
 
-        await self.send_message("\n".join(lines))
+        return await self.send_message("\n".join(lines))
 
-    async def send_error_alert(self, error: str):
-        """Send critical error notification."""
-        msg = f"\u26a0\ufe0f <b>STOCK AGENT ERROR</b>\n\n<code>{_escape_html(error[:1500])}</code>"
-        await self.send_message(msg)
+    async def send_error_alert(self, error: str) -> bool:
+        safe = _escape_html(self._redact(error)[:1500])
+        msg = f"\u26a0\ufe0f <b>STOCK AGENT ALERT</b>\n\n<code>{safe}</code>"
+        return await self.send_message(msg)
 
 
 def _split_message(text: str) -> list[str]:
-    """Split a long message into chunks that fit within Telegram's limit."""
     if len(text) <= MAX_MESSAGE_LENGTH:
         return [text]
 
-    chunks = []
+    chunks: list[str] = []
     while text:
         if len(text) <= MAX_MESSAGE_LENGTH:
             chunks.append(text)
             break
-
-        # Try to split at a newline
         split_at = text.rfind("\n", 0, MAX_MESSAGE_LENGTH)
         if split_at == -1:
             split_at = MAX_MESSAGE_LENGTH
-
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
-
     return chunks
 
 
 def _escape_html(text: str) -> str:
-    """Escape HTML special characters for Telegram."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+__all__ = ["TelegramReporter", "_escape_html", "_split_message", "datetime"]
