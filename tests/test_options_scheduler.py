@@ -32,18 +32,22 @@ def _sched(opts):
 def test_scan_and_monitor_delegate_to_manager():
     opts = FakeOptions()
     s = _sched(opts)
-    asyncio.run(s._run_options_scan())
+    out = asyncio.run(s._run_options_scan())
     asyncio.run(s._check_options_positions())
+    assert out[0].opened == "os-1"
     assert [c[0] for c in opts.calls] == ["scan", "monitor"]
     assert all(c[1].tzinfo is not None for c in opts.calls)
     assert s._options_scan_done_today is not None
 
 
-def test_failures_are_contained_and_logged(caplog):
+def test_failures_propagate_to_the_caller():
+    import pytest
     s = _sched(FakeOptions(fail=True))
-    asyncio.run(s._run_options_scan())
-    asyncio.run(s._check_options_positions())
-    assert "Options scan failed" in caplog.text and "Options monitor failed" in caplog.text
+    with pytest.raises(RuntimeError):
+        asyncio.run(s._run_options_scan())
+    assert s._options_scan_done_today is None  # a failed scan is not marked done
+    with pytest.raises(RuntimeError):
+        asyncio.run(s._check_options_positions())
 
 
 def test_no_manager_places_nothing(caplog):

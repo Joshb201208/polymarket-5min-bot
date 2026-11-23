@@ -793,29 +793,26 @@ class StockAgentScheduler:
         The manager owns everything else: mode, market gate, research gate,
         risk, sizing, the write-ahead book and confirmed orders. Without a
         manager no options orders are placed (the legacy path is not used).
+        Returns the manager's ScanOutcomes; exceptions propagate to the caller,
+        which records the job status and retries.
         """
-        now = datetime.now(timezone.utc)
-        self._options_scan_done_today = now.astimezone(ET).strftime("%Y-%m-%d")
+        now = _now_utc()
         if self.options is None:
             logger.warning("Options scan skipped: no OptionsManager wired")
-            return
-        try:
-            outcomes = await self.options.scan(now)
-        except Exception:
-            logger.exception("Options scan failed")
-            return
+            return []
+        outcomes = await self.options.scan(now)
+        self._options_scan_done_today = now.astimezone(ET).strftime("%Y-%m-%d")
         opened = [o for o in outcomes if getattr(o, "opened", None)]
         logger.info("Options scan: %d candidates, %d opened", len(outcomes), len(opened))
+        return outcomes
 
     async def _check_options_positions(self):
         """Exit manager and repair pass: reconcile with the broker, then apply
-        exits (T-2 time exit, targets, thesis break, ex-dividend) and repairs."""
+        exits (T-2 time exit, targets, thesis break, ex-dividend) and repairs.
+        Returns the MonitorOutcome; exceptions propagate to the caller."""
         if self.options is None:
-            return
-        try:
-            await self.options.monitor(datetime.now(timezone.utc))
-        except Exception:
-            logger.exception("Options monitor failed")
+            return None
+        return await self.options.monitor(_now_utc())
 
     async def _check_for_market_event(self):
         """A healthy regime change can alert, but cannot open a trade job."""
