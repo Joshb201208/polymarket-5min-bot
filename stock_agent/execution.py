@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import contextlib
 import logging
 import math
 import uuid
@@ -138,6 +139,7 @@ class ExecutionEngine:
         bars: Callable[[str], Awaitable[Any]] | None = None,
         controls: Callable[[], Any] | None = None,
         market_gate: Callable[..., Awaitable[Any]] | None = None,
+        capital_lock: Any = None,
         config: Any = Config,
         settings: ExecSettings | None = None,
         now: Callable[[], datetime] | None = None,
@@ -151,6 +153,7 @@ class ExecutionEngine:
         self.bars = bars
         self.controls = controls
         self._market_gate = market_gate
+        self._capital_lock = capital_lock
         self.config = config
         self.s = settings or ExecSettings()
         self._alert_fn = alert
@@ -270,6 +273,7 @@ class ExecutionEngine:
         self._in_flight.add(req.client_order_id)
         try:
             order = await self.broker.submit_order(req)
+            self._mark_accepted(req.client_order_id, order.id)
             final = await self.broker.wait_terminal(order.id, timeout_s=wait_s or self.s.fill_wait_seconds,
                                                     poll_s=self.s.fill_poll_seconds)
             if not final.is_terminal:
@@ -277,6 +281,33 @@ class ExecutionEngine:
             return final
         finally:
             self._in_flight.discard(req.client_order_id)
+
+    def _mark_accepted(self, cid: str, order_id: str) -> None:
+        """Persist SUBMITTED as soon as the broker accepts, so a later poll or
+        cancel failure can never be recorded as 'nothing happened'."""
+        base = cid[:-2] if cid.endswith(("-m", "-f")) else cid
+        try:
+            it = self.ledger.intent_by_client_order_id(base) or self.ledger.intent_by_client_order_id(cid)
+            if it is not None and it.status == IntentStatus.SUBMITTING:
+                self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=order_id)
+        except Exception:
+            logger.exception("could not mark intent for %s submitted", cid)
+
+    async def resolve_pending(self) -> list[str]:
+        """Resolve submitted/ambiguous intents that are not in flight in this process."""
+        done: list[str] = []
+        for it in self.ledger.list_intents([IntentStatus.AMBIGUOUS, IntentStatus.SUBMITTED,
+                                            IntentStatus.PARTIALLY_FILLED]):
+            if any(c in self._in_flight for c in self._order_ids_for(it)):
+                continue
+            try:
+                await self._resolve(it)
+                done.append(it.intent_id)
+            except BrokerError as e:
+                await self.alert("critical", f"{it.symbol}: order still unresolved",
+                                 f"Order {it.client_order_id} could not be resolved ({e}); retrying next tick.",
+                                 key=f"pending-{it.intent_id}")
+        return done
 
     # --------------------------------------------------------------- resume
     async def resume(self) -> None:
@@ -352,11 +383,16 @@ class ExecutionEngine:
         self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id,
                                meta={"filled_qty": filled, "avg_price": price, "order_status": order.status})
         if it.side == "buy" and filled > 0 and it.kind != "cover":
+            try:  # books match the broker before the stop is recorded against the position
+                await self.ledger.refresh(f"entry fill {it.symbol}")
+            except Exception as e:
+                logger.warning("ledger refresh after %s fill failed: %s", it.symbol, e)
             await self._protect_symbol(it.symbol, fill_price=price)
-            self._journal_entry_fill(it, filled, price)
+            self._journal_entry_fill(it, filled, price, order.id)
         return ExecResult(it.intent_id, it.symbol, status, filled, price, order.status, order.id)
 
-    def _journal_entry_fill(self, it: OrderIntent, filled: float, price: float | None) -> None:
+    def _journal_entry_fill(self, it: OrderIntent, filled: float, price: float | None,
+                           fill_id: str | None = None) -> None:
         """A3 shadow-stop anchor. Never raises."""
         try:
             meta = self.ledger.open_position_meta(it.symbol)
@@ -364,7 +400,7 @@ class ExecutionEngine:
             self.ledger.journal.append(
                 "entry.filled", position_id=getattr(meta, "position_id", None), symbol=it.symbol,
                 session_date=self.session_date().isoformat(),
-                intent_id=it.intent_id, fill_price=price, qty=filled,
+                intent_id=it.intent_id, fill_id=fill_id, fill_price=price, qty=filled,
                 atr=None if atr is None else str(atr),
                 stop_fraction=None if dist is None else str(dist.fraction),
                 stop_fallback=None if dist is None else dist.fallback,
@@ -422,6 +458,18 @@ class ExecutionEngine:
 
     async def _broker_failure(self, intent: OrderIntent, e: BrokerError) -> ExecResult:
         cur = self.ledger.get_intent(intent.intent_id)
+        if cur is not None and cur.status in (IntentStatus.SUBMITTED, IntentStatus.PARTIALLY_FILLED):
+            # The broker accepted the order; a later poll/cancel failed. Shares may be
+            # held. Protect what is confirmed now and resolve the remainder each tick.
+            try:
+                await self._protect_symbol(intent.symbol)
+            except Exception as pe:
+                logger.warning("protect after failure for %s: %s", intent.symbol, pe)
+            await self.alert("critical", f"{intent.symbol}: order accepted, follow-up failed",
+                             f"{intent.side} {intent.symbol}: {e}. Order {intent.client_order_id} is being "
+                             "resolved on every monitoring tick; no new order for this intent.",
+                             key=f"accepted-{intent.intent_id}")
+            return ExecResult(intent.intent_id, intent.symbol, cur.status, reason=str(e))
         if e.uncertain:
             if cur is not None and cur.status == IntentStatus.SUBMITTING:
                 self.ledger.ack_intent(intent.intent_id, IntentStatus.AMBIGUOUS, error=str(e))
@@ -461,6 +509,28 @@ class ExecutionEngine:
             return self._skip(intent, f"price {ask:.2f} ran more than {self.s.max_price_drift_pct:.0%} above "
                                       f"the analysed {ref:.2f}")
         limit = round_price(ask * (1 + self.s.buy_limit_offset_pct))
+        try:
+            async with (self._capital_lock or contextlib.nullcontext()):
+                # Held only from the fresh risk snapshot through submit/confirm, so the
+                # options engine cannot authorise against the same free cash meanwhile.
+                got = await self._authorise_and_submit_buy(intent, q, limit, ask)
+        except BaseException as e:
+            sym = getattr(e, "_exec_reprotect", None)
+            if sym:
+                await self._protect_symbol(sym)
+            raise
+        if isinstance(got, ExecResult):
+            return got
+        claimed, order, released = got
+        res = await self._finish(claimed, order)
+        if released and res.filled_qty <= 0:
+            await self._protect_symbol(intent.symbol)
+        if res.filled_qty > 0:
+            await self.alert("info", f"Bought {intent.symbol}",
+                             f"{res.filled_qty:g} shares at {res.avg_price or 0:.2f}", key=None)
+        return res
+
+    async def _authorise_and_submit_buy(self, intent: OrderIntent, q: Any, limit: float, ask: float):
         snap = await self._snapshot("pre-buy")
         if intent.symbol in getattr(snap, "blocked_symbols", frozenset()):
             return self._skip(intent, "symbol blocked by reconcile")
@@ -486,6 +556,15 @@ class ExecutionEngine:
             claimed = self.ledger.claim_intent(intent.intent_id)
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e))
+        # Sizing takes bar/quote/book round trips; the entry window can close meanwhile
+        # (e.g. a 12:50 half-day cutoff). Re-check right before the order goes out.
+        gate = await self._gate("entry")
+        if not gate.allowed:
+            nxt = gate.next_open or (self.now() + timedelta(minutes=5))
+            self.ledger.ack_intent(claimed.intent_id, IntentStatus.QUEUED,
+                                   error=f"market gate at submit: {gate.reason}", next_attempt_at=nxt)
+            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED,
+                              reason=f"market gate at submit: {gate.reason}")
         if verdict.allowed_existing_breaches if hasattr(verdict, "allowed_existing_breaches") else ():
             self.ledger.journal.append("risk.allowed_existing_breaches", intent_id=claimed.intent_id,
                                        symbol=intent.symbol, breaches=[
@@ -504,17 +583,11 @@ class ExecutionEngine:
                     await self._cancel_confirm(o)
                     released = True
             order = await self._place_and_wait(req)
-        except BaseException:
+        except BaseException as e:
             if released:
-                await self._protect_symbol(intent.symbol)
+                e._exec_reprotect = intent.symbol  # re-protected by buy(), outside the capital lock
             raise
-        res = await self._finish(claimed, order)
-        if released and res.filled_qty <= 0:
-            await self._protect_symbol(intent.symbol)
-        if res.filled_qty > 0:
-            await self.alert("info", f"Bought {intent.symbol}",
-                             f"{res.filled_qty:g} shares at {res.avg_price or 0:.2f}", key=None)
-        return res
+        return claimed, order, released
 
     async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None) -> ExecResult:
         nxt = until or (self.now() + timedelta(minutes=5))
@@ -840,7 +913,7 @@ class ExecutionEngine:
             if stops and stops[0].stop_price:
                 price = _f(stops[0].stop_price)
             elif meta is not None and meta.stop_price is not None and fill_price is None:
-                price = float(meta.stop_price)
+                price = await self._split_adjusted(sym, pos, float(meta.stop_price))
         if price is None:
             ref = fill_price or _f(pos.current_price)
             if ref <= 0:
@@ -871,9 +944,33 @@ class ExecutionEngine:
         req = OrderRequest(symbol=sym, side="sell", qty=qty, type="stop", time_in_force="gtc",
                            stop_price=round_price(price), client_order_id=cid, position_intent="sell_to_close")
         order = await self.broker.submit_order(req)
+        self._kv_set(f"exec.stop_basis.{sym}", {"qty": str(pos2.qty), "avg": str(pos2.avg_entry_price)})
         exp = order.expires_at or (now + timedelta(days=self.s.gtc_life_days))
         if meta is not None:
             self.ledger.set_stop(meta.position_id, order.stop_price or price, order.id, exp)
+
+    async def _split_adjusted(self, sym: str, pos: BrokerPosition, recorded: float) -> float:
+        """The broker cancels resting stops on a split; our recorded stop is then
+        in pre-split dollars. Detect a split (qty up by k, average cost down by k)
+        and scale the stop, rather than reading the old price as a breach."""
+        basis = self._kv_get(f"exec.stop_basis.{sym}", None) or {}
+        try:
+            q0, a0 = float(basis["qty"]), float(basis["avg"])
+        except (KeyError, TypeError, ValueError):
+            return recorded
+        q1, a1 = _f(pos.qty), _f(pos.avg_entry_price)
+        if q0 <= 0 or a0 <= 0 or q1 <= 0 or a1 <= 0:
+            return recorded
+        k_qty, k_px = q1 / q0, a0 / a1
+        if abs(k_qty - 1) < 0.01 or abs(k_qty / k_px - 1) > 0.01:
+            return recorded  # no split (or a partial sale / top-up, which leaves avg cost alone)
+        adj = recorded / k_qty
+        await self.alert("warning", f"{sym}: corporate action detected",
+                         f"Shares changed by a factor of {k_qty:g} and cost basis by 1/{k_px:g}; "
+                         f"re-placing the stop at {adj:.2f} (was {recorded:.2f}).", key=f"split-{sym}")
+        self.ledger.journal.append("stop.split_adjusted", symbol=sym, factor=round(k_qty, 6),
+                                   old_stop=round(recorded, 4), new_stop=round(adj, 4))
+        return adj
 
     def _enqueue_hard_stop(self, symbol: str, meta: Any) -> None:
         self.ledger.enqueue_intents([NewIntent(
@@ -890,7 +987,11 @@ class ExecutionEngine:
             rep.errors.append(f"normalise: {e}")
             await self.alert("critical", "Account clean-up failed", str(e), key="normalise-failed")
         try:
-            for p in await self.broker.get_positions():
+            await self.resolve_pending()
+            # Until clean-up is done, normalise owns short covering (it sets
+            # no_shorting and reads it back first); afterwards any short is repaired here.
+            positions = await self.broker.get_positions() if self.normalised else []
+            for p in positions:
                 if not p.is_option and p.is_short:
                     o = await self.cover_short(p.symbol, reason="short found at broker")
                     if o is not None:
@@ -990,14 +1091,33 @@ class ExecutionEngine:
                              key="normalise-failed")
             return self._norm_fail(str(e), done)
 
+    async def _ensure_no_shorting(self, done: list[str]) -> bool:
+        """Set no_shorting=true and read it back. A failure alerts and continues:
+        the submit-time sell guard still refuses any sell that could open a short."""
+        try:
+            cfg = await self.broker.get_account_config()
+            if cfg.no_shorting:
+                return True
+            await self.broker.set_account_config(no_shorting=True)
+            back = await self.broker.get_account_config()
+            if back.no_shorting:
+                done.append("shorting off (read back)")
+                return True
+            why = "read-back still shows shorting allowed"
+        except BrokerError as e:
+            why = str(e)
+        await self.alert("critical", "Could not turn shorting off at the broker",
+                         f"{why}. Continuing: every sell is still checked against shares held, "
+                         "so no order can open a short. Will retry on the next clean-up.",
+                         key="no-shorting-config")
+        done.append("shorting off FAILED (sell guard still active)")
+        return False
+
     async def _run_normalise(self, done: list[str]) -> NormaliseStatus:
         st = self._norm_state()
         st["state"] = "running"
         self._kv_set(self.NORMALISE_KEY, st)
-        cfg = await self.broker.get_account_config()
-        if not cfg.no_shorting:
-            await self.broker.set_account_config(no_shorting=True)
-            done.append("shorting off (read back)")
+        # B3 order: buy back existing shorts FIRST, then turn shorting off.
         for p in await self.broker.get_positions():
             if not p.is_option and p.is_short:
                 o = await self.cover_short(p.symbol, reason="clean-up")
@@ -1005,6 +1125,7 @@ class ExecutionEngine:
                     return self._norm_fail(f"short {p.symbol} not covered", done)
                 done.append(f"covered {p.symbol}")
                 await self.ledger.refresh("normalise: cover")
+        await self._ensure_no_shorting(done)
         acct = await self.broker.get_account()
         equity = _f(acct.equity)
         cap = float(getattr(self.config, "MAX_POSITION_PCT", 0.15))
