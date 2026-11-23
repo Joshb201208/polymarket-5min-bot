@@ -167,3 +167,37 @@ def test_world_fixture_runs_the_real_executor(world):
     assert [o["type"] for o in open_orders] == ["stop"]
     assert len(world.orders_sent()) == 2
     assert world.clock.sleeps == [3]
+
+
+def test_llm_shapes():
+    from tests.fakes.providers import FakeAnthropic, FakePerplexity, LLMReply
+
+    clock = SimClock.at_et(2026, 11, 23, 10, 0)
+    oa, px, an = FakeOpenAI(clock), FakePerplexity(clock), FakeAnthropic(clock)
+    c = httpx.Client(transport=FakeInternet([oa, px, an]).transport)
+    src = [{"url": "https://example.invalid/a", "title": "A", "date": "2026-11-23"}]
+    oa.reply(LLMReply(text='{"ok": true}', sources=src))
+    j = c.post("https://api.openai.com/v1/responses", json={"tools": [{"type": "web_search"}]}).json()
+    assert [o["type"] for o in j["output"]] == ["web_search_call", "message"]
+    assert j["output"][1]["content"][0]["annotations"][0]["type"] == "url_citation"
+    oa.reply(LLMReply(refusal="no", status="incomplete"))
+    j = c.post("https://api.openai.com/v1/responses", json={}).json()
+    assert j["status"] == "incomplete" and j["output"][0]["content"][0]["type"] == "refusal"
+    px.reply(LLMReply(text="x", sources=src, cost_usd=0.002))
+    j = c.post("https://api.perplexity.ai/v1/agent", json={}).json()
+    assert j["output"][0]["results"][0]["id"] == 1 and j["usage"]["cost"]["total_cost"] == 0.002
+    an.reply(LLMReply(text="y", tool_error="max_uses_exceeded"))
+    j = c.post("https://api.anthropic.com/v1/messages", json={"tools": [{"type": "web_search_20260318"}]}).json()
+    assert j["content"][1]["content"]["error_code"] == "max_uses_exceeded" and j["content"][-1]["text"] == "y"
+
+
+def test_world_news_reaches_both_feeds(world):
+    from datetime import timedelta
+
+    world.news(["AAA"], "AAA guidance cut", at=world.clock.now() + timedelta(minutes=5))
+    c = httpx.Client()
+    url = "https://finnhub.io/api/v1/company-news"
+    assert c.get(url, params={"symbol": "AAA"}).json() == []
+    world.clock.advance(minutes=5)
+    assert c.get(url, params={"symbol": "AAA"}).json()[0]["headline"] == "AAA guidance cut"
+    assert c.get("https://data.alpaca.markets/v1beta1/news", params={"symbols": "AAA"}).json()["news"]

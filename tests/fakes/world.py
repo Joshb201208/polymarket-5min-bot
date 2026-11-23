@@ -79,6 +79,14 @@ class FakeWorld:
         if symbol not in self.fmp.profiles:
             self.fmp.set_profile(symbol)
 
+    def news(self, symbols: list[str], headline: str, *, at: datetime | None = None, summary: str = "") -> None:
+        """A story on both news feeds (Alpaca /v1beta1/news and Finnhub company-news),
+        visible from `at` (default now) as the simulated clock moves."""
+        at = at or self.clock.now()
+        self.alpaca.add_news(symbols, headline, summary=summary, created_at=at)
+        for s in symbols:
+            self.finnhub.add_news(s, headline, at=at, summary=summary)
+
     # assertions
     def orders_sent(self, *, include_failed: bool = True) -> list[RecordedRequest]:
         """Every order submission/replace the bot attempted at the broker."""
