@@ -162,6 +162,7 @@ class OptionsManager:
         universe: Callable[[], Iterable[str]] | None = None,
         risk_controls: Callable[[], RiskControls] | None = None,
         capital_lock: asyncio.Lock | None = None,
+        defer_load: bool = False,
         ex_dividend: Callable[[str], Any] | None = None,
         journal: Any = None,
         alerts: Any = None,
@@ -192,9 +193,27 @@ class OptionsManager:
         self.cooldowns: dict[str, Cooldown] = {}
         self.meta: dict[str, Any] = {}
         self.load_error: str | None = None
-        self._load()
+        self._loaded = False
+        if not defer_load:
+            self.load_state()
 
     # ---------------------------------------------------------------- state
+    def load_state(self) -> None:
+        """Read the book (call after the shared store is opened when built with
+        defer_load=True). Every public entry point also loads lazily."""
+        self._load()
+        self._loaded = True
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        try:
+            self.load_state()
+        except OptionsStateError:
+            raise
+        except Exception as e:  # store not open yet: fail loudly, never report "nothing committed"
+            raise OptionsError(f"options book not loaded: {e}") from e
+
     def _load(self) -> None:
         try:
             self.structures, self.cooldowns, self.meta = self.store.load()
@@ -232,7 +251,8 @@ class OptionsManager:
     def commitments(self) -> tuple[OptionCommitment, ...]:
         """Open and pending structures for risk: max loss for all; for pending ones the
         debit is also reserved as cash (identified by order ids) until the fill shows
-        up in the broker's cash."""
+        up in the broker's cash. Raises OptionsError if the book can't be loaded."""
+        self._ensure_loaded()
         out = []
         for s in self.live():
             ml = s.max_loss if s.max_loss is not None else 0.0
@@ -252,6 +272,8 @@ class OptionsManager:
 
     def open_blocker(self) -> str | None:
         """Why no new structure may open right now, or None."""
+        if not self._loaded:
+            return "options book not loaded"
         if not self.mode.may_open:
             return f"OPTIONS_MODE={self.mode.value}"
         if self.load_error or self.meta.get("rebuild"):
@@ -368,6 +390,7 @@ class OptionsManager:
         (news reactions); otherwise the research universe."""
         now = now or self._now()
         async with self._lock:
+            self._ensure_loaded()
             blocker = self.open_blocker()
             if blocker:
                 syms = [c.symbol for c in candidates] if candidates else []
@@ -699,6 +722,7 @@ class OptionsManager:
     # ============================================================== reconcile
     async def reconcile(self, now: datetime | None = None) -> ReconcileReport:
         async with self._lock:
+            self._ensure_loaded()
             return await self._reconcile_locked(now or self._now())
 
     async def _reconcile_locked(self, now: datetime) -> ReconcileReport:
@@ -876,6 +900,7 @@ class OptionsManager:
         now = now or self._now()
         out = MonitorOutcome()
         async with self._lock:
+            self._ensure_loaded()
             try:
                 out.reconcile = await self._reconcile_locked(now)
             except BrokerError as e:
@@ -1132,6 +1157,7 @@ class OptionsManager:
         if occ is None or occ.type != "call":
             return CloseResult(False, 0, None, None, "refused", "not a call contract")
         async with self._lock:
+            self._ensure_loaded()
             pos = await self.broker.get_position(contract)
             if pos is None or not pos.is_short:
                 return CloseResult(False, 0, None, None, "no_position", "no short position in this contract")

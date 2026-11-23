@@ -128,7 +128,7 @@ class Alerts:
 
 
 def make_manager(world, tmp_path: Path, *, mode=OptionsMode.DEFINED_RISK, risk=None, gate=None,
-                 covers=None, universe=("AAA",), ex_dividend=None, store=None, **settings):
+                 covers=None, universe=("AAA",), ex_dividend=None, store=None, defer_load=False, **settings):
     a = world.alpaca
     broker = AlpacaClient("https://paper-api.alpaca.markets", "k", "s")
     broker.lookup_attempts = 1
@@ -149,7 +149,7 @@ def make_manager(world, tmp_path: Path, *, mode=OptionsMode.DEFINED_RISK, risk=N
         snapshot=lambda: object(), calendar=cal, market_gate=cal.market_gate, spot=spot,
         cover_short=cover_short, universe=lambda: list(universe), journal=Journal(), alerts=Alerts(),
         ex_dividend=ex_dividend, settings=OptionsSettings(mode=mode, fill_poll_seconds=1.0, **settings),
-        now=world.clock.now,
+        now=world.clock.now, defer_load=defer_load,
     )
     m.covered = covered
     return m
