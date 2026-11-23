@@ -31,6 +31,7 @@ from stock_agent.portfolio import Portfolio
 from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.news_service import NewsService
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
 from stock_agent.performance import close_session
@@ -123,7 +124,8 @@ class StockAgentScheduler:
             now=_now_utc,
         ))
         self.health = service("health", lambda: ProviderHealthRegistry(
-            self.config, now=_now_utc, on_transition=getattr(self.alerts, "handle_health_transition", None),
+            self.config, store=self.store, defer_load=True, now=_now_utc,
+            on_transition=getattr(self.alerts, "handle_health_transition", None),
         ))
         self.assets = service("assets", lambda: AssetRegistry(
             self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
@@ -151,18 +153,18 @@ class StockAgentScheduler:
             self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
             cached_company=getattr(self.fundamentals, "cached_company", None),
             fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
-        ) if self.news is not None else None)
+        ))
         self.research_health = service("research_health", lambda: ResearchInputHealth(
             self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
             research_store=self.research_store,
-        ) if self.research_sources is not None else self.health)
+        ))
         self.research_gate = service("research_gate", lambda: ResearchGate(
             self.ledger, self.research_health, self.config,
         ))
         self.research = service("research", lambda: ResearchPipeline(
             self.config, self.ledger, self.calendar, self.analyst, self.research_store,
             self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus, alerts=self.alerts,
-        ) if self.research_sources is not None else None)
+        ))
         self.capital_lock = asyncio.Lock()
         self._asset_lock = asyncio.Lock()
         self.engine = service("engine", lambda: ExecutionEngine(
@@ -205,7 +207,8 @@ class StockAgentScheduler:
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
         self.macro = service("macro", lambda: MacroMonitor(
-            self.config, prices=self.prices, alert=self._alert, report=self._provider_health, now=_now_utc,
+            self.config, prices=self.prices, store=self.store, defer_load=True,
+            alert=self._alert, report=self._provider_health, now=_now_utc,
         ))
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
@@ -329,16 +332,12 @@ class StockAgentScheduler:
     def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
         return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
 
-    def _build_news_service(self):
-        try:
-            from stock_agent.news_service import NewsService
-        except ModuleNotFoundError as exc:
-            if exc.name != "stock_agent.news_service":
-                raise
-            # Transitional for the shared branches; eligibility remains fail-closed.
-            return None
-        return NewsService(self.http, config=self.config, store=self.store, health=self.health,
-                           assets=self.assets, now=_now_utc)
+    def _build_news_service(self) -> NewsService:
+        return NewsService(
+            self.http, config=self.config, store=self.store, defer_load=True, health=self.health,
+            assets=self.assets, enable_sec_filings=bool(getattr(self.config, "SEC_USER_AGENT", "")),
+            now=_now_utc,
+        )
 
     async def _refresh_assets(self, *, force: bool = False):
         if isinstance(self.assets, AssetRegistry) and not (
@@ -433,13 +432,13 @@ class StockAgentScheduler:
         boot = prepare_ledger(self.ledger, self.config.DATA_DIR, options_importer=import_legacy_options)
         self._needs_rebuild = boot.needs_rebuild
         if isinstance(self.health, ProviderHealthRegistry):
-            self.health.store = self.store
-            self.health._load_persisted()
+            self.health.load_state()
         if isinstance(self.assets, AssetRegistry):
             self.assets.load_state()
+        if isinstance(self.news, NewsService):
+            self.news.load_state()
         if isinstance(self.macro, MacroMonitor):
-            self.macro.store = self.store
-            self.macro._last_snapshot = self.macro._load_state()
+            self.macro.load_state()
         if isinstance(self.options, OptionsManager):
             self.options.load_state()
         if not boot.health.ok:
