@@ -11,7 +11,7 @@ change out at the top of the pull request.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -20,8 +20,9 @@ from stock_agent import options_engine, options_portfolio
 from stock_agent.config import Config
 from stock_agent.models import PortfolioState, Position, Thesis
 from stock_agent.risk_manager import (
-    CanonicalSector, DrawdownState, RiskManager, StopDistance, atr14,
-    classify_symbol, normalize_sector, stop_fraction, stop_price, update_drawdown,
+    CanonicalSector, DrawdownState, RiskManager, ShadowDailyBar, ShadowEntryAnchor, StopDistance,
+    atr14, classify_symbol, normalize_sector, shadow_stop_results, stop_fraction, stop_price,
+    update_drawdown,
 )
 
 NOW = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
@@ -311,3 +312,42 @@ def test_drawdown_pauses_throttles_and_automatically_recovers():
     assert state.alert and not state.throttled and not state.paused
     state = update_drawdown(state, "2026-10-19", Decimal(101))
     assert state.high_water == 101 and not state.alert
+
+
+def test_missing_expected_close_breaks_drawdown_recovery_streak():
+    state = DrawdownState(Decimal(100), Decimal(".14"), True, 4, "2026-10-14")
+    result = update_drawdown(state, "2026-10-16", Decimal(86), previous_session="2026-10-15")
+    assert result.paused and result.recovery_closes == 1
+
+
+def test_drawdown_state_roundtrip_never_resets_a_corrupt_latch_as_cutover():
+    assert DrawdownState.from_record(None) == DrawdownState()
+    state = DrawdownState(Decimal(100), Decimal(".14"), True, 3, "2026-10-14")
+    assert DrawdownState.from_record(state.to_record()) == state
+    with pytest.raises(ValueError):
+        DrawdownState.from_record({**state.to_record(), "paused": "false"})
+    with pytest.raises(ValueError):
+        DrawdownState.from_record({**state.to_record(), "last_session": "bad"})
+
+
+def test_shadow_stops_skip_entry_session_and_use_gap_or_stop_level():
+    day1, day2, day3, day4 = (date(2026, 11, day) for day in (16, 17, 18, 19))
+    anchor = ShadowEntryAnchor("test", "ALFA", day1, Decimal(100), Decimal(50),
+                               Decimal(".09"), Decimal(91))
+    bars = (
+        ShadowDailyBar(day1, 87, 101, 80, 100),
+        ShadowDailyBar(day2, 96, 99, 92, 94),
+        ShadowDailyBar(day3, 89, 100, 88, 95),
+        ShadowDailyBar(day4, 96, 106, 95, 105),
+    )
+    results = {result.variant: result for result in shadow_stop_results(anchor, bars)}
+    assert [(results[name].exit_session, results[name].price) for name in
+            ("fixed_7", "fixed_10", "fixed_12", "atr_placed", "no_stop")] == [
+        (day2, Decimal(93)), (day3, Decimal(89)), (day3, Decimal(88)),
+        (day3, Decimal(89)), (None, Decimal(105)),
+    ]
+    assert results["fixed_7"].pnl == -350
+    assert results["atr_placed"].return_fraction == Decimal("-.11")
+    assert results["no_stop"].through_session == day4 and not results["no_stop"].stopped
+    assert not shadow_stop_results(anchor, bars[:1])
+    assert not shadow_stop_results(anchor, (*bars, ShadowDailyBar(day2, 96, 99, 90, 94)))

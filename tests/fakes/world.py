@@ -38,6 +38,7 @@ PLACEHOLDER_CREDENTIALS = {
 
 class FakeWorld:
     def __init__(self, start: datetime | None = None, **alpaca_kw):
+        self.data_dir: Path | None = None
         self.clock = SimClock(start) if start else SimClock.at_et(2026, 11, 23, 9, 0)
         self.alpaca = FakeAlpaca(self.clock, **alpaca_kw)
         self.fmp = FakeFMP(self.clock, price_source=self.alpaca.price)
@@ -62,6 +63,7 @@ class FakeWorld:
         self.clock.install(monkeypatch)
         if data_dir is not None:
             monkeypatch.setattr(Config, "DATA_DIR", Path(data_dir))
+            self.data_dir = Path(data_dir)
         if credentials:
             for k, v in PLACEHOLDER_CREDENTIALS.items():
                 monkeypatch.setattr(Config, k, v)

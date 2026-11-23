@@ -122,7 +122,7 @@ class Journal:
         return sorted(out, key=lambda p: p.name.replace(".gz", ""))
 
     # ------------------------------------------------------------------ write
-    def append(self, kind: str, **fields: Any) -> int | None:
+    def append(self, kind: str, /, **fields: Any) -> int | None:
         """Append one record. Returns its sequence number, or None on failure.
 
         Never raises. A failure is counted in ``health()``.
