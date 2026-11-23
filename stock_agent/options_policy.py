@@ -106,6 +106,28 @@ class ContractQuote:
         return (self.bid + self.ask) / 2
 
 
+WORTHLESS_ASK = 0.10
+
+
+def mark_problem(q: ContractQuote | None, now: datetime, s: OptionsSettings) -> str | None:
+    """Why this quote can't be used as a mark for exits or P&L, or None.
+    Zero, one-sided and crossed quotes (common before the open) are not marks;
+    the only zero bid accepted is a near-worthless contract (ask <= 0.10)."""
+    if q is None:
+        return "no quote"
+    if q.ask is None or q.ask <= 0:
+        return "no ask"
+    if q.bid is not None and q.ask < q.bid:
+        return "crossed quote"
+    if (q.bid is None or q.bid <= 0) and q.ask > WORTHLESS_ASK:
+        return "no bid"
+    if q.quote_at is None:
+        return "quote has no timestamp"
+    if (now - q.quote_at).total_seconds() > s.max_quote_age_s:
+        return "stale quote"
+    return None
+
+
 def quote_problem(q: ContractQuote, now: datetime, s: OptionsSettings, *, need_bid: bool = True) -> str | None:
     """Why this leg's quote is not good enough to trade on, or None."""
     if q.ask is None or q.ask <= 0:
