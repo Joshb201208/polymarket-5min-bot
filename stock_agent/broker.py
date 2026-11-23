@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from decimal import ROUND_FLOOR, Decimal
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Literal
@@ -51,6 +52,15 @@ TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "replaced"
 
 _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 _EPS = 1e-9
+
+
+def _dec(x: float) -> Decimal:
+    """Exact decimal of a broker quantity (parsed from the broker's string)."""
+    return Decimal(repr(float(x)))
+
+
+def _floor_exact(x: float) -> int:
+    return int(_dec(x).to_integral_value(rounding=ROUND_FLOOR))
 
 ErrorKind = Literal[
     "rejected",      # 403/422 and similar: the broker said no. Safe to treat as "not placed".
@@ -187,25 +197,27 @@ class BrokerPosition(_Model):
 
     @property
     def is_long(self) -> bool:
-        return self.qty > _EPS
+        return self.qty > 0
 
     @property
     def is_short(self) -> bool:
-        return self.qty < -_EPS
+        return self.qty < 0
 
     @property
     def whole_qty(self) -> int:
-        """Whole shares held long (0 for shorts)."""
-        return int(math.floor(self.qty + _EPS)) if self.is_long else 0
+        """Whole shares held long (0 for shorts). Exact: 0.999999999 is 0, not 1."""
+        return _floor_exact(self.qty) if self.is_long else 0
 
     @property
     def free_whole_qty(self) -> int:
         """Whole long shares not reserved by open orders or covered calls."""
-        return int(math.floor(self.qty_available + _EPS)) if self.qty_available > _EPS else 0
+        return _floor_exact(self.qty_available) if self.qty_available > 0 else 0
 
     @property
     def fractional_qty(self) -> float:
-        return round(self.qty - self.whole_qty, 9) if self.is_long else 0.0
+        if not self.is_long:
+            return 0.0
+        return float(_dec(self.qty) - self.whole_qty)
 
 
 class BrokerOrder(_Model):
@@ -850,7 +862,7 @@ class AlpacaClient:
             if pos is None or not pos.is_long:
                 raise BrokerError("guard", f"refused: no long position in {req.symbol}; selling would open a short",
                                   method="POST", path="/v2/orders")
-            if req.qty > pos.qty_available + _EPS:
+            if _dec(req.qty) > _dec(pos.qty_available):
                 raise BrokerError("guard", f"refused: sell {req.qty:g} {req.symbol} exceeds available "
                                   f"{pos.qty_available:g} (held {pos.qty:g})", method="POST", path="/v2/orders")
             return
@@ -863,7 +875,7 @@ class AlpacaClient:
             if pos is None or not pos.is_short:
                 raise BrokerError("guard", f"refused: buy_to_close but no short in {req.symbol}",
                                   method="POST", path="/v2/orders")
-            if req.qty > abs(pos.qty) + _EPS:
+            if _dec(req.qty) > abs(_dec(pos.qty)):
                 raise BrokerError("guard", f"refused: cover {req.qty:g} exceeds short {abs(pos.qty):g}",
                                   method="POST", path="/v2/orders")
 
