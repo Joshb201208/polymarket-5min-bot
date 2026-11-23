@@ -108,6 +108,26 @@ def test_operator_stop_while_installing_does_not_get_undone(tmp_path, monkeypatc
     assert not any("try-restart" in event for event in updater.events)
 
 
+@pytest.mark.parametrize("candidate_state", ["failed", "inactive"])
+def test_rollback_distinguishes_crash_from_operator_stop(tmp_path, monkeypatch, candidate_state):
+    updater = FakeUpdater(tmp_path)
+
+    def wait_healthy(sha, old_pid):
+        updater.events.append(("health", sha, old_pid))
+        if sha == NEW:
+            updater.service_state = candidate_state
+            updater.service_pid = 0
+            return False
+        return True
+
+    monkeypatch.setattr(updater, "wait_healthy", wait_healthy)
+    assert updater.locked_update() == 1
+    assert updater.current == OLD
+    assert updater.unit_path.read_text() == "working unit"
+    recovered = ("restart", "--job-mode=fail", mod.UNIT) in updater.events
+    assert recovered is (candidate_state == "failed")
+
+
 def test_private_paths_and_untracked_collisions_preserved(tmp_path):
     updater = FakeUpdater(tmp_path)
     updater.paths = "data/portfolio.json\0"

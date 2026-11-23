@@ -238,6 +238,15 @@ def test_trim_and_exit_do_not_sell_shares_behind_a_short_call(risk):
     assert risk.evaluate_trade(book, option(kind=TradeKind.COVERED_CALL)).reasons == ("covered_calls_deferred",)
 
 
+def test_hedging_long_call_is_not_counted_as_stock_coverage(risk):
+    short = leg("ALFA", -2)
+    hedge = replace(short, occ_symbol="ALFA-long-option", strike=D(90), qty=D(1))
+    book = snapshot(stock("ALFA", 120, "Industrials"), legs=(short, hedge))
+    # One contract is hedged by the long leg; the remaining contract needs 100 shares.
+    assert risk.evaluate_trade(book, TradeIntent(TradeKind.SELL, "ALFA", D(20))).ok
+    assert not risk.evaluate_trade(book, TradeIntent(TradeKind.SELL, "ALFA", D(21))).ok
+
+
 def test_any_unexpected_short_blocks_buys_but_not_funded_cover(risk):
     book = snapshot(stock("ALFA", -2, "Industrials"), cash="250")
     assert risk.evaluate_trade(book, buy("BETA")).reasons == ("unexpected_short",)
@@ -253,3 +262,50 @@ def test_unknown_broker_or_unbounded_pending_order_denies_new_entries(risk):
     assert "broker_book_blocked" in risk.evaluate_trade(blocked, buy()).reasons
     pending = snapshot(orders=(order("BETA", limit=None),))
     assert risk.evaluate_trade(pending, buy()).reasons == ("invalid_risk_input",)
+
+
+def test_existing_issuer_drift_is_reported_but_only_blocks_worsening(risk):
+    book = snapshot(stock("GOOG", 160, "Communication Services"))
+    verdict = risk.evaluate_trade(book, buy(price=D(101), mark_price=D(100), fee=D(1)))
+    assert verdict.ok
+    (breach,) = verdict.allowed_existing_breaches
+    assert breach.kind == "issuer_cap" and breach.key == "GOOGL"
+    assert not risk.evaluate_trade(book, buy(symbol="GOOGL", sector="Communication Services")).ok
+
+
+def test_same_sector_cannot_add_to_drift_even_when_ticker_differs(risk):
+    book = snapshot(stock("BANKA", 140, "Financials"), stock("BANKB", 140, "Financials"),
+                    stock("BANKC", 130, "Financial Services"))
+    assert risk.evaluate_trade(book, buy()).allowed_existing_breaches[0].kind == "sector_cap"
+    assert risk.evaluate_trade(book, buy(sector="Financials")).reasons == ("sector_cap",)
+
+
+def test_concentration_exact_cap_alerts_without_buy_or_trim_veto(risk):
+    book = snapshot(stock("ALFA", 150, "Industrials"))
+    assert [(b.kind, b.key, b.at_limit) for b in risk.evaluate_portfolio(book)] == [
+        ("issuer_cap", "ALFA", True),
+    ]
+    assert not risk.plan_remediation(book, broker_action=True)
+    assert risk.evaluate_trade(book, buy("BETA")).ok
+
+
+def test_options_cannot_cross_gross_via_existing_leverage(risk):
+    book = snapshot(*(stock(f"NAME{i}", 101, "Industrials") for i in range(10)))
+    assert risk.evaluate_trade(book, option()).reasons == ("gross_cap",)
+
+
+def test_fee_and_unfavorable_fill_do_not_overshoot_stop_budget(risk):
+    trade = buy(qty="100", stop_distance=D(".10"), mark_price=D(99), fee=D(1))
+    assert risk.evaluate_trade(snapshot(), trade).reasons == ("stop_risk_budget",)
+    assert risk.propose_equity_qty(snapshot(), trade) == 99
+
+
+def test_option_entry_requires_fresh_thesis(risk):
+    assert risk.evaluate_trade(snapshot(), option(signal_at=None)).reasons == ("stale_signal",)
+
+
+def test_two_share_classes_count_as_two_positions_but_one_exposure_bucket(risk):
+    holdings = (stock("GOOG", 1, "Communication Services"), stock("GOOGL", 1, "Communication Services"))
+    verdict = risk.evaluate_trade(snapshot(*holdings), buy())
+    assert verdict.after.positions == 3
+    assert verdict.after.issuer_values["GOOGL"] == D(200)

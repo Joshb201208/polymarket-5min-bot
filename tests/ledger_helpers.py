@@ -15,6 +15,9 @@ from stock_agent.ledger import Ledger
 from stock_agent.state_store import StateStore
 
 
+_UNSET = object()
+
+
 class StubBroker:
     def __init__(self, cash: float = 100000.0):
         self.cash = cash
@@ -26,9 +29,9 @@ class StubBroker:
         self._aid = 0
         self.positions_replies: list[list[dict]] = []   # scripted replies for get_positions
 
-    def pos(self, symbol: str, qty: float, avg: float, price: float | None = None, *,
+    def pos(self, symbol: str, qty: float, avg: float, price=_UNSET, *,
             asset_class: str | None = None, mult: int = 1, lastday: float | None = None) -> None:
-        price = avg if price is None else price
+        price = avg if price is _UNSET else price
         ac = asset_class or ("us_option" if len(symbol) > 10 else "us_equity")
         m = 100 if ac == "us_option" else mult
         self.positions[symbol] = {
@@ -63,6 +66,7 @@ class StubBroker:
 
     async def get_account(self):
         self._check("get_account")
+        await asyncio.sleep(0)          # yield like a real request, so concurrency is exercised
         long_mv = sum(float(p["market_value"]) for p in self.positions.values()
                       if p["asset_class"] == "us_equity" and float(p["qty"]) > 0)
         short_mv = sum(float(p["market_value"]) for p in self.positions.values()

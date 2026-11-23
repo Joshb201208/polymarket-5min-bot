@@ -60,6 +60,7 @@ CASH_FLOW_TYPES = ("JNLC", "CSD", "CSW", "JNL")
 
 # a run that would close at least this share of >= 2 open positions re-reads once
 MASS_CLOSE_FRACTION = 0.5
+REOPEN_TOLERANCE = timedelta(seconds=120)   # bot-recorded open time vs broker fill time
 
 
 
@@ -221,16 +222,18 @@ def _symbol_activities(ledger: Ledger, symbol: str, since: str | None = None) ->
     if since:
         sql += " AND ts>=?"
         p.append(since)
-    sql += " ORDER BY ts"
+    sql += " ORDER BY ts, activity_id"
     return [json.loads(r[0]) for r in ledger.store.query(sql, tuple(p))]
 
 
-def _opened_from_history(ledger: Ledger, symbol: str, qty: Decimal) -> tuple[datetime | None, str]:
+def _open_event(ledger: Ledger, symbol: str, qty: Decimal) -> tuple[datetime | None, str, str | None]:
     """Replay stored fills/OPTRD for a symbol; return when it last went from flat
-    to non-flat and how (fill | assignment/exercise), if the replay ends at ``qty``."""
+    to non-flat, how (fill | assignment_or_exercise) and that activity's id, if
+    the replay ends at ``qty``. Otherwise (None, "import", None)."""
     running = ZERO
     opened: datetime | None = None
     how = "import"
+    aid: str | None = None
     for a in _symbol_activities(ledger, symbol):
         t = a.get("activity_type")
         if t not in ("FILL", "OPTRD"):
@@ -240,9 +243,15 @@ def _opened_from_history(ledger: Ledger, symbol: str, qty: Decimal) -> tuple[dat
         if before == 0 and running != 0:
             opened = _dt(_activity_ts(a))
             how = "fill" if t == "FILL" else "assignment_or_exercise"
+            aid = str(a.get("id") or "") or None
     if running == qty and opened is not None:
-        return opened, how
-    return None, "import"
+        return opened, how, aid
+    return None, "import", None
+
+
+def _opened_from_history(ledger: Ledger, symbol: str, qty: Decimal) -> tuple[datetime | None, str]:
+    opened, how, _ = _open_event(ledger, symbol, qty)
+    return opened, how
 
 
 def _explain_close(ledger: Ledger, symbol: str, since: datetime | None) -> str:
@@ -281,12 +290,33 @@ def _renames(ledger: Ledger) -> dict[str, str]:
 
 
 def _new_meta(c, symbol: str, asset_class: str, opened_at: datetime | None, source: str,
-              sector: str | None = None) -> str:
+              sector: str | None = None, open_activity_id: str | None = None) -> str:
     pid = new_id("pos")
-    c.execute("INSERT INTO positions_meta(position_id, symbol, asset_class, opened_at, opened_source, sector)"
-              " VALUES (?,?,?,?,?,?)",
-              (pid, symbol, asset_class, opened_at.isoformat() if opened_at else None, source, sector))
+    notes = {"open_activity_id": open_activity_id} if open_activity_id else {}
+    c.execute("INSERT INTO positions_meta(position_id, symbol, asset_class, opened_at, opened_source, sector,"
+              " notes_json) VALUES (?,?,?,?,?,?,?)",
+              (pid, symbol, asset_class, opened_at.isoformat() if opened_at else None, source, sector,
+               json.dumps(notes)))
     return pid
+
+
+def _validate_read(account: Any, positions: list) -> None:
+    """A successful HTTP read can still be unusable. Anything we cannot trust
+    aborts the reconcile (ledger untouched) instead of being read as zero/flat."""
+    for k in ("equity", "cash"):
+        if _dec(_g(account, k)) is None:
+            raise ReconcileError(f"account {k} missing or not a finite number")
+    seen: set[str] = set()
+    for p in positions:
+        sym = _g(p, "symbol")
+        if not sym or not str(sym).strip():
+            raise ReconcileError("position row without a symbol")
+        sym = str(sym)
+        if sym in seen:
+            raise ReconcileError(f"duplicate position row for {sym}")
+        seen.add(sym)
+        if _dec(_g(p, "qty")) is None:
+            raise ReconcileError(f"position {sym}: qty missing or not a finite number")
 
 
 async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> BookSnapshot:
@@ -299,6 +329,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     after = (cursor - timedelta(days=3)) if cursor else None
     try:
         account, positions, orders, acts = await _read_broker(broker, after)
+        _validate_read(account, positions)
     except ReconcileError as e:
         journal.append("reconcile", ok=False, reason=reason, error=str(e))
         raise
@@ -311,6 +342,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     if len(open_meta) >= 2 and len(to_close) / len(open_meta) >= MASS_CLOSE_FRACTION:
         try:
             positions = list(await broker.get_positions())
+            _validate_read(account, positions)
         except Exception as e:
             journal.append("reconcile", ok=False, reason=reason, error=f"re-read failed: {e}")
             raise ReconcileError(f"positions re-read failed: {e}") from e
@@ -357,17 +389,61 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
             mv = _dec(_g(p, "market_value")) or ZERO
             option = is_option_row(p)
             meta = open_meta.get(sym)
+            ev_open, how, open_aid = _open_event(ledger, sym, qty)
+            source = {"fill": "import", "assignment_or_exercise": "assignment"}.get(how, "import")
+            asset_class = "us_option" if option else "us_equity"
             if meta is None:
-                opened, how = _opened_from_history(ledger, sym, qty)
-                source = {"fill": "import", "assignment_or_exercise": "assignment"}.get(how, "import")
-                pid = _new_meta(c, sym, "us_option" if option else "us_equity", opened, source)
-                meta = PositionMeta(position_id=pid, symbol=sym, asset_class="us_option" if option else "us_equity",
-                                    opened_at=opened, opened_source=source)
+                pid = _new_meta(c, sym, asset_class, ev_open, source, open_activity_id=open_aid)
+                meta = PositionMeta(position_id=pid, symbol=sym, asset_class=asset_class, opened_at=ev_open,
+                                    opened_source=source, notes={"open_activity_id": open_aid} if open_aid else {})
                 open_meta[sym] = meta
                 diffs.append(Diff(DiffKind.IMPORTED, sym, Severity.INFO if rebuild else Severity.WARNING,
                                   ledger=None, broker=str(qty),
                                   explanation=_explain_close(ledger, sym, None) or "no matching activity",
                                   action=f"imported ({source})"))
+            else:
+                known = meta.notes.get("open_activity_id")
+                reopened = False
+                if ev_open is not None:
+                    if known:
+                        reopened = open_aid is not None and open_aid != known
+                    elif meta.opened_at is not None and meta.opened_source != "v0":
+                        reopened = ev_open > meta.opened_at + REOPEN_TOLERANCE
+                if reopened:
+                    # sold to flat and bought again between refreshes: a new position, not the old one
+                    c.execute("UPDATE positions_meta SET closed_at=?, close_cause=? WHERE position_id=?",
+                              (ev_open.isoformat(), "flat_then_reopened", meta.position_id))
+                    diffs.append(Diff(DiffKind.CLOSED, sym, Severity.INFO, ledger=meta.position_id, broker=str(qty),
+                                      explanation="went flat and was reopened between refreshes",
+                                      action="old position closed; new position opened"))
+                    pid = _new_meta(c, sym, meta.asset_class, ev_open, source, open_activity_id=open_aid)
+                    meta = PositionMeta(position_id=pid, symbol=sym, asset_class=meta.asset_class,
+                                        opened_at=ev_open, opened_source=source,
+                                        notes={"open_activity_id": open_aid} if open_aid else {})
+                    open_meta[sym] = meta
+                    diffs.append(Diff(DiffKind.IMPORTED, sym, Severity.WARNING, broker=str(qty),
+                                      explanation=f"reopened by {how}", action=f"imported ({source})"))
+                else:
+                    notes = dict(meta.notes)
+                    opened_at, src = meta.opened_at, meta.opened_source
+                    if open_aid and not known:
+                        notes["open_activity_id"] = open_aid
+                    if ev_open is not None and (opened_at is None or src == "v0"):
+                        # migrated (or unknown) entry date: broker fills are the truth (F-07-03)
+                        if opened_at is None or opened_at.date() != ev_open.date():
+                            diffs.append(Diff(DiffKind.ENTRY_DATE_CORRECTED, sym, Severity.INFO,
+                                              ledger=opened_at.isoformat() if opened_at else None,
+                                              broker=ev_open.isoformat(), explanation=f"first {how} after flat",
+                                              action="entry date taken from broker fills"))
+                        opened_at, src = ev_open, ("v0_verified" if src == "v0" else src)
+                    if notes != dict(meta.notes) or opened_at != meta.opened_at or src != meta.opened_source:
+                        c.execute("UPDATE positions_meta SET opened_at=?, opened_source=?, notes_json=?"
+                                  " WHERE position_id=?",
+                                  (opened_at.isoformat() if opened_at else None, src,
+                                   json.dumps(notes, default=str), meta.position_id))
+                        meta = PositionMeta(**{**meta.__dict__, "opened_at": opened_at, "opened_source": src,
+                                               "notes": notes})
+                        open_meta[sym] = meta
             seen_meta.add(sym)
             pq = prev_qty.get(sym)
             if pq is not None and Decimal(str(pq)) != qty:
@@ -457,7 +533,10 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         account_flags={k: _g(account, k) for k in ("shorting_enabled", "trading_blocked", "account_blocked",
                                                   "multiplier", "options_trading_level", "status")},
     )
-    report = {"diffs": [{"kind": d.kind.value, "symbol": d.symbol, "severity": d.severity.value,
+    # B1: resume only after a CLEAN reconcile. Shorts are blocked per symbol, not globally.
+    blocking = [d for d in diffs if d.severity == Severity.CRITICAL and d.kind != DiffKind.SHORT_STOCK]
+    clean = not blocking
+    report = {"clean": clean, "diffs": [{"kind": d.kind.value, "symbol": d.symbol, "severity": d.severity.value,
                          "ledger": d.ledger, "broker": d.broker, "explanation": d.explanation,
                          "action": d.action} for d in diffs],
               "n_holdings": len(holdings), "n_legs": len(legs), "quality": quality}
@@ -469,16 +548,21 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         "cash": str(cash), "blocked": sorted(blocked),
         "fractional": sorted(h.symbol for h in holdings if h.is_fractional), "at": now.isoformat()})
     for d in diffs:
-        journal.append("reconcile_diff", run_id=run_id, kind=d.kind.value, symbol=d.symbol,
+        journal.append("reconcile_diff", run_id=run_id, diff_kind=d.kind.value, symbol=d.symbol,
                        severity=d.severity.value, ledger=d.ledger, broker=d.broker,
                        explanation=d.explanation, action=d.action)
         if d.severity != Severity.INFO:
             ledger._raise_alert(d.severity, f"Books: {d.kind.value} {d.symbol or ''}".strip(),
                                 f"ledger={d.ledger} broker={d.broker}. {d.explanation} {d.action}".strip(),
                                 key=f"reconcile:{d.kind.value}:{d.symbol}")
-    journal.append("reconcile", ok=True, run_id=run_id, reason=reason, n_diffs=len(diffs), quality=quality,
+    journal.append("reconcile", ok=True, clean=clean, run_id=run_id, reason=reason, n_diffs=len(diffs),
+                   quality=quality,
                    equity=str(equity), cash=str(cash), n_holdings=len(holdings), n_legs=len(legs))
-    if store.trading_block():
+    if store.trading_block() and blocking:
+        ledger._raise_alert(Severity.CRITICAL, "Books not clean; trading stays blocked",
+                            "; ".join(f"{d.kind.value} {d.symbol or ''}".strip() for d in blocking[:10]),
+                            key="state:still_blocked")
+    elif store.trading_block():
         old = store.trading_block()
         store.clear_trading_block(by=f"reconcile {run_id}")
         ledger._raise_alert(Severity.WARNING, "Books rebuilt from broker",

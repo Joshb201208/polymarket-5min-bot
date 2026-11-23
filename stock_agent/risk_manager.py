@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import StrEnum
 from typing import Protocol
@@ -11,6 +11,8 @@ from stock_agent.ledger import BookSnapshot
 from stock_agent.models import PortfolioState, Trade
 
 logger = logging.getLogger(__name__)
+
+DRAWDOWN_STATE_KEY = "drawdown"
 
 
 class TradeKind(StrEnum):
@@ -96,6 +98,33 @@ class DrawdownState:
     def alert(self) -> bool:
         return self.drawdown >= _decimal(Config.DRAWDOWN_ALERT_PCT)
 
+    def to_record(self) -> dict[str, str | bool | int | None]:
+        return {
+            "version": 1,
+            "high_water": str(self.high_water),
+            "drawdown": str(self.drawdown),
+            "paused": self.paused,
+            "recovery_closes": self.recovery_closes,
+            "last_session": self.last_session,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping | None) -> "DrawdownState":
+        if record is None:
+            return cls()
+        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] != 1:
+            raise ValueError("unrecognized drawdown record")
+        high, loss = _decimal(record.get("high_water")), _decimal(record.get("drawdown"))
+        paused, closes = record.get("paused"), record.get("recovery_closes")
+        session = record.get("last_session")
+        if (high < 0 or not 0 <= loss < 1 or type(paused) is not bool or type(closes) is not int
+                or not 0 <= closes < Config.DRAWDOWN_RECOVERY_SESSIONS
+                or (not paused and (closes or loss >= _decimal(Config.DRAWDOWN_PAUSE_PCT)))
+                or (session is None and (high or loss or paused or closes))
+                or (session is not None and (high <= 0 or _session_id(session) != session))):
+            raise ValueError("invalid drawdown record")
+        return cls(high, loss, paused, closes, session)
+
 
 @dataclass(frozen=True)
 class RiskControls:
@@ -124,6 +153,7 @@ class RiskVerdict:
     reasons: tuple[str, ...] = ()
     after: PortfolioTotals | None = None
     detect_only: bool = False
+    allowed_existing_breaches: tuple["Breach", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,6 +162,7 @@ class Breach:
     key: str
     value: Decimal
     cap: Decimal
+    at_limit: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,9 +204,11 @@ class _Projection:
             by_sector[c.sector] = by_sector.get(c.sector, Decimal(0)) + value
             for cluster in c.clusters:
                 by_cluster[cluster] = by_cluster.get(cluster, Decimal(0)) + value
+        symbols = {stock.symbol for stock in self.stocks.values() if stock.qty > 0}
+        symbols.update(self.pending_values)
         return PortfolioTotals(
             self.equity, self.cash, sum(by_issuer.values(), Decimal(0)),
-            by_issuer, by_sector, by_cluster, len(by_issuer),
+            by_issuer, by_sector, by_cluster, len(symbols),
             self.option_loss, self.option_count,
         )
 
@@ -194,6 +227,95 @@ class DailyBar(Protocol):
 
     @property
     def close(self) -> Decimal | float: ...
+
+
+@dataclass(frozen=True)
+class ShadowEntryAnchor:
+    position_id: str
+    symbol: str
+    session_date: date
+    fill_price: Decimal
+    qty: Decimal
+    stop_fraction: Decimal
+    stop_price: Decimal | None = None
+    atr: Decimal | None = None
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class ShadowDailyBar:
+    session_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+@dataclass(frozen=True)
+class ShadowStopResult:
+    variant: str
+    stopped: bool
+    exit_session: date | None
+    price: Decimal
+    return_fraction: Decimal
+    pnl: Decimal
+    through_session: date
+
+
+def shadow_stop_results(
+    entry_anchor: ShadowEntryAnchor, daily_bars: Sequence[ShadowDailyBar],
+) -> tuple[ShadowStopResult, ...]:
+    """Illustrative per-lot replay. Same-price-basis bars, no fees or intraday slippage.
+
+    Skip the entry-day bar; its low could predate the real fill. Use an opening
+    gap price when at/below the stop, otherwise the stop level when a later
+    session's low touches it. Untriggered variants mark at the final close.
+    """
+    try:
+        fill, qty = _decimal(entry_anchor.fill_price), _decimal(entry_anchor.qty)
+        fraction = _decimal(entry_anchor.stop_fraction)
+        if min(fill, qty, fraction) <= 0 or fraction >= 1:
+            return ()
+        atr_level = _decimal(entry_anchor.stop_price) if entry_anchor.stop_price is not None else stop_price(
+            fill, StopDistance(fraction, False),
+        )
+        if not 0 < atr_level < fill:
+            return ()
+        bars: dict[date, tuple[Decimal, Decimal, Decimal]] = {}
+        for bar in daily_bars:
+            if bar.session_date <= entry_anchor.session_date:
+                continue
+            opening, high, low, close = map(_decimal, (bar.open, bar.high, bar.low, bar.close))
+            if not (0 < low <= min(opening, close) <= max(opening, close) <= high):
+                return ()
+            values = opening, low, close
+            if bar.session_date in bars and bars[bar.session_date] != values:
+                return ()
+            bars[bar.session_date] = values
+        if not bars:
+            return ()
+        sessions = sorted(bars)
+        last = sessions[-1]
+        results = []
+        levels = [(f"fixed_{pct}", fill * (1 - Decimal(pct) / 100)) for pct in (7, 10, 12)]
+        levels += [("atr_placed", atr_level), ("no_stop", None)]
+        for name, level in levels:
+            price = bars[last][2]
+            exit_session = None
+            if level is not None:
+                for session in sessions:
+                    opening, low, _ = bars[session]
+                    if low <= level:
+                        price = min(opening, level)
+                        exit_session = session
+                        break
+            results.append(ShadowStopResult(
+                name, exit_session is not None, exit_session, price, price / fill - 1,
+                (price - fill) * qty, last,
+            ))
+        return tuple(results)
+    except (TypeError, ValueError, ArithmeticError, AttributeError):
+        return ()
 
 
 def normalize_sector(raw: str | None) -> CanonicalSector:
@@ -299,8 +421,16 @@ def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
     return value.quantize(tick, rounding=ROUND_CEILING)
 
 
-def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -> DrawdownState:
+def update_drawdown(
+    state: DrawdownState, session: str, close_equity: Decimal, *,
+    previous_session: str | None = None,
+) -> DrawdownState:
     """Apply one trusted (flow-adjusted when applicable) close, once."""
+    session = _session_id(session)
+    if previous_session is not None:
+        previous_session = _session_id(previous_session)
+        if previous_session >= session:
+            raise ValueError("expected previous close must precede the new close")
     if not session or (state.last_session is not None and session <= state.last_session):
         return state
     close_equity = _decimal(close_equity)
@@ -310,10 +440,20 @@ def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -
     drawdown = (high_water - close_equity) / high_water
     paused = state.paused or drawdown >= _decimal(Config.DRAWDOWN_PAUSE_PCT)
     recovering = paused and drawdown < _decimal(Config.DRAWDOWN_THROTTLE_PCT)
-    closes = state.recovery_closes + 1 if recovering else 0
+    streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session
+              else 0)
+    closes = streak + 1 if recovering else 0
     if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
     return DrawdownState(high_water, drawdown, paused, closes, session)
+
+
+def _session_id(day: str) -> str:
+    try:
+        parsed = date.fromisoformat(day)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid drawdown session label") from exc
+    return parsed.isoformat()
 
 
 class RiskManager:
@@ -352,6 +492,12 @@ class RiskManager:
             if kind in {TradeKind.OPTION_OPEN, TradeKind.CASH_SECURED_PUT}:
                 return self._evaluate_option(projection, intent, kind, qty, fee, controls)
             c = classify_symbol(symbol, intent.sector)
+            current = projection.stocks.get(symbol)
+            if current is not None:
+                if current.classification.sector != CanonicalSector.UNKNOWN:
+                    c = current.classification
+                elif c.sector != CanonicalSector.UNKNOWN:
+                    projection.stocks[symbol] = replace(current, classification=c)
             target, held, condition = self._stock_target(projection, intent, kind, controls)
             if condition:
                 return RiskVerdict(False, (condition,), projection.totals())
@@ -362,6 +508,8 @@ class RiskManager:
             mark = price if intent.mark_price is None else _decimal(intent.mark_price)
             if mark <= 0:
                 return RiskVerdict(False, ("invalid_mark",))
+            before = self._breaches(projection)
+            equity_before = projection.equity
             projection.add_buy(symbol, c, qty, price)
             if mark > price:
                 extra = (mark - price) * qty
@@ -371,9 +519,19 @@ class RiskManager:
             projection.equity -= fee + qty * max(Decimal(0), price - mark)
             if projection.equity <= 0:
                 return RiskVerdict(False, ("nonpositive_projected_equity",))
+            stop_distance = _decimal(self.config.STOP_LOSS_PCT if intent.stop_distance is None
+                                     else intent.stop_distance)
+            loss_budget = projection.equity * self._ratio("MAX_INITIAL_STOP_RISK_PCT")
+            if controls.drawdown.throttled:
+                loss_budget *= self._ratio("DRAWDOWN_THROTTLE_SCALE")
+            if (held + qty * price) * stop_distance > loss_budget:
+                return RiskVerdict(False, ("stop_risk_budget",), projection.totals())
             breaches = self._breaches(projection)
-            reasons = tuple(dict.fromkeys(b.kind for b in breaches if b.kind != "option_budget"))
-            return RiskVerdict(not reasons, reasons, projection.totals())
+            unchanged = self._unchanged_breaches(before, breaches, equity_before, projection.equity)
+            reasons = tuple(dict.fromkeys(b.kind for b in breaches
+                                         if b.kind != "option_budget" and b not in unchanged))
+            return RiskVerdict(not reasons, reasons, projection.totals(),
+                               allowed_existing_breaches=unchanged if not reasons else ())
         except (ValueError, TypeError, ArithmeticError, AttributeError):
             return RiskVerdict(False, ("invalid_risk_input",))
 
@@ -410,7 +568,9 @@ class RiskManager:
         self, snapshot: "BookSnapshot", *, controls: RiskControls | None = None,
     ) -> tuple[Breach, ...]:
         try:
-            return self._breaches(self._project_book(snapshot, controls or RiskControls()))
+            return self._breaches(
+                self._project_book(snapshot, controls or RiskControls()), include_at_limit=True,
+            )
         except (ValueError, TypeError, ArithmeticError, AttributeError):
             return (Breach("invalid_risk_input", "", Decimal(0), Decimal(0)),)
 
@@ -423,28 +583,25 @@ class RiskManager:
         """Recommend one executable next action. Reconcile before doing another."""
         controls = controls or RiskControls()
         try:
+            # One unpriced unrelated holding cannot suppress a funded short cover.
+            for held in snapshot.holdings:
+                if held.qty < 0 and held.price_ok and held.price is not None and held.price > 0:
+                    return (TradeIntent(TradeKind.BUY_TO_COVER, held.symbol, -held.qty,
+                                        held.price, reason="unexpected_short"),)
             book = self._project_book(snapshot, controls, include_pending=False)
             breaches = self._breaches(book)
             if not breaches:
                 return ()
-            for breach in breaches:
-                if breach.kind == "unexpected_short":
-                    stock = book.stocks[breach.key]
-                    return (TradeIntent(TradeKind.BUY_TO_COVER, stock.symbol, -stock.qty,
-                                        stock.mark, reason="unexpected_short"),)
             counters = consecutive_closes or {}
             headroom = _decimal(self.config.RISK_TRIM_HEADROOM_PCT)
             buffer = _decimal(self.config.RISK_DRIFT_BUFFER_PCT)
             for breach in breaches:
                 if breach.kind == "position_count" and broker_action:
-                    # Count only falls when the last class of the issuer is closed.
                     # Prefer the newly delivered name if fully saleable.
                     candidates = [
                         stock for stock in book.stocks.values()
                         if stock.qty > 0 and stock.qty == stock.qty.to_integral_value()
                         and self._covered_shares(snapshot, stock.symbol) == 0
-                        and sum(s.classification.issuer == stock.classification.issuer
-                                for s in book.stocks.values() if s.qty > 0) == 1
                     ]
                     candidates.sort(key=lambda s: (s.symbol != broker_symbol, s.qty * s.mark, s.symbol))
                     if candidates:
@@ -502,6 +659,8 @@ class RiskManager:
             loss, reserved = _decimal(option.max_loss), _decimal(option.cash_reserved)
             if not option.structure_id or option.structure_id in commitments or min(loss, reserved) < 0:
                 raise ValueError("invalid or duplicate option commitment")
+            if reserved_orders.intersection(option.order_ids):
+                raise ValueError("one broker order linked to multiple option commitments")
             commitments.add(option.structure_id)
             reserved_orders.update(option.order_ids)
             book.option_loss += loss
@@ -577,7 +736,7 @@ class RiskManager:
                     )
         return book
 
-    def _breaches(self, book: _Projection) -> tuple[Breach, ...]:
+    def _breaches(self, book: _Projection, *, include_at_limit: bool = False) -> tuple[Breach, ...]:
         totals = book.totals()
         breached = []
         for symbol, stock in book.stocks.items():
@@ -601,8 +760,8 @@ class RiskManager:
                 if kind == "sector_cap" and key != CanonicalSector.UNKNOWN:
                     value += book.unknown_pending
                 pct = value / totals.equity
-                if pct > cap:
-                    breached.append(Breach(kind, key, pct, cap))
+                if pct > cap or (include_at_limit and pct == cap):
+                    breached.append(Breach(kind, key, pct, cap, at_limit=(pct == cap)))
         loss_pct = totals.option_max_loss / totals.equity
         if loss_pct > self._ratio("RISK_OPTION_TOTAL_LOSS_PCT"):
             breached.append(Breach("option_budget", "", loss_pct,
@@ -611,6 +770,27 @@ class RiskManager:
             breached.append(Breach("option_budget", "count", Decimal(totals.option_structures),
                                    Decimal(self.config.RISK_OPTION_MAX_STRUCTURES)))
         return tuple(breached)
+
+    @staticmethod
+    def _unchanged_breaches(
+        before: tuple[Breach, ...], after: tuple[Breach, ...],
+        equity_before: Decimal, equity_after: Decimal,
+    ) -> tuple[Breach, ...]:
+        prior = {(b.kind, b.key): b for b in before}
+        allowed = []
+        for breach in after:
+            old = prior.get((breach.kind, breach.key))
+            if old is None:
+                continue
+            if breach.kind == "position_count" and breach.value <= old.value:
+                allowed.append(breach)
+            elif breach.kind in {"issuer_cap", "sector_cap", "cluster_cap"}:
+                # Same-bucket risk is judged on nominal exposure, not tiny changes
+                # in NAV from an unrelated bounded order's documented fee/slippage.
+                before_value, after_value = old.value * equity_before, breach.value * equity_after
+                if after_value <= before_value + Decimal("0.000001"):
+                    allowed.append(breach)
+        return tuple(allowed)
 
     def _entry_reasons(
         self, snapshot: "BookSnapshot", intent: TradeIntent, kind: TradeKind,
@@ -626,6 +806,9 @@ class RiskManager:
                 or any(snapshot.account_flags.get(x) is True for x in
                        ("account_blocked", "trading_blocked", "trade_suspended_by_user"))):
             reasons.append("broker_book_blocked")
+        status = snapshot.account_flags.get("status")
+        if status and str(status).lower() != "active":
+            reasons.append("broker_account_inactive")
         raw, effective = intent.raw_conviction, intent.effective_conviction
         floor = self.config.MIN_CONVICTION
         effective_floor = max(8 if option else floor, intent.minimum_conviction)
@@ -637,9 +820,10 @@ class RiskManager:
         now = now or snapshot.as_of
         if not 0 <= (now - snapshot.as_of).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
             reasons.append("stale_broker_book")
-        if not option or intent.signal_at is not None:
-            if intent.signal_at is None or not 0 <= (now - intent.signal_at).total_seconds() <= self.config.MAX_ENTRY_SIGNAL_HOURS * 3600:
-                reasons.append("stale_signal")
+        if intent.signal_at is None or not (
+            0 <= (now - intent.signal_at).total_seconds() <= self.config.MAX_ENTRY_SIGNAL_HOURS * 3600
+        ):
+            reasons.append("stale_signal")
         if not option:
             if intent.quote_at is None or not 0 <= (now - intent.quote_at).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
                 reasons.append("stale_quote")
@@ -698,6 +882,7 @@ class RiskManager:
             return RiskVerdict(False, ("invalid_option_cost",))
         if not intent.structure_id or any(x.structure_id == intent.structure_id for x in controls.option_commitments):
             return RiskVerdict(False, ("missing_or_duplicate_structure_id",))
+        before = self._breaches(book)
         book.cash -= debit + fee
         book.equity -= fee
         book.option_loss += max_loss
@@ -724,20 +909,34 @@ class RiskManager:
             book.cash -= shares * strike
         if book.cash < book.equity * self._ratio("MIN_FREE_CASH_PCT"):
             reasons.append("cash_floor")
-        return RiskVerdict(not reasons, tuple(reasons), book.totals())
+        if book.totals().gross_exposure > book.equity * self._ratio("MAX_TOTAL_EXPOSURE"):
+            reasons.append("gross_cap")
+        tolerated = tuple(b for b in before if b.kind in {"issuer_cap", "sector_cap", "cluster_cap",
+                                                         "position_count"})
+        return RiskVerdict(not reasons, tuple(reasons), book.totals(),
+                           allowed_existing_breaches=tolerated if not reasons else ())
 
     @staticmethod
     def _covered_shares(snapshot: "BookSnapshot", symbol: str) -> Decimal:
-        total = Decimal(0)
-        for leg in snapshot.legs:
-            right = getattr(leg, "right", "")
-            qty = _decimal(leg.qty)
-            short = qty < 0 or getattr(leg, "side", "") == "short"
-            if leg.underlying == symbol and str(right).lower() in {"c", "call"} and short:
-                # A short call with no explicit stock coverage need not pledge stock.
-                # Until the option manager clears it, never sell potential covering shares.
-                total += abs(qty) * _decimal(leg.multiplier)
-        return total
+        calls = [leg for leg in snapshot.legs_for(symbol) if leg.right.lower() in {"c", "call"}]
+        hedges = {leg.occ_symbol: leg.qty for leg in calls if leg.qty > 0}
+        reserved = Decimal(0)
+        for leg in sorted((leg for leg in calls if leg.qty < 0), key=lambda leg: leg.strike):
+            unhedged = -leg.qty
+            for hedge in calls:
+                available = hedges.get(hedge.occ_symbol, Decimal(0))
+                if (available <= 0 or hedge.expiry != leg.expiry or hedge.multiplier != leg.multiplier
+                        or hedge.strike >= leg.strike):
+                    continue
+                paired = min(available, unhedged)
+                hedges[hedge.occ_symbol] -= paired
+                unhedged -= paired
+                if unhedged == 0:
+                    break
+            # Existing broker qty_available is a separate, authoritative ceiling.
+            # Long calls serving as spread hedges do not also tie up stock shares.
+            reserved += unhedged * leg.multiplier
+        return reserved
 
     @staticmethod
     def _contributes(stock: _Stock, breach: Breach) -> bool:

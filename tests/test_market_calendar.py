@@ -3,6 +3,7 @@ import socket
 from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 
+from stock_agent.broker import AlpacaClient
 from stock_agent.market_calendar import ET, MarketCalendar, MarketSource, MarketStatus
 from stock_agent.runtime_status import notify_systemd
 
@@ -102,3 +103,22 @@ def test_systemd_readiness_protocol_datagram(tmp_path, monkeypatch):
         listener.bind(destination)
         notify_systemd("READY=1\nWATCHDOG=1")
         assert listener.recv(1024) == b"READY=1\nWATCHDOG=1"
+
+
+def test_calendar_contract_with_shared_broker_fake(world, tmp_path):
+    world.clock.set_et(2026, 11, 26, 10, 0)
+
+    async def check():
+        broker = AlpacaClient()
+        try:
+            assert await broker.get_calendar(date(2026, 11, 18), date(2026, 12, 10))
+            calendar = MarketCalendar(broker, tmp_path / "calendar.json", now=world.clock.now)
+            state = await calendar.refresh()
+            assert state.source is MarketSource.LIVE
+            assert state.status is MarketStatus.CLOSED
+            assert state.session is None
+            assert (await calendar.market_gate("entry")).allowed is False
+        finally:
+            await broker.close()
+
+    asyncio.run(check())

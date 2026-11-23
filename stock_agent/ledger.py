@@ -26,7 +26,9 @@ Consumers:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import uuid
@@ -77,6 +79,7 @@ class DiffKind(StrEnum):
     PRICE_INVALID = "price_invalid"
     UNEXPLAINED = "unexplained"
     MASS_CLOSE = "mass_close"
+    ENTRY_DATE_CORRECTED = "entry_date_corrected"   # migrated/unknown entry date replaced from broker fills
 
 
 @dataclass(frozen=True)
@@ -436,6 +439,10 @@ class Ledger:
         self._clock = clock or _now
         self._alert = alert              # callable(severity, title, body, key=None)
         self._snapshot: BookSnapshot | None = None
+        self._refresh_lock: asyncio.Lock | None = None
+        self._refresh_starts = 0
+        self._alert_tasks: set = set()
+        self._snapshot_start_seq = -1
 
     def now(self) -> datetime:
         return self._clock()
@@ -446,9 +453,19 @@ class Ledger:
         (the ledger is left untouched); never treats a failure as empty."""
         from stock_agent.reconcile import reconcile
 
-        snap = await reconcile(self, reason=reason, rebuild=rebuild)
-        self._snapshot = snap
-        return snap
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+        arrival = self._refresh_starts
+        async with self._refresh_lock:
+            # coalesce: a refresh that STARTED after we asked and succeeded is as fresh as ours
+            if not rebuild and self._snapshot is not None and self._snapshot_start_seq >= arrival:
+                return self._snapshot
+            seq = self._refresh_starts
+            self._refresh_starts += 1
+            snap = await reconcile(self, reason=reason, rebuild=rebuild)
+            self._snapshot = snap
+            self._snapshot_start_seq = seq
+            return snap
 
     def snapshot(self, max_age_s: int | None = None) -> BookSnapshot:
         """The last reconciled snapshot, if fresh enough. Raises ``StaleBook``."""
@@ -468,12 +485,14 @@ class Ledger:
         return self.store.trading_block()
 
     def last_reconcile(self) -> Mapping[str, Any] | None:
-        rows = self.store.query("SELECT * FROM reconcile_runs ORDER BY at DESC LIMIT 1")
+        rows = self.store.query("SELECT * FROM reconcile_runs ORDER BY at DESC, rowid DESC LIMIT 1")
         if not rows:
             return None
         r = rows[0]
+        report = json.loads(r["report_json"])
+        # ok = the broker read succeeded; clean = no critical diff (other than per-symbol shorts)
         return {"run_id": r["run_id"], "at": _dt(r["at"]), "reason": r["reason"], "ok": bool(r["ok"]),
-                "n_diffs": r["n_diffs"], "report": json.loads(r["report_json"])}
+                "clean": bool(report.get("clean", True)), "n_diffs": r["n_diffs"], "report": report}
 
     # ------------------------------------------------------ position meta
     def _row_to_meta(self, r) -> PositionMeta:
@@ -751,6 +770,11 @@ class Ledger:
             if cur is None or cur.thesis_id not in it.thesis_ids:
                 self._transition(intent_id, IntentStatus.CANCELLED, last_error="thesis superseded")
                 raise LedgerError(f"intent {intent_id}: thesis superseded")
+        if it.position_id:
+            row = self.store.query("SELECT closed_at FROM positions_meta WHERE position_id=?", (it.position_id,))
+            if not row or row[0][0] is not None:
+                self._transition(intent_id, IntentStatus.CANCELLED, last_error="position closed or replaced")
+                raise LedgerError(f"intent {intent_id}: position {it.position_id} is no longer open")
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
 
     def ack_intent(self, intent_id: str, status: IntentStatus | str, *, broker_order_id: str | None = None,
@@ -864,7 +888,16 @@ class Ledger:
         self.journal.append("alert", severity=severity.value, title=title, body=body, key=key)
         if self._alert is not None:
             try:
-                self._alert(severity.value, title, body, key=key)
+                res = self._alert(severity.value, title, body, key=key)
+                if inspect.isawaitable(res):
+                    # an async alert callable is scheduled, never left un-awaited
+                    try:
+                        task = asyncio.get_running_loop().create_task(res)
+                        self._alert_tasks.add(task)
+                        task.add_done_callback(self._alert_tasks.discard)
+                    except RuntimeError:
+                        res.close() if hasattr(res, "close") else None
+                        logger.error("async alert dropped (no running loop): %s", title)
             except Exception as e:  # alerting must not break the books
                 logger.error("alert delivery failed: %s", e)
 
