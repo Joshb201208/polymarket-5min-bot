@@ -231,6 +231,10 @@ async def shadow_stops(ledger: Ledger, session_date: date, daily_bars: DailyBars
             raw = await daily_bars(anchor.symbol, anchor.session_date, end)
             bars = sorted((b for b in (_bar(x) for x in raw or ()) if b and b.session_date <= end),
                           key=lambda b: b.session_date)
+            if not bars or bars[-1].session_date != end:
+                # the provider has not published the bar for ``end`` yet: retry at a later close
+                warnings.append(f"shadow stop {anchor.symbol}: no completed bar for {end.isoformat()} yet")
+                continue
             results = shadow_stop_results(anchor, bars)
         except Exception as e:  # never let analysis break the close job
             warnings.append(f"shadow stop {r.get('symbol')}: {type(e).__name__}: {e}")
