@@ -9,8 +9,11 @@ import httpx
 import pytest
 
 from stock_agent.fundamentals_service import FundamentalsService
-from stock_agent.research_pipeline import SourceUnavailable
+from stock_agent.health import ProviderHealthRegistry
+from stock_agent.news_service import NewsService
+from stock_agent.research_pipeline import ResearchPipeline, SourceUnavailable
 from stock_agent.research_sources import ResearchSources
+from stock_agent.state_store import StateStore
 
 NOW = datetime(2026, 11, 23, 15, tzinfo=UTC)
 
@@ -232,3 +235,65 @@ def test_actual_fundamentals_service_maps_snapshot_and_release_offline():
             assert "Reported EPS: 0.25" in releases[0].evidence.snippet
 
     asyncio.run(run())
+
+
+def test_actual_news_service_delivers_material_evidence_and_explicit_empty_coverage(world, tmp_path):
+    config = SimpleNamespace(
+        ALPACA_API_KEY="fixture", ALPACA_SECRET_KEY="fixture", FINNHUB_API_KEY="",
+        FMP_API_KEY="", OPENAI_API_KEY="", PERPLEXITY_API_KEY="", ANTHROPIC_API_KEY="",
+    )
+    store = StateStore(tmp_path / "adapter-news.db")
+    health = ProviderHealthRegistry(config, store=store, defer_load=True, now=world.clock.now)
+    news = NewsService(config=config, store=store, health=health, defer_load=True, now=world.clock.now)
+    store.open()
+    now = world.clock.now()
+    headline = "NVIDIA raises Q4 revenue guidance on surging Blackwell GPU demand"
+    world.news(["NVDA"], headline, summary="Issuer reported stronger data center demand.", at=now)
+    uncitable = world.alpaca.add_news(
+        ["NVDA"], "NVIDIA signs sovereign AI cluster contract win", summary="No original article URL.", created_at=now,
+    )
+    uncitable["url"] = ""
+
+    async def universe():
+        return ["NVDA", "EMPTY"]
+
+    async def run():
+        sources = ResearchSources(None, news, list_universe=universe, health=health)
+        try:
+            events = await sources.live_news(("NVDA",), (), ("EMPTY",), now)
+            assert len(events) == 1 and events[0].symbol == "NVDA"
+            assert events[0].evidence.title == headline
+            assert events[0].evidence.published_at == now
+            assert events[0].evidence.url.startswith("https://")
+            assert sources.news_ok("NVDA", now) and sources.news_ok("EMPTY", now)
+            assert not sources.news_ok("UNASKED", now)
+            assert news.get_cursor("live") is None  # Only the research store durably tracks reaction work.
+            assert await sources.live_news(("NVDA",), (), ("EMPTY",), now) == events
+        finally:
+            await news.aclose()
+
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()
+
+
+def test_scheduler_defaults_build_shared_research_sources_offline(world):
+    from stock_agent.scheduler import StockAgentScheduler
+
+    async def run():
+        scheduler = StockAgentScheduler()
+        try:
+            assert isinstance(scheduler.news, NewsService)
+            assert isinstance(scheduler.research, ResearchPipeline)
+            assert scheduler.research.sources is scheduler.research_sources
+            assert scheduler.research.gate is scheduler.research_gate
+            assert scheduler.research_sources.news_service is scheduler.news
+            assert scheduler.research_sources.health is scheduler.health
+            assert scheduler.news.health is scheduler.health
+            assert scheduler.research_sources.prices is scheduler.prices
+        finally:
+            await scheduler._cleanup()
+
+    asyncio.run(run())
+    world.assert_no_orders()
