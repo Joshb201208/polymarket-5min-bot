@@ -280,3 +280,84 @@ def test_heartbeat_noop_when_unset_and_daily_discord_line_by_default(world: Fake
         assert any("Daily Heartbeat" in t for t in world.discord.texts())
 
     asyncio.run(_run())
+
+
+def test_outbox_400_and_unconfigured_do_not_claim_delivery(world: FakeWorld, tmp_path: Path) -> None:
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path
+        cfg.DISCORD_BOT_TOKEN = "test-discord"
+        cfg.TELEGRAM_BOT_TOKEN = ""
+        cfg.TELEGRAM_CHAT_ID = ""
+        svc = AlertService(cfg, clock=world.clock.now)
+        world.discord.fail("/api/v10/channels/*/messages", "status", method="POST", status=400, times=1)
+        assert svc.alert("critical", "Broker stop missing", "fixture message", key="stop-key")
+        assert await svc.flush() == 0
+        #Dropped malformed alert must not leave key poisoned
+        assert "stop-key" not in svc.active_keys
+
+        # Unconfigured Discord + Telegram also returns 0 delivered
+        cfg_none = Config()
+        cfg_none.DATA_DIR = tmp_path / "none"
+        cfg_none.DISCORD_BOT_TOKEN = ""
+        cfg_none.TELEGRAM_BOT_TOKEN = ""
+        cfg_none.TELEGRAM_CHAT_ID = ""
+        svc_none = AlertService(cfg_none, clock=world.clock.now)
+        svc_none.alert("critical", "No sink", "body")
+        assert await svc_none.flush() == 0
+
+    asyncio.run(_run())
+
+
+def test_critical_not_evicted_by_info_and_resolved_supersedes_unsent(world: FakeWorld, tmp_path: Path) -> None:
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path
+        cfg.DISCORD_BOT_TOKEN = "test-discord"
+        cfg.TELEGRAM_BOT_TOKEN = ""
+        cfg.TELEGRAM_CHAT_ID = ""
+        cfg.ALERT_OUTBOX_MAX_ITEMS = 1
+
+        svc = AlertService(cfg, clock=world.clock.now)
+        assert svc.alert("critical", "Stop missing", "No protection", key="stop")
+        assert not svc.alert("info", "Routine note", "Should not evict critical")
+        assert any(i.event.key == "stop" for i in svc.outbox)
+
+        # Resolve before flush: unsent critical must not emit @here after restart
+        assert svc.alert("info", "Stop recovered", "Coverage restored", key="stop", resolved=True)
+        world.clock.advance(days=7)
+        restarted = AlertService(cfg, clock=world.clock.now)
+        await restarted.flush()
+        assert not any("@here" in (m.get("content") or "") for m in world.discord.messages)
+
+    asyncio.run(_run())
+
+
+def test_active_keys_bounded_and_bot_authorization_redacted(world: FakeWorld, tmp_path: Path) -> None:
+    cfg = Config()
+    cfg.DATA_DIR = tmp_path
+    cfg.ALERT_OUTBOX_MAX_ITEMS = 2
+    svc = AlertService(cfg, clock=world.clock.now)
+    for i in range(8):
+        svc.alert("info", "one-shot", "Authorization: Bot synthetic-discord-secret", key=f"k:{i}")
+        world.clock.advance(hours=5)
+
+    raw_disk = svc.outbox_path.read_text(encoding="utf-8")
+    assert "synthetic-discord-secret" not in raw_disk
+    restarted = AlertService(cfg, clock=world.clock.now)
+    assert len(restarted.active_keys) <= 2
+
+
+def test_heartbeat_callback_error_and_false_return_handled(world: FakeWorld) -> None:
+    from types import SimpleNamespace
+
+    async def _run() -> None:
+        def fail(**_kw: object) -> bool:
+            raise OSError("disk error")
+
+        beat = HeartbeatClient(ping_url="", clock=world.clock.now)
+        assert await beat.tick(SimpleNamespace(send_daily_heartbeat_line=fail)) is False
+        assert await beat.tick(SimpleNamespace(send_daily_heartbeat_line=lambda **_kw: False)) is False
+
+    asyncio.run(_run())
+

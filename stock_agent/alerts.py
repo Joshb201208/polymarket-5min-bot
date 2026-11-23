@@ -36,23 +36,36 @@ from stock_agent.telegram_alerts import TelegramReporter, _escape_html
 
 logger = logging.getLogger(__name__)
 
-_SECRET_URL_RE = re.compile(
-    r"((?:apikey|api_key|token|secret)=)[^&\s'\"]+|(/bot\d+:[A-Za-z0-9_-]+)",
-    re.IGNORECASE,
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)((?:[?&]|\b)(?:apikey|api_key|token|access_token|secret|password|auth|key)=)([^&\s'\"<>]+)"
 )
+_HEADER_SECRET_RE = re.compile(
+    r"(?i)(\b(?:authorization|apca-api-key-id|apca-api-secret-key|x-finnhub-token|x-api-key|apikey|api_key|secret_key)\s*[:=]\s*)(?:(?:bearer|bot|basic|token)\s+)?([^\s,'\"<>};]+)"
+)
+_BOT_PATH_RE = re.compile(r"/bot\d+:[A-Za-z0-9_-]+", re.IGNORECASE)
 
 
 def redact_secrets_in_text(text: str) -> str:
-    """Mask URL query keys and Telegram bot paths before logging or displaying errors."""
+    """Mask URL query keys, auth headers (Bot/Bearer/API keys), and Telegram bot paths."""
     if not text:
         return ""
+    cleaned = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", str(text))
+    cleaned = _HEADER_SECRET_RE.sub(r"\1[REDACTED]", cleaned)
+    cleaned = _BOT_PATH_RE.sub("/bot[REDACTED]", cleaned)
+    return cleaned
 
-    def _repl(m: re.Match[str]) -> str:
-        if m.group(1):
-            return f"{m.group(1)}[REDACTED]"
-        return "/bot[REDACTED]"
 
-    return _SECRET_URL_RE.sub(_repl, str(text))
+def _redact_structure(value: Any) -> Any:
+    """Recursively scrub credentials from embed dicts, lists, and tuples."""
+    if isinstance(value, str):
+        return redact_secrets_in_text(value)
+    if isinstance(value, dict):
+        return {k: _redact_structure(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_structure(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_structure(v) for v in value)
+    return value
 
 
 def _default_now() -> datetime:
@@ -252,6 +265,7 @@ class AlertService:
 
         self.outbox: list[OutboxItem] = []
         self.active_keys: dict[str, DedupState] = {}
+        self._in_flight_ids: set[str] = set()
         self._discord_halted_until: datetime | None = None
         self._load()
 
@@ -298,8 +312,10 @@ class AlertService:
                 str(k): DedupState.from_dict(v)
                 for k, v in (raw.get("active_keys") or {}).items()
             }
+            if self._prune_active_keys(self._clock()):
+                self._save()
         except Exception as e:
-            logger.error("Could not read alert outbox %s (%s): %s — starting fresh queue", self.outbox_path, type(e).__name__, e)
+            logger.error("Could not read alert outbox %s (%s): %s — starting fresh queue", self.outbox_path, type(e).__name__, redact_secrets_in_text(str(e)))
             self.outbox = []
             self.active_keys = {}
 
@@ -328,27 +344,79 @@ class AlertService:
         except Exception as e:
             logger.error("Could not persist alert outbox (%s): %s", type(e).__name__, e)
 
-    def _evict_if_full(self) -> None:
-        cap = self.max_outbox_items
+    def _prune_active_keys(self, now: datetime) -> bool:
+        """Expire elapsed one-shot keys and bound active_keys to max_outbox_items."""
+        changed = False
+        queued_keys = {it.event.key for it in self.outbox if it.event.key}
+        stale_crit_sec = max(self.critical_remind_sec * 24, 7 * 86400)
+
+        for k in list(self.active_keys.keys()):
+            if k in queued_keys:
+                continue
+            st = self.active_keys[k]
+            elapsed = (now - st.last_sent_at).total_seconds()
+            if st.severity != Severity.CRITICAL and elapsed >= self._cooldown_for(st.severity):
+                self.active_keys.pop(k, None)
+                changed = True
+            elif st.severity == Severity.CRITICAL and elapsed >= stale_crit_sec:
+                self.active_keys.pop(k, None)
+                changed = True
+
+        cap = max(1, self.max_outbox_items)
+        while len(self.active_keys) > cap:
+            # Prefer dropping non-queued keys first, then lowest severity (INFO -> WARNING -> CRITICAL), then oldest
+            victim = min(
+                self.active_keys.items(),
+                key=lambda kv: (
+                    1 if kv[0] in queued_keys else 0,
+                    0 if kv[1].severity == Severity.INFO else (1 if kv[1].severity == Severity.WARNING else 2),
+                    kv[1].last_sent_at,
+                ),
+            )[0]
+            self.active_keys.pop(victim, None)
+            changed = True
+        return changed
+
+    def _make_room_for(self, incoming_severity: Severity) -> bool:
+        """Ensure room for incoming_severity without ever evicting a higher-severity alert."""
+        cap = max(1, self.max_outbox_items)
+        if incoming_severity == Severity.INFO:
+            evictable = (Severity.INFO,)
+        elif incoming_severity == Severity.WARNING:
+            evictable = (Severity.INFO, Severity.WARNING)
+        else:
+            evictable = (Severity.INFO, Severity.WARNING, Severity.CRITICAL)
+
         while len(self.outbox) >= cap and self.outbox:
-            # Evict oldest INFO first, then oldest WARNING, never CRITICAL unless all are CRITICAL
             idx_to_drop: int | None = None
-            for target_sev in (Severity.INFO, Severity.WARNING, Severity.CRITICAL):
+            for target_sev in evictable:
                 for i, item in enumerate(self.outbox):
+                    if item.event.event_id in self._in_flight_ids:
+                        continue
                     if item.event.severity == target_sev:
                         idx_to_drop = i
                         break
                 if idx_to_drop is not None:
                     break
             if idx_to_drop is None:
-                break
+                logger.warning(
+                    "Alert outbox at cap (%d) with higher-severity items — rejecting %s alert",
+                    cap,
+                    incoming_severity.value,
+                )
+                return False
             dropped = self.outbox.pop(idx_to_drop)
+            # If the evicted alert never reached Discord and has no remaining queued twin, un-poison its dedupe key
+            dkey = dropped.event.key
+            if dkey and not dropped.discord_done and not any(it.event.key == dkey for it in self.outbox):
+                self.active_keys.pop(dkey, None)
             logger.warning(
                 "Alert outbox at cap (%d) — dropped oldest %s alert: %s",
                 cap,
                 dropped.event.severity.value,
                 dropped.event.title,
             )
+        return True
 
     def _record_journal(self, event: AlertEvent, *, suppressed: bool = False) -> None:
         if self.journal is None or not hasattr(self.journal, "append"):
@@ -390,19 +458,29 @@ class AlertService:
         sev = coerce_severity(severity)
         clean_title = redact_secrets_in_text(title).strip() or "Stock Agent Notice"
         clean_body = redact_secrets_in_text(body).strip()
-        dedup_key = key.strip() if isinstance(key, str) and key.strip() else None
+        raw_key = key.strip() if isinstance(key, str) and key.strip() else None
+        dedup_key = redact_secrets_in_text(raw_key) if raw_key else None
 
         default_channel = "risk" if sev in (Severity.CRITICAL, Severity.WARNING) else "announcements"
         target_channel = channel_key or default_channel
         now = self._clock()
+        self._prune_active_keys(now)
         suppressed_count = 0
+        prev_key_snapshot: DedupState | None = None
+        had_prev_key = False
 
         if dedup_key:
             state = self.active_keys.get(dedup_key)
             if resolved:
-                if state is None:
+                had_unsent = any(it.event.key == dedup_key and not it.event.resolved for it in self.outbox)
+                if had_unsent:
+                    self.outbox = [
+                        it for it in self.outbox
+                        if not (it.event.key == dedup_key and not it.event.resolved)
+                    ]
+                if state is None and not had_unsent:
                     return False
-                suppressed_count = state.suppressed_count
+                suppressed_count = state.suppressed_count if state is not None else 0
                 self.active_keys.pop(dedup_key, None)
                 sev = Severity.INFO
                 clean_title = f"Resolved: {clean_title}"
@@ -416,6 +494,13 @@ class AlertService:
                         state.suppressed_count += 1
                         self._save()
                         return False
+                    had_prev_key = True
+                    prev_key_snapshot = DedupState(
+                        first_seen_at=state.first_seen_at,
+                        last_sent_at=state.last_sent_at,
+                        severity=state.severity,
+                        suppressed_count=state.suppressed_count,
+                    )
                     suppressed_count = state.suppressed_count
                     state.last_sent_at = now
                     state.severity = sev
@@ -428,10 +513,21 @@ class AlertService:
                         suppressed_count=0,
                     )
 
+        if not self._make_room_for(sev):
+            if dedup_key and not resolved:
+                if had_prev_key and prev_key_snapshot is not None:
+                    self.active_keys[dedup_key] = prev_key_snapshot
+                else:
+                    self.active_keys.pop(dedup_key, None)
+            self._prune_active_keys(now)
+            self._save()
+            return False
+
         clean_fields = [
             (redact_secrets_in_text(name), redact_secrets_in_text(val), bool(inl))
             for name, val, inl in (fields or [])
         ]
+        clean_embeds = _redact_structure(list(embeds or []))
 
         event = AlertEvent(
             event_id=f"alrt-{uuid.uuid4().hex[:16]}",
@@ -443,13 +539,13 @@ class AlertService:
             category=category,
             channel_key=target_channel,
             fields=clean_fields,
-            embeds=list(embeds or []),
+            embeds=clean_embeds,
             resolved=resolved,
             suppressed_before_this=suppressed_count,
             mirror_telegram=mirror_telegram,
         )
-        self._evict_if_full()
         self.outbox.append(OutboxItem(event=event, next_attempt_at=now))
+        self._prune_active_keys(now)
         self._save()
         self._record_journal(event)
         return True
@@ -529,24 +625,27 @@ class AlertService:
         delivered_count = 0
         changed = False
 
-        # Sort indices: CRITICAL first, then WARNING, then INFO, preserving FIFO order
-        due_indices = [
-            idx
+        # Snapshot due items as object references (CRITICAL first, FIFO within severity)
+        indexed_due = [
+            (idx, item)
             for idx, item in enumerate(self.outbox)
             if item.next_attempt_at <= self._clock()
         ]
-        due_indices.sort(key=lambda idx: (_SEVERITY_RANK[self.outbox[idx].event.severity], idx))
+        indexed_due.sort(key=lambda pair: (_SEVERITY_RANK[pair[1].event.severity], pair[0]))
 
-        completed_ids: set[str] = set()
+        remove_ids: set[str] = set()
 
-        for idx in due_indices[:max_items]:
+        for _, item in indexed_due[:max_items]:
             now = self._clock()
             if (now - start_ts).total_seconds() >= max_budget_sec:
                 break
-
-            item = self.outbox[idx]
             ev = item.event
+            # Skip if superseded/evicted during a previous await
+            if not any(x.event.event_id == ev.event_id for x in self.outbox):
+                continue
 
+            ch_id = self.discord.channels.get(ev.channel_key) or self.discord.channels.get("risk", "")
+            has_discord = bool(self.discord.token and ch_id)
             want_telegram = bool(
                 self.telegram.enabled
                 and (
@@ -554,23 +653,23 @@ class AlertService:
                     or (ev.mirror_telegram is None and ev.severity == Severity.CRITICAL)
                 )
             )
-            if not want_telegram:
-                item.telegram_done = True
+            if not has_discord and not want_telegram:
+                # No configured sink: do not falsely claim delivery
+                continue
 
-            # 1. Discord delivery
-            if not item.discord_done:
-                if not self.discord.token:
-                    # Discord not configured: mark done if Telegram is configured, else drop cleanly
-                    item.discord_done = True
-                    changed = True
-                elif self._discord_halted_until and now < self._discord_halted_until:
-                    item.next_attempt_at = self._discord_halted_until
-                    changed = True
-                    if want_telegram and not item.telegram_done:
-                        item.telegram_done = await self.telegram.send_message(self._build_telegram_html(ev))
-                    continue
-                else:
-                    ch_id = self.discord.channels.get(ev.channel_key) or self.discord.channels.get("risk", "")
+            self._in_flight_ids.add(ev.event_id)
+            try:
+                permanent_discord_failure = False
+
+                # 1. Discord delivery
+                if has_discord and not item.discord_done:
+                    if self._discord_halted_until and now < self._discord_halted_until:
+                        item.next_attempt_at = self._discord_halted_until
+                        changed = True
+                        if want_telegram and not item.telegram_done:
+                            item.telegram_done = await self.telegram.send_message(self._build_telegram_html(ev))
+                        continue
+
                     is_crit = ev.severity == Severity.CRITICAL and not ev.resolved
                     content, mentions = (
                         self.discord.build_critical_mention(ev.title)
@@ -604,7 +703,7 @@ class AlertService:
                                 changed = True
                             else:
                                 item.attempts += 1
-                                item.last_error = outcome2.error
+                                item.last_error = redact_secrets_in_text(outcome2.error)
                                 item.next_attempt_at = self._clock() + timedelta(
                                     seconds=min(outcome2.retry_after_sec or 10.0, 300.0)
                                 )
@@ -620,42 +719,66 @@ class AlertService:
                         # Protect against Discord 10k/10min invalid-request IP ban
                         self._discord_halted_until = self._clock() + timedelta(seconds=600)
                         item.attempts += 1
-                        item.last_error = outcome.error
+                        item.last_error = redact_secrets_in_text(outcome.error)
                         item.next_attempt_at = self._discord_halted_until
                         changed = True
-                        if self.telegram.enabled and not item.telegram_done:
+                        if want_telegram and not item.telegram_done:
                             item.telegram_done = await self.telegram.send_message(self._build_telegram_html(ev))
                         continue
                     elif outcome.permanent_error:
-                        logger.error("Dropping malformed Discord alert %s: %s", ev.title, outcome.error)
-                        item.discord_done = True
-                        item.last_error = outcome.error
+                        logger.error(
+                            "Dropping malformed Discord alert %s: %s",
+                            ev.title,
+                            redact_secrets_in_text(outcome.error),
+                        )
+                        permanent_discord_failure = True
+                        item.last_error = redact_secrets_in_text(outcome.error)
                         changed = True
-                        if self.telegram.enabled and not item.telegram_done:
-                            item.telegram_done = await self.telegram.send_message(self._build_telegram_html(ev))
                     else:
                         item.attempts += 1
                         backoff = min(15 * (2 ** max(0, item.attempts - 1)), 900)
-                        item.last_error = outcome.error
+                        item.last_error = redact_secrets_in_text(outcome.error)
                         item.next_attempt_at = self._clock() + timedelta(seconds=backoff)
                         changed = True
-                        if ev.severity == Severity.CRITICAL and self.telegram.enabled and not item.telegram_done:
+                        if want_telegram and not item.telegram_done:
                             item.telegram_done = await self.telegram.send_message(self._build_telegram_html(ev))
                         continue
 
-            # 2. Optional Telegram mirror
-            if want_telegram and not item.telegram_done:
-                ok_tg = await self.telegram.send_message(self._build_telegram_html(ev))
-                item.telegram_done = ok_tg or item.attempts >= 2
-                changed = True
+                # 2. Optional Telegram mirror
+                if want_telegram and not item.telegram_done:
+                    ok_tg = await self.telegram.send_message(self._build_telegram_html(ev))
+                    if ok_tg:
+                        item.telegram_done = True
+                        changed = True
+                    elif item.attempts >= 2:
+                        changed = True
 
-            if item.discord_done and item.telegram_done:
-                completed_ids.add(ev.event_id)
-                delivered_count += 1
-                changed = True
+                discord_ok = item.discord_done if has_discord else False
+                telegram_ok = item.telegram_done if want_telegram else False
 
-        if completed_ids:
-            self.outbox = [it for it in self.outbox if it.event.event_id not in completed_ids]
+                if permanent_discord_failure and not telegram_ok:
+                    # Permanently rejected by Discord and not delivered elsewhere: drop without counting as delivered
+                    remove_ids.add(ev.event_id)
+                    if ev.key and not any(
+                        x.event.key == ev.key and x.event.event_id != ev.event_id for x in self.outbox
+                    ):
+                        self.active_keys.pop(ev.key, None)
+                    changed = True
+                elif (not has_discord or item.discord_done or permanent_discord_failure) and (
+                    not want_telegram or item.telegram_done or item.attempts >= 2
+                ):
+                    if discord_ok or telegram_ok:
+                        remove_ids.add(ev.event_id)
+                        delivered_count += 1
+                        changed = True
+            finally:
+                self._in_flight_ids.discard(ev.event_id)
+
+        if remove_ids:
+            self.outbox = [it for it in self.outbox if it.event.event_id not in remove_ids]
+
+        if self._prune_active_keys(self._clock()):
+            changed = True
 
         if changed:
             self._save()

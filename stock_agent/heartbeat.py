@@ -49,7 +49,13 @@ class HeartbeatClient:
     def ping_url(self) -> str:
         if self._explicit_url is not None:
             return self._explicit_url.strip()
-        val = getattr(self.config, "HEARTBEAT_PING_URL", "") or os.environ.get("HEARTBEAT_PING_URL", "")
+        val = (
+            getattr(self.config, "HEARTBEAT_PING_URL", "")
+            or getattr(self.config, "HEARTBEAT_URL", "")
+            or os.environ.get("HEARTBEAT_PING_URL", "")
+            or os.environ.get("STOCK_HEARTBEAT_URL", "")
+            or os.environ.get("HEARTBEAT_URL", "")
+        )
         return str(val).strip()
 
     @property
@@ -130,11 +136,16 @@ class HeartbeatClient:
         day_str = now.strftime("%Y-%m-%d")
         queued_discord = False
         if ok and alerts is not None and self._last_discord_heartbeat_day != day_str:
-            send_fn = getattr(alerts, "send_daily_heartbeat_line", None)
+            send_fn = getattr(alerts, "send_daily_heartbeat_line", None) or getattr(
+                alerts, "send_daily_heartbeat", None
+            )
             if callable(send_fn):
-                send_fn(date_str=day_str, note=note)
-                self._last_discord_heartbeat_day = day_str
-                queued_discord = True
+                try:
+                    if bool(send_fn(date_str=day_str, note=note)):
+                        self._last_discord_heartbeat_day = day_str
+                        queued_discord = True
+                except Exception as e:
+                    logger.warning("Daily Discord heartbeat callback failed (%s): %s", type(e).__name__, e)
         ext_ok = await self.maybe_ping(ok=ok, note=note)
         return queued_discord or ext_ok
 
