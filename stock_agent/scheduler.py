@@ -1380,10 +1380,15 @@ class StockAgentScheduler:
             outlook_lines.append(f"**Scan Depth:** {scan_depth} stocks \u2192 analyze top {analysis_depth}")
 
             # Available slots and firepower
-            open_slots = self.config.MAX_POSITIONS - len(self.portfolio.state.positions)
-            if open_slots > 0 and alpaca_account:
+            held_long_count = (
+                sum(1 for h in book.holdings if not h.is_short)
+                if book is not None
+                else len(self.portfolio.state.positions)
+            )
+            open_slots = self.config.MAX_POSITIONS - held_long_count
+            if open_slots > 0 and book is not None:
                 outlook_lines.append(f"**Open Slots:** {open_slots} positions available")
-                outlook_lines.append(f"**Buying Power:** ${cash:,.0f} ready to deploy")
+                outlook_lines.append(f"**Buying Power:** ${float(book.cash):,.0f} ready to deploy")
             elif open_slots <= 0:
                 outlook_lines.append("**Slots:** Fully invested \u2014 no new positions unless one is sold")
 

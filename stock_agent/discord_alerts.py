@@ -4,6 +4,7 @@ import asyncio
 import copy
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,16 @@ from stock_agent.config import Config
 from stock_agent.models import DailySummary, Position, Signal, Thesis, Trade
 
 logger = logging.getLogger(__name__)
+
+_DISCORD_SECRET_RE = re.compile(
+    r"(?i)(\b(?:authorization|apca-api-key-id|apca-api-secret-key|x-finnhub-token|x-api-key|apikey|api_key|token|secret)\s*[:=]\s*)(?:(?:bearer|bot|basic|token)\s+)?([^\s,'\"<>};&]+)"
+)
+
+
+def _scrub_discord_error(text: str) -> str:
+    if not text:
+        return ""
+    return _DISCORD_SECRET_RE.sub(r"\1[REDACTED]", str(text))
 
 DISCORD_API = "https://discord.com/api/v10"
 MAX_CONTENT_LENGTH = 2000
@@ -298,7 +309,11 @@ class DiscordReporter:
                         error="rate_limited",
                     )
                 if resp.status_code in (401, 403):
-                    logger.error("Discord auth/permission error (%s): %s", resp.status_code, resp.text[:200])
+                    logger.error(
+                        "Discord auth/permission error (%s): %s",
+                        resp.status_code,
+                        _scrub_discord_error(resp.text[:200]),
+                    )
                     return SendOutcome(
                         ok=False,
                         status_code=resp.status_code,
@@ -306,7 +321,11 @@ class DiscordReporter:
                         error=f"http_{resp.status_code}",
                     )
                 if 400 <= resp.status_code < 500:
-                    logger.error("Discord 4xx payload error (%s): %s", resp.status_code, resp.text[:300])
+                    logger.error(
+                        "Discord 4xx payload error (%s): %s",
+                        resp.status_code,
+                        _scrub_discord_error(resp.text[:300]),
+                    )
                     return SendOutcome(
                         ok=False,
                         status_code=resp.status_code,
@@ -327,8 +346,9 @@ class DiscordReporter:
                     error=f"http_{e.response.status_code}",
                 )
             except Exception as e:
-                logger.error("Discord transport error (%s): %s", type(e).__name__, e)
-                return SendOutcome(ok=False, error=f"{type(e).__name__}: {e}")
+                clean_err = _scrub_discord_error(str(e))
+                logger.error("Discord transport error (%s): %s", type(e).__name__, clean_err)
+                return SendOutcome(ok=False, error=f"{type(e).__name__}: {clean_err}")
 
         return SendOutcome(ok=True, status_code=200, message_id=last_message_id)
 
