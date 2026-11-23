@@ -1,5 +1,6 @@
 """ExecutionEngine against the fake broker: mechanics first (DECISIONS A1, A3, A6, A8, B2, B3)."""
 import asyncio
+import uuid
 from datetime import timedelta
 
 from stock_agent.ledger import IntentStatus
@@ -831,3 +832,147 @@ def test_resume_binds_every_ambiguous_order_before_resolving(world, tmp_path, mo
     for it in its:
         assert eng.ledger.get_intent(it.intent_id).status == IntentStatus.FILLED
         assert len(_stops(a, it.symbol)) == 1
+
+
+def test_stop_filling_during_cancel_skips_exit_without_using_a_model_slot(world, tmp_path, monkeypatch):
+    """REQ-002: the resting stop fills while exit() is cancelling it."""
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    a.seed_position("AAA", 10, 45.0)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    run(eng.ensure_protection())
+    orig = eng._cancel_confirm
+
+    async def racing_cancel(order):
+        if order.type == "stop":
+            world.price("AAA", 40, spread=0.02)  # stop triggers and fills mid-cancel
+            world.clock.advance(minutes=1)
+        return await orig(order)
+
+    monkeypatch.setattr(eng, "_cancel_confirm", racing_cancel)
+    before = len(world.orders_sent(include_failed=False))
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "sell", rule="model")))
+    assert a.position("AAA") is None
+    assert res.status == IntentStatus.SKIPPED and "stop" in res.reason
+    assert int(eng._kv_get(eng._model_exit_key(), 0) or 0) == 0
+    assert [r for r in world.orders_sent(include_failed=False)[before:] if r.method == "POST"] == []
+    assert _no_shorts(a)
+
+
+class _CloseCalls:
+    """Minimal options manager: buys the short call back at the fake broker."""
+
+    def __init__(self, eng, log):
+        self.eng, self.log = eng, log
+
+    async def close_short_call(self, occ):
+        from types import SimpleNamespace
+
+        from stock_agent.broker import OrderRequest
+
+        self.log.append(("close_call", occ))
+        o = await self.eng.broker.submit_order(OrderRequest(
+            symbol=occ, side="buy", qty=1, type="market", time_in_force="day",
+            client_order_id=f"t-close-{uuid.uuid4().hex[:8]}", position_intent="buy_to_close"))
+        o = await self.eng.broker.wait_terminal(o.id, timeout_s=5, poll_s=0.01)
+        return SimpleNamespace(filled=o.status == "filled", reason=o.status)
+
+
+def test_oversized_stock_locked_by_short_call_closes_call_first(world, tmp_path, monkeypatch):
+    """REQ-010 / A6: normalise trim and exit() both close the short call before selling shares."""
+    a = world.alpaca
+    # plan posted before the open (default clock), executed after open+5
+    from datetime import date
+
+    from tests.fakes import occ_symbol
+
+    a.add_option_contract("JJJ", date(2026, 12, 18), "call", 320)
+    occ = occ_symbol("JJJ", date(2026, 12, 18), "call", 320)
+    world.price("JJJ", 300, spread=0.02)
+    world.price("DDD", 100, spread=0.02)
+    world.price(occ, 2.0, spread=0.02)
+    a.seed_position("JJJ", 130, 250)   # far above 15% of equity
+    a.seed_position("DDD", 31, 100)
+    a.seed_position(occ, -1, 2.0)      # locks 100 JJJ shares
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    log = []
+    eng.options = _CloseCalls(eng, log)
+    plan = run(eng.plan_normalise())
+    assert plan.index("close the short call on JJJ") < plan.index("trim JJJ to 15% of equity")
+    st = run(eng.normalise_step())
+    assert st.state == "planned"
+    world.clock.set_et(2026, 11, 23, 9, 36)
+    st = run(eng.normalise_step())
+    assert st.state == "done", st
+    assert log == [("close_call", occ)] and a.position(occ) is None
+    acct = run(eng.broker.get_account())
+    assert a.position("JJJ").qty * 300 <= 0.15 * float(acct.equity) + 300
+    assert _no_shorts(a)
+
+    # exit(): a new short call locks the remaining shares; a full model exit closes it first.
+    a.seed_position(occ, -1, 2.0)
+    run(eng.ledger.refresh("t"))
+    log.clear()
+    res = run(eng.execute_intent(enqueue(eng, "JJJ", "sell", rule="model")))
+    assert log == [("close_call", occ)]
+    assert res.status == IntentStatus.FILLED and a.position("JJJ") is None and a.position(occ) is None
+    assert _no_shorts(a)
+
+
+def test_accepted_then_rejected_buy_alerts(world, tmp_path, monkeypatch):
+    """REQ-009: HTTP 200 on submit, then the order ends 'rejected' with nothing filled."""
+    from stock_agent.broker import BrokerOrder
+
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    orig = eng.broker.wait_terminal
+
+    async def rejecting(order_id, **kw):
+        o = await eng.broker.get_order(order_id)
+        if o.side == "buy" and o.type != "stop":
+            await eng.broker.cancel_order(order_id)
+            return BrokerOrder.model_validate({**o.model_dump(), "status": "rejected", "filled_qty": 0})
+        return await orig(order_id, **kw)
+
+    monkeypatch.setattr(eng.broker, "wait_terminal", rejecting)
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.REJECTED and res.filled_qty == 0
+    assert any("rejected by the broker" in t for _, t, _ in eng.alerts)
+
+
+def test_drain_waits_until_a_fresh_fill_has_its_stop(world, tmp_path, monkeypatch):
+    """REQ-055: SIGTERM drain must not report idle between a buy fill and its stop."""
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    seen = {}
+    orig = eng._protect_symbol
+
+    async def slow_protect(sym, **kw):
+        seen["in_flight_ids"] = set(eng._in_flight)
+        seen["drained"] = await eng.drain(timeout_s=0)  # SIGTERM arrives right here
+        return await orig(sym, **kw)
+
+    monkeypatch.setattr(eng, "_protect_symbol", slow_protect)
+    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    assert res.status == IntentStatus.FILLED
+    assert seen["in_flight_ids"] == set()    # the order itself is done...
+    assert seen["drained"] is False          # ...but the workflow is not, so drain waits
+    assert len(_stops(a, "AAA")) == 1
+    assert run(eng.drain(timeout_s=0)) is True
+
+
+def test_normalise_plan_lists_short_buyback_before_no_shorting(world, tmp_path, monkeypatch):
+    """REQ-010(a): the posted plan matches _run_normalise's B3 order."""
+    a = world.alpaca
+    world.price("PPP", 100, spread=0.02)
+    a.seed_position("PPP", -5, 100)
+    a.configurations["no_shorting"] = False
+    eng = make_engine(world, tmp_path, monkeypatch, normalised=False)
+    plan = run(eng.plan_normalise())
+    buy_back = next(i for i, s in enumerate(plan) if s.startswith("buy back the short in PPP"))
+    assert buy_back < plan.index("turn shorting off at the broker (no_shorting) and read it back")

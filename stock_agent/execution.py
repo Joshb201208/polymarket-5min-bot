@@ -165,6 +165,7 @@ class ExecutionEngine:
         self._now = now
         self._draining = False
         self._in_flight: set[str] = set()
+        self._busy = 0  # whole order workflows (submit -> fill -> stop) still running; drain waits on these
         self._last_atr: dict[str, tuple[Any, Any]] = {}
 
     # ------------------------------------------------------------------ utils
@@ -362,6 +363,20 @@ class ExecutionEngine:
         return [base, f"{base}-m"[:128], f"{base}-f"[:128]]
 
     async def _resolve(self, it: OrderIntent) -> None:
+        async with self._workflow():
+            await self._resolve_inner(it)
+
+    @contextlib.asynccontextmanager
+    async def _workflow(self):
+        """Marks an order workflow as running until its fill is booked and protected,
+        so drain() never reports idle between a fill and its stop placement."""
+        self._busy += 1
+        try:
+            yield
+        finally:
+            self._busy -= 1
+
+    async def _resolve_inner(self, it: OrderIntent) -> None:
         found: list[BrokerOrder] = []
         for cid in self._order_ids_for(it):
             o = await self.broker.get_order_by_client_id(cid)
@@ -410,6 +425,12 @@ class ExecutionEngine:
             self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=order.id)
         self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id,
                                meta={"filled_qty": filled, "avg_price": price, "order_status": order.status})
+        if status == IntentStatus.REJECTED:
+            # Accepted (HTTP 200) but rejected afterwards by the broker: as loud as a refused submit.
+            await self.alert("warning" if it.side == "buy" and it.kind != "cover" else "critical",
+                             f"{it.symbol}: {it.side} rejected by the broker",
+                             f"Order {order.id} for {it.symbol} was accepted, then rejected (status "
+                             f"{order.status}); nothing filled.", key=f"rejected-{it.intent_id}")
         if it.side == "buy" and filled > 0 and it.kind != "cover":
             try:  # books match the broker before the stop is recorded against the position
                 await self.ledger.refresh(f"entry fill {it.symbol}")
@@ -447,21 +468,27 @@ class ExecutionEngine:
         for it in due:
             if it.kind == "option_structure":
                 continue  # the options module executes its own structures
-            try:
-                out.append(await self.execute_intent(it))
-            except Exception as e:  # one lane's bug must not stop the other intents or protection
-                logger.exception("intent %s crashed", it.intent_id)
-                await self.alert("critical", f"{it.symbol}: order step crashed",
-                                 f"{it.side} {it.symbol}: {type(e).__name__}: {e}", key=f"crash-{it.intent_id}")
+            async with self._workflow():
                 try:
-                    await self._protect_symbol(it.symbol)
-                except Exception:
-                    logger.exception("protect after crash failed")
+                    out.append(await self.execute_intent(it))
+                except Exception as e:  # one lane's bug must not stop the other intents or protection
+                    logger.exception("intent %s crashed", it.intent_id)
+                    await self.alert("critical", f"{it.symbol}: order step crashed",
+                                     f"{it.side} {it.symbol}: {type(e).__name__}: {e}",
+                                     key=f"crash-{it.intent_id}")
+                    try:
+                        await self._protect_symbol(it.symbol)
+                    except Exception:
+                        logger.exception("protect after crash failed")
         return out
 
     async def execute_intent(self, intent: OrderIntent) -> ExecResult:
         if self._draining:
             return ExecResult(intent.intent_id, intent.symbol, intent.status, reason="draining")
+        async with self._workflow():
+            return await self._execute_intent(intent)
+
+    async def _execute_intent(self, intent: OrderIntent) -> ExecResult:
         try:
             if intent.kind == "cover":
                 return await self._execute_cover_intent(intent)
@@ -715,6 +742,9 @@ class ExecutionEngine:
     def _model_exit_key(self) -> str:
         return f"exec.model_exits.{self.session_date().isoformat()}"
 
+    def _count_model_exit(self) -> None:
+        self._kv_set(self._model_exit_key(), int(self._kv_get(self._model_exit_key(), 0) or 0) + 1)
+
     async def _replan_trim(self, intent: OrderIntent) -> float | str:
         """A queued risk trim is re-planned from a fresh, trusted book right before it
         sells: still the recommended symbol, and never more than the fresh quantity."""
@@ -792,18 +822,31 @@ class ExecutionEngine:
             claimed = self.ledger.claim_intent(intent.intent_id, check_thesis=False)
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e))
-        if rule not in self.s.uncapped_exit_rules:
-            self._kv_set(self._model_exit_key(), int(self._kv_get(self._model_exit_key(), 0) or 0) + 1)
+        capped = rule not in self.s.uncapped_exit_rules
         try:
             filled, avg, last = await self._sell_qty(intent.symbol, want_qty, claimed.client_order_id, reason=rule)
         except BaseException:
+            if capped:  # an order may have reached the broker: count it, never under-count
+                self._count_model_exit()
             # the stop was cancelled for this exit: put it back before reporting the failure
             await self._protect_symbol(intent.symbol)
             raise
         if last is None:
-            self.ledger.ack_intent(claimed.intent_id, IntentStatus.REJECTED, error="nothing sellable after cancel")
+            # No sell order was placed, so no model-exit slot is used.
             await self._protect_symbol(intent.symbol)
+            after = await self.broker.get_position(intent.symbol)
+            if after is None or not after.is_long:
+                # The resting stop filled while we were cancelling it: the exit is moot.
+                why = "position closed by its stop while the exit was cancelling it"
+                self.ledger.ack_intent(claimed.intent_id, IntentStatus.REJECTED, error=why)
+                return ExecResult(claimed.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=why)
+            self.ledger.ack_intent(claimed.intent_id, IntentStatus.REJECTED, error="nothing sellable after cancel")
+            await self.alert("warning" if capped else "critical", f"{intent.symbol}: exit not placed",
+                             f"Exit ({rule}) placed no order (no usable quote or no free shares); "
+                             "the stop has been re-placed.", key=f"exit-noorder-{intent.intent_id}")
             return ExecResult(claimed.intent_id, intent.symbol, IntentStatus.REJECTED, reason="nothing sellable")
+        if capped:
+            self._count_model_exit()
         res = await self._finish_sell(claimed, last, filled, avg)
         await self._protect_symbol(intent.symbol)
         if filled > 0:
@@ -1144,10 +1187,10 @@ class ExecutionEngine:
 
         self._draining = True
         waited = 0.0
-        while self._in_flight and waited < timeout_s:
+        while (self._in_flight or self._busy) and waited < timeout_s:
             await asyncio.sleep(1.0)
             waited += 1.0
-        return not self._in_flight
+        return not (self._in_flight or self._busy)
 
     # -------------------------------------------------------------- normalise
     def _norm_state(self) -> dict:
@@ -1156,24 +1199,26 @@ class ExecutionEngine:
     async def plan_normalise(self) -> list[str]:
         """Describe, from fresh broker state, what normalise would do."""
         steps: list[str] = []
+        # Same order as _run_normalise (B3): buy back shorts FIRST, then turn shorting off.
+        positions = await self.broker.get_positions()
+        for p in positions:
+            if not p.is_option and p.is_short:
+                steps.append(f"buy back the short in {p.symbol} ({abs(p.qty):g} shares)")
         cfg = await self.broker.get_account_config()
         if not cfg.no_shorting:
             steps.append("turn shorting off at the broker (no_shorting) and read it back")
-        positions = await self.broker.get_positions()
         acct = await self.broker.get_account()
         equity = _f(acct.equity)
         cap = float(getattr(self.config, "MAX_POSITION_PCT", 0.15))
         for p in positions:
-            if p.is_option:
+            if p.is_option or not p.is_long:
                 continue
-            if p.is_short:
-                steps.append(f"buy back the short in {p.symbol} ({abs(p.qty):g} shares)")
-                continue
+            needs_trim = equity > 0 and _f(p.market_value) > cap * equity
+            if needs_trim and await self._short_calls(p.symbol):
+                steps.append(f"close the short call on {p.symbol}")
             if p.fractional_qty > 0:
                 steps.append(f"sell the fractional {p.fractional_qty:g} share of {p.symbol}")
-            if equity > 0 and _f(p.market_value) > cap * equity:
-                if await self._short_calls(p.symbol):
-                    steps.append(f"close the short call on {p.symbol}")
+            if needs_trim:
                 steps.append(f"trim {p.symbol} to {cap:.0%} of equity")
         for p in positions:
             if p.is_option and p.qty != 0:
