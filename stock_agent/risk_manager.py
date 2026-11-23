@@ -124,6 +124,7 @@ class RiskVerdict:
     reasons: tuple[str, ...] = ()
     after: PortfolioTotals | None = None
     detect_only: bool = False
+    allowed_existing_breaches: tuple["Breach", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,7 @@ class Breach:
     key: str
     value: Decimal
     cap: Decimal
+    at_limit: bool = False
 
 
 @dataclass(frozen=True)
@@ -299,7 +301,10 @@ def stop_price(price: Decimal, distance: StopDistance) -> Decimal:
     return value.quantize(tick, rounding=ROUND_CEILING)
 
 
-def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -> DrawdownState:
+def update_drawdown(
+    state: DrawdownState, session: str, close_equity: Decimal, *,
+    previous_session: str | None = None,
+) -> DrawdownState:
     """Apply one trusted (flow-adjusted when applicable) close, once."""
     if not session or (state.last_session is not None and session <= state.last_session):
         return state
@@ -310,7 +315,9 @@ def update_drawdown(state: DrawdownState, session: str, close_equity: Decimal) -
     drawdown = (high_water - close_equity) / high_water
     paused = state.paused or drawdown >= _decimal(Config.DRAWDOWN_PAUSE_PCT)
     recovering = paused and drawdown < _decimal(Config.DRAWDOWN_THROTTLE_PCT)
-    closes = state.recovery_closes + 1 if recovering else 0
+    streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session
+              else 0)
+    closes = streak + 1 if recovering else 0
     if closes >= Config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
     return DrawdownState(high_water, drawdown, paused, closes, session)
@@ -352,6 +359,12 @@ class RiskManager:
             if kind in {TradeKind.OPTION_OPEN, TradeKind.CASH_SECURED_PUT}:
                 return self._evaluate_option(projection, intent, kind, qty, fee, controls)
             c = classify_symbol(symbol, intent.sector)
+            current = projection.stocks.get(symbol)
+            if current is not None:
+                if current.classification.sector != CanonicalSector.UNKNOWN:
+                    c = current.classification
+                elif c.sector != CanonicalSector.UNKNOWN:
+                    projection.stocks[symbol] = replace(current, classification=c)
             target, held, condition = self._stock_target(projection, intent, kind, controls)
             if condition:
                 return RiskVerdict(False, (condition,), projection.totals())
@@ -362,6 +375,8 @@ class RiskManager:
             mark = price if intent.mark_price is None else _decimal(intent.mark_price)
             if mark <= 0:
                 return RiskVerdict(False, ("invalid_mark",))
+            before = self._breaches(projection)
+            equity_before = projection.equity
             projection.add_buy(symbol, c, qty, price)
             if mark > price:
                 extra = (mark - price) * qty
@@ -372,8 +387,11 @@ class RiskManager:
             if projection.equity <= 0:
                 return RiskVerdict(False, ("nonpositive_projected_equity",))
             breaches = self._breaches(projection)
-            reasons = tuple(dict.fromkeys(b.kind for b in breaches if b.kind != "option_budget"))
-            return RiskVerdict(not reasons, reasons, projection.totals())
+            unchanged = self._unchanged_breaches(before, breaches, equity_before, projection.equity)
+            reasons = tuple(dict.fromkeys(b.kind for b in breaches
+                                         if b.kind != "option_budget" and b not in unchanged))
+            return RiskVerdict(not reasons, reasons, projection.totals(),
+                               allowed_existing_breaches=unchanged if not reasons else ())
         except (ValueError, TypeError, ArithmeticError, AttributeError):
             return RiskVerdict(False, ("invalid_risk_input",))
 
@@ -410,7 +428,9 @@ class RiskManager:
         self, snapshot: "BookSnapshot", *, controls: RiskControls | None = None,
     ) -> tuple[Breach, ...]:
         try:
-            return self._breaches(self._project_book(snapshot, controls or RiskControls()))
+            return self._breaches(
+                self._project_book(snapshot, controls or RiskControls()), include_at_limit=True,
+            )
         except (ValueError, TypeError, ArithmeticError, AttributeError):
             return (Breach("invalid_risk_input", "", Decimal(0), Decimal(0)),)
 
@@ -423,15 +443,15 @@ class RiskManager:
         """Recommend one executable next action. Reconcile before doing another."""
         controls = controls or RiskControls()
         try:
+            # One unpriced unrelated holding cannot suppress a funded short cover.
+            for held in snapshot.holdings:
+                if held.qty < 0 and held.price_ok and held.price is not None and held.price > 0:
+                    return (TradeIntent(TradeKind.BUY_TO_COVER, held.symbol, -held.qty,
+                                        held.price, reason="unexpected_short"),)
             book = self._project_book(snapshot, controls, include_pending=False)
             breaches = self._breaches(book)
             if not breaches:
                 return ()
-            for breach in breaches:
-                if breach.kind == "unexpected_short":
-                    stock = book.stocks[breach.key]
-                    return (TradeIntent(TradeKind.BUY_TO_COVER, stock.symbol, -stock.qty,
-                                        stock.mark, reason="unexpected_short"),)
             counters = consecutive_closes or {}
             headroom = _decimal(self.config.RISK_TRIM_HEADROOM_PCT)
             buffer = _decimal(self.config.RISK_DRIFT_BUFFER_PCT)
@@ -502,6 +522,8 @@ class RiskManager:
             loss, reserved = _decimal(option.max_loss), _decimal(option.cash_reserved)
             if not option.structure_id or option.structure_id in commitments or min(loss, reserved) < 0:
                 raise ValueError("invalid or duplicate option commitment")
+            if reserved_orders.intersection(option.order_ids):
+                raise ValueError("one broker order linked to multiple option commitments")
             commitments.add(option.structure_id)
             reserved_orders.update(option.order_ids)
             book.option_loss += loss
@@ -577,7 +599,7 @@ class RiskManager:
                     )
         return book
 
-    def _breaches(self, book: _Projection) -> tuple[Breach, ...]:
+    def _breaches(self, book: _Projection, *, include_at_limit: bool = False) -> tuple[Breach, ...]:
         totals = book.totals()
         breached = []
         for symbol, stock in book.stocks.items():
@@ -601,8 +623,8 @@ class RiskManager:
                 if kind == "sector_cap" and key != CanonicalSector.UNKNOWN:
                     value += book.unknown_pending
                 pct = value / totals.equity
-                if pct > cap:
-                    breached.append(Breach(kind, key, pct, cap))
+                if pct > cap or (include_at_limit and pct == cap):
+                    breached.append(Breach(kind, key, pct, cap, at_limit=(pct == cap)))
         loss_pct = totals.option_max_loss / totals.equity
         if loss_pct > self._ratio("RISK_OPTION_TOTAL_LOSS_PCT"):
             breached.append(Breach("option_budget", "", loss_pct,
@@ -611,6 +633,27 @@ class RiskManager:
             breached.append(Breach("option_budget", "count", Decimal(totals.option_structures),
                                    Decimal(self.config.RISK_OPTION_MAX_STRUCTURES)))
         return tuple(breached)
+
+    @staticmethod
+    def _unchanged_breaches(
+        before: tuple[Breach, ...], after: tuple[Breach, ...],
+        equity_before: Decimal, equity_after: Decimal,
+    ) -> tuple[Breach, ...]:
+        prior = {(b.kind, b.key): b for b in before}
+        allowed = []
+        for breach in after:
+            old = prior.get((breach.kind, breach.key))
+            if old is None:
+                continue
+            if breach.kind == "position_count" and breach.value <= old.value:
+                allowed.append(breach)
+            elif breach.kind in {"issuer_cap", "sector_cap", "cluster_cap"}:
+                # Same-bucket risk is judged on nominal exposure, not tiny changes
+                # in NAV from an unrelated bounded order's documented fee/slippage.
+                before_value, after_value = old.value * equity_before, breach.value * equity_after
+                if after_value <= before_value + Decimal("0.000001"):
+                    allowed.append(breach)
+        return tuple(allowed)
 
     def _entry_reasons(
         self, snapshot: "BookSnapshot", intent: TradeIntent, kind: TradeKind,
@@ -698,6 +741,7 @@ class RiskManager:
             return RiskVerdict(False, ("invalid_option_cost",))
         if not intent.structure_id or any(x.structure_id == intent.structure_id for x in controls.option_commitments):
             return RiskVerdict(False, ("missing_or_duplicate_structure_id",))
+        before = self._breaches(book)
         book.cash -= debit + fee
         book.equity -= fee
         book.option_loss += max_loss
@@ -724,7 +768,12 @@ class RiskManager:
             book.cash -= shares * strike
         if book.cash < book.equity * self._ratio("MIN_FREE_CASH_PCT"):
             reasons.append("cash_floor")
-        return RiskVerdict(not reasons, tuple(reasons), book.totals())
+        if book.totals().gross_exposure > book.equity * self._ratio("MAX_TOTAL_EXPOSURE"):
+            reasons.append("gross_cap")
+        tolerated = tuple(b for b in before if b.kind in {"issuer_cap", "sector_cap", "cluster_cap",
+                                                         "position_count"})
+        return RiskVerdict(not reasons, tuple(reasons), book.totals(),
+                           allowed_existing_breaches=tolerated if not reasons else ())
 
     @staticmethod
     def _covered_shares(snapshot: "BookSnapshot", symbol: str) -> Decimal:
