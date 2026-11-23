@@ -304,3 +304,34 @@ def test_live_story_creates_replayable_intent_once_with_blind_exit(monkeypatch, 
 
     asyncio.run(run())
     state.close()
+
+
+def test_regime_change_requires_both_fresh_prices_and_never_runs_a_thesis(tmp_path):
+    config = settings()
+    state = StateStore(tmp_path / "s.db", clock=lambda: NOW)
+    store = ResearchStore(state, config)
+    state.open()
+    benchmark = {
+        "SPY": SecurityInputs("SPY", "SPY", "Unknown", Decimal("100"), NOW, True, {"session_return": 0.01}),
+        "QQQ": SecurityInputs("QQQ", "QQQ", "Unknown", Decimal("100"), NOW, True, {"session_return": 0.01}),
+    }
+
+    class Sources:
+        async def market(self, now):
+            return tuple(benchmark.values())
+
+    pipeline = ResearchPipeline(config, None, None, None, store, Sources(), None, clock=lambda: NOW)
+
+    async def run():
+        assert await pipeline.observe_regime() is None  # First observation seeds baseline.
+        benchmark["SPY"] = SecurityInputs("SPY", "SPY", "Unknown", Decimal("95"), NOW, True, {"session_return": -.05})
+        benchmark["QQQ"] = SecurityInputs("QQQ", "QQQ", "Unknown", Decimal("96"), NOW - timedelta(hours=1),
+                                         True, {"session_return": -.04})
+        assert await pipeline.observe_regime() is None  # Stale second benchmark does not fire.
+        benchmark["QQQ"] = SecurityInputs("QQQ", "QQQ", "Unknown", Decimal("96"), NOW, True, {"session_return": -.04})
+        assert await pipeline.observe_regime() == ("normal", "cautious")
+        assert await pipeline.observe_regime() is None
+        assert state.query("SELECT * FROM research_work") == []
+
+    asyncio.run(run())
+    state.close()
