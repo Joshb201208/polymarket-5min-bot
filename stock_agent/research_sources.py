@@ -200,12 +200,14 @@ class ResearchSources:
             tradable = decide if type(decide) is bool else symbol in self._universe
             if getattr(asset, "renamed_to", None):
                 tradable = False
-            metrics = _metrics(getattr(snapshot, "metrics", {}))
+            raw_metrics = getattr(snapshot, "metrics", {})
+            metrics = _metrics(raw_metrics)
             quote = quotes.get(symbol)
             out[symbol] = SecurityInputs(
                 symbol, str(display_name), str(sector), _price(quote.price) if quote else None,
                 utc_datetime(quote.as_of) if quote else None, tradable, metrics,
                 tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))[:12],
+                _provenance(raw_metrics),
             )
         return out
 
@@ -234,6 +236,23 @@ def _metrics(values) -> dict[str, float]:
         if result.get(key, 0) > 0:
             result.setdefault("earnings_yield", 1 / result[key])
             break
+    if "gross_margin_ttm" in result:
+        result.setdefault("gross_margin", result["gross_margin_ttm"])
+    return result
+
+
+def _provenance(values) -> dict[str, dict]:
+    if not isinstance(values, Mapping):
+        return {}
+    result = {}
+    for key, item in values.items():
+        stamp = utc_datetime(getattr(item, "as_of", None))
+        source = getattr(item, "source", None)
+        if isinstance(key, str) and stamp is not None and source:
+            result[key] = {
+                "as_of": stamp.isoformat(), "source": str(source)[:100], "unit": str(getattr(item, "unit", ""))[:40],
+                "period": str(getattr(item, "period", ""))[:40],
+            }
     return result
 
 

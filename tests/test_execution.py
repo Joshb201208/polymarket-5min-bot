@@ -656,3 +656,85 @@ def test_buy_skipped_when_quote_reports_a_renamed_symbol(world, tmp_path, monkey
     res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
     assert res.status == IntentStatus.SKIPPED and "AAAB" in res.reason
     world.assert_no_orders()
+
+
+def _trim(eng, sym, origin, **meta):
+    from stock_agent.ledger import NewIntent
+
+    ids = eng.ledger.enqueue_intents([NewIntent(
+        symbol=sym, side="sell", kind="trim", dedupe_key=f"{origin}:{sym}", origin=origin,
+        meta={"rule": "risk_limit" if origin == "limit_drift" else "assignment", **meta})])
+    return eng.ledger.get_intent(ids[0])
+
+
+def test_queued_risk_trim_is_replanned_and_capped_to_fresh_quantity(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("DDD", 100, spread=0.02)
+    a.seed_position("DDD", 400, 100)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    snap = run(eng.ledger.refresh("t"))
+    counters = {("issuer_cap", "DDD"): 3}
+    fresh = eng.risk.plan_remediation(snap, consecutive_closes=counters)[0]
+    assert 0 < fresh.qty < 400
+    it = _trim(eng, "DDD", "limit_drift", qty=400, consecutive_closes=[["issuer_cap", "DDD", 3]])
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.FILLED and res.filled_qty == float(fresh.qty)
+    left = a.position("DDD").qty
+    assert left == 400 - float(fresh.qty)
+    assert len(_stops(a, "DDD")) == 1 and _stops(a, "DDD")[0].qty == left
+
+
+def test_queued_risk_trim_skipped_when_no_longer_needed(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    world.price("DDD", 100, spread=0.02)
+    a.seed_position("DDD", 50, 100)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    it = _trim(eng, "DDD", "limit_drift", qty=20, consecutive_closes=[["issuer_cap", "DDD", 3]])
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.SKIPPED and "no longer needed" in res.reason
+    assert not [o for o in a.orders.values() if o.side == "sell" and o.type != "stop"]
+
+
+def test_one_crashing_intent_does_not_stop_the_others(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    for s in ("AAA", "BBB"):
+        world.price(s, 50, spread=0.02)
+        a.seed_position(s, 10, 50)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    enqueue(eng, "AAA", "sell", rule="hard_stop")
+    enqueue(eng, "BBB", "sell", rule="hard_stop")
+    orig = eng.exit
+
+    async def flaky(intent):
+        if intent.symbol == "AAA":
+            raise RuntimeError("bug")
+        return await orig(intent)
+
+    eng.exit = flaky
+    out = run(eng.execute_due())
+    assert a.position("BBB") is None and [r.symbol for r in out] == ["BBB"]
+    assert any("crashed" in t for _, t, _ in eng.alerts)
+    assert len(_stops(a, "AAA")) == 1
+
+
+def test_no_shorting_retried_after_failed_cleanup(world, tmp_path, monkeypatch):
+    a = world.alpaca
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    a.configurations["no_shorting"] = False
+    a.shorting_enabled = True
+    eng = make_engine(world, tmp_path, monkeypatch)
+    f = a.fail("/v2/account/configurations", "status", method="PATCH", status=500, times=None)
+    run(eng.monitor_tick())
+    assert a.configurations["no_shorting"] is False
+    a.faults.remove(f)
+    world.clock.advance(minutes=30)
+    run(eng.monitor_tick())
+    assert a.configurations["no_shorting"] is False  # hourly back-off
+    world.clock.advance(minutes=31)
+    run(eng.monitor_tick())
+    assert a.configurations["no_shorting"] is True

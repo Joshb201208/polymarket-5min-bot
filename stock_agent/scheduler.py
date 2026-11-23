@@ -1,21 +1,25 @@
 import asyncio
+import inspect
 import logging
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-import httpx
 
+from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
-from stock_agent.asset_registry import AssetRegistry
+from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
-from stock_agent.executor import Executor
 from stock_agent.execution import ExecutionEngine
+from stock_agent.heartbeat import HeartbeatClient
+from stock_agent.health import ProviderHealthRegistry
+from stock_agent.http_safety import DataHttpClient
 from stock_agent.models import (
     CompanyData,
     DailySummary,
@@ -25,18 +29,20 @@ from stock_agent.models import (
     Trade,
 )
 from stock_agent.portfolio import Portfolio
-from stock_agent.ledger import JobStatus
+from stock_agent.ledger import JobStatus, NewIntent
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
-from stock_agent.performance import close_session, shadow_stops
+from stock_agent.performance import close_session
 from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_pipeline import JobOutcome, OptionIdea
 from stock_agent.research_store import ResearchStore
-from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, update_drawdown
+from stock_agent.risk_manager import (
+    DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, TradeKind, update_drawdown,
+)
 from stock_agent.runtime_status import RuntimeStatus, notify_systemd
 from stock_agent.screener import Screener
 from stock_agent.state_boot import build_ledger, prepare_ledger
@@ -44,11 +50,6 @@ from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
-from stock_agent.options_data import OptionsDataFeed
-from stock_agent.options_engine import OptionsEngine
-from stock_agent.options_executor import OptionsExecutor
-from stock_agent.options_portfolio import OptionsPortfolio
-from stock_agent.options_models import OptionSide, OptionOrderType
 from stock_agent.tipranks_client import (
     build_tipranks_lookup,
     adjust_conviction_with_tipranks,
@@ -103,26 +104,36 @@ class StockAgentScheduler:
             return supplied if supplied is not None else factory()
 
         self.broker = service("broker", lambda: AlpacaClient(config=self.config))
-        self.alerts = service("alerts", lambda: None)
         self.ledger = service("ledger", lambda: build_ledger(
             self.config.DATA_DIR, broker=self.broker, alert=self._queue_ledger_alert, clock=_now_utc,
         ))
         self.store = self.ledger.store
         self.journal = self.ledger.journal
-        self.http = service("http", lambda: httpx.AsyncClient(timeout=10))
+        self.discord = service("discord", lambda: DiscordReporter(self.config))
+        self.telegram = service("telegram", lambda: TelegramReporter(self.config))
+        self.alerts = service("alerts", lambda: AlertService(
+            self.config, discord=self.discord, telegram=self.telegram, journal=self.journal, clock=_now_utc,
+        ))
+        self.heartbeat = service("heartbeat", lambda: HeartbeatClient(self.config, clock=_now_utc))
+        self.http = service("http", lambda: DataHttpClient(self.config))
         self.risk = service("risk", lambda: RiskManager(self.config))
         self.calendar = service("calendar", lambda: MarketCalendar(
             self.broker, self.config.DATA_DIR / "market-calendar.json", namespace=self.config.MODE,
             now=_now_utc,
         ))
-        self.health = service("health", lambda: None)
+        self.health = service("health", lambda: ProviderHealthRegistry(
+            self.config, now=_now_utc, on_transition=getattr(self.alerts, "handle_health_transition", None),
+        ))
         self.assets = service("assets", lambda: AssetRegistry(
             self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
+            on_rename=self._on_asset_rename, defer_load=True,
         ))
         self.prices = service("prices", lambda: PriceService(
             self.http, config=self.config, store=self.store, calendar=self.calendar,
             assets=self.assets, report=self._provider_health, now=_now_utc,
         ))
+        self.price_service = self.prices
+        self.health_registry = self.health
         self.news = service("news", lambda: None)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
         self.llm = service("llm", lambda: LLMClient(
@@ -131,6 +142,7 @@ class StockAgentScheduler:
         self.research_gate = service("research_gate", lambda: ResearchGate(self.ledger, self.health, self.config))
         self.research = service("research", lambda: None)
         self.capital_lock = asyncio.Lock()
+        self._asset_lock = asyncio.Lock()
         self.engine = service("engine", lambda: ExecutionEngine(
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
             bars=self._stop_bars, controls=self._risk_controls,
@@ -162,6 +174,7 @@ class StockAgentScheduler:
         self._job_tasks: dict[str, asyncio.Task] = {}
         self._order_task: asyncio.Task | None = None
         self._options_task: asyncio.Task | None = None
+        self._telemetry_task: asyncio.Task | None = None
         self._last_issue: dict[str, datetime] = {}
         self._pending_ledger_alerts: set[asyncio.Task] = set()
         # Legacy read interfaces temporarily remain for report/research callbacks.
@@ -170,15 +183,7 @@ class StockAgentScheduler:
         self.screener = Screener(self.config)
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
-        self.risk_manager = self.risk
-        self.executor = Executor(self.config)
-        self.telegram = TelegramReporter(self.config)
-        self.discord = DiscordReporter(self.config)
         self.macro = MacroMonitor(self.config)
-        self.options_data = OptionsDataFeed(self.config)
-        self.options_engine = OptionsEngine(self.config, self.macro, self.options_data)
-        self.options_executor = OptionsExecutor(self.config)
-        self.options_portfolio = OptionsPortfolio(self.config, self.options_data)
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
@@ -209,14 +214,22 @@ class StockAgentScheduler:
             self._last_issue[key] = now
         if self.alerts is not None:
             try:
-                async with asyncio.timeout(2):
-                    await self.alerts.alert(severity, title, body, key=key)
+                routing = {"channel_key": "announcements"} if (
+                    key == "normalise-plan" and isinstance(self.alerts, AlertService)
+                ) else {}
+                result = self.alerts.alert(severity, title, body, key=key, **routing)
+                if inspect.isawaitable(result):
+                    async with asyncio.timeout(2):
+                        await result
             except Exception:
                 logger.warning("Could not queue alert: %s", title)
         else:
             logger.log(logging.WARNING if severity != "info" else logging.INFO, "%s: %s", title, body)
 
     def _queue_ledger_alert(self, severity: str, title: str, body: str, *, key: str | None = None) -> None:
+        if isinstance(self.alerts, AlertService):
+            self.alerts.alert(severity, title, body, key=key)
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -250,11 +263,43 @@ class StockAgentScheduler:
         await self._alert("warning", "Research provider unavailable", f"{error.provider}: {error.kind}",
                           key=f"research-provider:{error.provider}:{error.kind}")
 
-    async def _provider_health(self, provider: str, capability: str, ok: bool, error: str | None) -> None:
-        # The health service persists provider proof; provider failures do not prevent protection.
-        if not ok:
-            await self._alert("warning", "Market data unavailable", f"{provider}: {capability}",
-                              key=f"data-provider:{provider}:{capability}")
+    def _provider_health(self, provider: str, capability: str, ok: bool, error: str | None) -> None:
+        report = getattr(self.health, "report", None)
+        if report is not None:
+            report(provider, capability, ok, error)
+
+    async def _on_asset_rename(self, event: SymbolRenameEvent) -> None:
+        self.ledger.register_symbol_alias(event.old_symbol, event.new_symbol, source="asset_registry",
+                                          effective=event.process_date)
+        await self._alert(
+            "warning", "Broker confirmed a symbol change",
+            f"{event.old_symbol} now trades as {event.new_symbol}; a fresh thesis is needed for new entries.",
+            key=f"symbol-rename:{event.old_symbol}:{event.new_symbol}:{event.process_date}",
+        )
+
+    def _tracked_symbols(self) -> tuple[str, ...]:
+        current = self.ledger.last_snapshot()
+        held = (position.symbol for position in current.holdings) if current else ()
+        return tuple(dict.fromkeys([
+            *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
+            *self.assets.active_symbols()[:self.config.UNIVERSE_SIZE],
+        ]))
+
+    async def _refresh_assets(self, *, force: bool = False):
+        if isinstance(self.assets, AssetRegistry) and not (
+            self.config.ALPACA_API_KEY and self.config.ALPACA_SECRET_KEY
+        ):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "assets_credentials_missing"})
+        async with self._asset_lock:
+            symbols = (*self._tracked_symbols(), *(m.symbol for m in self.ledger.all_open_meta()
+                                                   if m.asset_class == "us_equity"))
+            await self.assets.refresh(tuple(dict.fromkeys(symbols)), force=force)
+        if not self.assets.active_symbols():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "active_assets_unavailable"})
+        return None
+
+    async def _list_universe(self) -> tuple[str, ...]:
+        return self._option_universe()[:self.config.UNIVERSE_SIZE]
 
     async def _stop_bars(self, symbol: str):
         getter = getattr(self.prices, "get_daily_bars", None)
@@ -273,9 +318,9 @@ class StockAgentScheduler:
         return quote if quote is not None and getattr(quote, "symbol", symbol) == symbol else None
 
     def _option_universe(self) -> tuple[str, ...]:
-        current = self.ledger.last_snapshot()
-        holding_symbols = (position.symbol for position in current.holdings) if current else ()
-        return tuple(dict.fromkeys([*holding_symbols, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS]))
+        return tuple(dict.fromkeys(
+            resolved for symbol in self._tracked_symbols() if (resolved := self.assets.resolve_symbol(symbol))
+        ))
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -298,8 +343,10 @@ class StockAgentScheduler:
             result = self.ledger.last_reconcile()
             self._reconciled = not self.ledger.trading_block() and bool(result is None or result.get("clean"))
             self._last_reconcile_at = _now_utc()
+            self._provider_health("alpaca", "broker", True, None)
         except Exception as exc:
             self._reconciled = False
+            self._provider_health("alpaca", "broker", False, type(exc).__name__)
             await self._alert("critical", "Broker reconciliation unavailable",
                               f"{reason}: {type(exc).__name__}. New entries are blocked.",
                               key="reconcile-unavailable")
@@ -323,6 +370,11 @@ class StockAgentScheduler:
             raise ValueError("trading mode does not match broker host")
         boot = prepare_ledger(self.ledger, self.config.DATA_DIR, options_importer=import_legacy_options)
         self._needs_rebuild = boot.needs_rebuild
+        if isinstance(self.health, ProviderHealthRegistry):
+            self.health.store = self.store
+            self.health._load_persisted()
+        if isinstance(self.assets, AssetRegistry):
+            self.assets.load_state()
         if isinstance(self.options, OptionsManager):
             self.options.load_state()
         if not boot.health.ok:
@@ -330,6 +382,14 @@ class StockAgentScheduler:
                               "The previous state was quarantined; new entries stay blocked until recovery.")
         self.ledger.mark_submitting_ambiguous()
         await self.calendar.refresh()
+        # Resolve aliases for yesterday's book before reconcile can archive an old ticker.
+        if not self._shutdown and self.ledger.all_open_meta():
+            try:
+                async with asyncio.timeout(8):
+                    await self._refresh_assets()
+            except Exception as exc:
+                await self._alert("warning", "Startup asset refresh pending", type(exc).__name__,
+                                  key="assets-startup")
         if not self._shutdown:
             await self._reconcile_scheduler("startup")
         if self._shutdown:
@@ -352,6 +412,8 @@ class StockAgentScheduler:
             return
         self._state_ready = True
         self._publish_runtime()
+        startup_at = _now_et()
+        self._schedule_job("assets_startup", startup_at.isoformat(), self._refresh_assets, timeout=30)
         notify_systemd("READY=1\nSTATUS=Scheduler running; entry gates checked separately")
         await self._alert("info", "Stock agent started",
                           f"{mode}; broker reconciled: {self._reconciled}; entries enabled: {self._entries_enabled()}")
@@ -367,6 +429,7 @@ class StockAgentScheduler:
                         break
                     self._publish_runtime()
                     notify_systemd("WATCHDOG=1")
+                    self._schedule_notifications()
                 except Exception as exc:
                     logger.error("Scheduler cycle failed: %s", type(exc).__name__)
                     await self._alert("warning", "Scheduler cycle failed", type(exc).__name__, key="scheduler-tick")
@@ -377,6 +440,27 @@ class StockAgentScheduler:
                         pass
         finally:
             await self._cleanup()
+
+    def _schedule_notifications(self) -> None:
+        if self._telemetry_task is not None:
+            if not self._telemetry_task.done():
+                return
+            if not self._telemetry_task.cancelled() and self._telemetry_task.exception() is not None:
+                logger.warning("Notification lane exited unexpectedly")
+        self._telemetry_task = asyncio.create_task(self._notification_tick(), name="stock-agent:notifications")
+
+    async def _notification_tick(self) -> None:
+        try:
+            async with asyncio.timeout(6):
+                note = "broker sync healthy" if self._reconciled else "broker sync needs attention"
+                await self.heartbeat.tick(self.alerts, note=note)
+        except Exception as exc:
+            logger.warning("Heartbeat did not complete: %s", type(exc).__name__)
+        try:
+            async with asyncio.timeout(8):
+                await self.alerts.flush(max_budget_sec=7)
+        except Exception as exc:
+            logger.warning("Alert delivery deferred: %s", type(exc).__name__)
 
     async def _tick_until_stopped(self) -> None:
         tick = asyncio.create_task(self._tick(_now_et()))
@@ -427,6 +511,7 @@ class StockAgentScheduler:
         now_et = _now_et()
         day_key = now_et.date().isoformat()
         jobs = (
+            ("assets", self._should_refresh_assets, self._refresh_session_assets, 90),
             ("macro", self._should_run_macro_check, self._run_macro_check, 120),
             ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
             ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
@@ -468,6 +553,7 @@ class StockAgentScheduler:
         mark = next((item for item in marks if item.session_date == session.date), None)
         if mark is None:
             self._last_close_report = await close_session(self.ledger, snapshot, session.date)
+        risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
         try:
             state = DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY))
         except ValueError:
@@ -478,7 +564,7 @@ class StockAgentScheduler:
         updated = update_drawdown(state, session.date.isoformat(), mark.equity if mark else snapshot.equity,
                                   previous_session=previous.date.isoformat())
         if updated == state:
-            return None
+            return risk_result
         self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
         if (state.alert, state.throttled, state.paused) != (updated.alert, updated.throttled, updated.paused):
             await self._alert(
@@ -487,6 +573,111 @@ class StockAgentScheduler:
                 f"Drawdown: {updated.drawdown:.1%}; throttled: {updated.throttled}; paused: {updated.paused}.",
                 key=f"drawdown:{session.date}",
             )
+        return risk_result
+
+    async def _evaluate_close_limits(self, snapshot, session_date: date, previous_session: date):
+        controls = self._risk_controls()
+        breaches = self.risk.evaluate_portfolio(snapshot, controls=controls)
+        if any(breach.kind == "invalid_risk_input" for breach in breaches):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_risk_input_unverified"})
+        key = "a6.close_drift"
+        state = self.ledger.risk_state_get(key, {})
+        counts = {(kind, scope): n for kind, scope, n in state.get("counts", ())}
+        day = session_date.isoformat()
+        if state.get("session") != day:
+            previous = counts if state.get("session") == previous_session.isoformat() else {}
+            band = Decimal(str(self.config.RISK_DRIFT_BUFFER_PCT))
+            counts = {
+                (b.kind, b.key): previous.get((b.kind, b.key), 0) + 1 for b in breaches
+                if (b.value < b.cap - band if b.kind == "cash_floor" else b.value > b.cap + band)
+            }
+            self.ledger.risk_state_set(key, {"session": day, "counts": [
+                [kind, scope, n] for (kind, scope), n in sorted(counts.items())
+            ]})
+        if breaches:
+            await self._alert("warning", "Portfolio at or beyond risk limits", "\n".join(
+                f"{b.kind} {b.key}: {b.value} (limit {b.cap})" for b in breaches
+            ), key=f"risk-limit-close:{day}")
+        plans = self.risk.plan_remediation(snapshot, consecutive_closes=counts, controls=controls)
+        if any(plan.kind is TradeKind.SELL for plan in plans):
+            following = self.calendar.next_session(session_date)
+            if following is None:
+                return JobOutcome(JobStatus.FAILED, detail={"reason": "trim_session_unverified"})
+            intents = self._trim_intents(
+                snapshot, plans, "limit_drift", day, following,
+                consecutive_closes=[[kind, scope, n] for (kind, scope), n in sorted(counts.items())],
+            )
+            return JobOutcome(JobStatus.DONE, intents=intents)
+        return None
+
+    def _trim_intents(self, snapshot, plans, source: str, event: str, session, **proof) -> tuple[NewIntent, ...]:
+        intents = []
+        for plan in plans:
+            if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
+                continue
+            intents.append(NewIntent(
+                symbol=plan.symbol, side="sell", kind="trim", origin=source,
+                dedupe_key=f"a6:{source}:{event}:{plan.symbol}",
+                position_id=holding.meta.position_id if holding.meta else None,
+                reference_price=plan.price,
+                session_date=session.date, next_attempt_at=session.opens_at + timedelta(minutes=5),
+                expires_at=session.closes_at,
+                meta={"rule": "assignment" if source == "option_delivery" else "risk_limit",
+                      "qty": str(plan.qty), "reason": plan.reason, **proof},
+            ))
+        return tuple(intents)
+
+    async def _queue_delivery_trims(self, now: datetime) -> None:
+        session = self.calendar.session_on(now.date())
+        if (session is None or now < session.opens_at + timedelta(minutes=5)
+                or now >= session.closes_at or not (await self.market_gate("exit", rule="assignment")).allowed):
+            return
+        previous = self.calendar.previous_session(session.date)
+        if previous is None:
+            return
+        deliveries = self.store.query(
+            "SELECT activity_id, symbol, ts FROM broker_activities WHERE activity_type='OPTRD'"
+            " AND qty>0 AND ts>=? ORDER BY ts, activity_id", (previous.date.isoformat(),),
+        )
+        if not deliveries:
+            return
+        key = "a6.delivery_processed"
+        processed = self.ledger.risk_state_get(key, {})
+        retained = {row["activity_id"]: processed[row["activity_id"]] for row in deliveries
+                    if row["activity_id"] in processed}
+        pending = [row for row in deliveries if row["activity_id"] not in retained]
+        if not pending:
+            return
+        snapshot = await self.ledger.refresh("option delivery risk check")
+        if snapshot.quality != "live" or self.ledger.trading_block() or snapshot.equity <= 0:
+            return
+        controls = self._risk_controls()
+        if any(b.kind == "invalid_risk_input" for b in self.risk.evaluate_portfolio(snapshot, controls=controls)):
+            return
+        for row in pending:
+            activity, symbol, ts = row["activity_id"], row["symbol"], row["ts"]
+            try:
+                delivered_at = datetime.fromisoformat(ts) if "T" in ts else None
+                delivered_day = (delivered_at.astimezone(ET).date() if delivered_at and delivered_at.tzinfo
+                                 else date.fromisoformat(ts[:10]))
+            except ValueError:
+                continue
+            if delivered_day > session.date or (delivered_at and delivered_at.tzinfo
+                                                  and delivered_at >= session.opens_at):
+                continue
+            if symbol and (holding := snapshot.holding(symbol)) and holding.qty > 0:
+                plans = self.risk.plan_remediation(snapshot, broker_action=True, broker_symbol=symbol,
+                                                   controls=controls)
+                intents = self._trim_intents(snapshot, plans, "option_delivery", session.date.isoformat(), session,
+                                            delivery_symbol=symbol)
+                if intents:
+                    self.ledger.enqueue_intents(intents)
+                    await self._alert("warning", f"Option delivery triggered a trim for {symbol}",
+                                      "Queued for execution against the reconciled book.",
+                                      key=f"option-delivery:{activity}")
+            retained[activity] = ts
+        if retained != processed:
+            self.ledger.risk_state_set(key, retained)
 
     def _summary_ready(self, now: datetime) -> bool:
         if not self._should_send_daily_summary(now):
@@ -498,13 +689,25 @@ class StockAgentScheduler:
 
     def _should_run_shadow_close(self, now: datetime) -> bool:
         session = self.calendar.session_on(now.date())
-        return bool(session and now >= session.closes_at + timedelta(minutes=17))
+        return bool(session and now >= session.closes_at + timedelta(minutes=16))
+
+    def _should_refresh_assets(self, now: datetime) -> bool:
+        session = self.calendar.session_on(now.date())
+        return bool(session and session.opens_at - timedelta(hours=6) <= now < session.closes_at)
+
+    async def _refresh_session_assets(self):
+        return await self._refresh_assets(force=True)
 
     async def _run_shadow_close(self):
-        warnings: list[str] = []
-        rows = await shadow_stops(self.ledger, _now_et().date(), self._shadow_bars, warnings)
-        status = JobStatus.FAILED if warnings else JobStatus.DONE
-        return JobOutcome(status, detail={"shadow_rows": rows, "warnings": len(warnings)})
+        day = _now_et().date()
+        snapshot = self.ledger.last_snapshot()
+        if snapshot is None or not any(m.session_date == day for m in self.ledger.equity_marks("close", since=day)):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "trusted_close_pending"})
+        report = await close_session(self.ledger, snapshot, day, daily_bars=self._shadow_bars)
+        self._last_close_report = report
+        missing = sum(w.startswith("shadow stop") for w in report.warnings)
+        return JobOutcome(JobStatus.FAILED if missing else JobStatus.DONE,
+                          detail={"shadow_rows": report.shadow_rows, "warnings": missing})
 
     def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
         if self._shutdown or name in self._job_tasks:
@@ -613,6 +816,11 @@ class StockAgentScheduler:
                 return
         if self._shutdown:
             return
+        try:
+            await self._queue_delivery_trims(_now_et())
+        except Exception as exc:
+            await self._alert("warning", "Option delivery risk check did not complete",
+                              type(exc).__name__, key="option-delivery-check")
         await self._run_market_monitoring()
         if self.engine.normalised and not self._normalised:
             self._normalised = await self._reconcile_scheduler("normalise completed")
@@ -991,7 +1199,7 @@ class StockAgentScheduler:
         change = await research.observe_regime()
         if change is not None:
             before, after = change
-            await self.alerts.alert(
+            await self._alert(
                 "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
                 key=f"market_regime_{before}_{after}",
             )
@@ -1013,14 +1221,16 @@ class StockAgentScheduler:
             embeds: list[dict] = []
 
             # ── 1. PORTFOLIO STATUS ──────────────────────────────
-            # Sync from Alpaca for accurate data
-            alpaca_account = await self.executor.get_account()
-            alpaca_positions = await self.executor.get_positions()
-
-            if alpaca_account:
-                equity = float(alpaca_account.get("equity", 0))
-                cash = float(alpaca_account.get("cash", 0))
-                last_equity = float(alpaca_account.get("last_equity", 0))
+            book = self.ledger.last_snapshot()
+            if book:
+                equity, cash = float(book.equity), float(book.cash)
+                marks = [mark for mark in self.ledger.equity_marks("close") if mark.session_date < now.date()]
+                last_equity = float(marks[-1].equity) if marks else equity
+                alpaca_positions = [{
+                    "symbol": h.symbol, "unrealized_pl": (h.price - h.avg_cost) * h.qty if h.price else 0,
+                    "unrealized_plpc": h.price / h.avg_cost - 1 if h.price and h.avg_cost else 0,
+                    "current_price": h.price or 0, "market_value": h.market_value,
+                } for h in book.holdings]
                 day_pnl = equity - last_equity
                 day_pnl_pct = (day_pnl / last_equity * 100) if last_equity > 0 else 0
                 starting = self.portfolio.state.starting_capital
@@ -1028,10 +1238,6 @@ class StockAgentScheduler:
                 total_pnl_pct = (total_pnl / starting * 100) if starting > 0 else 0
                 invested = equity - cash
                 exposure_pct = (invested / equity * 100) if equity > 0 else 0
-
-                # Also sync internal portfolio
-                if alpaca_positions:
-                    self.portfolio.sync_from_alpaca(alpaca_positions, alpaca_account)
 
                 pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
                 day_emoji = "\u2705" if day_pnl >= 0 else "\u274c"
@@ -1275,6 +1481,8 @@ class StockAgentScheduler:
         self.shutdown()
         notify_systemd("STOPPING=1\nSTATUS=Draining trading tasks")
         passive = [task for name, task in self._job_tasks.items() if name != "options"]
+        if self._telemetry_task is not None:
+            passive.append(self._telemetry_task)
         for task in passive:
             task.cancel()
         active = [task for task in (self._order_task, self._options_task, self._job_tasks.get("options"))
@@ -1304,8 +1512,8 @@ class StockAgentScheduler:
                 task.cancel()
 
         seen = set()
-        dynamic = ("data_feed", "screener", "executor", "telegram", "discord", "macro",
-                   "options_data", "options_executor", "alerts", "prices", "news", "llm", "broker", "http")
+        dynamic = ("data_feed", "screener", "telegram", "discord", "macro",
+                   "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:

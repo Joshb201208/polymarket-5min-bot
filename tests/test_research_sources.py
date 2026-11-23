@@ -42,7 +42,9 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
     async def fetch_company(symbol):
         return SimpleNamespace(
             canonical_sector="Technology", name=symbol, tradable=True,
-            metrics={"pe_ttm": SimpleNamespace(value=20), "revenue_growth_yoy": 0.2},
+            metrics={"pe_ttm": SimpleNamespace(value=20), "revenue_growth_yoy": 0.2,
+                     "gross_margin_ttm": SimpleNamespace(value=0.3, as_of=NOW, source="Fixture", unit="ratio",
+                                                         period="ttm")},
         )
 
     async def run():
@@ -53,6 +55,8 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
         assert [(item.story_id, item.symbol) for item in stories] == [("abc", "AAA")]
         assert rows["AAA"].price == Decimal("52")
         assert rows["AAA"].metrics["earnings_yield"] == 0.05
+        assert rows["AAA"].metrics["gross_margin"] == 0.3
+        assert rows["AAA"].metric_provenance["gross_margin_ttm"]["as_of"] == NOW.isoformat()
         assert sources.quote_ok("AAA", NOW) and not sources.quote_ok("BBB", NOW)
         assert sources.news_ok("AAA", NOW) and not sources.news_ok("BBB", NOW)
         assert not sources.news_ok("AAA", NOW + timedelta(minutes=21))
