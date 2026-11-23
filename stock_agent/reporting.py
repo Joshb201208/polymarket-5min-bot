@@ -232,6 +232,51 @@ class ReportBuilder:
             logger.warning("Could not read options structures for report: %s", e)
         return []
 
+    # ---- options helpers (structure maths lives in options_book)
+    @staticmethod
+    def _option_origin(s: Any) -> str:
+        src = str(getattr(s, "source", "") or "")
+        if src == "adopted":
+            return "ADOPTED"
+        return "NEWS" if src == "news" else "SCHEDULED"
+
+    @staticmethod
+    def _option_origin_label(s: Any) -> str:
+        return {"ADOPTED": "adopted/legacy", "NEWS": "news"}.get(ReportBuilder._option_origin(s), "scheduled")
+
+    @staticmethod
+    def _option_marks(snap: BookSnapshot | None) -> dict[str, float]:
+        if snap is None:
+            return {}
+        return {leg.occ_symbol: float(leg.price) for leg in snap.legs if leg.price_ok and leg.price is not None}
+
+    @staticmethod
+    def _option_risk(structs: Sequence[Any]) -> tuple[float, int]:
+        """(sum of known max loss, count of live structures whose max loss is unknown).
+        Unknown risk is never counted as zero."""
+        total, unknown = 0.0, 0
+        for s in structs:
+            ml = getattr(s, "max_loss", None)
+            if ml is None:
+                unknown += 1
+            else:
+                total += float(ml)
+        return total, unknown
+
+    @staticmethod
+    def _fmt_option_risk(total: float, unknown: int) -> str:
+        if not unknown:
+            return _fmt_money(total)
+        return f"{_fmt_money(total)} known + {unknown} structure(s) with unknown max loss"
+
+    def _option_total_limit_pct(self) -> float:
+        try:
+            from stock_agent.options_settings import load_options_settings
+
+            return float(load_options_settings(self.config).max_loss_total_pct) * 100.0
+        except Exception:
+            return 10.0
+
     def _fallback_starting_capital(self) -> Decimal:
         raw = getattr(self.config, "STARTING_CAPITAL", None)
         d = _safe_dec(raw)
@@ -411,21 +456,23 @@ class ReportBuilder:
         # Options Sleeve Summary (separate from stocks!)
         structs = [s for s in self._load_options_structures() if getattr(s, "st", None) and s.st.live]
         if structs or snap.legs:
-            total_max_loss = sum(float(getattr(s, "max_loss", 0.0) or 0.0) for s in structs)
+            total_max_loss, unknown_risk = self._option_risk(structs)
             max_loss_pct = (total_max_loss / equity_f * 100.0) if equity_f > 0 else 0.0
             opt_lines: list[str] = []
             if structs:
                 for s in structs:
                     strat_label = str(getattr(s, "strategy", "option")).replace("_", " ")
                     ml = getattr(s, "max_loss", None)
-                    origin = "news" if getattr(s, "source", "") == "news" else "scheduled"
+                    origin = self._option_origin_label(s)
+                    ml_txt = _fmt_money(ml) if ml is not None else "unknown"
                     opt_lines.append(
                         f"• **{s.underlying}** {strat_label} x{s.qty} (exp {s.expiry}, {origin}) — "
-                        f"max possible loss {_fmt_money(ml)}"
+                        f"max possible loss {ml_txt}"
                     )
                 opt_lines.append(
-                    f"**Total Modeled Option Max Loss:** {_fmt_money(total_max_loss)} "
-                    f"({max_loss_pct:.1f}% of account vs 8.0% limit)"
+                    f"**Total Modeled Option Max Loss:** {self._fmt_option_risk(total_max_loss, unknown_risk)} "
+                    f"({max_loss_pct:.1f}% of account vs {self._option_total_limit_pct():.1f}% limit"
+                    + (", excluding unknown" if unknown_risk else "") + ")"
                 )
             else:
                 for leg in snap.legs:
@@ -617,7 +664,7 @@ class ReportBuilder:
             if str(getattr(s, "closed_at", "") or "")[:10] == session_date.isoformat()
         ]
         opt_realized_today = sum(float(getattr(s, "realized_pnl", 0.0) or 0.0) for s in closed_today_structs)
-        opt_open_max_loss = sum(float(getattr(s, "max_loss", 0.0) or 0.0) for s in live_structs)
+        opt_open_max_loss, opt_unknown_risk = self._option_risk(live_structs)
 
         # Today's stock trades & closed win count (sells only — never count buys as wins!)
         did_lines, passed_lines = self._daily_decisions_summary(session_date, closed_today_structs)
@@ -647,7 +694,7 @@ class ReportBuilder:
             {
                 "name": "Options Sleeve (Separate)",
                 "value": (
-                    f"Value {_fmt_money(opt_mv)} | Open Max Risk {_fmt_money(opt_open_max_loss)} | "
+                    f"Value {_fmt_money(opt_mv)} | Open Max Risk {self._fmt_option_risk(opt_open_max_loss, opt_unknown_risk)} | "
                     f"Closed Today {_fmt_money(opt_realized_today, signed=True)}"
                 ),
                 "inline": True,
@@ -836,7 +883,7 @@ class ReportBuilder:
         learned = self._compile_what_we_learned(bm)
 
         structs = [s for s in self._load_options_structures() if getattr(s, "st", None) and s.st.live]
-        open_opt_max_loss = sum(float(getattr(s, "max_loss", 0.0) or 0.0) for s in structs)
+        open_opt_max_loss, open_opt_unknown_risk = self._option_risk(structs)
         open_opt_max_loss_pct = (open_opt_max_loss / float(live_eq) * 100.0) if live_eq > ZERO else 0.0
 
         invalid_marks = 0
@@ -846,8 +893,9 @@ class ReportBuilder:
             for h in snap.holdings:
                 if h.is_short or (live_eq > ZERO and (h.market_value / live_eq) > Decimal("0.15")):
                     breaches += 1
-            if open_opt_max_loss_pct > 8.0:
+            if open_opt_max_loss_pct > self._option_total_limit_pct():
                 breaches += 1
+        breaches += open_opt_unknown_risk  # a live structure with no known max loss is uncapped risk
 
         scorecard: dict[str, Any] = {
             "account": {
@@ -882,6 +930,7 @@ class ReportBuilder:
                 "peak_exposure_pct": round(peak_exp_pct, 2) if peak_exp_pct is not None else None,
                 "open_option_max_loss": round(open_opt_max_loss, 2),
                 "open_option_max_loss_pct": round(open_opt_max_loss_pct, 2),
+                "open_option_unknown_risk_count": open_opt_unknown_risk,
                 "breach_count": breaches,
                 "invalid_mark_count": invalid_marks,
             },
@@ -925,6 +974,7 @@ class ReportBuilder:
         options_by_origin = {
             "SCHEDULED": _empty_sleeve(),
             "NEWS": _empty_sleeve(),
+            "ADOPTED": _empty_sleeve(),  # legacy/adopted: kept out of the OPTIONS strategy stats
         }
         by_conviction: dict[str, dict[str, Any]] = {
             str(k): {"count": 0, "closed_count": 0, "net_pnl": None, "display": "N/A (0 closed)"}
@@ -1070,11 +1120,34 @@ class ReportBuilder:
             except Exception:
                 pass
 
-        # Options structures -> OPTIONS sleeve + SCHEDULED/NEWS origin subsets (never double-counted in NEWS_EQUITY!)
+        # Options structures -> OPTIONS sleeve (new strategy only) + SCHEDULED/NEWS origin
+        # subsets; adopted/legacy structures go only to ADOPTED. Never in NEWS_EQUITY.
+        from stock_agent.options_book import open_pnl, structure_mark
+
+        marks = self._option_marks(snap)
+        for b in (sleeves["OPTIONS"], *options_by_origin.values()):
+            b["unrealized_unknown_count"] = 0
         for s in self._load_options_structures():
-            origin_key = "NEWS" if getattr(s, "source", "") == "news" else "SCHEDULED"
-            buckets = (sleeves["OPTIONS"], options_by_origin[origin_key])
+            origin_key = self._option_origin(s)
+            buckets = ((options_by_origin[origin_key],) if origin_key == "ADOPTED"
+                       else (sleeves["OPTIONS"], options_by_origin[origin_key]))
             st_val = str(getattr(s, "state", ""))
+            live = getattr(s, "st", None) is not None and s.st.live
+            upnl = None
+            if live and st_val != "pending":
+                try:
+                    upnl = open_pnl(s, structure_mark(s, marks))
+                except Exception:
+                    upnl = None
+            for b in buckets:
+                if live and st_val != "pending":
+                    if upnl is None:
+                        b["unrealized_unknown_count"] += 1
+                    else:
+                        b["unrealized_pnl"] = round(b["unrealized_pnl"] + upnl, 2)
+                    partial = float(getattr(s, "partial_pnl", 0.0) or 0.0)
+                    if partial:
+                        b["realized_pnl"] = round(b["realized_pnl"] + partial, 2)
             for b in buckets:
                 b["candidates"] += 1
                 if st_val in ("open", "closing", "repair", "unknown"):
@@ -1090,16 +1163,13 @@ class ReportBuilder:
                         b["win_denominator"] += 1
                         if rf > 0:
                             b["wins"] += 1
-                        if rf < 0:
+                        if rf < 0 and origin_key != "ADOPTED":
                             losses_by_sleeve["OPTIONS"].append(rf)
             conv_s = getattr(s, "conviction", None)
-            if conv_s is not None and str(conv_s) in by_conviction:
+            if origin_key != "ADOPTED" and conv_s is not None and str(conv_s) in by_conviction:
                 by_conviction[str(conv_s)]["count"] += 1
                 if st_val == "closed" and getattr(s, "realized_pnl", None) is not None:
                     conv_pnls[str(conv_s)].append(float(s.realized_pnl))
-
-        if snap is not None and snap.options_mv != ZERO:
-            sleeves["OPTIONS"]["unrealized_pnl"] = round(float(snap.options_mv), 2)
 
         sleeves["CORE_EQUITY"]["fees"] = round(float(real_fifo.fees), 2)
 
@@ -1372,8 +1442,15 @@ class ReportBuilder:
             f"Open {_fmt_money(sl['NEWS_EQUITY']['unrealized_pnl'], signed=True)}",
             f"• **Options (Separate Sleeve):** {sl['OPTIONS']['fills']}/{sl['OPTIONS']['candidates']} structures | "
             f"Wins {sl['OPTIONS']['win_summary']} | Realized {_fmt_money(sl['OPTIONS']['realized_pnl'], signed=True)} | "
-            f"Open Max Loss {_fmt_money(acc['open_option_max_loss'])} ({acc['open_option_max_loss_pct']:.1f}% of equity)\n"
-            f"  ↳ Scheduled origin: {opt_orig['SCHEDULED']['fills']} | News origin: {opt_orig['NEWS']['fills']} (not double-counted in News Stocks)",
+            f"Open {_fmt_money(sl['OPTIONS']['unrealized_pnl'], signed=True)}"
+            + (f" (+{sl['OPTIONS']['unrealized_unknown_count']} unmarked)" if sl['OPTIONS'].get('unrealized_unknown_count') else "")
+            + f" | Open Max Loss {self._fmt_option_risk(acc['open_option_max_loss'], acc.get('open_option_unknown_risk_count', 0))} "
+            f"({acc['open_option_max_loss_pct']:.1f}% of equity)\n"
+            f"  ↳ Scheduled origin: {opt_orig['SCHEDULED']['fills']} | News origin: {opt_orig['NEWS']['fills']} (not double-counted in News Stocks)"
+            + (f"\n  ↳ Adopted/legacy (excluded from strategy stats): {opt_orig['ADOPTED']['fills']} | "
+               f"Realized {_fmt_money(opt_orig['ADOPTED']['realized_pnl'], signed=True)} | "
+               f"Open {_fmt_money(opt_orig['ADOPTED']['unrealized_pnl'], signed=True)}"
+               if opt_orig.get('ADOPTED', {}).get('fills') else ""),
         ]
         if sl["LEGACY_REPAIR"]["open_count"] or sl["LEGACY_REPAIR"]["closed_count"]:
             sleeve_lines.append(

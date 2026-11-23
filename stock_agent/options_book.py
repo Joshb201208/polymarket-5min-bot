@@ -162,6 +162,27 @@ class Structure:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+def structure_mark(st: Structure, marks: Mapping[str, float | None]) -> float | None:
+    """Per-share value of the open structure from per-share leg marks, signed like
+    `entry_debit` (long legs add, short legs subtract). None if any leg is unmarked."""
+    total = 0.0
+    for leg in st.legs:
+        px = marks.get(leg.symbol)
+        if px is None:
+            return None
+        total += leg.sign * leg.ratio * float(px)
+    return round(total, 4)
+
+
+def open_pnl(st: Structure, mark: float | None) -> float | None:
+    """Unrealised dollars on the contracts still open: (value - entry) x 100 x qty.
+    Debit structures gain as value rises; credit structures (negative entry and value)
+    gain as the value moves back toward zero."""
+    if mark is None or st.entry_debit is None:
+        return None
+    return round((mark - st.entry_debit) * 100 * st.qty, 2)
+
+
 def new_structure_id() -> str:
     return f"os-{uuid.uuid4().hex[:12]}"
 
