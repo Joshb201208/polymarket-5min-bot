@@ -428,6 +428,14 @@ class FakeAlpaca(FakeService):
             self.set_price(symbol, price if price is not None else avg_entry_price)
         return p
 
+    def submit(self, body: dict) -> dict:
+        """Place an order directly (as if another client did). Raises on rejection."""
+        self._process(self.now())
+        r = self._submit(dict(body))
+        if r.status_code != 200:
+            raise ValueError(f"fake alpaca rejected order: {r.status_code} {r.json()}")
+        return r.json()
+
     def script_partial_fills(self, symbol: str, chunks: list[float]) -> None:
         """The next order on `symbol` fills in these quantity chunks, one per minute."""
         self.fill_scripts.setdefault(symbol, []).append(list(chunks))
