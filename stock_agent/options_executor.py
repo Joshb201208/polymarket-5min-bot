@@ -24,7 +24,6 @@ from stock_agent.options_models import OptionOrderType, OptionSide, OptionsPosit
 
 logger = logging.getLogger(__name__)
 
-_TRADING_BASE = "https://paper-api.alpaca.markets"
 
 
 class OptionsExecutor:
@@ -218,7 +217,7 @@ class OptionsExecutor:
     ) -> Optional[dict]:
         """Legacy DELETE-based close (kept for reference — rejected on paper)."""
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/positions/{contract_symbol}"
+        url = f"{Config.trading_base_url}/v2/positions/{contract_symbol}"
         params: dict = {}
         if qty is not None:
             params["qty"] = str(qty)
@@ -271,7 +270,7 @@ class OptionsExecutor:
             List of raw Alpaca position dicts where ``asset_class == "us_option"``.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/positions"
+        url = f"{Config.trading_base_url}/v2/positions"
 
         try:
             resp = await client.get(url, headers=self._auth_headers())
@@ -299,7 +298,7 @@ class OptionsExecutor:
         records or the server returns no more.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/account/activities"
+        url = f"{Config.trading_base_url}/v2/account/activities"
         collected: list[dict] = []
         page_token: Optional[str] = None
         try:
@@ -341,7 +340,7 @@ class OptionsExecutor:
             Alpaca position dict, or ``None`` if not found.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/positions/{contract_symbol}"
+        url = f"{Config.trading_base_url}/v2/positions/{contract_symbol}"
 
         try:
             resp = await client.get(url, headers=self._auth_headers())
@@ -368,7 +367,7 @@ class OptionsExecutor:
             List of Alpaca order dicts filtered to ``asset_class == "us_option"``.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/orders"
+        url = f"{Config.trading_base_url}/v2/orders"
 
         try:
             resp = await client.get(
@@ -390,7 +389,7 @@ class OptionsExecutor:
             ``True`` if cancelled successfully, ``False`` otherwise.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/orders/{order_id}"
+        url = f"{Config.trading_base_url}/v2/orders/{order_id}"
 
         try:
             resp = await client.delete(url, headers=self._auth_headers())
@@ -423,7 +422,7 @@ class OptionsExecutor:
             Alpaca response dict on success, ``None`` on failure.
         """
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/positions/{contract_symbol}/exercise"
+        url = f"{Config.trading_base_url}/v2/positions/{contract_symbol}/exercise"
 
         try:
             resp = await client.post(url, headers=self._auth_headers())
@@ -445,7 +444,7 @@ class OptionsExecutor:
     async def _submit_order(self, payload: dict, label: str = "") -> Optional[dict]:
         """POST to /v2/orders and return the response dict."""
         client = await self._get_client()
-        url = f"{_TRADING_BASE}/v2/orders"
+        url = f"{Config.trading_base_url}/v2/orders"
 
         try:
             resp = await client.post(url, json=payload, headers=self._auth_headers())
