@@ -181,3 +181,37 @@ def test_client_uses_security_config_urls():
                           market_data_url="https://data.alpaca.markets/", ALPACA_DATA_URL="https://x.example")
     c = AlpacaClient(key_id="k", secret="s", config=cfg)
     assert c.base_url == "https://paper-api.alpaca.markets" and c.data_url == "https://data.alpaca.markets"
+
+
+def test_account_margin_fields_are_decimal_and_none_safe():
+    from decimal import Decimal
+
+    from stock_agent.broker import Account
+
+    a = Account.model_validate({
+        "equity": "100000", "cash": "-5000", "buying_power": "380000", "multiplier": "4",
+        "regt_buying_power": "190000", "daytrading_buying_power": "380000",
+        "non_marginable_buying_power": "0", "options_buying_power": "0", "initial_margin": "52000",
+        "maintenance_margin": "31200", "last_maintenance_margin": "30000", "sma": "0"})
+    assert a.regt_buying_power == Decimal("190000") and isinstance(a.maintenance_margin, Decimal)
+    assert a.multiplier == Decimal("4") and a.margin_enabled_at_broker
+    # A13b: overnight basis only, never the 4x intraday figure
+    assert a.overnight_buying_power == Decimal("190000")
+    assert a.margin_excess == Decimal("68800")
+    assert a.margin_call is None
+    bare = Account.model_validate({"equity": "1000", "cash": "1000", "multiplier": "2"})
+    assert bare.regt_buying_power is None and bare.maintenance_margin is None and bare.sma is None
+    assert bare.overnight_buying_power is None and bare.margin_excess is None  # missing never reads as 0
+    cash = Account.model_validate({"equity": "1000", "cash": "800", "buying_power": "800", "multiplier": "1"})
+    assert cash.overnight_buying_power == Decimal("800")
+    with pytest.raises(ValueError):
+        Account.model_validate({"equity": "1", "cash": "1", "regt_buying_power": "NaN"})
+
+
+def test_insufficient_buying_power_error_is_recognised(world):
+    world.price("AAA", 50, spread=0.02)
+    world.alpaca.fail("/v2/orders", "status", method="POST", status=403,
+                      body={"code": 40310000, "message": "insufficient buying power"})
+    with pytest.raises(BrokerError) as e:
+        run(_client().submit_order(_buy("AAA", 1, limit=51)))
+    assert e.value.insufficient_buying_power and not e.value.retryable
