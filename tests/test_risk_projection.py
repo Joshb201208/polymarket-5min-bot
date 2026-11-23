@@ -238,6 +238,15 @@ def test_trim_and_exit_do_not_sell_shares_behind_a_short_call(risk):
     assert risk.evaluate_trade(book, option(kind=TradeKind.COVERED_CALL)).reasons == ("covered_calls_deferred",)
 
 
+def test_hedging_long_call_is_not_counted_as_stock_coverage(risk):
+    short = leg("ALFA", -2)
+    hedge = replace(short, occ_symbol="ALFA-long-option", strike=D(90), qty=D(1))
+    book = snapshot(stock("ALFA", 120, "Industrials"), legs=(short, hedge))
+    # One contract is hedged by the long leg; the remaining contract needs 100 shares.
+    assert risk.evaluate_trade(book, TradeIntent(TradeKind.SELL, "ALFA", D(20))).ok
+    assert not risk.evaluate_trade(book, TradeIntent(TradeKind.SELL, "ALFA", D(21))).ok
+
+
 def test_any_unexpected_short_blocks_buys_but_not_funded_cover(risk):
     book = snapshot(stock("ALFA", -2, "Industrials"), cash="250")
     assert risk.evaluate_trade(book, buy("BETA")).reasons == ("unexpected_short",)
