@@ -1,12 +1,19 @@
+# Local environment & editor secrets (never commit)
 .env
+.env.*
+!.env.example
+.mcp.json
+
+# Runtime state & rotating logs
 data/
+*.log
+
+# Python bytecode & virtualenvs
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
-*.log
-dashboard/data/
 
 # Test and lint caches
 .pytest_cache/
