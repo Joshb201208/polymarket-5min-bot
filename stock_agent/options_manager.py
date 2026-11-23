@@ -184,6 +184,7 @@ class OptionsManager:
         self._risk_controls = risk_controls or (lambda: RiskControls())
         self._bad_marks: set[str] = set()
         self._capital_lock = capital_lock
+        self._closed_queue: list[str] = []
         self._ex_dividend = ex_dividend
         self.journal = journal
         self.alerts = alerts
@@ -292,6 +293,40 @@ class OptionsManager:
             self.journal.append(kind, **fields)
         except Exception:  # journal never blocks trading
             logger.exception("journal append failed for %s", kind)
+
+    async def _notify(self, method: str, **kw: Any) -> bool:
+        """Use AlertService's typed hook when it has one. True if delivered."""
+        fn = getattr(self.alerts, method, None) if self.alerts is not None else None
+        if fn is None:
+            return False
+        try:
+            await _maybe(fn(**kw))
+            return True
+        except Exception:
+            logger.exception("alert hook %s failed", method)
+            return False
+
+    def _legs_summary(self, st: Structure) -> str:
+        return " / ".join(f"{'+' if lg.side == 'buy' else '-'}{lg.ratio} {lg.type} {lg.strike:g}" for lg in st.legs) \
+            + f" exp {st.expiry}"
+
+    async def _rejected(self, st_or_symbol: Any, side: str, qty: int, reason: str, title: str, key: str) -> None:
+        sym = st_or_symbol if isinstance(st_or_symbol, str) else st_or_symbol.underlying
+        if not await self._notify("alert_order_rejected", symbol=sym, side=side, qty=qty, reason=reason,
+                                  asset_class="option"):
+            await self._alert("critical", title, reason, key=key)
+
+    async def _flush_closed(self, now: datetime) -> None:
+        while self._closed_queue:
+            st = self.get(self._closed_queue.pop(0))
+            if st is not None:
+                await self._closed_alert(st, now)
+
+    async def _closed_alert(self, st: Structure, now: datetime) -> None:
+        held = (now - (_parse_ts(st.opened_at) or now)).days if st.opened_at else None
+        await self._notify("send_option_structure_closed", underlying=st.underlying, strategy=st.strategy,
+                           legs_summary=self._legs_summary(st), realized_pnl=st.realized_pnl,
+                           exit_reason=st.exit_reason or "", held_days=held)
 
     async def _alert(self, severity: str, title: str, body: str, key: str | None = None) -> None:
         logger.log({"critical": logging.ERROR, "error": logging.ERROR, "warning": logging.WARNING}.get(severity, logging.INFO), "%s: %s", title, body)
@@ -481,7 +516,8 @@ class OptionsManager:
         spot, why = await self._spot_now(sym, now)
         if spot is None:
             return ScanOutcome(sym, None, f"underlying {why}", final=False)
-        # ---- research gate
+        # ---- research gate (at a time no earlier than the quote just fetched)
+        now = max(now, self._now())
         el = await _maybe(self.gate.is_entry_eligible(sym, now))
         if not el.ok:
             return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
@@ -645,8 +681,8 @@ class OptionsManager:
                 st.state = StructState.VOID.value
                 st.note(f"open rejected: {e.message}")
                 self._save()
-                await self._alert("critical", f"Options open rejected: {st.underlying}", e.message,
-                                  key=f"opt-open-{st.id}")
+                await self._rejected(st, "buy", st.qty, e.message, f"Options open rejected: {st.underlying}",
+                                     key=f"opt-open-{st.id}")
                 return ScanOutcome(st.underlying, None, f"order rejected: {e.message}")
             st.open_order_id = order.id
             self._save()
@@ -660,9 +696,16 @@ class OptionsManager:
                     direction=st.direction, qty=st.qty, entry_debit=st.entry_debit, max_loss=st.max_loss,
                     width=st.width, expiry=st.expiry, thesis_id=st.thesis_id, greeks=st.entry_greeks,
                     conviction=st.conviction, source=st.source)
-            await self._alert("info", f"Options opened: {st.underlying} {st.strategy}",
-                              f"{st.qty} x {st.expiry}, debit {st.entry_debit:.2f}, max loss {st.max_loss:.0f}",
-                              key=f"opt-open-{st.id}")
+            max_profit = (round((st.width - st.entry_debit) * MULTIPLIER * st.qty, 2)
+                          if st.width is not None and st.entry_debit is not None else None)
+            if not await self._notify(
+                    "send_option_structure_opened", underlying=st.underlying, strategy=st.strategy,
+                    legs_summary=self._legs_summary(st), debit_total=round((st.entry_debit or 0) * MULTIPLIER * st.qty, 2),
+                    max_loss=st.max_loss, max_profit=max_profit, expiry=st.expiry, conviction=st.conviction,
+                    origin="NEWS" if st.source == "news" else "SCHEDULED", reason=st.thesis_id or ""):
+                await self._alert("info", f"Options opened: {st.underlying} {st.strategy}",
+                                  f"{st.qty} x {st.expiry}, debit {st.entry_debit:.2f}, max loss {st.max_loss:.0f}",
+                                  key=f"opt-open-{st.id}")
             return ScanOutcome(st.underlying, st.id, "opened")
         if st.st is StructState.PENDING:
             return ScanOutcome(st.underlying, None, "open order still working", final=False)
@@ -838,6 +881,7 @@ class OptionsManager:
             if sid not in self.meta.get("journaled_unknown", []):
                 self._j("options.reconcile_unknown", structure_id=sid)
         self.meta["journaled_unknown"] = rep.unknown
+        await self._flush_closed(now)
         return rep
 
     def _resolve_missing(self, st: Structure, broker_qty: dict[str, int], ev: dict, rep: ReconcileReport,
@@ -896,6 +940,7 @@ class OptionsManager:
                 reason=st.exit_reason, realized_pnl=st.realized_pnl, exit_credit=st.exit_credit,
                 entry_debit=st.entry_debit, evidence={k: v[1] for k, v in values.items()},
                 thesis_id=st.thesis_id)
+        self._closed_queue.append(st.id)
 
     def _record_result(self, st: Structure, now: datetime) -> None:
         if st.realized_pnl is None:
@@ -1009,8 +1054,13 @@ class OptionsManager:
         broken = False
         if st.dir is not None:
             try:
-                el = await _maybe(self.gate.is_entry_eligible(st.underlying, now))
-                broken = breaks_thesis(st.dir, getattr(el, "direction", None))
+                el = await _maybe(self.gate.is_entry_eligible(st.underlying, max(now, self._now())))
+                # only a fresh, healthy opposite view breaks the thesis; stale or
+                # unhealthy research never closes a position (price and time exits still run)
+                reasons = " ".join(str(r) for r in (getattr(el, "reasons", ()) or ())).lower()
+                trusted = getattr(el, "generated_at", None) is not None and not any(
+                    w in reasons for w in ("stale", "health", "unavailable", "missing", "invalid", "insufficient"))
+                broken = trusted and breaks_thesis(st.dir, getattr(el, "direction", None))
             except Exception:
                 broken = False
         x = ExitInputs(
@@ -1132,14 +1182,15 @@ class OptionsManager:
                 st.close_attempts += 1
                 st.note(f"close rejected: {e.message}")
                 self._save()
-                await self._alert("critical", f"Options close rejected: {st.underlying}", e.message,
-                                  key=f"opt-close-{st.id}")
+                await self._rejected(st, "close", st.qty, e.message, f"Options close rejected: {st.underlying}",
+                                     key=f"opt-close-{st.id}")
                 return f"rejected: {e.message}"
             st.close_order_id = order.id
             self._save()
             order = await self._wait_or_cancel(order)
             self._apply_close_order(st, order, now, fallback_state=fallback, count_attempt=False)
             self._save()
+            await self._flush_closed(now)
             status = order.status
             if st.st is StructState.CLOSED:
                 return status
@@ -1164,6 +1215,7 @@ class OptionsManager:
                     reason=st.exit_reason, entry_debit=st.entry_debit, exit_credit=st.exit_credit,
                     realized_pnl=st.realized_pnl, qty=st.qty, thesis_id=st.thesis_id,
                     held_days=(now - (_parse_ts(st.opened_at) or now)).days)
+            self._closed_queue.append(st.id)
             return
         if filled > 0:
             # part of the structures closed: keep the rest open with the same entry debit
@@ -1209,8 +1261,8 @@ class OptionsManager:
             except BrokerError as e:
                 if e.uncertain:
                     raise OptionsError(f"buy to close {contract}: outcome unknown ({e})") from e
-                await self._alert("critical", f"Options buy-to-close rejected: {contract}", e.message,
-                                  key=f"opt-bsc-{contract}")
+                await self._rejected(contract, "buy", qty, e.message, f"Options buy-to-close rejected: {contract}",
+                                     key=f"opt-bsc-{contract}")
                 return CloseResult(False, 0, None, None, "rejected", e.message)
             try:
                 order = await self._wait_or_cancel(order)
@@ -1227,9 +1279,11 @@ class OptionsManager:
                     st.exit_credit = -(order.filled_avg_price or 0.0)
                     if st.entry_debit is not None and order.filled_avg_price is not None:
                         st.realized_pnl = st.final_pnl(st.exit_credit)
+                    self._closed_queue.append(st.id)
             self._save()
             self._j("options.closed", contract=contract, reason="normalise_short_call", filled_qty=filled,
                     avg_price=order.filled_avg_price, status=order.status)
+            await self._flush_closed(now)
             return CloseResult(done, filled, order.filled_avg_price, order.id, order.status,
                                "" if done else f"order ended {order.status}")
 

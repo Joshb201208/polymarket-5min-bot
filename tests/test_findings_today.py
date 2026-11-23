@@ -143,32 +143,26 @@ def test_F_07_01_unreadable_state_is_not_an_empty_book(world, tmp_path, monkeypa
     assert snap is not None and snap.holding("AAA") is not None, "sized a trade on a book without AAA"
 
 
-def test_F_04_01_spread_not_recorded_when_a_leg_fails(world, monkeypatch):
-    # Fixed: the scheduler no longer uses the legacy per-leg path; OptionsManager sends one
-    # atomic mleg order (see tests/test_options_manager.py for leg-level coverage).
-    from stock_agent.options_models import OptionSide, OptionsSignal, OptionsStrategy, OptionType
+def test_F_04_01_spread_not_recorded_when_a_leg_fails(world, tmp_path):
+    # Fixed: the scheduler's options scan goes through OptionsManager, which sends a spread
+    # as one atomic mleg order and records it only from the broker's fills.
+    from stock_agent.options_manager import OptionsManager
+    from tests.options_support import EXP, StubGate, make_manager, seed_chain
 
     world.clock.set_et(2026, 11, 23, 10, 0)
-    exp = date(2026, 12, 18)
-    world.price("AAA", 100.0)
-    world.alpaca.add_option_chain("AAA", exp, [100, 110])
-    long_c, short_c = occ_symbol("AAA", exp, "call", 100), occ_symbol("AAA", exp, "call", 110)
-    world.alpaca.set_option_quote(long_c, 4.0, 4.2)
-    world.alpaca.set_option_quote(short_c, 1.0, 1.1)
+    seed_chain(world)
+    long_c, short_c = occ_symbol("AAA", EXP, "call", 100), occ_symbol("AAA", EXP, "call", 105)
+    gate = StubGate()
+    gate.set("AAA")
     sched = world.scheduler()
-    signal = OptionsSignal(
-        strategy=OptionsStrategy.BULL_CALL_SPREAD, underlying_symbol="AAA", underlying_price=100.0,
-        contract_symbol=long_c, option_type=OptionType.CALL, side=OptionSide.BUY, target_strike=100,
-        leg2_contract_symbol=short_c, leg2_option_type=OptionType.CALL, leg2_side=OptionSide.SELL,
-        leg2_target_strike=110, qty=1, max_debit_per_contract=3.2,
-    )
-
-    async def one_signal(**kw):
-        return [signal]
-
-    monkeypatch.setattr(sched.options_engine, "scan_opportunities", one_signal)
+    sched.options = make_manager(world, tmp_path, gate=gate)
+    assert isinstance(sched.options, OptionsManager)
+    world.alpaca.fail("/v2/orders", "status", method="POST", status=422, times=None,
+                      body={"code": 42210000, "message": "leg rejected"})
     run(sched._run_options_scan())
+    sent = [r.json for r in world.orders_sent()]
+    assert sent and all(b.get("order_class") == "mleg" for b in sent), "spread legs sent separately"
     held = [s for s in (long_c, short_c) if world.alpaca.position(s)]
     assert len(held) != 1, "broker holds one leg of a spread"
-    recorded = sched.options_portfolio.open_position_count > 0
+    recorded = bool(sched.options.live())
     assert recorded == (len(held) == 2), "spread recorded as open without both legs at the broker"

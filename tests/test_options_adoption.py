@@ -291,3 +291,52 @@ def test_renamed_underlying_is_not_traded(world, tmp_path):
     m._spot = lambda sym: SimpleNamespace(symbol="AAAN", price=100.0, as_of=world.clock.now())
     out = run(m.scan())
     assert out[0].opened is None and "AAAN" in out[0].reason and world.orders_sent() == []
+
+
+class TypedAlerts:
+    def __init__(self):
+        self.calls = []
+
+    def send_option_structure_opened(self, **kw):
+        self.calls.append(("opened", kw))
+
+    def send_option_structure_closed(self, **kw):
+        self.calls.append(("closed", kw))
+
+    def alert_order_rejected(self, symbol, side, qty, reason, asset_class="stock"):
+        self.calls.append(("rejected", dict(symbol=symbol, side=side, qty=qty, reason=reason, asset_class=asset_class)))
+
+    def alert(self, *a, **k):
+        self.calls.append(("alert", a))
+
+
+def test_typed_alert_hooks(world, tmp_path):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA")
+    m = make_manager(world, tmp_path, gate=gate)
+    m.alerts = TypedAlerts()
+    st = m.get(run(m.scan())[0].opened)
+    kinds = [k for k, _ in m.alerts.calls]
+    assert "opened" in kinds
+    opened = dict(m.alerts.calls)["opened"]
+    assert opened["underlying"] == "AAA" and opened["origin"] == "SCHEDULED" and opened["max_loss"] == st.max_loss
+    world.clock.set_et(2026, 12, 22, 10, 0)
+    seed_chain(world)
+    run(m.monitor())
+    closed = [kw for k, kw in m.alerts.calls if k == "closed"]
+    assert closed and closed[0]["exit_reason"] == "time_exit" and closed[0]["realized_pnl"] == st.realized_pnl
+
+
+def test_typed_rejection_hook(world, tmp_path):
+    world.clock.set_et(2026, 11, 23, 10, 0)
+    seed_chain(world)
+    gate = StubGate()
+    gate.set("AAA")
+    m = make_manager(world, tmp_path, gate=gate)
+    m.alerts = TypedAlerts()
+    world.alpaca.fail("/v2/orders", "status", method="POST", status=403, body={"code": 40310000, "message": "no"})
+    run(m.scan())
+    rej = [kw for k, kw in m.alerts.calls if k == "rejected"]
+    assert rej and rej[0]["asset_class"] == "option" and rej[0]["symbol"] == "AAA"
