@@ -1416,8 +1416,7 @@ class StockAgentScheduler:
                 task.cancel()
 
         seen = set()
-        dynamic = ("data_feed", "screener", "telegram", "discord", "macro",
-                   "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
+        dynamic = ("telegram", "discord", "macro", "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
         for name in dynamic:
             resource = getattr(self, name, None)
             if resource is None or id(resource) in seen:
