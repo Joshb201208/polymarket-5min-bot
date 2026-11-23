@@ -136,6 +136,13 @@ class ResearchSources:
         return {symbol: tuple(sorted(rows, key=lambda e: e.published_at or e.retrieved_at, reverse=True)[:6])
                 for symbol, rows in result.items()}
 
+    async def refresh_entry_inputs(self, symbol: str, now: datetime) -> None:
+        """Revalidate after model latency without replacing the analysis price."""
+        if not self.quote_ok(symbol, now):
+            await self._quotes((symbol,), purpose="order_sizing")
+        if not self.news_ok(symbol, now):
+            await self.background((symbol,))
+
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
         if self.fetch_releases is None:
             return ()
