@@ -1,0 +1,386 @@
+# Revamp plan
+
+## Goals
+
+The revamped bot will actively trade stocks, defined-risk option structures, and live market-hours news reactions on the paper account so the owner can learn, react to market themes such as artificial intelligence and bear-market swings, and pursue real returns with sized, transparent risk. Every trade will obey strict mechanical guardrails: stocks are long-only with zero margin borrowing, broker-side stop orders are the single stop-loss owner, defined-risk options exit before expiry day, and the local ledger reconciles continuously against the broker. Research and intraday news reactions will run cleanly on the subscriptions that work today, incorporate an owner focus list, and halt new entries loudly whenever required market data, news, or AI services are unhealthy. Daily and weekly Discord briefings will report honest broker-verified returns alongside QQQ and SPY benchmarks, full option profit and loss, and the live status of every data source. Done means the first-run account clean-up finishes automatically, every offline and continuous-integration check passes, and the bot completes live paper trading cycles with zero silent failures, zero unintended short stock positions, and books that match the broker to the penny.
+
+## Decisions recorded
+
+On 2026-11-23 the owner delegated the 27 audit technical and operational decisions to the engineering lead and stated his risk appetite for the paper account: the account exists to learn and grow by actively trading stocks, defined-risk options, and live news reactions (including emerging artificial intelligence and bear-market developments once the revamp is in place) using sized risk limits rather than pausing trading, while enforcing strict mechanical accuracy and safety. The table below records the binding decision taken on each of the 27 audit questions.
+
+| # | Question from the audit | Josh's decision | Date |
+| --- | --- | --- | --- |
+| 1 | Exposed credentials and repository visibility | Remove all exposed keys and `.mcp.json` from tracked files, clean `.env.example`, redact keys in logs, and do not rewrite git history; the owner will revoke exposed tokens at their providers, and the repository remains compatible with public hosting until a deploy key is added. | 2026-11-23 |
+| 2 | Holiday and early-close calendar | Build a dedicated market-calendar check backed by the broker's live clock and holiday/early-close calendar, refusing to authorise any order when the live broker clock cannot be verified. | 2026-11-23 |
+| 3 | Market data source for live prices | Switch live stock quotes and daily price bars to the broker's market-data feed, stop hammering failing third-party endpoints, and block new entries with a Discord alert whenever required quotes or news are unhealthy. | 2026-11-23 |
+| 4 | Options module on day one | Keep options enabled by default in `defined_risk` mode (`off` and `close_only` also work) for four debit strategies only—bull call spread, bear put spread, long call, and long put—using atomic multi-leg limit orders, tightened loss caps, and exits at least two trading days before expiry. | 2026-11-23 |
+| 5 | Stop-loss ownership | Make a broker good-til-cancelled stop order placed after fill confirmation for the exact filled share count the sole stop-loss owner, and remove the duplicate software stop-sell path. | 2026-11-23 |
+| 6 | Short selling | Keep stock trading strictly long-only with no short stock (expressing bearish views via put options), and on first run automatically enable the broker's no-shorting setting and buy to cover the two existing accidental short stock positions. | 2026-11-23 |
+| 7 | Minimum conviction to buy | Require at least 7 out of 10 on both the raw AI score and the adjusted score in normal markets, and at least 8 out of 10 in cautious markets, on live-news stock buys, and on all option entries. | 2026-11-23 |
+| 8 | Score inflation after the AI call | Cap post-model conviction adjustments to at most plus or minus 1 point, and forbid any adjustment from lifting a raw score below 7 over the entry floor. | 2026-11-23 |
+| 9 | Buying power on a margin account | Forbid margin borrowing: size positions from equity and require projected post-trade cash—after subtracting cash reserved for open buy orders and option obligations—to stay at or above 2% of equity. | 2026-11-23 |
+| 10 | Sector and cluster caps on every path | Keep today's portfolio caps (15% per issuer, 40% per sector, 48% per named cluster, 20 stock names, 100% gross long exposure) and enforce every cap on the projected portfolio after the trade across all stock buys and top-ups. | 2026-11-23 |
+| 11 | Model-driven exits | Require a second independent blind AI confirmation (from another healthy provider, or a distinct model on the same provider marked degraded) before executing any news- or thesis-driven exit, capped at 4 model-driven exits per session while hard stops stay uncapped. | 2026-11-23 |
+| 12 | Out-of-hours exit signals | Save any confirmed exit decided outside regular trading hours in the persistent order queue and execute it after the next regular session opens. | 2026-11-23 |
+| 13 | Order type for stock buys | Place stock buys as marketable limit orders sized from a fresh live quote, never during the first 5 minutes after open or the final 10 minutes before close, and skip signals older than 96 hours or more than 3% away from their reference price. | 2026-11-23 |
+| 14 | Mid-day market-regime flips and live news | Poll fresh news every few minutes during market hours for live news-driven exits, stock buys, and bearish option trades under strict gates, while a market-regime change by itself never trades and only adjusts thresholds and sends an alert. | 2026-11-23 |
+| 15 | Stop distance and trailing stops | Set each initial stop from 14-day stock volatility (`2.5` times average daily range, clamped between 7% and 12%, defaulting to 7% with a note if bars are missing), cap position size so loss at the stop is at most 1.0% of equity, and use fixed stops in v1 while recording shadow stop comparisons in the journal. | 2026-11-23 |
+| 16 | Silent failures when the bot dies | Use Discord as the single required alert channel with severity levels, deduplication, and a persistent retry queue, paired with optional external heartbeat URL pings and zero-configuration liveness monitoring. | 2026-11-23 |
+| 17 | Automatic deploys every ten minutes | Keep deploys self-installing in place at the existing server directory and user, restarting only when GitHub Actions checks passed, the market is closed with at least 30 minutes before open, no hold file is present, and a post-start health check passes (rolling back automatically if it fails). | 2026-11-23 |
+| 18 | Emergency pause switch | Provide a pause setting and hold file (plus stretch Discord commands) that block new entries while keeping reconciliation, stops, and exits running, and ensure the updater never starts an intentionally stopped service. | 2026-11-23 |
+| 19 | Corrupt state file handling | Replace scattered state files with one validated database and automated backups; if state cannot be read, quarantine the file, alert on Discord, rebuild from the broker while holding orders, and resume automatically after a clean reconciliation. | 2026-11-23 |
+| 20 | Droplet git access if repo goes private | Preserve unauthenticated git pulls while the repository stays public and provide step-by-step read-only deploy-key instructions if the owner later makes the repository private. | 2026-11-23 |
+| 21 | Who placed the eight stop orders at 04:01 ET on 27 April | Clean up resulting position and stop mismatches automatically on first run and attach deterministic bot client identifiers to every new order so non-bot orders are unmistakable in future audits. | 2026-11-23 |
+| 22 | Unwinding the existing 0.5 fractional share | Sell the existing half-share remainder automatically during the first-run normalisation routine at 5 minutes after the next regular market open. | 2026-11-23 |
+| 23 | Fifteen unstopped long positions today | Place broker good-til-cancelled stop orders automatically on every open whole-share long position from its current market price during first-run normalisation and watch them on every monitoring cycle. | 2026-11-23 |
+| 24 | Fixing broken data and AI subscriptions | Run immediately on working broker quotes/news, Finnhub news, and OpenAI (routing across Perplexity, OpenAI, and Anthropic within a USD 15 weekly research budget with 20% reserved for exit confirmations), while degrading optional broken feeds cleanly until topped up. | 2026-11-23 |
+| 25 | Single holding at 33.6% of equity with an open short call | On first run, automatically buy back the short call first and then trim the oversized stock holding to the 15% cap; going forward, auto-trim passive drift after two closes more than 2 percentage points above a cap and trim option-delivery breaches at the next session. | 2026-11-23 |
+| 26 | Telegram notifications | Leave Telegram optional and off by default with no repeated log warnings when unset, routing all alerts and summaries through Discord. | 2026-11-23 |
+| 27 | Minimum conviction in normal markets | Use a single minimum conviction floor of 7 out of 10 in normal markets and 8 out of 10 in cautious markets, live-news entries, and options—retiring the code path that accepted conviction 6. | 2026-11-23 |
+
+## Principles for ordering
+
+1. **Build offline test doubles and continuous-integration guardrails first** so every subsequent trading, accounting, options, and deployment change is proven offline without touching live broker or paid data services.
+2. **Stop information leaks and deploy hazards early** by scrubbing credentials from files and logs, locking paper versus live broker settings, and gating the 10-minute server updater before new trading logic ships.
+3. **Make the broker book and local ledger trustworthy before changing strategy** so reconciliation, fill polling, single-owner broker stops, and first-run account normalisation eliminate phantom profits and accidental short stock.
+4. **Enforce risk, data-health, and cash-reserve gates underneath active trading** so stocks, four defined-risk option strategies, live news reactions, and the owner focus list can trade actively within clear, tested loss boundaries.
+5. **Ensure zero manual server intervention at cut-over** by keeping code defaults operational with only the environment variables already present on the server today and keeping each item small enough to review and roll back cleanly.
+
+## Items
+
+### Area: Test harness
+
+### R-01: Build offline fake broker, market-data, news, and AI test doubles
+- Fixes: F-10-01, F-10-14, F-10-15
+- Why: Nearly all trading, option, reconciliation, and failure paths previously had zero automated tests, allowing silent crashes and double sales to reach production.
+- Change: Provide an in-memory simulated broker, simulated market clock, and controllable fake price, news, fundamental, AI, and Discord services so tests can replay delayed fills, partial fills, wash-trade rejections, multi-leg options, expired stops, corrupt files, and provider outages completely offline.
+- Files likely touched: `tests/conftest.py`, `tests/fakes/__init__.py`, `tests/fakes/base.py`, `tests/fakes/clock.py`, `tests/fakes/alpaca.py`, `tests/fakes/providers.py`, `tests/fakes/world.py`, `tests/test_fakes_base.py`, `tests/test_fakes_clock.py`, `tests/test_fakes_alpaca.py`
+- Trading behaviour change: None
+- Risk limits touched: None
+- Tests: Self-tests verify realistic broker share reservation on open stop orders, wash-trade HTTP 403 rejections, multi-leg option fills, simulated clock progression, HTTP fault injection, and a hard block against real network sockets during test runs.
+- New environment variables: None
+- Rollback: Revert the test-only files; production runtime does not import them.
+- Depends on: None
+- Size: L
+
+### R-02: Enforce automated tests, lint checks, type checks, and secret scanning in GitHub Actions
+- Fixes: F-10-13
+- Why: Existing continuous integration checked only syntax errors and missed broken attribute lookups, unused imports, and committed credentials.
+- Change: Expand the `test` workflow in GitHub Actions to install pinned dependencies, run the full offline test suite, run broader lint and static attribute checks across `stock_agent/`, and scan commits for accidentally added secrets so broken or unsafe code can never be deployed by the server updater.
+- Files likely touched: `.github/workflows/ci.yml`, `.gitleaks.toml`, `pyproject.toml`, `requirements-dev.txt`
+- Trading behaviour change: None
+- Risk limits touched: None
+- Tests: Deliberately introducing a missing method reference, an unformatted import, or a fake token pattern in a test branch fails the workflow before merge.
+- New environment variables: None
+- Rollback: Revert `.github/workflows/ci.yml` to the prior test step while keeping existing tests running.
+- Depends on: R-01
+- Size: S
+
+### Area: Security and configuration
+
+### R-03: Remove exposed repository credentials, clean environment templates, and redact secrets from logs
+- Fixes: F-05-15, F-06-03, F-06-07, F-08-03, F-08-12, F-09-01, F-09-02, F-09-08, F-09-10, F-09-13, F-10-06
+- Why: Tracked files contained real API tokens and historical trade details, `.env.example` mixed 78 obsolete variables from an older project with active settings, and HTTP request logging wrote raw API keys into server logs tens of thousands of times.
+- Change: Remove all hardcoded credentials, private trade-loss comments, and `.mcp.json` (ignoring `.mcp.json` in `.gitignore`), replace `.env.example` with a clean stock-bot template containing empty secret placeholders, honour the configured log level, quiet verbose third-party HTTP request logs, and install a global log redactor that scrubs API keys and tokens from all console and rotating file logs.
+- Files likely touched: `.env.example`, `.gitignore`, `stock_agent/config.py`, `stock_agent/tipranks_client.py`, `stock_agent/logging_setup.py`
+- Trading behaviour change: None
+- Risk limits touched: None
+- Tests: Automated scans verify zero non-empty secret defaults exist in code or `.env.example`, every `.env.example` variable maps to a valid setting, and simulated HTTP errors on URLs carrying query-string or path tokens write `[REDACTED]` instead of the secret in every log output.
+- New environment variables: Optional `STOCK_LOG_LEVEL` (defaults to `INFO`; also honours legacy `LOG_LEVEL` if present).
+- Rollback: Revert logging and template changes; never restore hardcoded secret values.
+- Depends on: None
+- Size: M
+
+### R-04: Validate settings at startup, lock paper versus live broker endpoints, pin dependencies, and update docs
+- Fixes: F-01-05, F-02-14, F-03-14, F-09-03, F-09-11, F-10-05, F-10-10, F-10-11, F-10-12, F-11-12
+- Why: `STOCK_AGENT_MODE` was only a display label while broker URLs determined whether real money moved, unvalidated environment numbers could silently multiply risk caps by 100 or crash on import, dependencies were unpinned, and `README.md` described features that did not match reality.
+- Change: Validate all configuration values at startup while remaining backward-compatible with every variable currently set on the server (ignoring leftover Polymarket variables safely). Refuse to start if `STOCK_AGENT_MODE` (`PAPER` versus `LIVE`) disagrees with `ALPACA_BASE_URL` or if `LIVE` mode lacks a second explicit confirmation flag, reject out-of-range risk percentages, pin all Python 3.12 runtime dependencies without heavy packages, remove dead helper functions, and rewrite `README.md` in plain language with the owner security checklist.
+- Files likely touched: `stock_agent/config.py`, `requirements.txt`, `requirements-dev.txt`, `README.md`, `CLAUDE.md`
+- Trading behaviour change: None in paper mode when configured consistently; startup now halts immediately with a clear error message instead of trading if paper/live settings conflict or risk percentages are malformed.
+- Risk limits touched: None (existing defaults stay identical, with `OPTIONS_MODE` defaulting to `defined_risk` per Decision 4 and percentage bounds checked between 0 and 1).
+- Tests: Startup tests confirm the exact variable set currently on the server loads cleanly in paper mode, `PAPER` mode paired with a live broker URL fails immediately, `LIVE` mode without `STOCK_AGENT_LIVE_CONFIRMED` fails immediately, `MAX_POSITION_PCT=15` fails validation, and `requirements.txt` contains pinned versions with no heavy data-science libraries.
+- New environment variables: Optional `STOCK_AGENT_LIVE_CONFIRMED` (defaults to `false`; only needed if ever switching to live trading) and optional `ANTHROPIC_API_KEY` (already present on the server and now wired).
+- Rollback: Revert `config.py`, `requirements.txt`, and documentation together.
+- Depends on: R-03
+- Size: M
+
+### Area: State and ledger
+
+### R-05: Move local state to a single validated database with migration, backups, and safe broker rebuild
+- Fixes: F-05-17, F-07-01, F-07-11, F-07-12, F-07-13, F-07-15
+- Why: Local portfolio and option records lived in separate unbacked JSON files where a corrupted write silently reset the portfolio to a blank starting balance, mixed UTC and New York dates, and overwrote original entry theses during later reviews.
+- Change: Store all positions, option structures, theses, order intents, job markers, close marks, and drawdowns in one atomic local database (`state.db`) using New York market dates, daily rolling backups, and immutable entry theses separate from later review notes. Coordinate startup preparation through `state_boot.py` (migrating legacy JSON stock and option files automatically on first startup while keeping the legacy `Portfolio` object strictly as an in-memory read view that never writes JSON again); if `state.db` is ever unreadable, quarantine the broken file, send a critical Discord alert, hold order placement while rebuilding holdings from the broker, and resume automatically after one clean reconciliation.
+- Files likely touched: `stock_agent/state_store.py`, `stock_agent/state_boot.py`, `stock_agent/ledger.py`, `stock_agent/migrate_v0.py`, `stock_agent/models.py`, `stock_agent/portfolio.py`
+- Trading behaviour change: Yes: unreadable local state never invents an empty account or double-buys held stocks; orders pause briefly while the book rebuilds from the broker and then resume automatically once verified clean.
+- Risk limits touched: None
+- Tests: Migration tests prove existing JSON state converts cleanly and idempotently; corruption tests verify a truncated database is quarantined, orders are held during broker rebuild, and trading resumes after a clean reconciliation; thesis tests verify entry theses stay unchanged across reviews and enforce the 96-hour freshness rule for new entries.
+- New environment variables: None
+- Rollback: Restore the preserved pre-migration JSON files from disk and revert to the previous commit while markets are closed.
+- Depends on: R-01, R-04
+- Size: L
+
+### R-06: Reconcile continuously against the broker, ingest real account activities, and compute honest return marks
+- Fixes: F-01-09, F-05-07, F-06-12, F-07-03, F-07-05, F-07-06, F-07-07, F-07-08, F-07-10, F-07-14, F-11-01, F-11-03, F-11-04, F-11-05, F-11-06, F-11-08, F-11-16
+- Why: The old bot reconciled only once at startup, wiped local position metadata on transient broker errors, missed broker stop-outs and dividends, accepted zero or missing prices, grew its trade file without bound, and misreported portfolio returns by 12 percentage points.
+- Change: Reconcile positions, open orders, cash, and broker account activities (fills, dividends, fees, corporate symbol renames, and option exercises/assignments/expiries) at startup, before every order batch, on every monitoring cycle, and before daily reports—aborting without touching local state if a broker read fails. Reject zero, negative, or missing price and pre-market option marks, record one verified New York market-close equity mark per trading day (never trusting the broker's broken `portfolio_history` or `last_equity` fields), and append every thesis, trade decision, fill, reconciliation diff, and shadow stop comparison (`7%`, `10%`, `12%`, and `no-stop`) to a monthly-rotated journal.
+- Files likely touched: `stock_agent/reconcile.py`, `stock_agent/performance.py`, `stock_agent/journal.py`, `stock_agent/ledger.py`
+- Trading behaviour change: Yes: risk checks and exit monitoring always act on the true broker book including fractional shares, accidental shorts, and broker-triggered stop fills rather than stale local records.
+- Risk limits touched: None
+- Tests: Simulated broker tests prove failed position reads leave local theses untouched, broker stop fills and symbol renames update cost basis and realized profit accurately, zero or missing marks cannot zero out portfolio value, daily return matches live equity minus the prior session's verified close mark, and the journal rotates cleanly without bloating active state.
+- New environment variables: None
+- Rollback: Revert reconciliation and performance modules together with `R-05`.
+- Depends on: R-05, R-07
+- Size: L
+
+### Area: Broker execution and first-run normalisation
+
+### R-07: Create one shared broker client that fails loudly, tags every order, and blocks accidental short sales
+- Fixes: F-03-04, F-03-06, F-03-15, F-03-16, F-08-06, F-10-04
+- Why: Four modules previously talked to the broker independently, swallowed connection errors as empty position lists, sent untagged orders that could duplicate on timeout, and submitted plain sell orders capable of opening unintended short stock positions.
+- Change: Route all broker calls through `stock_agent/broker.py`, raising explicit errors on any timeout, HTTP error, or malformed response instead of returning empty data. Attach a deterministic client order ID to every order, look up existing orders by client ID before retrying a timeout, support reading and setting account `no_shorting`, and enforce a hard sell guard at the broker boundary so stock sales always specify `sell_to_close` for whole shares never exceeding the broker's available unlocked share count (`qty_available`), while permitting `buy_to_close` only to cover an existing accidental short.
+- Files likely touched: `stock_agent/broker.py`, `stock_agent/executor.py`
+- Trading behaviour change: Yes: broker outages immediately halt order placement instead of looking like an empty account, and the broker client refuses any stock sell order that could exceed available shares or open a short position.
+- Risk limits touched: Yes: accidental short stock exposure goes from unconstrained on duplicate sells to hard-blocked (`0` new short shares).
+- Tests: Fault-injection tests prove HTTP 500/429 and timeouts raise typed errors, post-timeout retries recover existing orders via client ID without duplicating fills, and any attempt to sell unheld shares or more than `qty_available` is rejected before reaching the network.
+- New environment variables: None
+- Rollback: Revert `broker.py` along with execution consumers while markets are closed.
+- Depends on: R-01, R-04
+- Size: M
+
+### R-08: Execute marketable limit buys, poll real fills, and make broker stop orders the single stop-loss owner
+- Fixes: F-01-02, F-01-10, F-01-11, F-02-01, F-02-02, F-02-06, F-02-08, F-02-11, F-02-15, F-03-01, F-03-02, F-03-03, F-03-05, F-03-07, F-03-08, F-03-09, F-03-10, F-03-11, F-03-12, F-03-13, F-05-02, F-06-02, F-06-06, F-08-01, F-08-04, F-10-02, F-11-02, F-11-09, F-11-15
+- Why: Market buys without fill polling caused `0` of `19` regular-session stop orders to succeed (rejected by the broker's wash-trade guard after a 3-second sleep), software stop checks raced resting broker stops to create two short positions, sells crashed on a missing `_tipranks_lookup` attribute, and surviving stops expired silently after 90 days.
+- Change: Replace `executor.py` with `execution.py`: reconcile right before every order batch, isolate per-symbol failures so one bad symbol never aborts other orders or stop monitoring, and submit stock buys only between 5 minutes after regular open and 10 minutes before close as marketable limit orders sized from a fresh quote (skipping signals older than 96 hours or drifted over 3%). Poll until buys reach a terminal fill state, then place one broker good-til-cancelled stop order for the exact filled whole-share count from the actual fill price (alerting immediately if rejected). Remove all software stop-sell execution. Before any bot exit, trim, or top-up on a stock, cancel its resting broker stop and confirm cancellation first (skipping the sell if the stop already filled, and restoring or updating the stop afterward), never sell shares backing an open short call without closing the call first, watch every long position on every monitoring cycle to replace missing or expiring 90-day stops, fix the sell-alert crash, and alert on every rejected order.
+- Files likely touched: `stock_agent/execution.py`, `stock_agent/executor.py`
+- Trading behaviour change: Yes: buys use protected limit prices during stable regular hours, every filled stock buy gets a confirmed broker stop order, exits cancel the resting stop cleanly before selling, and resting stops are renewed before their 90-day broker expiry.
+- Risk limits touched: None (implements the single-owner stop rule and 3% entry-drift / 96-hour signal-age gates).
+- Tests: Simulated broker tests verify delayed (60-second) and partial buy fills get exact stop coverage, top-ups and exits cancel resting stops first without HTTP 403 errors, stops already filled during cancel abort the duplicate sell, stops nearing 90 days are renewed, `_tipranks_lookup` crashes are gone, and rejected orders fire Discord alerts.
+- New environment variables: None
+- Rollback: Revert `execution.py` and pause trading via hold file until inspected; active broker stop orders remain resting at the broker.
+- Depends on: R-06, R-07, R-10, R-15, R-21
+- Size: L
+
+### R-09: Normalise the existing paper account automatically on first run after cut-over
+- Fixes: F-02-01, F-03-01, F-04-05, F-11-15
+- Why: The paper account currently carries legacy defects from the old code—two accidental short stock positions, one half-share remainder, one stock position above 33% of equity with an open short call, and unstopped long holdings—and the owner should not have to run manual cleanup trades.
+- Change: Add an automatic, idempotent first-run `normalise` routine that posts its exact action plan to Discord first and then executes at 5 minutes after the next regular market open: buy to cover the two accidental short stock positions and enable `no_shorting` on the broker account (verifying read-back so covering existing shorts cannot be blocked), sell the fractional share remainder, buy to close the open short call on the oversized stock holding and confirm fill before trimming that stock holding down to the 15% cap, place broker good-til-cancelled stop orders from current market prices on every open whole-share long position, hand existing option spreads to the options exit manager, and rebuild the ledger from the broker. Hold all new stock and option entries until normalisation finishes and one full reconciliation comes back clean.
+- Files likely touched: `stock_agent/execution.py`, `stock_agent/options_manager.py`, `stock_agent/scheduler.py`
+- Trading behaviour change: Yes: on the first regular session after deploy, the bot automatically cleans up legacy shorts, fractional shares, the oversized holding's covered call and excess shares, and missing stops before opening any new trades.
+- Risk limits touched: Yes: brings the existing oversized stock holding down from roughly a third of equity to the 15% single-issuer cap and restores active broker stops (`7%` to `12%` from current price) across all existing long stocks.
+- Tests: An end-to-end offline simulation seeded with two short positions, one half-share position, one 33.6% stock position locked by a short call, two vertical spreads, and zero stops proves the routine posts its plan, executes every step in safe order, passes reconciliation, unlocks normal trading, and performs zero duplicate actions if re-run.
+- New environment variables: None
+- Rollback: Set the pause switch or hold file before `open + 5 minutes` if the Discord preview plan looks unexpected; once normalised, `no_shorting` and protective stops remain safely at the broker.
+- Depends on: R-06, R-08, R-10, R-20, R-21
+- Size: M
+
+### Area: Market calendar, scheduler, and deployment
+
+### R-10: Check live market hours, holidays, and early closes before sending any order
+- Fixes: F-01-03, F-01-12
+- Why: Checking only weekday numbers and wall-clock time caused the bot to run full market-open scans and submit equity orders on Good Friday and ignore 1:00 PM early closes such as the day after Thanksgiving.
+- Change: Introduce `stock_agent/market_calendar.py` backed by the broker's live clock and trading-calendar endpoints: cached calendar dates drive job scheduling and trading-day counts (shifting end-of-day jobs ahead on early-close sessions), while actual order placement requires a fresh live broker clock confirmation and fails closed whenever the clock cannot be reached. Remove unreachable schedule branches from the main loop.
+- Files likely touched: `stock_agent/market_calendar.py`, `stock_agent/scheduler.py`
+- Trading behaviour change: Yes: zero orders are sent on market holidays, early-close afternoons, or during broker clock outages, and end-of-day close summaries run right after early closes rather than 3 hours late.
+- Risk limits touched: None
+- Tests: Simulated calendar tests across Good Friday, Thanksgiving, Black Friday 1:00 PM early close, and a simulated clock timeout verify zero orders are authorised while closed or unreachable and early-close jobs fire on schedule.
+- New environment variables: None
+- Rollback: Revert `market_calendar.py` and scheduler call sites while markets are closed.
+- Depends on: R-01, R-07
+- Size: S
+
+### R-11: Persist pending orders and job schedules across restarts with single-instance locking and graceful shutdown
+- Fixes: F-01-01, F-01-04, F-01-07, F-01-08, F-01-13, F-07-04, F-09-06
+- Why: Keeping pending trades and daily run flags only in memory caused 10-minute deploy restarts to wipe weekend research buys, fire morning jobs twice, retry broken weekly jobs every minute for 3 hours, risk two bot copies running at once, and lacked a clean pause switch or mid-order shutdown drain.
+- Change: Persist queued order intents and per-session job markers (with bounded retry counts and backoff) in `state.db`, acquire an exclusive process lock file at startup so two bot instances can never run simultaneously, publish machine-readable liveness state and systemd readiness/watchdog heartbeats through `runtime_status.py`, support a `STOCK_TRADING_PAUSED` flag and pause file that halt new entries while keeping reconciliation, stop maintenance, and exits active, and handle service stop signals by blocking new orders while finishing stop placement on any buy fill already in flight before exiting.
+- Files likely touched: `stock_agent/__main__.py`, `stock_agent/scheduler.py`, `stock_agent/runtime_status.py`, `stock_agent/state_store.py`
+- Trading behaviour change: Yes: weekend and overnight trade intents survive service restarts without firing while the market is closed, duplicate morning runs and 3-hour retry storms stop, and pausing trading cleanly holds new buys without abandoning open positions.
+- Risk limits touched: None
+- Tests: Restart simulations prove Sunday signals survive a pre-open Monday restart and wait for `open + 5 minutes`, morning briefs run once across restarts, failing weekly jobs stop retrying after bounded attempts, a second bot process exits immediately on lock contention, and `SIGTERM` during a buy fill places its protective stop before exiting.
+- New environment variables: Optional `STOCK_TRADING_PAUSED` (defaults to `false`).
+- Rollback: Revert `__main__.py` and `scheduler.py` changes during a closed-market window.
+- Depends on: R-05, R-08, R-10
+- Size: M
+
+### R-12: Gate in-place automatic updates on passing tests, closed markets, health checks, and automatic rollback
+- Fixes: F-09-04, F-09-05, F-09-07, F-09-09, F-09-12, F-11-11
+- Why: The server's 10-minute cron script pulled and restarted the bot mid-day regardless of test results, documentation-only commits, or stopped-service state, `stock-agent.service` ran `git reset --hard` as root before every boot, and host log churn rotated bot logs away after two months.
+- Change: Keep deployment self-installing in place at `/root/polymarket-bot` under the existing user, `.env`, and `data/` directory so zero manual server commands are required. Remove `git` commands from `stock-agent.service`, configure graceful shutdown timeouts and restart-loop protection, write persistent rotating application logs inside `data/logs/` (retaining over a year of bot logs unaffected by host SSH noise), update `scripts/vps_snapshot.sh` to capture complete diagnostics, and upgrade `deploy/auto_update.sh` to honour a hold file, never start a stopped service, skip restarts on documentation-only changes, deploy only when the target commit's GitHub Actions `test` workflow succeeded and the market is closed with at least 30 minutes until open, verify post-restart health, and automatically roll back to the previous commit and alert Discord if startup fails.
+- Files likely touched: `deploy/auto_update.sh`, `deploy/stock-agent.service`, `deploy/setup.sh`, `scripts/vps_snapshot.sh`, `stock_agent/logging_setup.py`
+- Trading behaviour change: Yes: mid-session restarts during market hours are eliminated, untested or broken commits can no longer go live, and an intentionally stopped bot stays stopped.
+- Risk limits touched: None
+- Tests: Automated shell tests against a local mock repository and mock `systemctl`/GitHub status responses prove first-time self-installation from the old updater works cleanly, open-market and failing-CI updates are deferred, docs-only commits do not restart the bot, stopped services stay stopped, and a failing startup rolls back to the prior commit.
+- New environment variables: None
+- Rollback: Touch the deploy hold file or revert `deploy/auto_update.sh` to a pinned commit while markets are closed.
+- Depends on: R-02, R-04, R-10, R-11
+- Size: M
+
+### Area: News, market data, and input health
+
+### R-13: Track input health, switch live quotes and daily bars to the broker feed, and halt entries when required feeds fail
+- Fixes: F-06-01, F-06-05, F-06-11, F-06-13, F-08-05, F-08-06, F-10-04, F-10-09, F-11-13
+- Why: Broken third-party endpoints returned roughly 20,000 HTTP 402 and 429 errors without circuit breakers, zero quotes caused false market-regime crash alerts, and rate-unlimited bursts risked throttling live trading data.
+- Change: Add an input-health registry (`health.py`) and shared rate-limited, header-authenticated, secret-scrubbing HTTP transport (`http_safety.py`) working alongside the `risk_limits`-owned quote and daily-bar service (`price_service.py` in `R-23`). Classify the broker connection, fresh stock quotes, fresh symbol news, and at least one healthy AI provider route as required for new entries, while treating third-party fundamentals, sentiment, and analyst scores as optional enrichments with persisted 24-hour circuit breakers on 401/402/403 plan blocks across restarts. Whenever any required input is unhealthy, block new stock and option entries from that path, send a deduplicated Discord alert, and keep stop protection and exits running; require healthy quotes before updating market-regime state.
+- Files likely touched: `stock_agent/health.py`, `stock_agent/http_safety.py`, `stock_agent/data_feed.py`, `stock_agent/macro_monitor.py`
+- Trading behaviour change: Yes: live quotes and daily bars succeed immediately using the existing broker key, optional paid-API errors trip quiet circuit breakers with a single degradation note instead of log floods, false zero-quote regime flips disappear, and a real quote or news outage halts new buys safely.
+- Risk limits touched: None
+- Tests: Offline provider tests with third-party fundamentals returning 402 and sentiment returning 403 confirm required health stays green on broker data plus Finnhub/OpenAI, circuit breakers suppress repeat calls, failed index quotes leave market regime unchanged, and breaking the broker quote feed blocks new entries with a Discord alert while exits still run.
+- New environment variables: None
+- Rollback: Revert `health.py`, `prices.py`, and `macro_monitor.py` together.
+- Depends on: R-01, R-04, R-07
+- Size: M
+
+### R-14: Poll fresh company and market news continuously and fix universe, fundamentals, earnings, and insider data feeds
+- Fixes: F-06-08, F-06-09, F-06-14, F-06-15, F-06-17, F-06-18, F-11-17
+- Why: Retired screening dependencies collapsed the research universe to four hardcoded symbols (one of which had changed its ticker in June), fundamental ratio field names did not match API responses, scheduled future earnings dates triggered premature "earnings reaction" runs, stock-award filings were misread as insider buying, and news lacked story deduplication.
+- Change: Upgrade news polling and add `fundamentals_service.py` to deliver fresh, timestamped, story-deduplicated company and market headlines every few minutes during market hours (and during scheduled research) across held positions, the research universe, `owner_focus.json`, and broad market feeds using the broker's news feed and Finnhub company news within strict rate limits. Build a versioned multi-sector liquid stock universe and provenance-tagged fundamentals and earnings service (`fundamentals_service.py`, combining Finnhub metrics, SEC EDGAR dollar trailing-twelve-month filings rather than per-share figures, and broker screener movers) that works with today's free keys even when optional paid endpoints return 402/429, normalise share-class tickers (`BRK.B` versus `BRK-B`), trigger earnings reviews only after actual reported numbers arrive in Eastern Time, count only open-market dollar-weighted insider purchases and sales, and remove dead data helpers.
+- Files likely touched: `stock_agent/fundamentals_service.py`, `stock_agent/news_feed.py`, `stock_agent/sentiment.py`, `stock_agent/analyst_trends.py`, `stock_agent/tipranks_client.py`
+- Trading behaviour change: Yes: screening evaluates a full liquid multi-sector stock universe instead of four fallback tickers, renamed tickers are handled cleanly, earnings and insider signals reflect real events, and fresh deduplicated news powers intraday reactions.
+- Risk limits touched: None
+- Tests: Offline provider tests verify that with FMP returning 402 and TipRanks returning 401, universe construction still produces a broad multi-sector candidate list (never shrinking to the four priority symbols), duplicate syndicated headlines collapse to one story ID, unreported earnings rows are skipped, stock-grant filings do not count as insider buys, and class-share tickers resolve cleanly.
+- New environment variables: None
+- Rollback: Revert news and enrichment modules to the prior commit while keeping `R-13` health gates in place.
+- Depends on: R-13
+- Size: L
+
+### Area: Risk limits, position sizing, and drawdown controls
+
+### R-15: Enforce post-trade portfolio caps, zero-borrowing cash reserve, volatility-based stop sizing, and unified sectors
+- Fixes: F-02-03, F-02-04, F-02-05, F-02-07, F-02-09, F-02-10, F-02-12, F-02-13, F-02-16, F-02-17, F-05-03, F-05-09, F-06-04, F-06-10, F-10-07
+- Why: Top-ups bypassed `RiskManager`, concentration checks evaluated holdings before adding the proposed order, `buying_power` allowed leverage on a 4x margin account, inconsistent sector labels (`Financial Services` versus `Financials`) bypassed the 40% sector cap, a broken local 7-day trade counter needlessly froze swing buys, and conviction-6 trades slipped through.
+- Change: Route every stock buy and top-up through one pure post-trade evaluation in `risk_manager.py` backed by live reconciled broker equity and cash. Keep today's portfolio limits (15% per issuer combining share classes, 40% per canonical sector pooling any unknown sectors safely, 48% per named cluster, 20 stock names, 100% gross long exposure), forbid margin borrowing by requiring projected post-trade cash minus cash reserved for open buy orders and option obligations to remain at least 2% of equity, enforce minimum conviction of 7 on both raw and adjusted scores (8 in cautious markets and live-news entries, with post-model adjustments capped at `+/-1` and unable to lift a sub-7 score), compute stop distance from 14-day stock volatility (`2.5 x ATR(14) / price` clamped to `7%–12%`, or `7%` flagged if bars are missing), reduce conviction-tier ceilings (`5/7/8/10%`) whenever needed so loss at the stop never exceeds `1.0%` of equity, and replace the inaccurate local 7-day day-trade buy freeze with actual broker account restriction flags.
+- Files likely touched: `stock_agent/risk_manager.py`, `stock_agent/config.py`
+- Trading behaviour change: Yes: top-ups obey every cap, margin borrowing is blocked, conviction-6 buys are eliminated, volatile stocks with wider `10%–12%` stops automatically take slightly smaller initial sizes so a stop-out loses at most `1.0%` of equity, and valid swing trades are no longer blocked by the false local PDT counter.
+- Risk limits touched: Yes: minimum conviction goes from `6` (normal-regime override) to `7` always (`8` in cautious regime / live news / options); post-model score adjustment goes from uncapped `+2` to `+/-1` without floor bypass; cash floor goes from unconstrained `4x` margin buying power to `>= 2%` unreserved cash after every trade; per-position risk at stop goes from up to `1.2%` (`10%` size at `12%` stop) to at most `1.0%` of equity; issuer (`15%`), sector (`40%`), cluster (`48%`), count (`20`), and gross long (`100%`) numbers stay unchanged and are now enforced after the trade on every path.
+- Tests: Boundary unit tests prove a sector at `39%` clips or rejects a `5%` buy or top-up at `40%`, `Financial Services` and `Financials` merge into one bucket, raw score `6` plus `+1` is rejected, `12%` stop distance caps size at `8.33%` of equity, buys leaving `< 2%` unreserved cash are sized down or blocked, and unrestricted accounts are not frozen for 7 days after swing sells.
+- New environment variables: None
+- Rollback: Revert `risk_manager.py` during a closed-market window.
+- Depends on: R-04, R-06, R-13
+- Size: M
+
+### R-16: Trim cap-breaching holdings automatically and step down risk during portfolio drawdowns
+- Fixes: F-02-03, F-02-14, F-04-03
+- Why: When market gains or option share deliveries pushed a single stock to 33.6% (and previously 71.5%) of equity, nothing trimmed the excess exposure, and no portfolio-level circuit breaker slowed new risk during a sustained losing streak.
+- Change: Add automated cap-breach trimming and portfolio drawdown controls in `risk_manager.py`: alert on Discord whenever a holding reaches a cap, automatically queue a trim back to `cap - 2` percentage points once passive drift stays above `cap + 2` points for two consecutive market closes, and trim breaches caused by option share delivery or broker actions at the very next regular session (always closing any short call on those shares before selling stock). Track drawdown from the post-cut-over high-water mark of verified market-close equity marks: alert at `10%` drawdown, halve new stock position sizes and pause new option entries at `15%` drawdown, pause all new entries at `20%` drawdown until drawdown stays below `15%` for five consecutive closes, and keep all stops and exits active throughout.
+- Files likely touched: `stock_agent/risk_manager.py`, `stock_agent/performance.py`, `stock_agent/scheduler.py`
+- Trading behaviour change: Yes: runaway single-stock or sector concentration is trimmed automatically under clear rules, and deep portfolio drawdowns automatically scale back and then pause new entries until performance stabilises, with automatic recovery.
+- Risk limits touched: Yes: passive cap-drift trim goes from none to `cap - 2` points after 2 closes above `cap + 2` points (next session for option delivery breaches); portfolio drawdown controls go from none to `10%` alert, `15%` half-size stocks and no new options, and `20%` new-entry pause with 5-close `< 15%` auto-recovery.
+- Tests: Multi-session simulations prove passive drift to `17.5%` trims to `13%` only after the second consecutive close, option-assigned stock over `15%` queues a trim for the next regular session (closing any short call first), and drawdown sequences step cleanly through `10%`, `15%`, `20%`, and 5-close recovery while allowing exits at every stage.
+- New environment variables: None
+- Rollback: Revert drawdown and auto-trim rules in `risk_manager.py` while keeping pre-trade caps active.
+- Depends on: R-06, R-08, R-15
+- Size: M
+
+### R-23: Serve broker-verified quotes, daily bars, and corporate symbol renames from risk_limits and evaluate post-close shadow stops
+- Fixes: F-02-09, F-06-01, F-06-04, F-06-12, F-06-18, F-07-07, F-11-17
+- Why: Stop-loss sizing, volatility calculations, sector caps, corporate ticker renames, and post-session stop comparisons all depend on verified quotes, contiguous split-adjusted daily bars, and clean corporate-action metadata; leaving those scattered across unvalidated callers risked stale prices, dead-symbol errors after ticker renames, and false counterfactual stop-outs on entry days.
+- Change: Place ownership of `price_service.py` and `asset_registry.py` with `risk_limits` so one validated service provides freshness-checked live quotes (broker primary with automatic Finnhub fallback), completed split-adjusted daily bars (`16` minutes after market close so consolidated session bars are final), canonical GICS sector mapping, and broker-verified corporate symbol renames (moving open position metadata to the new symbol only when share counts carry over and halting dead-symbol polling). Pair entry-fill journal anchors written by `execution.py` with a dedicated post-close shadow-stop job (`close + 16 minutes`) in `scheduler.py` and `performance.py` that tracks counterfactual `7%`, `10%`, `12%`, and `no-stop` outcomes across every subsequent session's open/high/low bars (skipping the entry session itself so pre-entry morning lows cannot trigger false shadow exits) without overwriting recorded close marks on retries.
+- Files likely touched: `stock_agent/price_service.py`, `stock_agent/asset_registry.py`, `stock_agent/performance.py`, `stock_agent/execution.py`, `stock_agent/ledger.py`, `stock_agent/scheduler.py`
+- Trading behaviour change: Yes: dead or renamed symbols stop generating repeated broker rejections, stop-loss volatility math uses verified split-adjusted daily bars without bridging missing-session gaps, and counterfactual stop evidence accumulates automatically after every market close without affecting live orders.
+- Risk limits touched: None (supplies verified price, bar, sector, and corporate-action inputs to `R-15` and `R-16` and records Decision 3 shadow-stop evidence).
+- Tests: Offline market-data, reconciliation, and performance tests verify stale or crossed primary quotes fall back cleanly while rejecting zero/NaN values, split-adjusted daily bar histories never bridge missing calendar sessions, verified corporate renames move ledger metadata only when share counts match, and post-close shadow stops skip the entry session and use gap-open or stop prices accurately across retries.
+- New environment variables: Optional `ALPACA_DATA_FEED` (defaults to `iex` on free accounts).
+- Rollback: Revert `price_service.py`, `asset_registry.py`, and the post-close shadow-stop job together while markets are closed.
+- Depends on: R-05, R-06, R-10, R-13
+- Size: M
+
+### Area: Research pipeline, live news reactions, and owner focus list
+
+### R-17: Build a resilient multi-provider AI client with weekly budget caps, deterministic screening, and validated theses
+- Fixes: F-05-04, F-05-05, F-05-06, F-05-12, F-05-13, F-05-14, F-05-16, F-08-11, F-11-13
+- Why: Calling a retired OpenAI model (`gpt-4.1-nano`) broke screening for months, an exhausted Perplexity quota caused silent `0 signals` runs with zero alerts, unvalidated AI JSON or untrusted news text could corrupt prompts, and there was no cap on weekly AI spend.
+- Change: Replace the AI plumbing with `llm_client.py`, `screener.py`, `research_schemas.py`, `analyst.py`, and `research_notes.py`: rank screening candidates deterministically from price, momentum, liquidity, and fundamental factors with zero AI calls required, then write structured theses through a health-checked provider chain (`Perplexity -> OpenAI -> Anthropic`) using verified active models so the bot works completely on OpenAI alone today. Enforce a persisted weekly AI budget defaulting to `USD 15` per week with `20%` reserved exclusively for exit confirmations, fence external headlines and notes against prompt injection, align prompt questions strictly with supplied timestamped metrics, apply the same liquidity and market-cap eligibility rules to every discovery source, validate all AI outputs against strict schemas, and raise loud input-health alerts whenever all AI providers fail.
+- Files likely touched: `stock_agent/llm_client.py`, `stock_agent/screener.py`, `stock_agent/research_schemas.py`, `stock_agent/analyst.py`, `stock_agent/research_store.py`, `stock_agent/research_sources.py`, `stock_agent/research_health.py`, `stock_agent/research_notes.py`
+- Trading behaviour change: Yes: candidate screening succeeds every cycle without depending on an AI call, thesis generation runs reliably today on OpenAI (using Perplexity or Anthropic automatically when healthy), non-exit research pauses cleanly at 80% of the weekly budget so exit confirmations stay funded, and total AI outages alert Discord instead of silently doing nothing.
+- Risk limits touched: Yes: weekly AI spend goes from uncapped to `USD 15/week` default (`20%` reserved for exit confirmations).
+- Tests: Fake-provider tests verify full screening and thesis generation succeed when Perplexity returns 401 and only OpenAI is active, malformed or wrong-ticker AI JSON fails only that symbol, prompt-injection strings in headlines stay fenced as data, sub-threshold discovery tickers are filtered out, non-exit calls stop at 80% of weekly budget while exit confirmations still pass, and total AI failure triggers a Discord health alert.
+- New environment variables: Optional `RESEARCH_WEEKLY_BUDGET_USD` (defaults to `15.0`).
+- Rollback: Revert research modules to the prior commit while keeping `R-13` health alerts active.
+- Depends on: R-04, R-05, R-13, R-14
+- Size: L
+
+### R-18: Trade live market-hours news reactions, confirm model exits with a second check, and read the owner focus list
+- Fixes: F-01-05, F-01-06, F-05-01, F-05-08, F-05-10, F-05-11, F-10-08
+- Why: Previously, a single unconfirmed AI headline review could panic-sell a holding (and repeat-evaluate the same headline every hour), intraday regime glitches launched full unscheduled buying scans, scheduled and event paths duplicated glue code and could queue conflicting buy and sell orders on the same stock, and the owner had no clean file to steer research toward timely market themes.
+- Change: Unify all scheduled research and live market-hours news reactions through `research_gate.py` and add `stock_agent/owner_focus.json` (`symbol` or `theme`, `note`, `added`, `expires`, plus stretch Discord `pause`, `resume`, `status`, and `focus` commands). During market hours, cheaply pre-score fresh deduplicated news every few minutes and send only material new stories once to the AI: bad news on a held stock proposes an exit or trim that requires a blind second confirmation (from a second healthy provider, or a distinct model on the same provider marked degraded) before executing in the same session, capped at 4 model-driven exits per session (hard stops uncapped); strong positive news on a held or watched stock creates a buy or add candidate requiring effective conviction `>= 8` and passing every risk, freshness, quote, and `3%` drift gate; a strong bearish thesis with conviction `>= 8` on a liquid stock routes to defined-risk put options; and a market-regime shift never trades by itself, only adjusting thresholds (`>= 8` for new longs in cautious markets, bearish options permitted) and alerting Discord. Listed non-expired focus items always receive thesis coverage and news polling while obeying every risk gate, and conflicting same-session buy and sell intents on the same ticker are blocked.
+- Files likely touched: `stock_agent/research_pipeline.py`, `stock_agent/research_gate.py`, `stock_agent/research_focus.py`, `stock_agent/owner_focus.json`, `stock_agent/scheduler.py`, `stock_agent/alerts.py`
+- Trading behaviour change: Yes: the bot reacts during market hours to material breaking news on stocks and bearish option setups under strict conviction-8 and risk gates, requires blind second confirmation on news/thesis sells (at most 4 per session), never trades solely because the regime indicator flipped, and evaluates themes or tickers placed in `owner_focus.json`.
+- Risk limits touched: Yes: model-driven exits go from unconfirmed/uncapped to blind-confirmed and capped at `4` per session; live-news stock buys and cautious-regime stock buys require conviction `>= 8` (up from `7`); market-regime flips go from triggering autonomous buy scans to `0` automatic trades.
+- Tests: Pipeline tests prove single unconfirmed exit proposals hold, OpenAI-only mode runs blind confirmation on a second distinct model labelled degraded, a 5th model exit in one session is deferred while broker stops remain active, duplicate story IDs never re-invoke the AI, positive news below conviction 8 is skipped, bearish conviction 8 routes to options, regime flips place zero orders, same-symbol buy/sell conflicts are blocked, and `owner_focus.json` symbols get researched without bypassing risk caps.
+- New environment variables: Optional `RESEARCH_MAX_MODEL_EXITS_PER_SESSION` (defaults to `4`).
+- Rollback: Revert `research_gate.py` and set intraday news reactions off in config if needed while keeping scheduled cycles active.
+- Depends on: R-08, R-14, R-15, R-17
+- Size: L
+
+### Area: Defined-risk options
+
+### R-19: Trade four defined-risk debit option strategies using atomic multi-leg limit orders and strict loss caps
+- Fixes: F-04-01, F-04-03, F-04-05, F-04-06, F-04-07, F-04-08, F-04-09, F-04-11, F-04-12, F-04-13, F-04-14, F-04-15, F-06-16, F-10-03
+- Why: Options settings in `config.py` were completely unwired, spreads were sent as two separate market orders (leaving naked short legs if leg two failed), strike selectors paired different expirations or narrow low-reward widths, `HOLD` theses opened spreads, and a losing ticker was traded repeatedly without cooldown.
+- Change: Wire `OPTIONS_MODE` defaulting to `defined_risk` (`off` and `close_only` also supported) and read all option parameters from validated settings using the shared broker base URL, paginated chain/snapshot requests, and once-per-session holiday-aware scheduling. Support four debit defined-risk strategies in v1—bull call spread, bear put spread, long call, and long put (deferring covered calls so short calls never fight broker stock stops, with cash-secured puts as an optional stretch goal only after debit strategies are proven). Require a fresh (`<= 96h`) directional thesis with effective conviction `>= 8` and healthy inputs, pair spread strikes within a single expiration at least `5%` of spot wide using liquid chains, submit spreads as one atomic multi-leg limit order (`mleg`) and single legs as limit orders, confirm fills by polling before recording open structures, enforce tightened maximum-loss caps (`<= 3%` of equity per structure, `<= 10%` across all open structures, at most `6` open structures, plus the `>= 2%` unreserved cash floor), quarantine invalid underlying tickers on 422 errors, and enforce a `10`-trading-day underlying cooldown after a losing option structure (`30` trading days after two consecutive losses).
+- Files likely touched: `stock_agent/options_policy.py`, `stock_agent/options_settings.py`, `stock_agent/options_models.py`, `stock_agent/options_data.py`, `stock_agent/options_engine.py`, `stock_agent/options_executor.py`, `stock_agent/config.py`
+- Trading behaviour change: Yes: the bot actively trades bullish and bearish defined-risk option structures on conviction-8 directional theses using atomic limit orders, wider sensible spread widths, and underlying loss cooldowns, and no longer opens covered calls against stopped shares.
+- Risk limits touched: Yes: per-structure max option loss tightens from `7%` to `3%` of equity; total open option max loss tightens from `15%` to `10%` of equity; max open option structures tightens from `10` to `6`; minimum conviction for options rises from `7` (including `HOLD` theses) to `8` with an explicit bullish or bearish direction; minimum spread width rises from fixed dollar steps (`< 2.5%` on high-priced stocks) to `>= 5%` of spot; post-loss underlying cooldown goes from `0` days to `10` trading days (`30` after two losses in a row).
+- Tests: Simulated broker and chain tests across all four debit strategies verify atomic `mleg` limit submission, zero orphan legs on rejected or cancelled orders, single-expiry listed strikes `>= 5%` wide, rejection of `HOLD` or conviction-7 theses, strict enforcement of `3% / 10% / 6` loss caps, batched chain pagination, and 10-day / 30-day underlying cooldowns.
+- New environment variables: Optional `OPTIONS_MODE` (defaults to `defined_risk`).
+- Rollback: Set `OPTIONS_MODE=close_only` (or `off` once flat) to stop new option entries immediately without redeploying code.
+- Depends on: R-04, R-06, R-07, R-10, R-13, R-15, R-18
+- Size: L
+
+### R-20: Manage active option exits before expiry, reconcile broker option events, and track accurate contract profit and loss
+- Fixes: F-04-02, F-04-04, F-04-10, F-07-02, F-07-09, F-11-07
+- Why: The old options exit check only sent notifications without placing closing orders—allowing an expiring short leg to assign into a 71.5% single-stock position with negative cash—while reconciliation wiped open options during transient errors and booked fake "assumed worthless" losses.
+- Change: Build `options_manager.py` and `options_portfolio.py` to actively close open option structures via limit orders (repricing via cancel-and-confirm when needed) at `50%` of maximum profit, `50%` loss of debit paid, thesis invalidation, day-before ex-dividend risk on short calls, and mandatory time exit at `T-2` trading days so nothing is carried into expiry day. Run two-way broker reconciliation that aborts untouched on broker read failures, imports any untracked broker option legs, ingests broker exercise/assignment/expiry activities, computes real `100x` contract profit and loss from actual leg fills (never inventing expired losses when marks are missing), and runs an immediate repair action (exercising the protective leg or buying to cover, followed by `R-16` next-session stock trimming) if early assignment or unexpected exercise ever delivers shares or creates a short position.
+- Files likely touched: `stock_agent/options_manager.py`, `stock_agent/options_book.py`, `stock_agent/options_portfolio.py`, `stock_agent/reconcile.py`
+- Trading behaviour change: Yes: open spreads and long options are actively closed at profit targets, loss limits, ex-dividend risk, or two trading days before expiry instead of drifting into expiration day, and any unexpected early assignment is repaired immediately.
+- Risk limits touched: Yes: mandatory option time exit tightens from `0` (alert-only into expiry) to `T-2` trading days, with explicit `+50%` max-profit and `-50%` debit loss-limit closing orders.
+- Tests: Lifecycle simulations prove closing `mleg` and single-leg limit orders fire and fill at `+50%` profit, `-50%` loss, ex-dividend `T-1`, thesis break, and `T-2` trading days; HTTP 500 on positions read preserves option state; existing broker spreads are imported cleanly; `100x` contract accounting matches fills to the cent; and simulated early assignment triggers immediate repair plus next-session trim without colliding with `no_shorting`.
+- New environment variables: None
+- Rollback: Switch `OPTIONS_MODE=close_only` while inspecting any open structures; never revert to alert-only expiry handling while contracts remain open.
+- Depends on: R-06, R-07, R-10, R-16, R-19
+- Size: L
+
+### Area: Alerts, heartbeats, and honest reporting
+
+### R-21: Deliver reliable Discord alerts with severity levels, deduplication, persistent retry queue, and liveness checks
+- Fixes: F-08-02, F-08-07, F-08-08, F-08-09, F-08-13, F-08-14, F-11-01, F-11-14
+- Why: Failed Discord multi-embed sends falsely returned success, rate limits blocked the trading loop, large portfolios overflowed Discord's 25-field limit, broker stop-outs and assignments went unannounced, empty Telegram settings logged warnings 171 times, and nothing outside the bot checked whether it had frozen or died.
+- Change: Consolidate notifications in `alerts.py` and `heartbeat.py` with Discord as the single required channel (keeping Telegram optional, HTML-escaped, and completely silent when unset): add severity levels, per-issue cooldown deduplication so repeated errors collapse into summaries, a persistent disk outbox in `state.db` / `data/` that retries 429/5xx failures asynchronously without blocking trading, automatic embed splitting and length clamping, and Discord alerts for broker-side stop fills, option assignments/expiries, and cancelled stops. Support optional outbound pings when `HEARTBEAT_PING_URL` is set, plus systemd watchdog pings and periodic Discord heartbeat updates paired with a scheduled GitHub Actions check so a dead server or hung loop is flagged with zero server configuration edits.
+- Files likely touched: `stock_agent/alerts.py`, `stock_agent/discord_alerts.py`, `stock_agent/telegram_alerts.py`, `stock_agent/heartbeat.py`, `.github/workflows/heartbeat-monitor.yml`
+- Trading behaviour change: None directly on trade selection; trading loops no longer stall on Discord rate limits, and silent crashes or broker-side fills now alert reliably.
+- Risk limits touched: None
+- Tests: Offline alert tests verify 50 duplicate warnings collapse into one message plus a suppressed count, simulated Discord HTTP 429 responses queue to disk without sleeping on the trading loop and return `False` until delivered, 30-position reports split cleanly within Discord field limits, empty Telegram variables emit zero warnings after startup, and missing heartbeats fail the monitor check.
+- New environment variables: Optional `HEARTBEAT_PING_URL` (defaults to empty; works automatically if the owner adds a URL later).
+- Rollback: Revert `heartbeat-monitor.yml` or `alerts.py` changes independently of trading modules.
+- Depends on: R-01, R-04, R-05
+- Size: M
+
+### R-22: Publish honest daily and weekly briefings with live broker returns, QQQ and SPY benchmarks, options, and input health
+- Fixes: F-08-10, F-08-11, F-11-03, F-11-07, F-11-08, F-11-10, F-11-12, F-11-13, F-11-16
+- Why: Daily briefings overstated account gains by roughly 12 percentage points (summing local stock positions while ignoring cash and option losses), relied on broken broker `last_equity` / `portfolio_history` numbers that omitted a held stock, counted buy fills as losing sells in win-rate stats, hid open options and broken data feeds, and showed no benchmark comparison.
+- Change: Build `reporting.py` and `benchmark.py` so morning briefs, daily market-close summaries, and weekly scorecards report live reconciled broker equity, cash, stock exposure, open option structures and option profit/loss, true daily return from verified close marks, cumulative return since launch alongside `QQQ` and `SPY` over the identical window, real realized win/loss attribution (excluding opening buys), active drawdown tier, recent job and refusal summaries, and a clear green/degraded/down table of every market-data, news, and AI input.
+- Files likely touched: `stock_agent/reporting.py`, `stock_agent/benchmark.py`, `stock_agent/discord_alerts.py`, `stock_agent/scheduler.py`
+- Trading behaviour change: None (reporting and observability only).
+- Risk limits touched: None
+- Tests: Snapshot-style report tests verify total return reflects true broker equity (`+24.0%` rather than the old `+36.0%` stock-only sum in fixture data), session profit uses the prior verified close mark rather than broken `last_equity`, `QQQ` and `SPY` benchmark returns render accurately from cached daily bars, buy orders never dilute sell win rate, option structures and P&L are displayed, and degraded inputs appear clearly in the health table.
+- New environment variables: None
+- Rollback: Revert `reporting.py` and `benchmark.py`; ledger close marks remain intact in `state.db`.
+- Depends on: R-06, R-13, R-20, R-21
+- Size: M
+
+## Not doing
+
+- **Rewriting Git commit history to scrub old tokens (`F-09-02`):** Force-pushing rewrites history across clones and risks breaking the server updater, whereas revoking the leaked tokens at each provider immediately invalidates them without repository surgery.
+- **Opening covered calls in v1 (`F-04-05`):** Selling covered calls locks underlying shares and directly competes with broker good-til-cancelled stop orders for the same stock; covered calls stay deferred until debit options and single-owner stops have run cleanly in production.
+- **Opening cash-secured puts in day-one v1 (`F-04-03`):** Treated as a later stretch goal after the four debit defined-risk option strategies are proven, because put assignment requires dedicated cash reservation and single-stock cap headroom.
+- **Live trailing stop orders in v1 (`F-02-09`, Decision 15):** Early trailing stops whipsawed profitable winners; v1 uses fixed volatility-based broker stops and logs shadow fixed and no-stop counterfactuals in the journal so any later trailing rule is backed by real trade evidence.
+- **Moving the server install out of `/root/polymarket-bot` or creating a new Linux user (`F-09-12`):** Changing paths or OS users would require manual SSH setup by the owner; keeping the existing path, user, `.env`, and `data/` lets the revamp self-install safely on the next closed-market update cycle.
+- **Activating Telegram alerts (`F-08-14`, withdrawn `F-11-14`):** Discord is already active and structured by channel on the server, so Telegram remains optional and silent by default.
+
+## Open questions
+
+None of the items below block building, testing, or deploying `R-01` through `R-23` (the code runs safely with today's server `.env`), so only owner-side account actions remain:
+
+1. **Provider key rotation (owner action, recommended immediately alongside `R-03`):** Because git history is intentionally not rewritten, please revoke/regenerate in each provider's dashboard the exposed Telegram bot token (`.env.example`), the Perplexity proxy token (`.mcp.json` on `master`), the TipRanks credentials (`config.py` / `tipranks_client.py`), the log-exposed FMP and Finnhub keys (updating `/root/polymarket-bot/.env` whenever convenient), and check that any old Polymarket wallet `PRIVATE_KEY` still sitting in `/root/polymarket-bot/.env` holds zero funds before deleting old Polymarket lines and stopping the unused `nginx` service on the droplet.
+2. **Optional paid data and AI top-ups (owner choice, does not block `R-13`, `R-14`, `R-17`):** The revamped bot works on day one using the active broker key, Finnhub news, and OpenAI (plus the Anthropic key already present on the server). If you later choose to top up Perplexity API credits or upgrade FMP/TipRanks plans—and inspect monthly provider billing consoles to record actual historical API spend—the input-health layer will automatically detect and use them without code changes.
+3. **Optional private repository switch (owner choice, after `R-12`):** If you decide later to make the GitHub repository private, follow the `README.md` checklist to add a read-only SSH deploy key and GitHub Actions read token on the server first so `auto_update.sh` continues pulling and checking CI cleanly.
+4. **Historical audit note on 27 April and 16 April orders (informational only; `R-09` cleans up the positions automatically):** Confirm when convenient whether a one-off script submitted the eight 04:01 ET stop orders on 27 April and whether the 16 April fractional buy was manual; if the 27 April batch is unfamiliar, rotate the paper broker API key as a precaution.
