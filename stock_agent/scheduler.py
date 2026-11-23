@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -16,6 +15,7 @@ from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.data_feed import DataFeed
 from stock_agent.execution import ExecutionEngine
+from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsService
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
@@ -37,7 +37,9 @@ from stock_agent.performance import close_session
 from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
-from stock_agent.research_pipeline import JobOutcome, OptionIdea
+from stock_agent.research_health import ResearchInputHealth
+from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline
+from stock_agent.research_sources import ResearchSources
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import (
     DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, TradeKind, update_drawdown,
@@ -133,20 +135,40 @@ class StockAgentScheduler:
         ))
         self.price_service = self.prices
         self.health_registry = self.health
-        self.news = service("news", lambda: None)
+        self._universe_symbols: tuple[str, ...] = ()
+        self.fundamentals = service("fundamentals", lambda: FundamentalsService(
+            self.http, config=self.config, health=self.health, assets=self.assets, prices=self.prices,
+            focus_symbols=self._pollable_focus, now=_now_utc, universe_size=self.config.UNIVERSE_SIZE,
+        ))
+        self.news = service("news", self._build_news_service)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
         self.llm = service("llm", lambda: LLMClient(
             self.config, spend=self.research_store, on_failure=self._on_research_failure, now=_now_utc,
+            health=self.health,
         ))
-        self.research_gate = service("research_gate", lambda: ResearchGate(self.ledger, self.health, self.config))
-        self.research = service("research", lambda: None)
+        self.analyst = service("analyst", lambda: Analyst(self.llm))
+        self.research_sources = service("research_sources", lambda: ResearchSources(
+            self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
+            fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
+        ) if self.news is not None else None)
+        self.research_health = service("research_health", lambda: ResearchInputHealth(
+            self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
+            research_store=self.research_store,
+        ) if self.research_sources is not None else self.health)
+        self.research_gate = service("research_gate", lambda: ResearchGate(
+            self.ledger, self.research_health, self.config,
+        ))
+        self.research = service("research", lambda: ResearchPipeline(
+            self.config, self.ledger, self.calendar, self.analyst, self.research_store,
+            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus, alerts=self.alerts,
+        ) if self.research_sources is not None else None)
         self.capital_lock = asyncio.Lock()
         self._asset_lock = asyncio.Lock()
         self.engine = service("engine", lambda: ExecutionEngine(
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
             bars=self._stop_bars, controls=self._risk_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
-            capital_lock=self.capital_lock, research_gate=self.research_gate,
+            capital_lock=self.capital_lock, research_gate=self.research_gate, notifier=self.alerts,
         ))
         self.options_store = service("options_store", lambda: KvOptionsStore(self.store))
         self.options = service("options", lambda: OptionsManager(
@@ -159,7 +181,7 @@ class StockAgentScheduler:
         ))
         if isinstance(self.engine, ExecutionEngine):
             self.engine.options = self.options
-        self.runtime = service("runtime", lambda: RuntimeStatus(self.config.DATA_DIR / "runtime-health.json"))
+        self.runtime = service("runtime", lambda: RuntimeStatus.for_data_dir(self.config.DATA_DIR))
         self.pause_file: Path = service("pause_file", lambda: self.config.DATA_DIR / "pause-trading")
         self._stop_event = asyncio.Event()
         self._normalised = False
@@ -178,7 +200,6 @@ class StockAgentScheduler:
         self._pending_ledger_alerts: set[asyncio.Task] = set()
         # Legacy read interfaces temporarily remain for report/research callbacks.
         self.data_feed = DataFeed(self.config)
-        self.analyst = Analyst(self.llm)
         self.screener = Screener(self.config)
         self.portfolio = Portfolio(self.config, persist=False)
         self.ledger.add_snapshot_listener(self.portfolio.sync_from_snapshot)
@@ -238,6 +259,13 @@ class StockAgentScheduler:
         self._pending_ledger_alerts.add(task)
         task.add_done_callback(self._pending_ledger_alerts.discard)
 
+    async def _report_exception(self, where: str, exc: Exception, *, critical: bool = False) -> None:
+        if isinstance(self.alerts, AlertService):
+            self.alerts.alert_unhandled_exception(where, type(exc).__name__, critical=critical)
+        else:
+            await self._alert("critical" if critical else "warning", f"{where} failed", type(exc).__name__,
+                              key=f"exception:{where}")
+
     def _entries_enabled(self) -> bool:
         if not self._normalised or not self._reconciled or self._shutdown or self._manually_paused():
             return False
@@ -257,6 +285,8 @@ class StockAgentScheduler:
 
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
+            return True
+        if isinstance(self.runtime, RuntimeStatus) and self.runtime.path.with_name("pause-trading").exists():
             return True
         configured = getattr(self.config, "is_trading_paused", None)
         return bool(configured is not None and configured(self.config.DATA_DIR))
@@ -282,10 +312,30 @@ class StockAgentScheduler:
     def _tracked_symbols(self) -> tuple[str, ...]:
         current = self.ledger.last_snapshot()
         held = (position.symbol for position in current.holdings) if current else ()
+        catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
         return tuple(dict.fromkeys([
             *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
-            *self.assets.active_symbols()[:self.config.UNIVERSE_SIZE],
+            *self._universe_symbols, *catalogue,
         ]))
+
+    def _resolve_symbols(self, symbols) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            resolved for symbol in symbols if (resolved := self.assets.resolve_symbol(symbol))
+        ))
+
+    def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
+
+    def _build_news_service(self):
+        try:
+            from stock_agent.news_service import NewsService
+        except ModuleNotFoundError as exc:
+            if exc.name != "stock_agent.news_service":
+                raise
+            # Transitional for the shared branches; eligibility remains fail-closed.
+            return None
+        return NewsService(self.http, config=self.config, store=self.store, health=self.health,
+                           assets=self.assets, now=_now_utc)
 
     async def _refresh_assets(self, *, force: bool = False):
         if isinstance(self.assets, AssetRegistry) and not (
@@ -301,7 +351,11 @@ class StockAgentScheduler:
         return None
 
     async def _list_universe(self) -> tuple[str, ...]:
-        return self._option_universe()[:self.config.UNIVERSE_SIZE]
+        candidates = await self.fundamentals.list_universe()
+        self._universe_symbols = self._resolve_symbols((*self.config.PRIORITY_SYMBOLS, *candidates))[
+            :self.config.UNIVERSE_SIZE
+        ]
+        return self._universe_symbols
 
     async def _stop_bars(self, symbol: str):
         getter = getattr(self.prices, "get_daily_bars", None)
@@ -320,9 +374,10 @@ class StockAgentScheduler:
         return quote if quote is not None and getattr(quote, "symbol", symbol) == symbol else None
 
     def _option_universe(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(
-            resolved for symbol in self._tracked_symbols() if (resolved := self.assets.resolve_symbol(symbol))
-        ))
+        current = self.ledger.last_snapshot()
+        held = (position.symbol for position in current.holdings) if current else ()
+        candidates = self._universe_symbols or self.assets.active_symbols()[:self.config.UNIVERSE_SIZE]
+        return self._resolve_symbols((*held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS, *candidates))
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
         if purpose != "protection" and self._shutdown:
@@ -344,6 +399,8 @@ class StockAgentScheduler:
             self._needs_rebuild = False
             result = self.ledger.last_reconcile()
             self._reconciled = not self.ledger.trading_block() and bool(result is None or result.get("clean"))
+            if self._engine_resumed and self._reconciled:
+                self._normalised = self.engine.normalised
             self._last_reconcile_at = _now_utc()
             self._provider_health("alpaca", "broker", True, None)
         except Exception as exc:
@@ -392,17 +449,17 @@ class StockAgentScheduler:
             except Exception as exc:
                 await self._alert("warning", "Startup asset refresh pending", type(exc).__name__,
                                   key="assets-startup")
-        if not self._shutdown:
-            await self._reconcile_scheduler("startup")
-        if self._shutdown:
-            return
-        if self._last_reconcile_at is not None and self.engine is not None:
+        if not self._shutdown and self.engine is not None:
             try:
+                # Bind lost HTTP replies to broker order IDs before a reconcile
+                # can record one of our own fills as an unexplained import.
                 await self._resume_execution()
             except TimeoutError:
                 await self._alert("warning", "Order recovery is still pending",
                                   "The scheduler will keep retrying; new entries are blocked.",
                                   key="order-resume")
+        if not self._shutdown and self._engine_resumed:
+            await self._reconcile_scheduler("startup")
         if not self._shutdown and self._last_reconcile_at is not None and isinstance(self.options, OptionsManager):
             try:
                 async with asyncio.timeout(8):
@@ -434,12 +491,15 @@ class StockAgentScheduler:
                     self._schedule_notifications()
                 except Exception as exc:
                     logger.error("Scheduler cycle failed: %s", type(exc).__name__)
-                    await self._alert("warning", "Scheduler cycle failed", type(exc).__name__, key="scheduler-tick")
+                    await self._report_exception("scheduler tick", exc)
                 if not self._shutdown:
                     try:
                         await asyncio.wait_for(self._stop_event.wait(), timeout=TICK_SECONDS)
                     except TimeoutError:
                         pass
+        except Exception as exc:
+            await self._report_exception("scheduler startup", exc, critical=True)
+            raise
         finally:
             await self._cleanup()
 
@@ -452,6 +512,14 @@ class StockAgentScheduler:
         self._telemetry_task = asyncio.create_task(self._notification_tick(), name="stock-agent:notifications")
 
     async def _notification_tick(self) -> None:
+        if isinstance(self.runtime, RuntimeStatus) and isinstance(self.alerts, AlertService):
+            event = self.runtime.deployment_event()
+            if event and event["at"] != self.store.kv_get("deploy.last_notified"):
+                if self.alerts.alert_deploy_event(
+                    event["event"], self.runtime.sha, reason=str(event.get("reason") or ""),
+                    rollback=event["event"] == "rollback",
+                ):
+                    self.store.kv_set("deploy.last_notified", event["at"])
         try:
             async with asyncio.timeout(6):
                 note = "broker sync healthy" if self._reconciled else "broker sync needs attention"
@@ -486,6 +554,11 @@ class StockAgentScheduler:
         await self.calendar.refresh()
         if self._shutdown:
             return
+        if not self._engine_resumed and self._last_reconcile_at is None:
+            try:
+                await self._resume_execution()
+            except TimeoutError:
+                return
         if not self._reconciled or self._last_reconcile_at is None or (
             _now_utc() - self._last_reconcile_at >= timedelta(seconds=90)
         ):
@@ -722,6 +795,8 @@ class StockAgentScheduler:
             if row.status is JobStatus.STARTED and not replay:
                 # An external notification/order may have succeeded before the crash.
                 self.ledger.finish_job(name, window_key, JobStatus.SKIPPED, detail={"reason": "interrupted"})
+                if isinstance(self.alerts, AlertService):
+                    self.alerts.alert_skipped_cycle(name, "interrupted; replay would risk a duplicate notification")
                 return
             if row.eligible_retry_at and row.eligible_retry_at > _now_utc():
                 return
@@ -742,14 +817,16 @@ class StockAgentScheduler:
                 detail = {"reason": str(detail)[:160]}
             retry = _now_utc() + timedelta(minutes=5 * attempt) if status is JobStatus.FAILED else None
             self.ledger.finish_job(name, window_key, status, intents=intents, detail=detail, eligible_retry_at=retry)
-            if status in {JobStatus.FAILED, JobStatus.SKIPPED}:
+            if status is JobStatus.SKIPPED and isinstance(self.alerts, AlertService):
+                self.alerts.alert_skipped_cycle(name, str(detail.get("reason") or "schedule gate declined"))
+            elif status is JobStatus.FAILED:
                 await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
                                   key=f"job-result:{name}")
         except Exception as exc:
             self.ledger.finish_job(name, window_key, JobStatus.FAILED,
                                    detail={"error": type(exc).__name__},
                                    eligible_retry_at=_now_utc() + timedelta(minutes=5 * attempt))
-            await self._alert("warning", f"{name} did not complete", type(exc).__name__, key=f"job:{name}")
+            await self._report_exception(name, exc)
 
     async def _collect_finished_jobs(self):
         for name, task in tuple(self._job_tasks.items()):

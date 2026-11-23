@@ -45,6 +45,24 @@ class RuntimeStatus:
         self.path = path
         self.sha = release_sha() if sha is None else sha
 
+    @classmethod
+    def for_data_dir(cls, data_dir: Path) -> RuntimeStatus:
+        # Cron and the systemd service agree on this path without moving the ledger.
+        path = os.environ.get("STOCK_AGENT_RUNTIME_STATUS")
+        return cls(Path(path) if path else data_dir / "runtime-health.json")
+
+    def deployment_event(self) -> dict | None:
+        try:
+            state = json.loads(self.path.with_name("deploy-status.json").read_text())
+            event = state.get("last_event") if isinstance(state, dict) else None
+            if (isinstance(event, dict) and event.get("active_sha") == self.sha
+                    and event.get("event") in {"deployed", "rollback"}
+                    and isinstance(event.get("at"), str)):
+                return event
+        except (OSError, ValueError):
+            pass
+        return None
+
     def publish(
         self, market: MarketState, *, ready: bool, reconciled: bool, entries_enabled: bool,
     ) -> None:
