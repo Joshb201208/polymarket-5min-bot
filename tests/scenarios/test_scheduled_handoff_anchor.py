@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import pytest
 
-from stock_agent.ledger import IntentStatus, NewIntent
+from stock_agent.ledger import IntentStatus, NewIntent, ThesisRole
 from tests.fakes import ET
 from tests.scenarios.v1_restore_support import Harness, Reply, monday_hold_catchup, tuesday_prescan_with_stale_quote
 
@@ -129,6 +129,29 @@ def test_handoff_will_not_compete_with_a_buy_queued_during_rollback(world, monke
         assert result.detail["handoff_outcomes"] == {"handoff_buy_pending": 1}
         assert [i.dedupe_key for i in h.intents() if not i.terminal] == ["weekly:rollback:synthetic"]
         assert not (await _sweep(h)).detail["handoff_outcomes"]
+
+    _run(world, monkeypatch, body, anchored=True)
+
+
+@pytest.mark.parametrize("change", ["newer_hold", "pending_exit"])
+def test_handoff_never_supersedes_a_current_hold_or_pending_exit(world, monkeypatch, change):
+    async def body(h):
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        if change == "newer_hold":
+            h.scheduler.ledger.record_thesis(
+                "AAPL", {"draft": {"direction": "HOLD", "symbol": "AAPL"}},
+                ThesisRole.ENTRY_CANDIDATE, source="synthetic", generated_at=world.clock.now(),
+                activate=True,
+            )
+            expected = "handoff_thesis_changed"
+        else:
+            h.scheduler.ledger.enqueue_intents((NewIntent("AAPL", "sell", "synthetic:new-exit"),))
+            expected = "handoff_exit_pending"
+        assert (await _sweep(h)).detail["handoff_outcomes"] == {expected: 1}
+        (buy,) = [intent for intent in h.intents() if intent.side == "buy"]
+        assert buy.status == IntentStatus.SKIPPED and buy.last_error == expected
+        assert not h.buys()
 
     _run(world, monkeypatch, body, anchored=True)
 
