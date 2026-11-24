@@ -727,3 +727,197 @@ def test_nullable_close_marks_rendered_cutover_persisted_drawdown_and_degrade(
 
     asyncio.run(_run())
 
+
+def test_entry_funnel_and_locks_in_daily_and_weekly_reports(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path / "funnel_test"
+        ledger = make_ledger(tmp_path / "funnel_test", world)
+
+        # 1) A13f: 15% drawdown throttle tier explicitly states no new margin borrowing
+        tier, desc = describe_drawdown_tier(Decimal("-16.0"), ledger)
+        assert tier == "throttle_15pct"
+        assert "no new margin borrowing" in desc
+
+        # 2) Zero-candidate locked session: zero buys never looks like silence, and shows exact lock + clear condition
+        (cfg.DATA_DIR / "pause-trading").write_text("paused\n", encoding="utf-8")
+        s_day = BookSnapshot(
+            as_of=datetime(2026, 11, 23, 21, 5, tzinfo=timezone.utc),
+            run_id="r-lock",
+            equity=Decimal("100000"),
+            cash=Decimal("40000"),
+            long_mv=Decimal("60000"),
+            short_mv=Decimal("0"),
+            options_mv=Decimal("0"),
+            last_equity=None,
+            buying_power=Decimal("80000"),
+            holdings=(),
+            legs=(),
+            open_orders=(),
+            diffs=(),
+        )
+        ledger.record_equity_mark(date(2026, 11, 23), "close", s_day)
+        rb = ReportBuilder(
+            cfg,
+            ledger=ledger,
+            clock=lambda: datetime(2026, 11, 23, 21, 10, tzinfo=timezone.utc),
+        )
+        zero_daily = str(await rb.build_daily_summary(snapshot=s_day))
+        assert "Entries locked: operator pause switch (pause-trading file) — clears when the data/pause-trading file is removed" in zero_daily
+        assert "**Screened 0** → **Thesis Written 0** → **Passed Conviction 0** → **Passed Risk 0** → **Ordered 0** → **Filled 0**" in zero_daily
+        assert "Zero buys attempted because new entries are currently locked" in zero_daily
+
+        # 3) Populate research.entry_funnel + execution intents (partial fill counted once, risk/hold skips grouped)
+        (cfg.DATA_DIR / "pause-trading").unlink()
+        world.clock.set_et(2026, 11, 23, 10, 30)
+        ledger.journal.append(
+            "research.entry_funnel",
+            job="scheduled_scan",
+            session_date="2026-11-23",
+            screened=12,
+            thesis_written=5,
+            passed_conviction=3,
+            buy_candidates=3,
+            option_ideas=1,
+            rejected_by_reason={"non_entry_direction": 1, "conviction_below_floor": 1},
+        )
+        ledger.journal.append(
+            "research.entry_funnel",
+            job="live_news",
+            session_date="2026-11-23",
+            screened=0,
+            thesis_written=2,
+            passed_conviction=1,
+            buy_candidates=1,
+            option_ideas=0,
+            rejected_by_reason={"quote_stale_or_unavailable": 1},
+        )
+
+        # Intent 1: partial fill whose remainder was cancelled at close -> counts once in Passed Risk, Ordered, Filled (with 1 partial note, NOT skipped!)
+        i_fill_id = ledger.enqueue_intents(
+            [
+                NewIntent(
+                    symbol="AAPL",
+                    side="buy",
+                    dedupe_key="scan:2026-11-23:AAPL:buy",
+                    sleeve="CORE_EQUITY",
+                    origin="scheduled",
+                    session_date=date(2026, 11, 23),
+                )
+            ]
+        )[0]
+        ledger.claim_intent(i_fill_id)
+        ledger.ack_intent(i_fill_id, IntentStatus.PARTIALLY_FILLED, broker_order_id="ord-aapl-1")
+        ledger.journal.append(
+            "execution.buy_funnel",
+            intent_id=i_fill_id,
+            symbol="AAPL",
+            origin="scheduled",
+            stage="filled",
+            code="partial_fill",
+            reason="6/10 filled",
+        )
+        ledger.ack_intent(
+            i_fill_id,
+            IntentStatus.CANCELLED,
+            meta={"skip_code": "unfilled_cancelled", "skip_reason": "remainder cancelled at close"},
+        )
+
+        # Intent 2: passed risk + ordered, then unfilled_cancelled at close (zero fills)
+        i_unfilled_id = ledger.enqueue_intents(
+            [
+                NewIntent(
+                    symbol="MSFT",
+                    side="buy",
+                    dedupe_key="news:2026-11-23:MSFT:buy",
+                    sleeve="NEWS_EQUITY",
+                    origin="news",
+                    session_date=date(2026, 11, 23),
+                )
+            ]
+        )[0]
+        ledger.claim_intent(i_unfilled_id)
+        ledger.ack_intent(i_unfilled_id, IntentStatus.SUBMITTED, broker_order_id="ord-msft-1")
+        ledger.ack_intent(
+            i_unfilled_id,
+            IntentStatus.CANCELLED,
+            meta={"skip_code": "unfilled_cancelled", "skip_reason": "unfilled at close"},
+        )
+
+        # Intent 3: refused by risk margin_buffer (25% margin safety cushion floor)
+        i_risk_id = ledger.enqueue_intents(
+            [
+                NewIntent(
+                    symbol="NVDA",
+                    side="buy",
+                    dedupe_key="scan:2026-11-23:NVDA:buy",
+                    sleeve="CORE_EQUITY",
+                    origin="scheduled",
+                    session_date=date(2026, 11, 23),
+                )
+            ]
+        )[0]
+        ledger.ack_intent(
+            i_risk_id,
+            IntentStatus.SKIPPED,
+            error="risk: margin_buffer",
+            meta={
+                "skip_code": "risk_refused",
+                "skip_reason": "risk: margin_buffer",
+                "risk_reasons": ["margin_buffer"],
+            },
+        )
+
+        # Intent 4: expired while held by cleanup_pending
+        i_exp_id = ledger.enqueue_intents(
+            [
+                NewIntent(
+                    symbol="AMZN",
+                    side="buy",
+                    dedupe_key="scan:2026-11-23:AMZN:buy",
+                    sleeve="CORE_EQUITY",
+                    origin="scheduled",
+                    session_date=date(2026, 11, 23),
+                )
+            ]
+        )[0]
+        ledger.ack_intent(
+            i_exp_id,
+            IntentStatus.EXPIRED,
+            error="intent expired",
+            meta={"skip_code": "intent_expired", "held_by": "cleanup_pending"},
+        )
+
+        explicit_locks = [
+            {
+                "code": "reconcile_unclean",
+                "lock": "broker reconciliation not clean",
+                "clears_when": "next reconcile finishes with zero blocking diffs",
+            }
+        ]
+        daily_embeds = await rb.build_daily_summary(snapshot=s_day, entry_locks=explicit_locks)
+        daily_flat = str(daily_embeds)
+        assert "**Screened 12** → **Thesis Written 7** → **Passed Conviction 4** → **Passed Risk 2** → **Ordered 2** → **Filled 1** (incl. 1 partial)" in daily_flat
+        assert "25% margin safety cushion floor" in daily_flat
+        assert "expired while held by first-run account clean-up pending" in daily_flat
+        assert "limit order unfilled by close" in daily_flat
+        assert "Entries locked: broker reconciliation not clean — clears when next reconcile finishes with zero blocking diffs" in daily_flat
+
+        wk_embeds, sc = await rb.build_weekly_scorecard(snapshot=s_day, entry_locks=explicit_locks)
+        assert sc["entry_funnel"]["screened"] == 12
+        assert sc["entry_funnel"]["thesis_written"] == 7
+        assert sc["entry_funnel"]["passed_conviction"] == 4
+        assert sc["entry_funnel"]["passed_risk"] == 2
+        assert sc["entry_funnel"]["ordered"] == 2
+        assert sc["entry_funnel"]["filled"] == 1
+        assert sc["entry_funnel"]["partial_fill_count"] == 1
+        assert sc["entry_locks"]["locked"] is True
+        assert "Entry Funnel (This Week)" in str(wk_embeds)
+
+        ledger.store.close()
+
+    asyncio.run(_run())
+
+

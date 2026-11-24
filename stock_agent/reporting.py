@@ -25,10 +25,11 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from stock_agent.alerts import redact_secrets_in_text
+from stock_agent.alerts import format_entry_lock_line, redact_secrets_in_text
 from stock_agent.benchmark import MIN_PAIRED_IR, BenchmarkSnapshot, BenchmarkTracker
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, EquityMark, Holding, Ledger
@@ -144,7 +145,7 @@ def describe_drawdown_tier(
         if st.is_throttled(config=config):
             return (
                 "throttle_15pct",
-                "15% Drawdown Guard — new stock sizes cut in half; new option trades paused",
+                "15% Drawdown Guard — new stock sizes cut in half, no new margin borrowing, and new option trades paused",
             )
         if st.should_alert(config=config):
             return (
@@ -168,7 +169,7 @@ def describe_drawdown_tier(
     if dd <= -15.0:
         return (
             "throttle_15pct",
-            "15% Drawdown Guard — new stock sizes cut in half; new option trades paused",
+            "15% Drawdown Guard — new stock sizes cut in half, no new margin borrowing, and new option trades paused",
         )
     if dd <= -10.0:
         return (
@@ -536,6 +537,7 @@ class ReportBuilder:
         snapshot: BookSnapshot | None = None,
         as_of: datetime | None = None,
         macro_embed: dict[str, Any] | None = None,
+        entry_locks: Sequence[Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build plain-English morning brief embeds from reconciled state; never raises."""
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
@@ -545,6 +547,7 @@ class ReportBuilder:
                 snapshot=snapshot,
                 as_of=as_of,
                 macro_embed=macro_embed,
+                entry_locks=entry_locks,
             )
         except Exception as e:
             return self._unavailable_embed(title, e)
@@ -555,6 +558,7 @@ class ReportBuilder:
         snapshot: BookSnapshot | None = None,
         as_of: datetime | None = None,
         macro_embed: dict[str, Any] | None = None,
+        entry_locks: Sequence[Any] | None = None,
     ) -> list[dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
@@ -758,6 +762,15 @@ class ReportBuilder:
         )
         health_txt, _ = format_input_health_table(self.health_registry)
         ops_fields.append({"name": "Data Sources & API Health", "value": health_txt, "inline": False})
+        locks = self._compile_entry_locks(snap, entry_locks)
+        if locks:
+            ops_fields.append(
+                {
+                    "name": "Entry Lock Status",
+                    "value": "\n".join(locks["lines"]),
+                    "inline": False,
+                }
+            )
 
         embeds.append(
             {
@@ -846,6 +859,8 @@ class ReportBuilder:
         snapshot: BookSnapshot | None = None,
         close_report: Any | None = None,
         as_of: datetime | None = None,
+        entry_locks: Sequence[Any] | None = None,
+        entry_funnel: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build honest end-of-day summary embeds from close mark & reconciled book; never raises."""
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
@@ -855,6 +870,8 @@ class ReportBuilder:
                 snapshot=snapshot,
                 close_report=close_report,
                 as_of=as_of,
+                entry_locks=entry_locks,
+                entry_funnel=entry_funnel,
             )
         except Exception as e:
             return self._unavailable_embed(title, e)
@@ -865,6 +882,8 @@ class ReportBuilder:
         snapshot: BookSnapshot | None = None,
         close_report: Any | None = None,
         as_of: datetime | None = None,
+        entry_locks: Sequence[Any] | None = None,
+        entry_funnel: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
@@ -876,11 +895,24 @@ class ReportBuilder:
         today_mark: EquityMark | None = next((m for m in marks if m.session_date == session_date), None)
 
         if today_mark is None and snap is None:
+            locks_empty = self._compile_entry_locks(None, entry_locks)
+            funnel_empty = self._compile_entry_funnel(session_date, week=False, explicit_funnel=entry_funnel)
+            empty_fields: list[dict[str, Any]] = []
+            if locks_empty:
+                empty_fields.append({"name": "Entry Lock Status", "value": "\n".join(locks_empty["lines"]), "inline": False})
+            empty_fields.append(
+                {
+                    "name": "Entry Funnel",
+                    "value": self._format_entry_funnel_text(funnel_empty, locked=bool(locks_empty)),
+                    "inline": False,
+                }
+            )
             return [
                 {
                     "title": f"📊 Daily Summary — {date_label}",
                     "description": "Could not produce end-of-day summary because no verified broker snapshot was available.",
                     "color": 0xEF4444,
+                    "fields": empty_fields,
                 }
             ]
 
@@ -1031,6 +1063,23 @@ class ReportBuilder:
 
         health_txt, _ = format_input_health_table(self.health_registry)
         summary_fields.append({"name": "Data Sources & API Health", "value": health_txt, "inline": False})
+        locks_info = self._compile_entry_locks(snap, entry_locks)
+        funnel_info = self._compile_entry_funnel(session_date, week=False, explicit_funnel=entry_funnel)
+        if locks_info:
+            summary_fields.append(
+                {
+                    "name": "Entry Lock Status",
+                    "value": "\n".join(locks_info["lines"]),
+                    "inline": False,
+                }
+            )
+        summary_fields.append(
+            {
+                "name": "Entry Funnel",
+                "value": self._format_entry_funnel_text(funnel_info, locked=bool(locks_info)),
+                "inline": False,
+            }
+        )
 
         return [
             {
@@ -1126,6 +1175,8 @@ class ReportBuilder:
         as_of: datetime | None = None,
         build_id: str = "revamp",
         cutover_date: date | None = None,
+        entry_locks: Sequence[Any] | None = None,
+        entry_funnel: Mapping[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build the weekly paper-test scorecard embeds and structured breakdown dict; never raises."""
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
@@ -1136,6 +1187,8 @@ class ReportBuilder:
                 as_of=as_of,
                 build_id=build_id,
                 cutover_date=cutover_date,
+                entry_locks=entry_locks,
+                entry_funnel=entry_funnel,
             )
         except Exception as e:
             embeds = self._unavailable_embed(title, e)
@@ -1155,6 +1208,8 @@ class ReportBuilder:
         as_of: datetime | None = None,
         build_id: str = "revamp",
         cutover_date: date | None = None,
+        entry_locks: Sequence[Any] | None = None,
+        entry_funnel: Mapping[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         now_et = as_of.astimezone(ET) if as_of else self._now_et()
         session_date = now_et.date()
@@ -1286,6 +1341,8 @@ class ReportBuilder:
             "orders_and_stops": orders_stats,
             "news_and_inputs": news_inputs,
             "what_we_learned": learned,
+            "entry_locks": self._compile_entry_locks(snap, entry_locks) or {"locked": False, "locks": [], "lines": []},
+            "entry_funnel": self._compile_entry_funnel(session_date, week=True, explicit_funnel=entry_funnel),
         }
 
         embeds = self._format_weekly_embeds(scorecard, bm, dd_label, now_et)
@@ -1856,15 +1913,31 @@ class ReportBuilder:
             + (f" | 7d AI Spend: ${ni['llm_budget_spent_7d_usd']:.2f}" if ni["llm_budget_spent_7d_usd"] is not None else "")
         )
 
+        e2_fields: list[dict[str, Any]] = [
+            {"name": "Results by Strategy Sleeve", "value": "\n".join(sleeve_lines), "inline": False},
+            {"name": "Results by Conviction Tier (Sample Size, Not Probability)", "value": "\n".join(conv_lines), "inline": False},
+            {"name": "Order & Stop-Loss Reliability", "value": ord_txt, "inline": False},
+            {"name": "Live News & Input Reliability", "value": ni_txt, "inline": False},
+        ]
+        wk_locks = sc.get("entry_locks") or {}
+        if wk_locks.get("locked") and wk_locks.get("lines"):
+            e2_fields.append(
+                {"name": "Entry Lock Status", "value": "\n".join(wk_locks["lines"]), "inline": False}
+            )
+        wk_funnel = sc.get("entry_funnel")
+        if isinstance(wk_funnel, Mapping):
+            e2_fields.append(
+                {
+                    "name": "Entry Funnel (This Week)",
+                    "value": self._format_entry_funnel_text(wk_funnel, locked=bool(wk_locks.get("locked"))),
+                    "inline": False,
+                }
+            )
+
         e2 = {
             "title": "🧩 Results by Sleeve, Execution & News Health",
             "color": 0x0D9488,
-            "fields": [
-                {"name": "Results by Strategy Sleeve", "value": "\n".join(sleeve_lines), "inline": False},
-                {"name": "Results by Conviction Tier (Sample Size, Not Probability)", "value": "\n".join(conv_lines), "inline": False},
-                {"name": "Order & Stop-Loss Reliability", "value": ord_txt, "inline": False},
-                {"name": "Live News & Input Reliability", "value": ni_txt, "inline": False},
-            ],
+            "fields": e2_fields,
         }
 
         # Embed 3: What We Learned (Plain-English Shadow Comparisons)
@@ -1899,6 +1972,621 @@ class ReportBuilder:
         }
 
         return [e1, e2, e3]
+
+    # ── A14c / A14d: Entry Locks & Entry Funnel ──────────────────────────────
+
+    def _compile_entry_locks(
+        self,
+        snap: BookSnapshot | None,
+        explicit_locks: Sequence[Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Collect all active global buy-entry locks and their clear conditions (DECISIONS A14c)."""
+        collected: list[dict[str, str]] = []
+        seen_codes: set[str] = set()
+
+        def _add(code: str, lock: str, clears_when: str, detail: str = "") -> None:
+            norm = code.strip().lower() or lock.strip().lower()
+            if not norm or norm in seen_codes:
+                return
+            seen_codes.add(norm)
+            item = {
+                "code": norm,
+                "lock": lock.strip(),
+                "detail": detail.strip(),
+                "clears_when": clears_when.strip(),
+            }
+            collected.append(item)
+
+        def _ingest_items(items: Sequence[Any] | None) -> None:
+            for it in items or ():
+                if not it:
+                    continue
+                if isinstance(it, str):
+                    txt = it.strip()
+                    if txt:
+                        _add(txt[:32], txt, "the blocking condition resolves")
+                elif isinstance(it, Mapping):
+                    c = str(it.get("code") or it.get("lock") or "safety_lock")
+                    lk = str(it.get("lock") or c)
+                    cl = str(it.get("clears_when") or it.get("clear_condition") or "the safety check passes")
+                    dt = str(it.get("detail") or "")
+                    _add(c, lk, cl, dt)
+                else:
+                    c = str(getattr(it, "code", None) or getattr(it, "lock", None) or "safety_lock")
+                    lk = str(getattr(it, "lock", None) or c)
+                    cl = str(
+                        getattr(it, "clears_when", None)
+                        or getattr(it, "clear_condition", None)
+                        or "the safety check passes"
+                    )
+                    dt = str(getattr(it, "detail", None) or "")
+                    _add(c, lk, cl, dt)
+
+        _ingest_items(explicit_locks)
+
+        if self.ledger is not None and hasattr(self.ledger, "risk_state_get"):
+            try:
+                persisted_locks = self.ledger.risk_state_get("entry_locks")
+                if isinstance(persisted_locks, Sequence) and not isinstance(persisted_locks, (str, bytes)):
+                    _ingest_items(persisted_locks)
+            except Exception:
+                pass
+
+        # Fallback live state checks so locks are reported accurately even without scheduler override
+        try:
+            data_dir = getattr(self.config, "DATA_DIR", None)
+            if data_dir and (Path(data_dir) / "pause-trading").exists():
+                _add(
+                    "pause_file",
+                    "operator pause switch (pause-trading file)",
+                    "the data/pause-trading file is removed",
+                )
+        except Exception:
+            pass
+
+        if self.ledger is not None:
+            try:
+                block = self.ledger.trading_block() if hasattr(self.ledger, "trading_block") else None
+                if block:
+                    _add(
+                        "books_untrusted",
+                        f"broker reconciliation not clean ({block})",
+                        "the next broker reconciliation finishes with zero blocking discrepancies",
+                    )
+            except Exception:
+                pass
+
+            try:
+                store = getattr(self.ledger, "store", None)
+                if store is not None and hasattr(store, "kv_get"):
+                    norm_rec = store.kv_get("execution.normalise")
+                    if isinstance(norm_rec, Mapping) and norm_rec.get("state") not in (None, "done"):
+                        _add(
+                            "cleanup_pending",
+                            f"first-run account clean-up ({norm_rec.get('state')})",
+                            "initial protective stops and legacy position repairs complete cleanly",
+                        )
+            except Exception:
+                pass
+
+        st_dd = _read_persisted_drawdown(self.ledger, config=self.config)
+        if st_dd is not None:
+            pause_thr = Decimal(str(getattr(self.config, "DRAWDOWN_PAUSE_PCT", "0.20")))
+            rec_target = int(getattr(self.config, "DRAWDOWN_RECOVERY_SESSIONS", 5))
+            if st_dd.paused or st_dd.drawdown >= pause_thr:
+                _add(
+                    "drawdown_pause",
+                    "20% drawdown safety stop",
+                    f"drawdown stays above -15% for {rec_target} consecutive closes ({st_dd.recovery_closes}/{rec_target} recorded)",
+                )
+
+        if snap is not None:
+            flags = getattr(snap, "account_flags", None) or {}
+            active_flags = [
+                k for k in ("trading_blocked", "account_blocked", "trade_suspended_by_user")
+                if flags.get(k)
+            ]
+            if active_flags:
+                _add(
+                    "broker_blocked",
+                    f"broker account flag ({', '.join(active_flags)})",
+                    "Alpaca clears the account trading restriction",
+                )
+
+        if not collected:
+            return None
+
+        return {
+            "locked": True,
+            "locks": collected,
+            "lines": [format_entry_lock_line(it) for it in collected],
+        }
+
+    def _compile_entry_funnel(
+        self,
+        session_date: date,
+        *,
+        week: bool = False,
+        explicit_funnel: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Compile the 6-stage entry funnel and skip counts by reason & sleeve (DECISIONS A14d)."""
+        if explicit_funnel is not None:
+            return dict(explicit_funnel)
+
+        start_date = (session_date - timedelta(days=6)) if week else session_date
+        start_iso = start_date.isoformat()
+        end_iso = session_date.isoformat()
+
+        screened = 0
+        thesis_written = 0
+        passed_conviction = 0
+        research_skips: Counter[str] = Counter()
+        exec_skips: Counter[str] = Counter()
+        held_counts: Counter[str] = Counter()
+        by_sleeve: dict[str, dict[str, Any]] = {
+            "CORE_EQUITY": {"candidates": 0, "passed_risk": 0, "ordered": 0, "filled": 0, "skips": Counter()},
+            "NEWS_EQUITY": {"candidates": 0, "passed_risk": 0, "ordered": 0, "filled": 0, "skips": Counter()},
+            "OPTIONS": {"candidates": 0, "passed_risk": 0, "ordered": 0, "filled": 0, "skips": Counter()},
+        }
+
+        has_research_funnel_events = False
+        exec_stage_by_intent: dict[str, set[str]] = defaultdict(set)
+        exec_code_by_intent: dict[str, tuple[str, str, str]] = {}
+
+        if self.ledger is not None and hasattr(self.ledger, "journal"):
+            try:
+                for ev in self.ledger.journal.read(kinds={"research.entry_funnel", "execution.buy_funnel"}):
+                    kind = ev.get("kind")
+                    if kind == "research.entry_funnel":
+                        ev_day = str(ev.get("session_date") or str(ev.get("ts") or "")[:10])[:10]
+                        if start_iso <= ev_day <= end_iso:
+                            has_research_funnel_events = True
+                            screened += int(ev.get("screened") or 0)
+                            thesis_written += int(ev.get("thesis_written") or 0)
+                            passed_conviction += int(ev.get("passed_conviction") or 0)
+                            rej = ev.get("rejected_by_reason")
+                            if isinstance(rej, Mapping):
+                                for r_key, r_cnt in rej.items():
+                                    if r_cnt:
+                                        research_skips[str(r_key)] += int(r_cnt)
+                    elif kind == "execution.buy_funnel":
+                        ts_et = self._iso_to_et_date(ev.get("ts"))
+                        ev_day = ts_et.isoformat() if ts_et else str(ev.get("ts") or "")[:10]
+                        if start_iso <= ev_day <= end_iso:
+                            iid = str(ev.get("intent_id") or "")
+                            stg = str(ev.get("stage") or "")
+                            if iid and stg:
+                                exec_stage_by_intent[iid].add(stg)
+                                if stg in ("skipped", "held"):
+                                    exec_code_by_intent[iid] = (
+                                        stg,
+                                        str(ev.get("code") or "other"),
+                                        str(ev.get("origin") or ""),
+                                    )
+            except Exception:
+                pass
+
+        # Fallback to job_runs.detail_json['entry_funnel'] if journal had no research.entry_funnel rows
+        if not has_research_funnel_events and self.ledger is not None and hasattr(self.ledger, "store"):
+            try:
+                rows = self.ledger.store.query(
+                    "SELECT window_key, detail_json FROM job_runs WHERE detail_json IS NOT NULL"
+                )
+                for r in rows:
+                    wk_key = str(r["window_key"] or "")[:10]
+                    if start_iso <= wk_key <= end_iso:
+                        det = json.loads(r["detail_json"]) if r["detail_json"] else {}
+                        ef = det.get("entry_funnel") if isinstance(det, Mapping) else None
+                        if isinstance(ef, Mapping):
+                            has_research_funnel_events = True
+                            screened += int(ef.get("screened") or 0)
+                            thesis_written += int(ef.get("thesis_written") or 0)
+                            passed_conviction += int(ef.get("passed_conviction") or 0)
+                            rej = ef.get("rejected_by_reason")
+                            if isinstance(rej, Mapping):
+                                for r_key, r_cnt in rej.items():
+                                    if r_cnt:
+                                        research_skips[str(r_key)] += int(r_cnt)
+            except Exception:
+                pass
+
+        # Aggregate buy OrderIntents in the window (distinct intent_id; partial fill counts once as filled)
+        passed_risk_ids: set[str] = set()
+        ordered_ids: set[str] = set()
+        filled_ids: set[str] = set()
+        partial_fill_count = 0
+        seen_intents: set[str] = set()
+
+        if self.ledger is not None and hasattr(self.ledger, "list_intents"):
+            filled_order_ids: set[str] = set()
+            filled_ledger_intents: set[str] = set()
+            try:
+                f_rows = self.ledger.store.query(
+                    "SELECT broker_order_id, intent_id FROM fills WHERE side='buy'"
+                )
+                for fr in f_rows:
+                    if fr["broker_order_id"]:
+                        filled_order_ids.add(str(fr["broker_order_id"]))
+                    if fr["intent_id"]:
+                        filled_ledger_intents.add(str(fr["intent_id"]))
+            except Exception:
+                pass
+            try:
+                for it in self.ledger.list_intents():
+                    if str(getattr(it, "side", "")).lower() != "buy":
+                        continue
+                    sleeve = str(getattr(it, "sleeve", "CORE_EQUITY") or "CORE_EQUITY")
+                    if sleeve == "LEGACY_REPAIR":
+                        continue
+                    cr_dt = it.created_at.astimezone(ET).date()
+                    it_dt = (it.updated_at.astimezone(ET).date() if it.updated_at is not None else cr_dt)
+                    sess_dt = getattr(it, "session_date", None)
+                    in_window = (
+                        start_date <= it_dt <= session_date
+                        or start_date <= cr_dt <= session_date
+                        or (isinstance(sess_dt, date) and start_date <= sess_dt <= session_date)
+                    )
+                    if not in_window:
+                        continue
+
+                    iid = str(it.intent_id)
+                    seen_intents.add(iid)
+                    sl_bucket = sleeve if sleeve in by_sleeve else "CORE_EQUITY"
+                    by_sleeve[sl_bucket]["candidates"] += 1
+
+                    meta = it.meta if isinstance(getattr(it, "meta", None), Mapping) else {}
+                    j_stages = exec_stage_by_intent.get(iid, set())
+                    status_s = str(getattr(it.status, "value", it.status)).lower()
+                    f_qty = getattr(it, "filled_qty", None) or ZERO
+                    boid = str(getattr(it, "broker_order_id", "") or "")
+                    has_fill = (
+                        status_s in ("filled", "partial", "partially_filled")
+                        or f_qty > ZERO
+                        or "filled" in j_stages
+                        or iid in filled_ledger_intents
+                        or (bool(boid) and boid in filled_order_ids)
+                    )
+                    has_order = (
+                        bool(boid)
+                        or status_s in ("submitted", "partial", "partially_filled", "filled")
+                        or "ordered" in j_stages
+                        or has_fill
+                    )
+                    skip_code = str(meta.get("skip_code") or "")
+                    has_risk_pass = (
+                        has_fill
+                        or has_order
+                        or bool(meta.get("passed_risk"))
+                        or status_s == "submitting"
+                        or skip_code in ("broker_rejected", "unfilled_cancelled", "insufficient_buying_power")
+                        or "passed_risk" in j_stages
+                    )
+
+                    if has_risk_pass:
+                        passed_risk_ids.add(iid)
+                        by_sleeve[sl_bucket]["passed_risk"] += 1
+                    if has_order:
+                        ordered_ids.add(iid)
+                        by_sleeve[sl_bucket]["ordered"] += 1
+                    if has_fill:
+                        filled_ids.add(iid)
+                        by_sleeve[sl_bucket]["filled"] += 1
+                        if (
+                            status_s in ("partial", "partially_filled", "cancelled", "expired")
+                            or (getattr(it, "qty", None) and ZERO < f_qty < it.qty)
+                        ):
+                            partial_fill_count += 1
+                        continue
+
+                    # Unfilled intent: bucket skip or active hold once per distinct intent_id
+                    code = skip_code
+                    if not code and iid in exec_code_by_intent:
+                        code = exec_code_by_intent[iid][1]
+
+                    if status_s in ("queued", "submitting", "submitted"):
+                        hold_key = code or ("awaiting_fill" if has_order else "queued")
+                        held_counts[hold_key] += 1
+                    else:
+                        reason_key = self._classify_intent_skip_key(code, meta, it.last_error, status_s)
+                        exec_skips[reason_key] += 1
+                        by_sleeve[sl_bucket]["skips"][reason_key] += 1
+            except Exception:
+                pass
+
+        # Include any execution.buy_funnel journal events whose intent_id wasn't in list_intents
+        for iid, stgs in exec_stage_by_intent.items():
+            if iid in seen_intents:
+                continue
+            if "passed_risk" in stgs or "ordered" in stgs or "filled" in stgs:
+                passed_risk_ids.add(iid)
+            if "ordered" in stgs or "filled" in stgs:
+                ordered_ids.add(iid)
+            if "filled" in stgs:
+                filled_ids.add(iid)
+            elif iid in exec_code_by_intent:
+                stg, code, _ = exec_code_by_intent[iid]
+                if stg == "held":
+                    held_counts[code or "held"] += 1
+                else:
+                    exec_skips[code or "other"] += 1
+
+        # Include Options structures opened/attempted in the window in the OPTIONS sleeve summary
+        for s in self._load_options_structures():
+            if self._option_origin(s) == "ADOPTED":
+                continue
+            created_iso = str(getattr(s, "created_at", "") or getattr(s, "opened_at", "") or "")[:10]
+            if start_iso <= created_iso <= end_iso:
+                by_sleeve["OPTIONS"]["candidates"] += 1
+                st_name = str(getattr(getattr(s, "st", None), "value", getattr(s, "state", ""))).lower()
+                if st_name not in ("rejected", "skipped", "failed"):
+                    by_sleeve["OPTIONS"]["passed_risk"] += 1
+                    by_sleeve["OPTIONS"]["ordered"] += 1
+                if st_name in ("open", "live", "closed", "closing", "repair"):
+                    by_sleeve["OPTIONS"]["filled"] += 1
+                elif st_name in ("cancelled", "expired", "rejected", "skipped"):
+                    by_sleeve["OPTIONS"]["skips"][f"options_{st_name}"] += 1
+
+        # If research.entry_funnel hasn't run/emitted yet, keep funnel monotonic from observed theses/intents
+        if not has_research_funnel_events and self.ledger is not None:
+            try:
+                th_rows = self.ledger.store.query(
+                    "SELECT created_at FROM theses WHERE role != 'EXIT_CONFIRMATION'"
+                )
+                for r in th_rows:
+                    th_dt = self._iso_to_et_date(r["created_at"])
+                    if th_dt and start_date <= th_dt <= session_date:
+                        thesis_written += 1
+            except Exception:
+                pass
+            passed_conviction = max(passed_conviction, len(seen_intents))
+            thesis_written = max(thesis_written, passed_conviction)
+            screened = max(screened, thesis_written)
+
+        passed_risk = len(passed_risk_ids)
+        ordered = len(ordered_ids)
+        filled = len(filled_ids)
+
+        combined_skips: dict[str, int] = {}
+        for k, v in research_skips.items():
+            combined_skips[k] = combined_skips.get(k, 0) + v
+        for k, v in exec_skips.items():
+            combined_skips[k] = combined_skips.get(k, 0) + v
+
+        return {
+            "window": "week" if week else "day",
+            "start_date": start_iso,
+            "as_of_date": end_iso,
+            "research_recorded": has_research_funnel_events,
+            "screened": screened,
+            "thesis_written": thesis_written,
+            "passed_conviction": passed_conviction,
+            "passed_risk": passed_risk,
+            "ordered": ordered,
+            "filled": filled,
+            "partial_fill_count": partial_fill_count,
+            "research_skips_by_reason": dict(research_skips),
+            "execution_skips_by_reason": dict(exec_skips),
+            "held_by_reason": dict(held_counts),
+            "skips_by_reason": combined_skips,
+            "by_sleeve": {
+                k: {
+                    "candidates": v["candidates"],
+                    "passed_risk": v["passed_risk"],
+                    "ordered": v["ordered"],
+                    "filled": v["filled"],
+                    "skips_by_reason": dict(v["skips"]),
+                }
+                for k, v in by_sleeve.items()
+            },
+        }
+
+    @staticmethod
+    def _iso_to_et_date(raw_ts: Any) -> date | None:
+        if not raw_ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(ET).date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _classify_intent_skip_key(
+        skip_code: str,
+        meta: Mapping[str, Any],
+        last_error: str | None,
+        status_s: str,
+    ) -> str:
+        code = (skip_code or "").strip()
+        if code == "intent_expired":
+            held_by = str(meta.get("held_by") or "").strip()
+            return f"intent_expired:{held_by}" if held_by else "intent_expired"
+        if code in ("risk_refused", "risk_size_zero"):
+            r_list = meta.get("risk_reasons")
+            if isinstance(r_list, Sequence) and not isinstance(r_list, (str, bytes)) and r_list:
+                first_r = str(r_list[0]).split(":")[0].strip()
+                if first_r:
+                    return f"{code}:{first_r}"
+        if code:
+            return code
+
+        # Fallback classification from legacy text in last_error / meta['reason']
+        raw = str(last_error or meta.get("reason") or status_s).lower()
+        if "clean-up" in raw or "normalis" in raw:
+            return "cleanup_pending"
+        if "trading blocked" in raw or "reconcil" in raw:
+            return "books_untrusted"
+        if "market gate" in raw or "closed" in raw:
+            return "market_closed"
+        if "ran more than" in raw or "drift" in raw:
+            return "price_ran_away"
+        if "quote" in raw:
+            return "quote_unavailable"
+        if "margin_buffer" in raw or "excess" in raw:
+            return "risk_refused:margin_buffer"
+        if "buying_power_floor" in raw or "buying power" in raw:
+            return "risk_refused:buying_power_floor"
+        if "gross_cap" in raw or "gross" in raw:
+            return "risk_refused:gross_cap"
+        if "drawdown_no_new_borrowing" in raw or "borrowing" in raw:
+            return "risk_refused:drawdown_no_new_borrowing"
+        if "sector" in raw:
+            return "risk_refused:sector_cap"
+        if "issuer" in raw:
+            return "risk_refused:issuer_cap"
+        if "less than one share" in raw:
+            return "risk_size_zero"
+        if raw.startswith("risk:"):
+            return "risk_refused"
+        if status_s == "cancelled":
+            return "unfilled_cancelled"
+        if status_s == "expired":
+            return "intent_expired"
+        if status_s == "rejected":
+            return "broker_rejected"
+        return status_s or "other"
+
+    @staticmethod
+    def _humanize_funnel_reason(reason_key: str) -> str:
+        labels = {
+            # Research reasons
+            "no_tradable_universe": "no tradable stock list loaded",
+            "required_source_unavailable": "mandatory quote/news feed unavailable",
+            "llm_budget": "AI research budget reached",
+            "llm_no_available_route": "AI model routes cooling down/unavailable",
+            "llm_upstream": "AI provider temporary error",
+            "llm_no_grounding": "AI thesis lacked grounded sources",
+            "llm_invalid_output": "AI output failed schema check",
+            "non_entry_direction": "rated Hold / non-buy",
+            "conviction_below_floor": "conviction below minimum floor",
+            "target_session_closed": "market closed for target session",
+            "not_tradable": "symbol not tradable",
+            "quote_stale_or_unavailable": "live quote stale or unavailable",
+            "add_thesis_not_strengthened": "held stock thesis did not strengthen",
+            "active_thesis_changed": "superseded by newer thesis",
+            "research_gate_refused": "research freshness gate refused",
+            # Execution & risk reasons
+            "cleanup_pending": "first-run account clean-up pending",
+            "books_untrusted": "broker reconciliation lock",
+            "market_closed": "outside regular market entry window",
+            "price_ran_away": "price moved past limit from analysis",
+            "quote_unavailable": "fresh quote unavailable at order time",
+            "symbol_blocked": "symbol blocked by reconcile mismatch",
+            "short_open": "existing short must be covered first",
+            "research_stale": "thesis/inputs went stale before order",
+            "position_changed": "position changed before order",
+            "risk_size_zero": "sized below 1 share under risk caps",
+            "risk_refused": "portfolio risk cap",
+            "risk_controls_unavailable": "risk controls unavailable",
+            "insufficient_buying_power": "insufficient overnight buying power",
+            "broker_rejected": "rejected by broker",
+            "unfilled_cancelled": "limit order unfilled by close",
+            "intent_expired": "expired before entry window opened",
+            "duplicate": "duplicate candidate skipped",
+            "awaiting_fill": "open order waiting at broker",
+            "queued": "waiting for entry window",
+            # Risk sub-reasons
+            "buying_power_floor": "2% overnight Reg T buying-power floor",
+            "margin_buffer": "25% margin safety cushion floor",
+            "margin_call": "broker margin call flag",
+            "gross_cap": "max gross stock exposure cap",
+            "drawdown_no_new_borrowing": "15% drawdown guard (no new borrowing)",
+            "drawdown_pause": "20% drawdown stop",
+            "options_buying_power": "options buying-power limit",
+            "cash_secured_put_unfunded": "cash-secured put unfunded",
+            "sector_cap": "40% sector cap",
+            "issuer_cap": "15% single-stock cap",
+            "cluster_cap": "48% theme cluster cap",
+            "max_positions": "20-stock slot limit",
+        }
+        if ":" in reason_key:
+            head, sub = reason_key.split(":", 1)
+            head_lbl = labels.get(head, head.replace("_", " "))
+            sub_lbl = labels.get(sub, sub.replace("_", " "))
+            if head == "intent_expired":
+                return f"expired while held by {sub_lbl}"
+            return f"{head_lbl} ({sub_lbl})"
+        if reason_key.startswith("llm_"):
+            suffix = reason_key[4:].replace("_", " ")
+            return labels.get(reason_key, f"AI model {suffix}")
+        return labels.get(reason_key, redact_secrets_in_text(reason_key.replace("_", " ")))
+
+    @classmethod
+    def _format_entry_funnel_text(cls, funnel: Mapping[str, Any], *, locked: bool = False) -> str:
+        sc_n = int(funnel.get("screened") or 0)
+        th_n = int(funnel.get("thesis_written") or 0)
+        cv_n = int(funnel.get("passed_conviction") or 0)
+        rk_n = int(funnel.get("passed_risk") or 0)
+        or_n = int(funnel.get("ordered") or 0)
+        fl_n = int(funnel.get("filled") or 0)
+        pt_n = int(funnel.get("partial_fill_count") or 0)
+        fill_note = f" (incl. {pt_n} partial)" if pt_n > 0 else ""
+
+        chain = (
+            f"**Screened {sc_n}** → **Thesis Written {th_n}** → **Passed Conviction {cv_n}** → "
+            f"**Passed Risk {rk_n}** → **Ordered {or_n}** → **Filled {fl_n}**{fill_note}"
+        )
+        lines = [chain]
+
+        r_skips = funnel.get("research_skips_by_reason") or {}
+        e_skips = funnel.get("execution_skips_by_reason") or {}
+        held = funnel.get("held_by_reason") or {}
+        all_skips = funnel.get("skips_by_reason") or {}
+
+        if r_skips:
+            top_r = sorted(r_skips.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:6]
+            lines.append(
+                "• **Research skips:** "
+                + ", ".join(f"{cls._humanize_funnel_reason(k)} ({v})" for k, v in top_r)
+            )
+        if e_skips:
+            top_e = sorted(e_skips.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:6]
+            lines.append(
+                "• **Order/risk skips:** "
+                + ", ".join(f"{cls._humanize_funnel_reason(k)} ({v})" for k, v in top_e)
+            )
+        elif all_skips and not r_skips:
+            top_a = sorted(all_skips.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:6]
+            lines.append(
+                "• **Skips by reason:** "
+                + ", ".join(f"{cls._humanize_funnel_reason(k)} ({v})" for k, v in top_a)
+            )
+        if held:
+            top_h = sorted(held.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:4]
+            lines.append(
+                "• **Still waiting / held:** "
+                + ", ".join(f"{cls._humanize_funnel_reason(k)} ({v})" for k, v in top_h)
+            )
+
+        by_sl = funnel.get("by_sleeve") or {}
+        sl_parts: list[str] = []
+        for sl_key, sl_lbl in (
+            ("CORE_EQUITY", "Core Stocks"),
+            ("NEWS_EQUITY", "News Stocks"),
+            ("OPTIONS", "Options"),
+        ):
+            b = by_sl.get(sl_key)
+            if isinstance(b, Mapping) and (b.get("candidates") or b.get("filled")):
+                sl_parts.append(
+                    f"{sl_lbl}: {b.get('filled', 0)}/{b.get('candidates', 0)} filled"
+                )
+        if sl_parts:
+            lines.append("• **By sleeve:** " + " | ".join(sl_parts))
+
+        if sc_n == 0 and th_n == 0 and cv_n == 0 and rk_n == 0 and or_n == 0 and fl_n == 0 and not all_skips and not held:
+            if locked:
+                lines.append("• Zero buys attempted because new entries are currently locked (see Entry Lock Status above).")
+            else:
+                lines.append("• Zero buys: no scheduled or live-news research pass completed for this window yet.")
+        elif fl_n == 0 and not all_skips and not held:
+            if locked:
+                lines.append("• Zero fills: new entries are currently held by an active safety lock.")
+            else:
+                lines.append("• Zero fills: no candidate cleared all entry gates in this window.")
+
+        return "\n".join(lines)[:1024]
 
 
 __all__ = [
