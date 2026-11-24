@@ -28,6 +28,7 @@ class StubBroker:
         self.calls: list[str] = []
         self._aid = 0
         self.positions_replies: list[list[dict]] = []   # scripted replies for get_positions
+        self.account_extra: dict = {}    # extra account fields (e.g. margin figures)
 
     def pos(self, symbol: str, qty: float, avg: float, price=_UNSET, *,
             asset_class: str | None = None, mult: int = 1, lastday: float | None = None) -> None:
@@ -73,7 +74,8 @@ class StubBroker:
                        if p["asset_class"] == "us_equity" and float(p["qty"]) < 0)
         return {"equity": str(self.equity()), "cash": str(self.cash), "last_equity": str(self.equity()),
                 "long_market_value": str(long_mv), "short_market_value": str(short_mv),
-                "buying_power": str(self.cash * 2), "shorting_enabled": True, "status": "ACTIVE"}
+                "buying_power": str(self.cash * 2), "shorting_enabled": True, "status": "ACTIVE",
+                **self.account_extra}
 
     async def get_positions(self):
         self._check("get_positions")

@@ -209,6 +209,133 @@ def realised_fifo(activities: Iterable[dict]) -> Realised:
     return out
 
 
+# ------------------------------------------------------- margin interest
+# Broker interest activity codes (trading-api.json ActivityType): INT "Interest
+# (credit/margin)", INTNRA / INTTW withholding adjustments. Sign of net_amount is not
+# specified by the docs (unverified): a negative INT is treated as margin interest
+# charged, a positive one as credit interest received.
+INTEREST_TYPES = frozenset({"INT", "INTNRA", "INTTW"})
+DEFAULT_MARGIN_RATE = Decimal("0.065")   # Alpaca non-elite, docs.alpaca.markets/us/docs/margin-and-short-selling
+INTEREST_DAY_BASIS = Decimal(360)
+
+
+def margin_rate(config: Any = None) -> Decimal:
+    """Annual rate as a fraction. ``MARGIN_INTEREST_RATE_PCT`` may be 6.5 or 0.065."""
+    v = _d(getattr(config, "MARGIN_INTEREST_RATE_PCT", None)) if config is not None else None
+    if v is None or v < 0:
+        return DEFAULT_MARGIN_RATE
+    return v / 100 if v > 1 else v
+
+
+@dataclass(frozen=True)
+class InterestDay:
+    session_date: date     # close whose overnight debit balance accrues
+    debit: Decimal         # borrowed = max(0, -cash) at that close
+    days: int              # calendar days charged (Friday close -> 3)
+    amount: Decimal        # ESTIMATED cost (positive = money owed)
+
+
+@dataclass
+class InterestSeries:
+    """Estimated margin interest by close, plus real broker postings.
+
+    Broker-reported equity is never changed. ``unposted(d)`` is the estimated interest
+    accrued before ``d`` that the broker has not posted yet (estimates on or after the
+    latest real posting). Subtracting it gives "after estimated borrowing cost"; once a
+    real posting exists its cost is already inside broker equity, so the estimates it
+    covers are dropped (no double count)."""
+
+    rate: Decimal
+    estimated: list[InterestDay] = field(default_factory=list)
+    postings: list[tuple[date, Decimal]] = field(default_factory=list)   # (date, cost>0) charged
+    credits: Decimal = ZERO                                              # interest received / adjustments
+
+    def _last_posting(self, d: date) -> date | None:
+        ps = [p for p, _ in self.postings if p <= d]
+        return max(ps) if ps else None
+
+    def unposted(self, d: date) -> Decimal:
+        last = self._last_posting(d)
+        return sum((e.amount for e in self.estimated
+                    if e.session_date < d and (last is None or e.session_date >= last)), ZERO)
+
+    def actual_cost(self, start: date | None, end: date) -> Decimal:
+        return sum((c for p, c in self.postings if (start is None or p > start) and p <= end), ZERO)
+
+    def period_cost(self, start: date | None, end: date) -> Decimal:
+        """Borrowing cost in ``(start, end]``: real postings plus the change in unposted estimate."""
+        base = self.unposted(start) if start is not None else ZERO
+        return self.actual_cost(start, end) + self.unposted(end) - base
+
+    @property
+    def basis(self) -> str:
+        if self.postings and self.estimated:
+            return "mixed"
+        return "actual" if self.postings else ("estimated" if self.estimated else "none")
+
+
+def _next_weekday_gap(d: date) -> int:
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5:
+        n += timedelta(days=1)
+    return (n - d).days
+
+
+def margin_interest(marks: Sequence[EquityMark], activities: Iterable[dict], *,
+                    rate: Decimal = DEFAULT_MARGIN_RATE) -> InterestSeries:
+    """Build the interest series from trusted close marks and broker activities.
+
+    Daily estimate = overnight debit balance x rate / 360, charged for the calendar days
+    until the next close mark (or next weekday for the latest close; holidays then count
+    from the next mark). Uses the close-mark cash (trade-date), an approximation of the
+    broker's settlement-date debit balance."""
+    out = InterestSeries(rate=rate)
+    closes = sorted((m for m in marks if m.quality == "close" and m.cash is not None), key=lambda m: m.session_date)
+    for m, nxt in zip(closes, [*closes[1:], None], strict=False):
+        debit = max(ZERO, -(m.cash or ZERO))
+        if debit <= 0:
+            continue
+        days = (nxt.session_date - m.session_date).days if nxt is not None else _next_weekday_gap(m.session_date)
+        days = max(1, min(days, 5))
+        out.estimated.append(InterestDay(m.session_date, debit, days,
+                                         (debit * rate * days / INTEREST_DAY_BASIS).quantize(Decimal("0.01"))))
+    seen: set[str] = set()
+    for a in activities:
+        t = a.get("activity_type")
+        if t not in INTEREST_TYPES:
+            continue
+        aid = str(a.get("id") or "")
+        if aid and aid in seen:
+            continue
+        seen.add(aid)
+        amt = _d(a.get("net_amount"))
+        d = _as_date(a.get("date") or a.get("transaction_time"))
+        if amt is None or d is None:
+            continue
+        if t == "INT" and amt < 0:
+            out.postings.append((d, -amt))
+        else:
+            out.credits += amt
+    out.postings.sort()
+    return out
+
+
+def after_cost_marks(marks: Sequence[EquityMark], series: InterestSeries) -> list[EquityMark]:
+    """Close marks with the unposted estimated interest removed (broker marks untouched)."""
+    from dataclasses import replace as _replace
+
+    return [_replace(m, equity=m.equity - series.unposted(m.session_date)) if m.quality == "close" else m
+            for m in marks]
+
+
+def average_leverage(marks: Sequence[EquityMark], start: date | None = None,
+                     end: date | None = None) -> Decimal | None:
+    """Mean of close-mark leverage (long stock value / equity) over [start, end]."""
+    vals = [m.leverage for m in marks if m.quality == "close" and m.leverage is not None
+            and (start is None or m.session_date >= start) and (end is None or m.session_date <= end)]
+    return (sum(vals, ZERO) / len(vals)).quantize(Decimal("0.01")) if vals else None
+
+
 # ------------------------------------------------------------ shadow stops
 def _anchor_key(r: dict) -> str:
     return str(r.get("fill_id") or r.get("order_id") or
@@ -334,6 +461,13 @@ class CloseReport:
     fees: Decimal
     shadow_rows: int = 0
     warnings: list[str] = field(default_factory=list)
+    # margin (A13j): borrowing itself never changes equity; costs are reported separately
+    borrowed: Decimal = ZERO
+    leverage: Decimal | None = None
+    margin_excess_pct: Decimal | None = None
+    interest_unposted_est: Decimal = ZERO      # estimated interest accrued, not yet posted by the broker
+    interest_posted: Decimal = ZERO            # real broker margin-interest postings to date
+    twr_after_cost_pct: Decimal | None = None
 
 
 async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: date, *,
@@ -370,6 +504,17 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
                       total_return_pct=_pct(equity - dep, dep) if dep > 0 else None,
                       twr_pct=twr(marks, flows), drawdown_pct=dd, hwm=hwm, deposits=dep,
                       realised_pnl=real.total, dividends=real.dividends, fees=real.fees, warnings=warnings)
+    interest = margin_interest(marks, acts, rate=margin_rate(getattr(ledger, "config", None)))
+    mark_today = next((m for m in marks if m.session_date == session_date), None)
+    cash = mark_today.cash if mark_today is not None and mark_today.cash is not None else snapshot.cash
+    long_mv = mark_today.long_mv if mark_today is not None and mark_today.long_mv is not None else snapshot.long_mv
+    rep.borrowed = max(ZERO, -Decimal(str(cash)))
+    rep.leverage = (Decimal(str(long_mv)) / equity).quantize(Decimal("0.0001")) if equity > 0 else None
+    mm = getattr(snapshot, "maintenance_margin", None)
+    rep.margin_excess_pct = _pct(equity - mm, equity) if mm is not None and equity > 0 else None
+    rep.interest_unposted_est = interest.unposted(session_date)
+    rep.interest_posted = interest.actual_cost(None, session_date)
+    rep.twr_after_cost_pct = twr(after_cost_marks(marks, interest), flows)
     if daily_bars is not None:
         try:
             rep.shadow_rows = await shadow_stops(ledger, session_date, daily_bars, warnings)
@@ -381,9 +526,13 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
                           day_pnl_pct=pnl_pct, total_return_pct=rep.total_return_pct, twr_pct=rep.twr_pct,
                           drawdown_pct=dd, hwm=hwm, deposits=dep, realised_pnl=real.total,
                           dividends=real.dividends, fees=real.fees, quality=quality,
+                          borrowed=rep.borrowed, leverage=rep.leverage, margin_excess_pct=rep.margin_excess_pct,
+                          interest_unposted_est=rep.interest_unposted_est, interest_posted=rep.interest_posted,
+                          interest_basis=interest.basis, twr_after_cost_pct=rep.twr_after_cost_pct,
                           shadow_rows=rep.shadow_rows, warnings=warnings)
     return rep
 
 
-__all__ = ["CloseReport", "Realised", "close_session", "day_pnl", "drawdown", "flows_between", "net_deposits", "previous_close",
+__all__ = ["CloseReport", "InterestDay", "InterestSeries", "Realised", "after_cost_marks", "average_leverage",
+           "margin_interest", "margin_rate", "close_session", "day_pnl", "drawdown", "flows_between", "net_deposits", "previous_close",
            "realised_fifo", "shadow_stops", "twr"]

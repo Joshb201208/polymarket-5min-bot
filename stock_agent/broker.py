@@ -145,6 +145,14 @@ class Account(_Model):
     short_market_value: float = 0.0
     options_buying_power: float | None = None
     multiplier: float | None = None
+    # margin figures (trading-api.json Account schema); None when the reply omits them
+    regt_buying_power: float | None = None
+    maintenance_margin: float | None = None
+    last_maintenance_margin: float | None = None
+    initial_margin: float | None = None
+    non_marginable_buying_power: float | None = None
+    sma: float | None = None
+    margin_call: bool | None = None   # not in the documented Account schema; kept if a reply carries it
     shorting_enabled: bool | None = None
     trading_blocked: bool = False
     account_blocked: bool = False
@@ -155,7 +163,9 @@ class Account(_Model):
 
     _n = field_validator(
         "equity", "cash", "buying_power", "last_equity", "long_market_value",
-        "short_market_value", "options_buying_power", "multiplier", mode="before",
+        "short_market_value", "options_buying_power", "multiplier", "regt_buying_power",
+        "maintenance_margin", "last_maintenance_margin", "initial_margin", "non_marginable_buying_power",
+        "sma", mode="before",
     )(_num)
 
     @property

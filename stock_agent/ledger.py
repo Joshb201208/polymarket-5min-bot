@@ -193,6 +193,34 @@ class BookSnapshot:
     quality: str = "live"          # live | indicative (pre/after-hours, invalid marks)
     blocked_symbols: frozenset[str] = frozenset()   # no new buys (shorts, unexplained diffs)
     account_flags: Mapping[str, Any] = field(default_factory=dict)
+    # Margin figures from the broker account (None when not reported). Cash may be
+    # negative: that is a debit balance (borrowed money), not an error.
+    regt_buying_power: Decimal | None = None
+    maintenance_margin: Decimal | None = None
+    initial_margin: Decimal | None = None
+    options_buying_power: Decimal | None = None
+    non_marginable_buying_power: Decimal | None = None
+    margin_call: bool | None = None
+
+    @property
+    def borrowed(self) -> Decimal:
+        """Debit balance: money borrowed from the broker (0 when cash >= 0)."""
+        return max(ZERO, -self.cash)
+
+    @property
+    def leverage(self) -> Decimal | None:
+        """Gross long stock market value / equity (None when equity <= 0)."""
+        return (self.long_mv / self.equity) if self.equity > 0 else None
+
+    @property
+    def margin_excess(self) -> Decimal | None:
+        """Equity above the broker's maintenance requirement (None if not reported)."""
+        return None if self.maintenance_margin is None else self.equity - self.maintenance_margin
+
+    @property
+    def margin_excess_pct(self) -> Decimal | None:
+        ex = self.margin_excess
+        return (ex / self.equity) if ex is not None and self.equity > 0 else None
 
     def holding(self, symbol: str) -> Holding | None:
         for h in self.holdings:
@@ -372,6 +400,15 @@ class EquityMark:
     short_mv: Decimal | None
     options_mv: Decimal | None
     taken_at: datetime
+    extra: Mapping[str, Any] = field(default_factory=dict)   # e.g. maintenance_margin at the mark
+
+    @property
+    def borrowed(self) -> Decimal | None:
+        return None if self.cash is None else max(ZERO, -self.cash)
+
+    @property
+    def leverage(self) -> Decimal | None:
+        return (self.long_mv / self.equity) if self.long_mv is not None and self.equity > 0 else None
 
 
 @dataclass(frozen=True)
@@ -406,6 +443,14 @@ def _dt(s: str | None) -> datetime | None:
 
 def _d(s: str | None) -> date | None:
     return date.fromisoformat(s[:10]) if s else None
+
+
+def _json_obj(raw: Any) -> dict[str, Any]:
+    try:
+        v = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
 
 
 def _dec(x: Any) -> Decimal | None:
@@ -762,7 +807,7 @@ class Ledger:
         return self._row_to_intent(rows[0]) if rows else None
 
     def list_intents(self, statuses: Iterable[IntentStatus | str] | None = None, *,
-                     symbol: str | None = None) -> list[OrderIntent]:
+                     symbol: str | None = None, origin: str | None = None) -> list[OrderIntent]:
         sql, params = "SELECT * FROM order_intents WHERE 1=1", []
         if statuses is not None:
             st = [IntentStatus(s).value for s in statuses]
@@ -771,6 +816,9 @@ class Ledger:
         if symbol:
             sql += " AND symbol=?"
             params.append(symbol)
+        if origin is not None:
+            sql += " AND origin=?"
+            params.append(origin)
         sql += " ORDER BY created_at"
         return [self._row_to_intent(r) for r in self.store.query(sql, tuple(params))]
 
@@ -916,7 +964,9 @@ class Ledger:
                 " options_mv, taken_at, extra_json) VALUES (?,?,?,?,?,?,?,?,?)",
                 (session_date.isoformat(), quality, str(snapshot.equity), str(snapshot.cash),
                  str(snapshot.long_mv), str(snapshot.short_mv), str(snapshot.options_mv),
-                 _iso(snapshot.as_of), json.dumps(dict(extra or {}), default=str)))
+                 _iso(snapshot.as_of), json.dumps(
+                     {"maintenance_margin": snapshot.maintenance_margin,
+                      "regt_buying_power": snapshot.regt_buying_power} | dict(extra or {}), default=str)))
         self.journal.append("state_event", event="equity_mark", session_date=session_date, quality=quality,
                             run_id=snapshot.run_id)
 
@@ -931,7 +981,8 @@ class Ledger:
         sql += " ORDER BY session_date"
         return [EquityMark(session_date=_d(r["session_date"]), quality=r["quality"], equity=Decimal(str(r["equity"])),
                            cash=_dec(r["cash"]), long_mv=_dec(r["long_mv"]), short_mv=_dec(r["short_mv"]),
-                           options_mv=_dec(r["options_mv"]), taken_at=_dt(r["taken_at"]))
+                           options_mv=_dec(r["options_mv"]), taken_at=_dt(r["taken_at"]),
+                           extra=_json_obj(r["extra_json"]))
                 for r in self.store.query(sql, tuple(p))]
 
     def cash_flows(self) -> list[CashFlow]:
