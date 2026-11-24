@@ -294,9 +294,9 @@ class Settings(BaseModel):
     DRAWDOWN_THROTTLE_PCT: float = Field(default=0.15, gt=0.0, lt=1.0)
     DRAWDOWN_PAUSE_PCT: float = Field(default=0.20, gt=0.0, lt=1.0)
     DRAWDOWN_THROTTLE_SCALE: float = Field(default=0.50, gt=0.0, le=1.0)
-    DRAWDOWN_RECOVERY_SESSIONS: int = Field(default=5, ge=1)
-    DRAWDOWN_ROLLING_SESSIONS: int = Field(default=252, ge=2)
-    DRAWDOWN_PAUSE_MAX_SESSIONS: int = Field(default=21, ge=1)
+    DRAWDOWN_RECOVERY_SESSIONS: int = Field(default=5, ge=1, le=10_000)
+    DRAWDOWN_ROLLING_SESSIONS: int = Field(default=252, ge=2, le=10_000)
+    DRAWDOWN_PAUSE_MAX_SESSIONS: int = Field(default=21, ge=1, le=10_000)
     RISK_OPTION_MAX_LOSS_PCT: float = Field(default=0.03, gt=0.0, le=1.0)
     RISK_OPTION_TOTAL_LOSS_PCT: float = Field(default=0.10, gt=0.0, le=1.0)
     RISK_OPTION_MAX_STRUCTURES: int = Field(default=6, ge=1)
@@ -401,6 +401,27 @@ class Settings(BaseModel):
             return _default_data_dir()
         path = Path(value)
         return path if path.name else _default_data_dir()
+
+    @field_validator(
+        "DRAWDOWN_ROLLING_SESSIONS",
+        "DRAWDOWN_PAUSE_MAX_SESSIONS",
+        "DRAWDOWN_RECOVERY_SESSIONS",
+        mode="before",
+    )
+    @classmethod
+    def _parse_strict_session_count(cls, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError("must be an integer session count, not a boolean")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned and (
+                cleaned.isdigit()
+                or (cleaned[0] in "+-" and len(cleaned) > 1 and cleaned[1:].isdigit())
+            ):
+                return int(cleaned)
+        raise ValueError("must be a whole integer number of trading sessions")
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> Settings:
@@ -519,6 +540,12 @@ class Settings(BaseModel):
                 "margin_min_excess_pct": self.MARGIN_MIN_EXCESS_PCT,
                 "margin_trim_excess_pct": self.MARGIN_TRIM_EXCESS_PCT,
                 "margin_interest_rate_pct": self.MARGIN_INTEREST_RATE_PCT,
+                "drawdown_alert_pct": self.DRAWDOWN_ALERT_PCT,
+                "drawdown_throttle_pct": self.DRAWDOWN_THROTTLE_PCT,
+                "drawdown_pause_pct": self.DRAWDOWN_PAUSE_PCT,
+                "drawdown_recovery_sessions": self.DRAWDOWN_RECOVERY_SESSIONS,
+                "drawdown_rolling_sessions": self.DRAWDOWN_ROLLING_SESSIONS,
+                "drawdown_pause_max_sessions": self.DRAWDOWN_PAUSE_MAX_SESSIONS,
                 "max_positions": self.MAX_POSITIONS,
                 "min_conviction": self.MIN_CONVICTION,
                 "research_weekly_budget_usd": self.RESEARCH_WEEKLY_BUDGET_USD,

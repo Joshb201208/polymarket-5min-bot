@@ -77,14 +77,25 @@ def test_default_settings_are_paper_and_safe() -> None:
     assert s.RESEARCH_EXIT_RESERVE_PCT == 20
     assert isinstance(s.RESEARCH_EXIT_RESERVE_PCT, int)
     assert s.RESEARCH_MAX_MODEL_EXITS_PER_SESSION == 4
+    assert s.DRAWDOWN_ROLLING_SESSIONS == 252
+    assert isinstance(s.DRAWDOWN_ROLLING_SESSIONS, int)
+    assert s.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
+    assert isinstance(s.DRAWDOWN_PAUSE_MAX_SESSIONS, int)
+    assert s.DRAWDOWN_RECOVERY_SESSIONS == 5
+    assert Config.DRAWDOWN_ROLLING_SESSIONS == 252
+    assert Config.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
 
 
 def test_starts_cleanly_with_only_todays_server_env_names() -> None:
+    assert "DRAWDOWN_ROLLING_SESSIONS" not in SERVER_ENV_SUMMARY_SYNTHETIC
+    assert "DRAWDOWN_PAUSE_MAX_SESSIONS" not in SERVER_ENV_SUMMARY_SYNTHETIC
     s = load_settings(SERVER_ENV_SUMMARY_SYNTHETIC, require_runtime_secrets=True)
     assert s.MODE == "PAPER"
     assert s.trading_base_url == PAPER_ALPACA_BASE_URL
     assert s.OPTIONS_MODE == "defined_risk"
     assert s.MAX_GROSS_EXPOSURE_PCT == 2.00
+    assert s.DRAWDOWN_ROLLING_SESSIONS == 252
+    assert s.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
     assert s.OPENAI_API_KEY == "test-openai-key"
     assert s.ANTHROPIC_API_KEY == "test-anthropic-key"
     assert not hasattr(s, "PRIVATE_KEY")
@@ -94,6 +105,8 @@ def test_starts_cleanly_with_only_todays_server_env_names() -> None:
     assert summary["providers_configured"]["anthropic"] is True
     assert summary["providers_configured"]["discord"] is True
     assert summary["providers_configured"]["telegram"] is False
+    assert summary["limits"]["drawdown_rolling_sessions"] == 252
+    assert summary["limits"]["drawdown_pause_max_sessions"] == 21
 
 
 def test_no_secret_defaults_exist_in_code_or_repr() -> None:
@@ -193,6 +206,20 @@ def test_runtime_secret_check_fails_fast_naming_missing_keys() -> None:
         ({"OPTIONS_MODE": "naked_short"}, "OPTIONS_MODE"),
         ({"STOCK_LOG_LEVEL": "VERBOSE"}, "STOCK_LOG_LEVEL"),
         ({"RESEARCH_PROVIDER_ORDER": "openai,grok"}, "RESEARCH_PROVIDER_ORDER"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "0"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "1"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "-5"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "10001"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "252.0"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "252.5"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_ROLLING_SESSIONS": "true"}, "DRAWDOWN_ROLLING_SESSIONS"),
+        ({"DRAWDOWN_PAUSE_MAX_SESSIONS": "0"}, "DRAWDOWN_PAUSE_MAX_SESSIONS"),
+        ({"DRAWDOWN_PAUSE_MAX_SESSIONS": "-1"}, "DRAWDOWN_PAUSE_MAX_SESSIONS"),
+        ({"DRAWDOWN_PAUSE_MAX_SESSIONS": "10001"}, "DRAWDOWN_PAUSE_MAX_SESSIONS"),
+        ({"DRAWDOWN_PAUSE_MAX_SESSIONS": "21.0"}, "DRAWDOWN_PAUSE_MAX_SESSIONS"),
+        ({"DRAWDOWN_PAUSE_MAX_SESSIONS": "false"}, "DRAWDOWN_PAUSE_MAX_SESSIONS"),
+        ({"DRAWDOWN_RECOVERY_SESSIONS": "0"}, "DRAWDOWN_RECOVERY_SESSIONS"),
+        ({"DRAWDOWN_RECOVERY_SESSIONS": "5.0"}, "DRAWDOWN_RECOVERY_SESSIONS"),
     ],
 )
 def test_invalid_percentage_or_bool_fails_fast_with_setting_name(
@@ -201,6 +228,37 @@ def test_invalid_percentage_or_bool_fails_fast_with_setting_name(
     with pytest.raises(SettingsError) as exc_info:
         load_settings(env)
     assert expected_name in str(exc_info.value)
+
+
+def test_drawdown_session_settings_blank_fallback_and_strict_constructor() -> None:
+    blank = load_settings(
+        {"DRAWDOWN_ROLLING_SESSIONS": "  ", "DRAWDOWN_PAUSE_MAX_SESSIONS": ""}
+    )
+    assert blank.DRAWDOWN_ROLLING_SESSIONS == 252
+    assert blank.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
+
+    custom = load_settings(
+        {"DRAWDOWN_ROLLING_SESSIONS": " 126 ", "DRAWDOWN_PAUSE_MAX_SESSIONS": "10"}
+    )
+    assert custom.DRAWDOWN_ROLLING_SESSIONS == 126
+    assert custom.DRAWDOWN_PAUSE_MAX_SESSIONS == 10
+
+    short_window = Config(DRAWDOWN_ROLLING_SESSIONS=4)
+    assert short_window.DRAWDOWN_ROLLING_SESSIONS == 4
+    assert short_window.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
+
+    for bad_field, bad_val in (
+        ("DRAWDOWN_ROLLING_SESSIONS", True),
+        ("DRAWDOWN_ROLLING_SESSIONS", False),
+        ("DRAWDOWN_ROLLING_SESSIONS", 1),
+        ("DRAWDOWN_ROLLING_SESSIONS", 252.0),
+        ("DRAWDOWN_PAUSE_MAX_SESSIONS", True),
+        ("DRAWDOWN_PAUSE_MAX_SESSIONS", 0),
+        ("DRAWDOWN_PAUSE_MAX_SESSIONS", 21.0),
+        ("DRAWDOWN_RECOVERY_SESSIONS", True),
+    ):
+        with pytest.raises(SettingsError, match=bad_field):
+            Config(**{bad_field: bad_val})
 
 
 def test_retired_gross_cap_ignored_and_warned_once_at_startup(caplog):
@@ -312,6 +370,8 @@ def test_env_example_matches_settings_and_contains_no_secrets() -> None:
     assert s.MODE == "PAPER"
     assert s.OPTIONS_MODE == "defined_risk"
     assert s.trading_base_url == PAPER_ALPACA_BASE_URL
+    assert s.DRAWDOWN_ROLLING_SESSIONS == 252
+    assert s.DRAWDOWN_PAUSE_MAX_SESSIONS == 21
 
     with pytest.raises(SettingsError, match="ALPACA_API_KEY"):
         load_settings(clean_env, require_runtime_secrets=True)
@@ -400,6 +460,8 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "MARGIN_MIN_EXCESS_PCT",
         "MARGIN_TRIM_EXCESS_PCT",
         "MARGIN_INTEREST_RATE_PCT",
+        "DRAWDOWN_ROLLING_SESSIONS",
+        "DRAWDOWN_PAUSE_MAX_SESSIONS",
         "MAX_TOTAL_EXPOSURE_PCT",
         "clean_server_env.py",
     ):
@@ -449,5 +511,63 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "portfolio.py",
     ):
         assert deleted_module not in readme, f"README.md still references {deleted_module}"
+
+
+def test_branch_diff_contains_no_leaked_secret_patterns() -> None:
+    import re
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent
+    base_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/master"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if base_check.returncode != 0:
+        return
+
+    diff_proc = subprocess.run(
+        ["git", "diff", "--unified=0", "origin/master...HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    token_patterns: tuple[tuple[str, re.Pattern[str]], ...] = (
+        ("openai_or_anthropic_key", re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b")),
+        ("perplexity_key", re.compile(r"\bpplx-[A-Za-z0-9]{24,}\b")),
+        ("alpaca_key_id", re.compile(r"\b(?:PK|AK)[A-Z0-9]{18}\b")),
+        (
+            "discord_bot_token",
+            re.compile(r"\b[MN][A-Za-z0-9]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b"),
+        ),
+        ("telegram_bot_token", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
+        (
+            "github_token",
+            re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b"),
+        ),
+        ("private_key_pem", re.compile(r"BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY")),
+    )
+    hex_key_re = re.compile(r"\b0x([0-9a-fA-F]{64})\b")
+
+    current_file = ""
+    findings: list[str] = []
+    for raw_line in diff_proc.stdout.splitlines():
+        if raw_line.startswith("+++ b/"):
+            current_file = raw_line[6:]
+            continue
+        if not raw_line.startswith("+") or raw_line.startswith("+++"):
+            continue
+        added = raw_line[1:]
+        for rule_name, pattern in token_patterns:
+            if pattern.search(added):
+                findings.append(f"{current_file}: matched {rule_name}")
+        for match in hex_key_re.finditer(added):
+            if len(set(match.group(1).lower())) >= 4:
+                findings.append(f"{current_file}: matched high-entropy 0x64 hex key")
+
+    assert not findings, f"Secret pattern(s) detected in branch diff: {findings}"
 
 
