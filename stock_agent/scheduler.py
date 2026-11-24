@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from stock_agent import close_trust
+from stock_agent import close_trust, market_move
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -58,6 +58,8 @@ except KeyError:
 
 TICK_SECONDS = 30
 NEWS_SECONDS = 180
+MARKET_MOVE_SLOT_SECONDS = 30 * 60
+MARKET_MOVE_STATE_KEY = "scheduler.market_move"
 MAX_JOB_ATTEMPTS = 3
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
@@ -145,6 +147,7 @@ class StockAgentScheduler:
             assets=self.assets, report=self._provider_health, now=_now_utc,
         ))
         self.price_service = self.prices
+        self.market_move_vix = getattr(services, "market_move_vix", None)
         self.health_registry = self.health
         self._universe_symbols: tuple[str, ...] = ()
         self.fundamentals = service("fundamentals", lambda: FundamentalsService(
@@ -224,12 +227,6 @@ class StockAgentScheduler:
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
         self._options_scan_done_today: str | None = None
-        # Event-triggered scanning state
-        self._last_event_spx: float = 0.0
-        self._last_event_vix: float = 0.0
-        self._last_event_regime: str = ""
-        self._event_scan_cooldown: datetime | None = None  # Don’t fire twice in 30 min
-
     def shutdown(self):
         if not self._shutdown:
             logger.info("Shutdown requested")
@@ -245,7 +242,8 @@ class StockAgentScheduler:
         if self.alerts is not None:
             try:
                 routing = {"channel_key": "announcements"} if (
-                    key == "normalise-plan" and isinstance(self.alerts, AlertService)
+                    isinstance(self.alerts, AlertService) and key
+                    and (key == "normalise-plan" or key.startswith("market-move-rescan:"))
                 ) else {}
                 if isinstance(self.alerts, AlertService) and key and key.startswith("trusted-close-missed:"):
                     routing["dedupe_window_sec"] = 48 * 3600
@@ -806,6 +804,7 @@ class StockAgentScheduler:
         if self._is_market_open(now_et):
             if self._shutdown:
                 return
+            self._schedule_market_move_sample(now_et)
             if self.research is not None and self._should_check_events():
                 self._last_news_at = now_et
                 slot = str(int(now_et.timestamp()) // NEWS_SECONDS)
@@ -1728,6 +1727,131 @@ class StockAgentScheduler:
                 "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
                 key=f"market_regime_{before}_{after}",
             )
+
+    def _schedule_market_move_sample(self, now: datetime) -> None:
+        if self.research is None:
+            return
+        session = self.calendar.session_on(now.date())
+        if session is None or not session.opens_at <= now < session.closes_at:
+            return
+        slot, offset = divmod(int((now - session.opens_at).total_seconds()), MARKET_MOVE_SLOT_SECONDS)
+        # Allow the opening print and normal scheduler jitter, but don't use
+        # a mid-slot restart as if it were a regularly spaced observation.
+        if not 30 <= offset < 180:
+            return
+        self._schedule_job("market_move_sample", f"{session.date}:{slot}",
+                           lambda: self._run_market_move_sample(session, slot), timeout=25, replay=False)
+
+    async def _market_move_input(self, label, callback):
+        try:
+            async with asyncio.timeout(10):
+                return await callback()
+        except Exception as exc:
+            logger.info("Market-move %s unavailable (%s)", label, type(exc).__name__)
+            return None
+
+    async def _run_market_move_sample(self, session, slot):
+        previous = self.calendar.previous_session(session.date)
+        prior_macro = self.macro.get_last_snapshot()
+
+        async def spy_close():
+            if previous is None:
+                return None
+            rows = await self.prices.get_daily_bars(["SPY"], start_date=previous.date, end_date=previous.date)
+            return next((row.close for row in rows.get("SPY", ()) if row.session_date == previous.date), None)
+
+        async def vix():
+            if self.market_move_vix is None:
+                return None
+            # Inject only a real intraday cash VIX feed. Its verified close must
+            # be for previous.date; FRED daily data and VIXY are not substitutes.
+            return await self.market_move_vix(session, previous)
+
+        close, vix_data, current_macro = await asyncio.gather(
+            self._market_move_input("prior SPY close", spy_close),
+            self._market_move_input("VIX", vix),
+            self._market_move_input("macro", self.macro.check_conditions),
+        )
+        quotes = await self._market_move_input(
+            "SPY", lambda: self.prices.get_quotes(["SPY"], purpose="brief", max_age_s=90),
+        )
+        now = _now_utc()
+        if self._shutdown or not self._is_market_open(now) or not session.opens_at <= now < session.closes_at:
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "regular_session_unavailable"})
+        readings, closes = {}, {"spy": close}
+        quote = quotes.quotes.get("SPY") if quotes is not None else None
+        if quote is not None and quote.is_market_hours:
+            reading = market_move.valid_reading(quote.price, quote.as_of, now=now, opens_at=session.opens_at)
+            if reading is not None:
+                readings["spy"] = reading
+        if isinstance(vix_data, tuple) and len(vix_data) == 2 and isinstance(vix_data[0], market_move.Reading):
+            vix_reading, vix_close = vix_data
+            reading = market_move.valid_reading(vix_reading.value, vix_reading.as_of, now=now,
+                                                opens_at=session.opens_at)
+            if reading is not None:
+                readings["vix"] = reading
+                if previous is not None:
+                    closes["vix"] = vix_close
+
+        def usable_regime(snapshot, allowed_dates, *, max_age=None):
+            if snapshot is None or snapshot.degraded or not snapshot.regime:
+                return None
+            try:
+                seen = datetime.fromisoformat(snapshot.timestamp)
+            except (ValueError, TypeError):
+                return None
+            if (seen.utcoffset() is None or seen > now or seen.astimezone(ET).date() not in allowed_dates
+                    or max_age is not None and now - seen > max_age):
+                return None
+            return snapshot.regime
+
+        regime = usable_regime(current_macro, {session.date}, max_age=market_move.MAX_QUOTE_AGE)
+        prior_dates = {session.date, previous.date} if previous else {session.date}
+        day = str(session.date)
+        name, window = "market_move_rescan", f"{day}:{slot}"
+        attempt = None
+        with self.store.transaction():
+            state = self.store.kv_get(MARKET_MOVE_STATE_KEY) or {}
+            if state.get("session") != day:
+                yesterday = state.get("regime") if previous and state.get("session") == str(previous.date) else None
+                state = {"regime": yesterday or usable_regime(prior_macro, prior_dates)}
+            state, hits = market_move.observe(
+                state, slot=slot, now=now, readings=readings, closes=closes, regime=regime,
+                can_claim=name not in self._job_tasks and self.ledger.job_status(name, window) is None,
+            )
+            self.store.kv_set(MARKET_MOVE_STATE_KEY, {"session": day, **state})
+            if hits:
+                attempt = self.ledger.start_job(name, window).attempts
+        if attempt is not None:
+            # Claim and cap are atomic with the job row. Intentional at-most-once
+            # semantics: an interrupted or failed rescan consumes its claim.
+            self._job_tasks[name] = asyncio.create_task(
+                self._run_scheduled_job(name, window, lambda: self._run_market_move_rescan(window, hits), 1500, attempt),
+                name=f"stock-agent:{name}",
+            )
+        return JobOutcome(JobStatus.DONE, detail={"inputs": sorted(readings), "triggered": bool(hits)})
+
+    async def _run_market_move_rescan(self, window, hits):
+        if not self._is_market_open(_now_et()):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "regular_session_unavailable", "triggers": hits})
+        why = "; ".join(hit["text"] for hit in hits)
+        await self._alert("info", "Market-move rescan",
+                          f"{why}. Reviewing held positions and looking for new ideas. "
+                          "The normal options scan will be requested; all research and risk limits still apply.",
+                          key=f"market-move-rescan:{window}")
+        result = await self.research.run("market_move", work_scope=f"market_move:{window}")
+        request_options = getattr(self, "request_options_rescan", None)
+        options_status = "not configured"
+        if request_options is not None:
+            try:
+                options_status = request_options(window) or "requested"
+            except Exception as exc:
+                # Do not lose valid stock intents because the separate options
+                # handoff was unavailable. This call only persists a request.
+                options_status = "request unavailable"
+                logger.warning("Market-move options request failed (%s)", type(exc).__name__)
+        detail = {**result.detail, "triggers": hits, "options_rescan": options_status}
+        return JobOutcome(result.status, result.intents, detail, result.option_candidates)
 
     # ── Morning Brief ────────────────────────────────────────────────
 
