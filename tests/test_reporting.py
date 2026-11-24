@@ -1072,3 +1072,151 @@ def test_rolling_and_all_time_drawdown_pause_cap_reporting(
         ledger.store.close()
 
     asyncio.run(_run())
+
+
+def test_daily_summary_never_claims_first_close_recorded_when_missing(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, update_drawdown
+
+    async def _run() -> None:
+        cfg = Config()
+        day1 = date(2026, 11, 23)
+        day2 = date(2026, 11, 24)
+        after_close_d1 = datetime(2026, 11, 23, 21, 15, tzinfo=timezone.utc)
+        after_close_d2 = datetime(2026, 11, 24, 21, 15, tzinfo=timezone.utc)
+
+        def _make_snap(d: date, *, quality: str = "indicative", bad_stock: bool = False) -> BookSnapshot:
+            holdings = (
+                (
+                    Holding(
+                        symbol="PDD",
+                        qty=Decimal("-50"),
+                        qty_available=Decimal("-50"),
+                        avg_cost=Decimal("100"),
+                        price=None,
+                        price_ok=False,
+                        market_value=Decimal("0"),
+                        lastday_price=Decimal("100"),
+                    ),
+                )
+                if bad_stock
+                else ()
+            )
+            return BookSnapshot(
+                as_of=datetime(d.year, d.month, d.day, 21, 5, tzinfo=timezone.utc),
+                run_id=f"r-{d.isoformat()}",
+                equity=Decimal("100000.00"),
+                cash=Decimal("45000.00"),
+                long_mv=Decimal("65000.00"),
+                short_mv=Decimal("-10000.00"),
+                options_mv=Decimal("0"),
+                last_equity=None,
+                buying_power=Decimal("100000"),
+                holdings=holdings,
+                legs=(),
+                open_orders=(),
+                diffs=(),
+                quality=quality,
+            )
+
+        # 1) Day 1 missed close (no prior close mark, drawdown_close FAILED on unpriced stock):
+        # MUST NOT say "First close baseline recorded"; must state close was not recorded and why.
+        ledger1 = make_ledger(tmp_path / "d1_missed", world)
+        ledger1.start_job("drawdown_close", day1.isoformat())
+        ledger1.finish_job(
+            "drawdown_close",
+            day1.isoformat(),
+            JobStatus.FAILED,
+            detail={"reason": "close_unpriced_stock", "symbols": ["PDD"]},
+        )
+        rb1 = ReportBuilder(cfg, ledger=ledger1, clock=lambda: after_close_d1)
+        embeds_missed = await rb1.build_daily_summary(snapshot=_make_snap(day1, quality="indicative", bad_stock=True))
+        txt_missed = str(embeds_missed)
+        assert "First close baseline recorded" not in txt_missed
+        assert "Close not recorded" in txt_missed
+        assert "one or more stock prices could not be verified (PDD)" in txt_missed
+        assert "Trusted close was not recorded today" in embeds_missed[0]["description"]
+
+        # Also check standalone snapshot=None fallback and live-but-unrecorded Day 1 snapshot:
+        embeds_none = await rb1.build_daily_summary(snapshot=None)
+        assert "First close baseline recorded" not in str(embeds_none)
+        assert "one or more stock prices could not be verified (PDD)" in embeds_none[0]["description"]
+
+        ledger_no_job = make_ledger(tmp_path / "d1_no_job", world)
+        rb_no_job = ReportBuilder(cfg, ledger=ledger_no_job, clock=lambda: after_close_d1)
+        txt_unrecorded_live = str(await rb_no_job.build_daily_summary(snapshot=_make_snap(day1, quality="live")))
+        assert "First close baseline recorded" not in txt_unrecorded_live
+        assert "Close not recorded" in txt_unrecorded_live
+        ledger1.store.close()
+        ledger_no_job.store.close()
+
+        # 2) Genuine Day 1 conservative trusted close recorded -> DOES say "First close baseline recorded"
+        # and labels the conservative option haircut clearly.
+        ledger2 = make_ledger(tmp_path / "d1_recorded", world)
+        snap_d1 = _make_snap(day1, quality="live")
+        ledger2.record_equity_mark(
+            day1,
+            "close",
+            snap_d1,
+            extra={
+                "conservative": True,
+                "unpriced_option_legs": ["GS261127C00920000", "JPM261127C00345000"],
+                "haircut": "0",
+            },
+        )
+        dd_d1 = update_drawdown(DrawdownState(), day1.isoformat(), snap_d1.equity, config=cfg)
+        ledger2.risk_state_set(DRAWDOWN_STATE_KEY, dd_d1.to_record())
+        rb2 = ReportBuilder(cfg, ledger=ledger2, clock=lambda: after_close_d1)
+        txt_recorded = str(await rb2.build_daily_summary(snapshot=_make_snap(day1, quality="indicative")))
+        assert "First close baseline recorded" in txt_recorded
+        assert "trusted close — conservative estimate: 2 option legs unpriced, haircut $0.00" in txt_recorded
+        assert "Close not recorded" not in txt_recorded
+
+        # 3) Watchpoint: Day 2 trusted close mark AND same-session DrawdownState persisted,
+        # while drawdown_close returned FAILED afterward in _evaluate_close_limits.
+        # Must NOT label as a missed trusted close or missed brake update.
+        snap_d2 = _make_snap(day2, quality="live")
+        ledger2.record_equity_mark(day2, "close", snap_d2)
+        dd_d2 = update_drawdown(
+            dd_d1,
+            day2.isoformat(),
+            snap_d2.equity,
+            previous_session=day1.isoformat(),
+            config=cfg,
+        )
+        ledger2.risk_state_set(DRAWDOWN_STATE_KEY, dd_d2.to_record())
+        ledger2.start_job("drawdown_close", day2.isoformat())
+        ledger2.finish_job(
+            "drawdown_close",
+            day2.isoformat(),
+            JobStatus.FAILED,
+            detail={"reason": "close_risk_input_unverified"},
+        )
+        rb2_d2 = ReportBuilder(cfg, ledger=ledger2, clock=lambda: after_close_d2)
+        embeds_watch = await rb2_d2.build_daily_summary(snapshot=_make_snap(day2, quality="indicative"))
+        txt_watch = str(embeds_watch)
+        assert "Close not recorded" not in txt_watch
+        assert "Trusted close was not recorded" not in txt_watch
+        assert "brakes did not update today" not in txt_watch
+        assert "verified close marks" in embeds_watch[0]["description"]
+
+        # 4) Standalone mark saved on Day 2, but DrawdownState remained on Day 1 (update_drawdown failed):
+        # Distinguishes saved mark from un-updated drawdown brakes.
+        ledger2.risk_state_set(DRAWDOWN_STATE_KEY, dd_d1.to_record())
+        ledger2.store.conn.execute("DELETE FROM job_runs WHERE job='drawdown_close' AND window_key=?", (day2.isoformat(),))
+        ledger2.start_job("drawdown_close", day2.isoformat())
+        ledger2.finish_job(
+            "drawdown_close",
+            day2.isoformat(),
+            JobStatus.FAILED,
+            detail={"reason": "drawdown_close_invalid"},
+        )
+        embeds_standalone = await rb2_d2.build_daily_summary(snapshot=_make_snap(day2, quality="indicative"))
+        txt_standalone = str(embeds_standalone)
+        assert "Trusted close was not recorded" not in txt_standalone
+        assert "fall-from-peak drawdown brakes did not update today" in embeds_standalone[0]["description"]
+        assert "the close or external cash flows could not be applied to drawdown" in txt_standalone
+        ledger2.store.close()
+
+    asyncio.run(_run())
