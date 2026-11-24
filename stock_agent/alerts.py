@@ -25,10 +25,11 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from stock_agent.config import Config
 from stock_agent.discord_alerts import DiscordReporter
@@ -265,6 +266,7 @@ class AlertService:
 
         self.outbox: list[OutboxItem] = []
         self.active_keys: dict[str, DedupState] = {}
+        self.blocked_buys: dict[str, dict[str, Any]] = {}
         self._in_flight_ids: set[str] = set()
         self._discord_halted_until: datetime | None = None
         self._load()
@@ -312,21 +314,38 @@ class AlertService:
                 str(k): DedupState.from_dict(v)
                 for k, v in (raw.get("active_keys") or {}).items()
             }
+            loaded_blocked: dict[str, dict[str, Any]] = {}
+            for day_k, state_v in (raw.get("blocked_buys") or {}).items():
+                if not isinstance(state_v, dict):
+                    continue
+                seen_raw = state_v.get("seen") or []
+                seen_clean = [str(x) for x in seen_raw if x]
+                loaded_blocked[str(day_k)[:10]] = {
+                    "seen": list(dict.fromkeys(seen_clean)),
+                    "sent_count": max(0, int(state_v.get("sent_count", 0) or 0)),
+                    "overflow_count": max(0, int(state_v.get("overflow_count", 0) or 0)),
+                    "overflow_emitted": bool(state_v.get("overflow_emitted", False)),
+                }
+            self.blocked_buys = _prune_blocked_buy_sessions(loaded_blocked)
             if self._prune_active_keys(self._clock()):
                 self._save()
         except Exception as e:
             logger.error("Could not read alert outbox %s (%s): %s — starting fresh queue", self.outbox_path, type(e).__name__, redact_secrets_in_text(str(e)))
             self.outbox = []
             self.active_keys = {}
+            self.blocked_buys = {}
 
     def _save(self) -> None:
         try:
             self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
+            self.blocked_buys = _prune_blocked_buy_sessions(self.blocked_buys)
+            payload: dict[str, Any] = {
                 "version": 1,
                 "outbox": [item.to_dict() for item in self.outbox],
                 "active_keys": {k: v.to_dict() for k, v in self.active_keys.items()},
             }
+            if self.blocked_buys:
+                payload["blocked_buys"] = self.blocked_buys
             fd, tmp_name = tempfile.mkstemp(
                 prefix=".alert_outbox_",
                 suffix=".tmp",
@@ -1399,6 +1418,656 @@ class AlertService:
             mirror_telegram=True,
         )
 
+    def alert_blocked_buy(
+        self,
+        symbol: str,
+        code: str,
+        reason: str = "",
+        *,
+        session_date: date | str | Any = None,
+        risk_reasons: Sequence[str] = (),
+        throttled: bool = False,
+        **_: Any,
+    ) -> bool:
+        """Emit one plain-English #risk notice when an order-stage or open-handoff buy is blocked.
+
+        Dedupes per ``(symbol, canonical_reason, ET session)`` across both displayed and
+        overflowed blocks, caps individual notices at 10 per session, and tracks overflow
+        durably so ``flush_blocked_buy_overflow`` emits at most one ``and N more`` summary.
+        """
+        sym = re.sub(r"[^A-Z0-9./-]", "", str(symbol or "").strip().upper())[:16]
+        if not sym:
+            return False
+
+        classified = _classify_blocked_buy(
+            sym,
+            code,
+            reason,
+            risk_reasons=risk_reasons,
+            throttled=throttled,
+        )
+        if classified is None:
+            return False
+
+        bucket, body = classified
+        day_str = _session_day_str(session_date, self._clock)
+
+        # If a prior session closed with un-flushed overflow and we rolled into a new day, flush it once.
+        self.flush_blocked_buy_overflow(before_session=day_str)
+
+        state = self.blocked_buys.setdefault(
+            day_str,
+            {"seen": [], "sent_count": 0, "overflow_count": 0, "overflow_emitted": False},
+        )
+        dedupe_pair = f"{sym}:{bucket}"
+        if dedupe_pair in state["seen"]:
+            return False
+
+        if int(state.get("sent_count", 0)) < BLOCKED_BUY_SESSION_CAP:
+            state["seen"].append(dedupe_pair)
+            state["sent_count"] = int(state.get("sent_count", 0)) + 1
+            queued = self.alert(
+                Severity.INFO,
+                f"Buy blocked — {sym}",
+                body,
+                key=f"blocked_buy:{day_str}:{sym}:{bucket}",
+                dedupe_window_sec=86400,
+                category=AlertCategory.RISK_BLOCK,
+                channel_key="risk",
+                mirror_telegram=False,
+            )
+            if not queued:
+                state["seen"].remove(dedupe_pair)
+                state["sent_count"] = max(0, int(state.get("sent_count", 1)) - 1)
+                self._save()
+                return False
+            return True
+
+        state["seen"].append(dedupe_pair)
+        state["overflow_count"] = int(state.get("overflow_count", 0)) + 1
+        self._save()
+        return False
+
+    def flush_blocked_buy_overflow(
+        self,
+        session_date: date | str | Any = None,
+        *,
+        before_session: date | str | Any = None,
+    ) -> bool:
+        """Emit at most one ``and N more`` #risk summary for completed session(s) above the 10-cap."""
+        if before_session is not None:
+            cutoff = _session_day_str(before_session, self._clock)
+            emitted_any = False
+            for prior_day in sorted(k for k in list(self.blocked_buys.keys()) if k < cutoff):
+                if self._emit_session_overflow_once(prior_day):
+                    emitted_any = True
+            return emitted_any
+
+        day_str = _session_day_str(session_date, self._clock)
+        return self._emit_session_overflow_once(day_str)
+
+    def _emit_session_overflow_once(self, day_str: str) -> bool:
+        state = self.blocked_buys.get(day_str)
+        if not state:
+            return False
+        overflow_n = int(state.get("overflow_count", 0) or 0)
+        if overflow_n <= 0 or bool(state.get("overflow_emitted", False)):
+            return False
+
+        noun = "buy was" if overflow_n == 1 else "buys were"
+        body = (
+            f"After the first {BLOCKED_BUY_SESSION_CAP} blocked-buy notices in the {day_str} session, "
+            f"risk rules held back additional setups — and {overflow_n} more blocked {noun} skipped. "
+            "Full counts appear in the end-of-day Entry Funnel."
+        )
+        state["overflow_emitted"] = True
+        queued = self.alert(
+            Severity.INFO,
+            f"Blocked buys — and {overflow_n} more",
+            body,
+            key=f"blocked_buy_overflow:{day_str}",
+            dedupe_window_sec=172800,
+            category=AlertCategory.RISK_BLOCK,
+            channel_key="risk",
+            mirror_telegram=False,
+        )
+        if not queued and f"blocked_buy_overflow:{day_str}" not in self.active_keys:
+            state["overflow_emitted"] = False
+            self._save()
+            return False
+        return queued
+
+    def send_handoff_outcome(
+        self,
+        *,
+        stage: str,
+        session_date: date | str | Any = None,
+        symbols: Sequence[str] = (),
+        source_job: str = "",
+        outcomes: Mapping[str, int] | None = None,
+        key_suffix: str = "",
+    ) -> bool:
+        """Send a plain-English #announcements update for staged or resolved open handoffs."""
+        day_str = _session_day_str(session_date, self._clock)
+        title, body = format_handoff_outcome_text(
+            stage=stage,
+            session_date=day_str,
+            symbols=symbols,
+            source_job=source_job,
+            outcomes=outcomes,
+        )
+        if not body:
+            return False
+        suffix = re.sub(r"[^a-z0-9_-]", "", str(key_suffix or source_job or stage).strip().lower())[:32]
+        return self.alert(
+            Severity.INFO,
+            title,
+            body,
+            key=f"handoff:{day_str}:{stage}:{suffix or 'update'}",
+            dedupe_window_sec=86400,
+            category=AlertCategory.LIFECYCLE,
+            channel_key="announcements",
+            mirror_telegram=False,
+        )
+
+
+BLOCKED_BUY_SESSION_CAP = 10
+_BLOCKED_BUY_HISTORY_CAP = 14
+_ET_ZONE = ZoneInfo("America/New_York")
+
+_CLUSTER_DISPLAY_NAMES: dict[str, str] = {
+    "semiconductors": "Semiconductors",
+    "megacaptech": "mega-cap technology",
+    "chinaadrs": "China ADRs",
+    "consumerdiscretionary": "consumer discretionary",
+    "healthcare": "healthcare",
+    "financials": "financials",
+    "energy": "energy",
+    "industrials": "industrials",
+}
+
+_CLEAN_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z &/-]{0,31}$")
+
+_RISK_REASON_TOKEN_RE = re.compile(
+    r"\b("
+    r"sector_cap(?::[A-Za-z][A-Za-z &/-]{0,31})?"
+    r"|cluster_cap(?::[A-Za-z][A-Za-z0-9 &/-]{0,31})?"
+    r"|theme_cap(?::[A-Za-z][A-Za-z0-9 &/-]{0,31})?"
+    r"|issuer_cap(?::[A-Za-z0-9._-]{1,12})?"
+    r"|position_count|max_positions"
+    r"|price_drift|price_ran_away|gap_drift"
+    r"|margin_buffer|margin_call|buying_power_floor|cash_floor|gross_cap|insufficient_buying_power"
+    r"|drawdown_pause|drawdown_paused|drawdown_no_new_borrowing|drawdown_throttle"
+    r"|sizing_limit|stop_risk_budget|entries_paused"
+    r"|conviction_floor|conviction_adjustment|stale_signal"
+    r"|near_target|top_up_conviction|top_up_thesis_change|top_up_below_stop|top_up_already_today"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_IGNORED_BLOCKED_BUY_CODES: frozenset[str] = frozenset(
+    {
+        # Research-stage candidate skips (never reached order stage or open handoff)
+        "non_entry_direction",
+        "conviction_below_floor",
+        "llm_budget",
+        "llm_unavailable",
+        "llm_malformed",
+        "llm_timeout",
+        "llm_error",
+        "no_tradable_universe",
+        "required_source_unavailable",
+        "not_tradable",
+        "quote_stale_or_unavailable",
+        "add_thesis_not_strengthened",
+        "add_thesis_not_reaffirmed",
+        "handoff_pending",
+        # Transient execution holds / retries
+        "market_closed",
+        "cleanup_pending",
+        "books_untrusted",
+        "research_inputs_pending",
+        "quote_unavailable",
+        "risk_controls_unavailable",
+        "stale_broker_book",
+        "stale_quote",
+        "handoff_input_timeout",
+        "handoff_input_unavailable",
+        "handoff_execution_window_closed",
+        # Non-blocked handoffs, duplicates, routine top-up skips, and broker errors alerted separately
+        "handoff_promoted",
+        "handoff_reanchored",
+        "handoff_buy_pending",
+        "handoff_superseded",
+        "handoff_already_processed",
+        "duplicate",
+        "near_target",
+        "top_up_already_today",
+        "top_up_conviction",
+        "top_up_thesis_change",
+        "top_up_below_stop",
+        "top_up_requires_holding",
+        "top_up_intent_required",
+        "broker_rejected",
+        "symbol_blocked",
+        "short_open",
+        "unexpected_short",
+        "unpriced_holding",
+        "nothing_to_sell",
+        "exit_cap",
+    }
+)
+
+_ROUTINE_SIZING_TOKENS: frozenset[str] = frozenset(
+    {
+        "near_target",
+        "top_up_conviction",
+        "top_up_thesis_change",
+        "top_up_below_stop",
+        "top_up_already_today",
+        "top_up_requires_holding",
+        "top_up_intent_required",
+    }
+)
+
+
+def _prune_blocked_buy_sessions(
+    sessions: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not sessions:
+        return {}
+    kept_keys = sorted(sessions.keys())[-_BLOCKED_BUY_HISTORY_CAP:]
+    return {k: sessions[k] for k in kept_keys}
+
+
+def _session_day_str(
+    session_date: date | str | Any,
+    clock: Callable[[], datetime],
+) -> str:
+    if session_date is not None and hasattr(session_date, "isoformat"):
+        return str(session_date.isoformat())[:10]
+    if session_date:
+        txt = str(session_date).strip()[:10]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", txt):
+            return txt
+    now = clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(_ET_ZONE).strftime("%Y-%m-%d")
+
+
+def _clean_sector_label(detail: str) -> str:
+    candidate = detail.strip()
+    if candidate and _CLEAN_LABEL_RE.match(candidate) and candidate.lower() not in {"unknown", "none"}:
+        return candidate
+    return ""
+
+
+def _clean_cluster_label(detail: str) -> str:
+    candidate = detail.strip()
+    if not candidate:
+        return ""
+    key = re.sub(r"[^a-z0-9]", "", candidate.lower())
+    if key in _CLUSTER_DISPLAY_NAMES:
+        return _CLUSTER_DISPLAY_NAMES[key]
+    if _CLEAN_LABEL_RE.match(candidate) and candidate.lower() not in {"unknown", "none"}:
+        return candidate
+    return ""
+
+
+def _extract_risk_tokens(reason: str, risk_reasons: Sequence[str]) -> list[str]:
+    tokens: list[str] = []
+    for raw in risk_reasons or ():
+        txt = str(raw or "").strip()
+        if txt:
+            tokens.append(txt)
+    if reason:
+        for match in _RISK_REASON_TOKEN_RE.finditer(str(reason)):
+            tokens.append(match.group(1).strip())
+    return tokens
+
+
+def _classify_risk_token(
+    sym: str,
+    token: str,
+    *,
+    throttled: bool = False,
+) -> tuple[str, str] | None:
+    head, _, detail = token.partition(":")
+    norm = head.strip().lower()
+    if norm in _ROUTINE_SIZING_TOKENS:
+        return None
+
+    if norm == "sector_cap":
+        sec = _clean_sector_label(detail)
+        target = sec if sec else "its sector"
+        return (
+            "sector_cap",
+            f"Could not buy {sym} because {target} is already at our 40% single-sector limit.",
+        )
+
+    if norm in {"cluster_cap", "theme_cap"}:
+        theme = _clean_cluster_label(detail)
+        if theme:
+            return (
+                "theme_cap",
+                f"Could not buy {sym} because our {theme} theme group is already at the 48% concentration limit.",
+            )
+        return (
+            "theme_cap",
+            f"Could not buy {sym} because its theme group is already at our 48% concentration limit.",
+        )
+
+    if norm == "issuer_cap":
+        return (
+            "issuer_cap",
+            f"Could not buy {sym} because we are already at our 15% single-stock position limit in {sym}.",
+        )
+
+    if norm in {"position_count", "max_positions"}:
+        return (
+            "max_positions",
+            f"Could not buy {sym} because all 20 stock slots are currently full.",
+        )
+
+    if norm in {"price_drift", "price_ran_away", "gap_drift"}:
+        return (
+            "gap_drift",
+            f"Skipped buying {sym} because the live price moved more than 3% away from our analysed entry price.",
+        )
+
+    if norm in {"margin_buffer", "margin_call"}:
+        return (
+            "margin",
+            f"Could not buy {sym} because the order would push our margin safety cushion below 25% of equity.",
+        )
+
+    if norm == "gross_cap":
+        return (
+            "margin",
+            f"Could not buy {sym} because total portfolio exposure is already at our 150% gross cap.",
+        )
+
+    if norm in {"buying_power_floor", "cash_floor", "insufficient_buying_power", "margin"}:
+        return (
+            "margin",
+            f"Could not buy {sym} because overnight buying power is below our safety floor.",
+        )
+
+    if norm in {"drawdown_pause", "drawdown_paused"}:
+        return (
+            "drawdown_pause",
+            f"Could not buy {sym} because portfolio drawdown reached our 20% safety brake, pausing new stock buys.",
+        )
+
+    if norm in {"drawdown_no_new_borrowing", "drawdown_throttle"}:
+        return (
+            "drawdown_throttle",
+            f"Could not buy {sym} because our 15% drawdown guard blocks new margin borrowing until equity recovers.",
+        )
+
+    if norm in {"sizing_limit", "stop_risk_budget"}:
+        if throttled:
+            return (
+                "drawdown_throttle",
+                f"Could not buy {sym} because drawdown risk throttling reduced the allowed position size below one share.",
+            )
+        return (
+            "sizing_limit",
+            f"Could not buy {sym} because our per-trade stop-loss risk budget sized the order below one share.",
+        )
+
+    if norm == "entries_paused":
+        return (
+            "entries_paused",
+            f"Could not buy {sym} because new buy entries are paused by operator setting.",
+        )
+
+    if norm in {"conviction_floor", "conviction_adjustment", "stale_signal"}:
+        return (
+            "recheck_failed",
+            f"Skipped buying {sym} because the pre-trade research recheck did not clear the setup.",
+        )
+
+    return None
+
+
+def _classify_blocked_buy(
+    sym: str,
+    code: str,
+    reason: str = "",
+    *,
+    risk_reasons: Sequence[str] = (),
+    throttled: bool = False,
+) -> tuple[str, str] | None:
+    norm_code = str(code or "").strip().lower()
+    if not norm_code or norm_code in _IGNORED_BLOCKED_BUY_CODES:
+        return None
+
+    tokens = _extract_risk_tokens(reason, risk_reasons)
+    lower_tokens = {t.partition(":")[0].strip().lower() for t in tokens}
+
+    # Direct or risk-refused/risk-size-zero rules
+    if norm_code in {"risk_refused", "risk_size_zero"}:
+        for tok in tokens:
+            classified = _classify_risk_token(sym, tok, throttled=throttled)
+            if classified is not None:
+                return classified
+        if lower_tokens and lower_tokens.issubset(_ROUTINE_SIZING_TOKENS):
+            return None
+        if norm_code == "risk_size_zero":
+            if throttled:
+                return (
+                    "drawdown_throttle",
+                    f"Could not buy {sym} because drawdown risk throttling reduced the allowed position size below one share.",
+                )
+            return (
+                "sizing_limit",
+                f"Could not buy {sym} because portfolio risk limits sized the order below one share.",
+            )
+        return (
+            "risk_limit",
+            f"Could not buy {sym} because portfolio risk limits held back the order.",
+        )
+
+    direct = _classify_risk_token(sym, norm_code, throttled=throttled)
+    if direct is not None:
+        return direct
+
+    # Order-stage and market-open handoff recheck refusals
+    if norm_code in {
+        "research_stale",
+        "research_gate_refused",
+        "position_changed",
+        "top_up_thesis_direction",
+        "handoff_gate_refused",
+        "handoff_thesis_changed",
+        "handoff_position_changed",
+        "handoff_exit_pending",
+        "handoff_reanchor_unavailable",
+        "recheck_failed",
+    }:
+        raw_ctx = {str(r or "").partition(":")[0].strip().lower() for r in (risk_reasons or ())}
+        if norm_code in {"position_changed", "handoff_position_changed"}:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because our {sym} holding changed before the order could be placed, so the pre-trade recheck stopped the buy.",
+            )
+        if norm_code == "handoff_exit_pending":
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because an exit order is already open for {sym}, so the pre-trade recheck cancelled the buy.",
+            )
+        if norm_code in {"top_up_thesis_direction", "handoff_thesis_changed"}:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because our latest research recheck no longer rates {sym} an actionable buy.",
+            )
+        if raw_ctx & {"llm_unavailable", "llm_budget", "budget"}:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because the market-open recheck could not run while AI review routes or weekly AI budget were unavailable.",
+            )
+        if raw_ctx & {"auth", "plan_blocked"}:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because the pre-trade recheck lacked an authenticated market-data or news feed.",
+            )
+        if "new_material_news_after_single_review" in raw_ctx:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because fresh material news arrived after the market-open recheck.",
+            )
+        if raw_ctx & {
+            "buy_thesis_or_conviction_changed",
+            "top_up_baseline_changed",
+            "targeted_review_did_not_qualify",
+            "targeted_review_already_attempted",
+        }:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because the market-open recheck lowered conviction below our buy threshold.",
+            )
+        return (
+            "recheck_failed",
+            f"Skipped buying {sym} because the pre-trade research recheck did not clear the setup.",
+        )
+
+    # Session-close handoff / queued-intent expiry (including all-day holds expiring once at close)
+    if norm_code in {"handoff_expired", "intent_expired"}:
+        raw_ctx = {str(r or "").partition(":")[0].strip().lower() for r in (risk_reasons or ())}
+        reason_lc = str(reason or "").lower()
+        if norm_code == "handoff_expired":
+            if raw_ctx & {
+                "quote_stale_or_unavailable",
+                "news_stale_or_unavailable",
+                "broker_book_unavailable",
+                "handoff_input_timeout",
+                "handoff_input_unavailable",
+            }:
+                return (
+                    "handoff_expired",
+                    f"Skipped buying {sym} because the queued open handoff expired at the session close before live market and news checks cleared.",
+                )
+            return (
+                "handoff_expired",
+                f"Skipped buying {sym} because the queued open handoff expired at the session close without clearing for entry.",
+            )
+        if "earlier held:" in reason_lc or "retrying" in reason_lc:
+            return (
+                "handoff_expired",
+                f"Skipped buying {sym} because the queued buy order stayed on hold until the session close and expired before live checks cleared.",
+            )
+        return (
+            "handoff_expired",
+            f"Skipped buying {sym} because the queued buy order expired at the session close before entry conditions cleared.",
+        )
+
+    return None
+
+
+_SOURCE_JOB_LABELS: dict[str, str] = {
+    "weekly": "the weekend scan",
+    "prescan": "the pre-market scan",
+    "midweek": "the midweek scan",
+}
+
+
+def format_handoff_outcome_text(
+    *,
+    stage: str,
+    session_date: date | str | Any = "",
+    symbols: Sequence[str] = (),
+    source_job: str = "",
+    outcomes: Mapping[str, int] | None = None,
+) -> tuple[str, str]:
+    """Build plain-English title and body for pre-open handoff staging or open resolution."""
+    day_txt = str(session_date.isoformat())[:10] if hasattr(session_date, "isoformat") else str(session_date or "")[:10]
+    norm_stage = str(stage or "").strip().lower()
+    clean_syms = [
+        re.sub(r"[^A-Z0-9./-]", "", str(s or "").strip().upper())[:16]
+        for s in (symbols or ())
+        if str(s or "").strip()
+    ]
+
+    if norm_stage == "staged":
+        if not clean_syms:
+            return ("Open handoff staged", "")
+        shown = ", ".join(clean_syms[:8])
+        more = f" and {len(clean_syms) - 8} more" if len(clean_syms) > 8 else ""
+        src_txt = _SOURCE_JOB_LABELS.get(str(source_job or "").strip().lower(), "closed-market research")
+        when_txt = f" for the {day_txt} open" if day_txt else " for the next market open"
+        return (
+            "Buy candidates staged for market open",
+            f"Staged {len(clean_syms)} buy candidate(s) from {src_txt}{when_txt} ({shown}{more}). "
+            "Each setup will run a live quote and news check five minutes after the opening bell before placing an order.",
+        )
+
+    counts = {str(k): int(v) for k, v in (outcomes or {}).items() if int(v or 0) > 0}
+    if not counts:
+        return ("Market-open handoff summary", "")
+
+    queued_n = counts.get("handoff_promoted", 0) + counts.get("handoff_reanchored", 0)
+    reanchored_n = counts.get("handoff_reanchored", 0)
+    already_queued_n = counts.get("handoff_buy_pending", 0)
+    superseded_n = counts.get("handoff_superseded", 0)
+    refused_n = sum(
+        counts.get(k, 0)
+        for k in (
+            "handoff_gate_refused",
+            "handoff_thesis_changed",
+            "handoff_position_changed",
+            "handoff_exit_pending",
+            "handoff_reanchor_unavailable",
+        )
+    )
+    expired_n = counts.get("handoff_expired", 0)
+
+    parts: list[str] = []
+    if queued_n:
+        reanchor_note = f" ({reanchored_n} re-checked after overnight news)" if reanchored_n else ""
+        parts.append(f"{queued_n} queued for execution{reanchor_note}")
+    if refused_n:
+        parts.append(f"{refused_n} held back by the open recheck")
+    if already_queued_n:
+        parts.append(f"{already_queued_n} skipped because another buy order already holds that stock's queue slot")
+    if superseded_n:
+        parts.append(f"{superseded_n} replaced by a fresher pre-market scan")
+    if expired_n:
+        parts.append(f"{expired_n} expired at session close")
+
+    if not parts:
+        return ("Market-open handoff summary", "")
+    session_prefix = f"For the {day_txt} session: " if day_txt else ""
+    return (
+        "Market-open handoff summary",
+        session_prefix + "; ".join(parts) + ".",
+    )
+
+
+def format_market_rescan_text(
+    *,
+    triggers: Sequence[str],
+    sp500_source: str = "SPY live quote",
+    vix_source: str = "",
+    vix_unavailable: bool = False,
+    rescan_number: int = 1,
+    max_rescans: int = 3,
+) -> str:
+    """Build plain-English announcement text for an intraday market-move rescan."""
+    clean_triggers = [redact_secrets_in_text(str(t).strip()) for t in (triggers or ()) if str(t).strip()]
+    trigger_txt = "; ".join(clean_triggers) if clean_triggers else "a sharp intraday market move"
+    if vix_unavailable or not vix_source:
+        source_txt = f"Sources: {sp500_source} (VIX quote unavailable — running in S&P-only mode)."
+    else:
+        source_txt = f"Sources: {sp500_source} and {vix_source}."
+    return (
+        f"Trigger: {trigger_txt}. "
+        f"{source_txt} "
+        f"Intraday market-move rescan {max(1, int(rescan_number))} of {max(1, int(max_rescans))} today "
+        "for stock and options setups."
+    )
+
 
 def format_entry_lock_line(item: Any) -> str:
     """Format any lock dict/object/string into the canonical A14c line."""
@@ -1453,12 +2122,15 @@ __all__ = [
     "AlertCategory",
     "AlertEvent",
     "AlertService",
+    "BLOCKED_BUY_SESSION_CAP",
     "DedupState",
     "OutboxItem",
     "Severity",
     "alert",
     "coerce_severity",
     "format_entry_lock_line",
+    "format_handoff_outcome_text",
+    "format_market_rescan_text",
     "get_default_alert_service",
     "redact_secrets_in_text",
     "set_default_alert_service",
