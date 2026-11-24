@@ -283,6 +283,14 @@ class ResearchStore:
         rows = self.store.query("SELECT * FROM research_pending_buys WHERE work_key=?", (key,))
         return rows[0] if rows else None
 
+    def supersede_pending_buys(self, symbol: str, session_date: str) -> int:
+        with self.store.transaction() as conn:
+            return conn.execute(
+                """UPDATE research_pending_buys SET status='handoff_superseded'
+                   WHERE symbol=? AND session_date=? AND status='waiting'""",
+                (symbol, session_date),
+            ).rowcount
+
     def protects_scheduled_buy(self, symbol: str, session_date: str) -> bool:
         return bool(self.store.query(
             """SELECT 1 FROM research_pending_buys p JOIN current_thesis t

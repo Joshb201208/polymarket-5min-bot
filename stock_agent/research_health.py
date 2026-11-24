@@ -33,8 +33,11 @@ class ResearchInputHealth:
             blockers.append("news_stale_or_unavailable")
         if not self.llm.is_healthy():
             blockers.append("llm_unavailable")
-        if self.research_store is not None and self.research_store.has_unqueued_exit(symbol, now):
-            blockers.append("confirmed_exit_pending")
+        if self.research_store is not None:
+            if self.research_store.has_unqueued_exit(symbol, now):
+                blockers.append("confirmed_exit_pending")
+            if self.research_store.has_pending_confirmation(symbol, now):
+                blockers.append("exit_confirmation_pending")
         return tuple(blockers)
 
     def extra_conviction_floor(self, now: datetime) -> int:

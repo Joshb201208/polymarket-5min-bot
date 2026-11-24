@@ -116,14 +116,21 @@ class _EntryFunnel:
     passed_conviction: int = 0
     buy_candidates: int = 0
     option_ideas: int = 0
+    handoff_staged: int = 0
+    handoff_superseded: int = 0
     rejected_by_reason: Counter[str] = field(default_factory=Counter)
 
     def payload(self) -> dict:
-        return {
+        fields = {
             "screened": self.screened, "thesis_written": self.thesis_written,
             "passed_conviction": self.passed_conviction, "buy_candidates": self.buy_candidates,
             "option_ideas": self.option_ideas, "rejected_by_reason": dict(self.rejected_by_reason),
         }
+        if self.handoff_staged:
+            fields["handoff_staged"] = self.handoff_staged
+        if self.handoff_superseded:
+            fields["handoff_superseded"] = self.handoff_superseded
+        return fields
 
 
 def _safe_previous(thesis) -> dict | None:
@@ -259,6 +266,10 @@ class ResearchPipeline:
         for symbol, key, story in work:
             if (work_scope and work_scope.startswith("catchup-")
                     and self._has_scheduled_entry(symbol, session.date)):
+                # A fallback retry for some other symbol must not redraw this
+                # symbol once its original handoff or queued BUY has resolved.
+                if self.store.claim_work(key, symbol, self.clock()):
+                    self.store.finish_work(key, "no_action", detail={"reason": "scheduled_entry_already_current"})
                 continue
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
@@ -289,7 +300,7 @@ class ResearchPipeline:
         collected, ideas = self._recover()
         incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
         status = JobStatus.FAILED if incomplete else JobStatus.DONE
-        if kind in _SCHEDULED and funnel.screened and funnel.healthy_unheld_theses and (
+        if kind in _SCHEDULED and funnel.screened and funnel.healthy_unheld_theses and not funnel.handoff_staged and (
             not failed and not deferred and not
             ((_INPUT_BLOCKERS | {"target_session_closed"}) & funnel.rejected_by_reason.keys())
         ):
@@ -371,9 +382,12 @@ class ResearchPipeline:
             async with self._analysis_lock:
                 await self._sweep_handoffs(funnel, outcomes)
         info = funnel.payload()
-        self.ledger.journal.append("research.entry_funnel", job="entry_handoff",
-                                   session_date=self.clock().astimezone(NY).date().isoformat(),
-                                   handoff_outcomes=dict(outcomes), **info)
+        if outcomes:
+            # Handoff waits and refusals are observable but not independent
+            # research rejections. A terminal refusal has one skipped intent.
+            self.ledger.journal.append("research.entry_funnel", job="entry_handoff",
+                                       session_date=self.clock().astimezone(NY).date().isoformat(),
+                                       handoff_outcomes=dict(outcomes), **info)
         return JobOutcome(JobStatus.DONE, detail={"entry_funnel": info, "handoff_outcomes": dict(outcomes)})
 
     async def _sweep_handoffs(self, funnel, outcomes):
@@ -403,8 +417,6 @@ class ResearchPipeline:
             outcomes[code] += 1
             if code == "handoff_promoted":
                 funnel.buy_candidates += 1
-            elif code != "handoff_reanchored":
-                funnel.rejected_by_reason[code] += 1
 
     def _finish_handoff(self, key, intent, code, *, reasons=()):
         with self.store.store.transaction():
@@ -414,7 +426,7 @@ class ResearchPipeline:
             if code != "handoff_reanchored":
                 queued = intent if code == "handoff_promoted" else replace(
                     intent, status=IntentStatus.SKIPPED, last_error=code,
-                    meta={**intent.meta, "handoff_reasons": reasons},
+                    meta={**intent.meta, "handoff_reasons": reasons, "skip_code": code},
                 )
                 (intent_id,) = self.ledger.enqueue_intents((queued,), job="entry_handoff")
             self.store.finish_pending_buy(key, code, intent_id=intent_id)
@@ -562,7 +574,9 @@ class ResearchPipeline:
             context = {**context, "unverified_owner_notes": approved_notes}
         price = security.price
         quote_at = security.quote_at
-        scheduled = kind in _SCHEDULED and story is None and now < session.opens_at
+        # Catch-up uses the weekly prompt but is a fallback, not an original
+        # scheduled decision. Keep its preopen/regular recovery semantics.
+        scheduled = kind in _SCHEDULED and key.startswith(f"{kind}:") and story is None and now < session.opens_at
         fresh_quote = _fresh_quote(security, now, max_age=timedelta(seconds=90) if scheduled else timedelta(minutes=20))
         anchor_kind = "quote" if fresh_quote else None
         if scheduled and not fresh_quote:
@@ -772,6 +786,10 @@ class ResearchPipeline:
             and (may_initialize or (baseline_grade is not None and record.effective_conviction >= baseline_grade))
         )
         if (qualifies or defer) and direction is Direction.BUY and (not holding or reaffirmed):
+            if reanchor is None:
+                # A newer, qualified BUY replaces (rather than falsely "blocking")
+                # an older waiting BUY for the same session. HOLDs remain refusals.
+                funnel.handoff_superseded += self.store.supersede_pending_buys(symbol, session.date.isoformat())
             intent = self._intent(key, symbol, "buy", position_id, (thesis_id,), price, evidence_ids, kind, session,
                                   {"raw_conviction": record.raw_conviction,
                                    "effective_conviction": record.effective_conviction,
@@ -791,7 +809,9 @@ class ResearchPipeline:
                                  meta={**intent.meta, **reviewed, "scheduled_handoff": True,
                                        "reference_price_kind": anchor_kind})
                 self.store.stage_pending_buy(key, thesis_id, intent, anchor_kind or "none")
-                funnel.rejected_by_reason["handoff_pending"] += 1
+                funnel.handoff_staged += 1
+                if defer:
+                    rejected.clear()  # A successfully deferred quote gap is not a rejection.
             else:
                 self.store.record_proposal(key, thesis_id, intent)
                 funnel.buy_candidates += 1

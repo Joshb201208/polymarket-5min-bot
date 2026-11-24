@@ -17,14 +17,15 @@ _SUNDAY = datetime(2026, 11, 15, 17, tzinfo=ET)
 
 
 @pytest.mark.world_start(_SUNDAY)
-@pytest.mark.parametrize(("kind", "decision_day", "hour", "target_day", "fresh_offhours_quote"), [
-    ("prescan", 17, 8, 17, False),
-    ("prescan", 17, 8, 17, True),
-    ("midweek", 18, 18, 19, False),
-    ("weekly", 15, 18, 16, False),
+@pytest.mark.parametrize(("kind", "decision_day", "hour", "target_day", "fresh_offhours_quote", "newer_prescan"), [
+    ("prescan", 17, 8, 17, False, False),
+    ("prescan", 17, 8, 17, True, False),
+    ("midweek", 18, 18, 19, False, False),
+    ("weekly", 15, 18, 16, False, False),
+    ("weekly", 15, 18, 16, False, True),
 ])
 def test_scheduled_buy_can_reach_open_with_fresh_quote(
-    world, monkeypatch, kind, decision_day, hour, target_day, fresh_offhours_quote,
+    world, monkeypatch, kind, decision_day, hour, target_day, fresh_offhours_quote, newer_prescan,
 ):
     monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", ("AAPL",))
     monkeypatch.setattr(Config, "UNIVERSE_SIZE", 1)
@@ -118,6 +119,15 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
             # symbol never established a healthy scheduled set.
             if fresh_offhours_quote:
                 scheduler.store.kv_set(_FRESH_SET, None)
+            if newer_prescan:
+                await advance(target_day, 8)
+                story()
+                prescan_key = world.clock.now_et().date().isoformat()
+                scheduler._schedule_job("prescan", prescan_key, scheduler._run_daily_prescan, timeout=120)
+                await drain("prescan")
+                replacement = scheduler.ledger.job_status("prescan", prescan_key)
+                assert replacement.detail["entry_funnel"]["handoff_superseded"] == 1
+                world.assert_no_orders()
             await advance(target_day, 9, 35)
             world.price("AAPL", 100, spread=0.02)
             if not scheduler.engine.normalised:
@@ -139,8 +149,9 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
             state = [(intent.status.value, intent.last_error) for intent in scheduler.ledger.list_intents(symbol="AAPL")]
             assert len(buys) == 1, (kind, job.detail["entry_funnel"], state)
             (intent,) = scheduler.ledger.list_intents(symbol="AAPL")
-            prefix = kind if fresh_offhours_quote else f"handoff:{kind}"
-            assert intent.origin == kind and intent.dedupe_key.startswith(f"{prefix}:")
+            origin = "prescan" if newer_prescan else kind
+            prefix = origin if fresh_offhours_quote else f"handoff:{origin}"
+            assert intent.origin == origin and intent.dedupe_key.startswith(f"{prefix}:")
         finally:
             await scheduler._cleanup()
 
