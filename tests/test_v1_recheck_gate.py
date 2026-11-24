@@ -117,6 +117,7 @@ def test_refresh_failure_holds_and_retries_instead_of_skipping(world, tmp_path, 
 
 
 @pytest.mark.parametrize("reason", ["pending_exit", "confirmed_exit_pending", "broker_book_blocked",
+                                    "exit_confirmation_pending",
                                     "conviction_below_floor_or_invalid", "stale_or_invalid_thesis",
                                     "invalid_clock"])
 def test_buy_direction_with_matching_thesis_but_not_ok_is_refused(world, tmp_path, monkeypatch, reason):
@@ -218,6 +219,31 @@ def test_gate_outage_fallback_still_refuses_when_an_exit_is_pending(world, tmp_p
     monkeypatch.setattr(eng.ledger, "list_intents",
                         lambda **k: [SimpleNamespace(side="sell", terminal=False)])
     assert "exit is pending" in run(eng._research_recheck(it, None))
+
+
+@pytest.mark.parametrize(("origin", "is_handoff"), [("weekly", True), ("market_move", False)])
+def test_new_entry_producer_holds_when_gate_raises_and_can_retry(world, tmp_path, monkeypatch, origin, is_handoff):
+    world.clock.set_et(2026, 11, 30, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng, gate = wired(world, tmp_path, monkeypatch, news_at=world.clock.now())
+    it = research_buy(eng, origin=origin)
+    if is_handoff:
+        it = eng.ledger.ack_intent(it.intent_id, IntentStatus.QUEUED, meta={"scheduled_handoff": True})
+
+    class Broken:
+        def is_entry_eligible(self, *args):
+            raise RuntimeError("unavailable")
+
+    eng._research_gate = Broken()
+    res = run(eng.execute_intent(it))
+    assert res.status == IntentStatus.QUEUED and res.code == "research_inputs_pending"
+    world.assert_no_orders()
+    eng._research_gate = gate
+    world.clock.set_et(2026, 11, 30, 10, 6)
+    world.price("AAA", 50, spread=0.02)
+    res = run(eng.execute_intent(eng.ledger.get_intent(it.intent_id)))
+    assert res.status == IntentStatus.FILLED
+    assert len([req for req in world.orders_sent() if req.json.get("side") == "buy"]) == 1
 
 
 def test_skipped_research_buy_reaches_blocked_buy_alert(world, tmp_path, monkeypatch):

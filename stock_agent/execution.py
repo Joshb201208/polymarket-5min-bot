@@ -883,6 +883,9 @@ class ExecutionEngine:
         try:
             g = await self._eligibility(intent.symbol)
         except Exception as e:
+            if intent.origin == "market_move" or intent.meta.get("scheduled_handoff") is True:
+                logger.warning("research gate unavailable at submit for %s (%s)", intent.symbol, type(e).__name__)
+                return "research gate unavailable at submit (retrying)", "research_inputs_pending"
             # A14a: a broken recheck must not block every buy. Degrade to the ledger's
             # current thesis: the intent still has to come from the newest thesis.
             logger.warning("research gate unavailable at submit (%s); using the ledger thesis", e)
