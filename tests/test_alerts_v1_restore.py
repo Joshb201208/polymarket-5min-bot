@@ -437,3 +437,67 @@ def test_scheduler_flushes_blocked_buy_overflow_only_after_close_and_handoff_com
     StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 10, tzinfo=ET))
     StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 25, 9, 35, tzinfo=ET))
     assert len(svc.outbox) == 11
+
+
+def test_failed_sweep_or_kv_get_error_defers_overflow_flush_and_retries_cleanly(
+    world: Any, tmp_path: Path
+) -> None:
+    from stock_agent.scheduler import StockAgentScheduler
+
+    cfg = _make_cfg(tmp_path)
+    world.clock.set_et(2026, 11, 24, 16, 5)
+    svc = AlertService(cfg, clock=world.clock.now)
+    for i in range(1, 13):
+        svc.alert_blocked_buy(f"RET{i:02d}", "risk_refused", "risk: position_count", session_date="2026-11-24")
+    assert len(svc.outbox) == 10
+
+    kv_data: dict[str, Any] = {}
+    state = {"kv_fail": True, "query_fail": True}
+
+    def _kv_get(key: str) -> Any:
+        if state["kv_fail"]:
+            raise RuntimeError("sqlite busy on kv_get")
+        return kv_data.get(key)
+
+    def _query(_sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        if state["query_fail"]:
+            raise RuntimeError("sqlite busy on order_intents")
+        lo, hi = str(params[0]), str(params[1])
+        rows = [{"symbol": "RET13", "session_date": "2026-11-24", "last_error": "expired before submission"}]
+        return [r for r in rows if lo <= r["session_date"] <= hi]
+
+    tue_session = SimpleNamespace(date=date(2026, 11, 24), closes_at=datetime(2026, 11, 24, 16, 0, tzinfo=ET))
+    sched = SimpleNamespace(
+        alerts=svc,
+        calendar=SimpleNamespace(session_on=lambda d: tue_session if str(d) == "2026-11-24" else None),
+        _job_tasks={},
+        research=SimpleNamespace(entry_handoff_due=lambda _now: False),
+        store=SimpleNamespace(
+            kv_get=_kv_get,
+            kv_set=lambda k, v: kv_data.__setitem__(k, v),
+        ),
+        ledger=SimpleNamespace(
+            expire_intents=lambda _now: 1,
+            store=SimpleNamespace(query=_query),
+        ),
+    )
+
+    # 1) Initial kv_get failure must not escape and must not flush an undercounted overflow.
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 5, tzinfo=ET))
+    assert getattr(sched, "_blocked_buy_swept_through", None) is None
+    assert len(svc.outbox) == 10
+
+    # 2) kv_get recovers, but ledger sweep fails -> must defer flush so RET13 is not missed ("and 2 more").
+    state["kv_fail"] = False
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 6, tzinfo=ET))
+    assert sched._blocked_buy_swept_through == ""
+    assert "alerts.blocked_buy_swept_through" not in kv_data
+    assert len(svc.outbox) == 10
+
+    # 3) Next healthy retry sweeps RET13, flushes complete "and 3 more" once, and persists marker.
+    state["query_fail"] = False
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 7, tzinfo=ET))
+    assert kv_data["alerts.blocked_buy_swept_through"] == "2026-11-24"
+    assert len(svc.outbox) == 11
+    assert svc.outbox[-1].event.title == "Blocked buys — and 3 more"
+    assert "and 3 more" in svc.outbox[-1].event.body

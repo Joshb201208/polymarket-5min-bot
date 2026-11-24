@@ -1629,7 +1629,14 @@ class StockAgentScheduler:
         last_swept = getattr(self, "_blocked_buy_swept_through", None)
         if last_swept is None:
             kv_get = getattr(store_obj, "kv_get", None)
-            raw_swept = kv_get("alerts.blocked_buy_swept_through") if callable(kv_get) else ""
+            if callable(kv_get):
+                try:
+                    raw_swept = kv_get("alerts.blocked_buy_swept_through")
+                except Exception as exc:
+                    logger.debug("Could not read blocked-buy sweep marker (%s)", type(exc).__name__)
+                    return
+            else:
+                raw_swept = ""
             last_swept = str(raw_swept or "")[:10]
             self._blocked_buy_swept_through = last_swept
 
@@ -1656,12 +1663,14 @@ class StockAgentScheduler:
             except Exception:
                 return
 
-        if needs_ledger_sweep and StockAgentScheduler._sweep_closed_expired_buys(
-            self,
-            today=today,
-            last_swept=last_swept,
-            closed_cutoff=closed_cutoff,
-        ):
+        if needs_ledger_sweep:
+            if not StockAgentScheduler._sweep_closed_expired_buys(
+                self,
+                today=today,
+                last_swept=last_swept,
+                closed_cutoff=closed_cutoff,
+            ):
+                return
             self._blocked_buy_swept_through = closed_cutoff
             kv_set = getattr(store_obj, "kv_set", None)
             if callable(kv_set):
