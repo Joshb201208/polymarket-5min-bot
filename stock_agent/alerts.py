@@ -1310,6 +1310,118 @@ class AlertService:
             mirror_telegram=True,
         )
 
+    def alert_entries_locked(
+        self,
+        locks: Sequence[Any],
+        *,
+        session_date: Any = None,
+    ) -> bool:
+        """Alert when new buy entries are locked, stating exact lock(s) and clear condition(s) (DECISIONS A14c)."""
+        lock_list = [x for x in (locks or ()) if x]
+        if not lock_list:
+            return False
+
+        lines = [format_entry_lock_line(item) for item in lock_list]
+        codes: list[str] = []
+        for item in lock_list:
+            if isinstance(item, dict):
+                c = str(item.get("code") or item.get("lock") or "lock")
+            elif isinstance(item, str):
+                c = item[:32]
+            else:
+                c = str(getattr(item, "code", None) or getattr(item, "lock", None) or "lock")
+            codes.append(c.strip().lower().replace(" ", "_"))
+        code_sig = ",".join(sorted(set(codes))) or "locked"
+
+        if session_date is not None and hasattr(session_date, "isoformat"):
+            day_str = session_date.isoformat()[:10]
+        elif session_date:
+            day_str = str(session_date)[:10]
+        else:
+            day_str = self._clock().strftime("%Y-%m-%d")
+
+        body = (
+            "New buy orders are currently on hold (existing stops and protective exits remain active):\n"
+            + "\n".join(f"• {ln}" for ln in lines)
+        )
+        return self.alert(
+            Severity.WARNING,
+            "New buy entries are locked",
+            body,
+            key=f"entries_locked:{day_str}:{code_sig}",
+            dedupe_window_sec=72000,
+            category=AlertCategory.RISK_BLOCK,
+            channel_key="risk",
+            mirror_telegram=True,
+        )
+
+    def alert_margin_trim(
+        self,
+        excess_pct: Any,
+        target_pct: Any = 0.25,
+        symbols: Sequence[str] = (),
+        in_session: bool = True,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Critical alert when margin safety buffer drops below 15% or broker margin call fires (DECISIONS A13e)."""
+        def _to_pct(val: Any, default: float) -> float:
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                return default
+            return f * 100.0 if abs(f) <= 1.5 else f
+
+        cur_pct = _to_pct(excess_pct, 15.0)
+        tgt_pct = _to_pct(target_pct, 25.0)
+        sym_list = [str(s).upper() for s in (symbols or ()) if s]
+        sym_txt = ", ".join(sym_list) if sym_list else "weakest-conviction stock holdings"
+        when_txt = (
+            "immediately during the open market session"
+            if in_session
+            else "five minutes after the next regular market open"
+        )
+        why_txt = f" Trigger: {redact_secrets_in_text(reason)}." if reason else ""
+        body = (
+            f"Margin safety cushion is at {cur_pct:.1f}% of account equity (below our 15.0% safety floor).{why_txt} "
+            f"To prevent a broker liquidation, the bot is trimming {sym_txt} {when_txt} until margin excess "
+            f"is back at or above {tgt_pct:.1f}% of equity (shares backing short calls are never touched)."
+        )
+        day_str = self._clock().strftime("%Y-%m-%d")
+        return self.alert(
+            Severity.CRITICAL,
+            f"Margin buffer low ({cur_pct:.1f}%) — trimming to restore {tgt_pct:.0f}% cushion",
+            body,
+            key=f"margin_trim:{day_str}:{','.join(sorted(sym_list)) or 'account'}",
+            dedupe_window_sec=3600,
+            category=AlertCategory.RISK_BLOCK,
+            channel_key="risk",
+            mirror_telegram=True,
+        )
+
+
+def format_entry_lock_line(item: Any) -> str:
+    """Format any lock dict/object/string into the canonical A14c line."""
+    if isinstance(item, str):
+        txt = redact_secrets_in_text(item.strip())
+        if txt.lower().startswith("entries locked:"):
+            return txt
+        return f"Entries locked: {txt} — clears when the blocking condition resolves"
+    if isinstance(item, dict):
+        lock = str(item.get("lock") or item.get("code") or "safety lock").strip()
+        detail = str(item.get("detail") or "").strip()
+        clears = str(item.get("clears_when") or item.get("clear_condition") or "the safety check passes").strip()
+    else:
+        lock = str(getattr(item, "lock", None) or getattr(item, "code", None) or "safety lock").strip()
+        detail = str(getattr(item, "detail", None) or "").strip()
+        clears = str(
+            getattr(item, "clears_when", None)
+            or getattr(item, "clear_condition", None)
+            or "the safety check passes"
+        ).strip()
+    lock_txt = f"{lock} ({detail})" if detail and detail not in lock else lock
+    return redact_secrets_in_text(f"Entries locked: {lock_txt} — clears when {clears}")
+
 
 _DEFAULT_SERVICE: AlertService | None = None
 
@@ -1346,6 +1458,7 @@ __all__ = [
     "Severity",
     "alert",
     "coerce_severity",
+    "format_entry_lock_line",
     "get_default_alert_service",
     "redact_secrets_in_text",
     "set_default_alert_service",

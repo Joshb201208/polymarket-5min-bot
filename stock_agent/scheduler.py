@@ -1327,6 +1327,13 @@ class StockAgentScheduler:
 
             raw_cr = getattr(self, "_last_close_report", None)
             close_report = raw_cr if getattr(raw_cr, "session_date", None) == now.date() else None
+            entry_locks = None
+            lock_fn = getattr(self, "get_entry_locks", None)
+            if callable(lock_fn):
+                try:
+                    entry_locks = lock_fn()
+                except Exception as exc:
+                    logger.warning("Could not read scheduler entry locks (%s)", type(exc).__name__)
 
             builder = ReportBuilder(
                 self.config,
@@ -1345,6 +1352,7 @@ class StockAgentScheduler:
                     snapshot=snap,
                     close_report=close_report,
                     as_of=now,
+                    entry_locks=entry_locks,
                 )
                 if self.alerts is not None:
                     enq = self.alerts.alert(
@@ -1400,7 +1408,11 @@ class StockAgentScheduler:
 
             if is_week_end:
                 try:
-                    wk_embeds, _ = await builder.build_weekly_scorecard(snapshot=snap, as_of=now)
+                    wk_embeds, _ = await builder.build_weekly_scorecard(
+                        snapshot=snap,
+                        as_of=now,
+                        entry_locks=entry_locks,
+                    )
                     if wk_embeds and cal is not None and hasattr(cal, "session_on"):
                         try:
                             sess = cal.session_on(now.date())
@@ -1552,12 +1564,21 @@ class StockAgentScheduler:
                 clock=_now_utc,
             )
 
+            entry_locks = None
+            lock_fn = getattr(self, "get_entry_locks", None)
+            if callable(lock_fn):
+                try:
+                    entry_locks = lock_fn()
+                except Exception as exc:
+                    logger.warning("Could not read scheduler entry locks (%s)", type(exc).__name__)
+
             brief_status = "skipped"
             try:
                 embeds = await builder.build_morning_brief(
                     snapshot=snap,
                     as_of=now,
                     macro_embed=macro_embed,
+                    entry_locks=entry_locks,
                 )
                 if self.alerts is not None:
                     enq = self.alerts.alert(

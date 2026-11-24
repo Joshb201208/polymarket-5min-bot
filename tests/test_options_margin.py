@@ -178,3 +178,18 @@ def test_debit_closes_are_never_blocked_by_cash_or_buying_power(world, tmp_path)
     m = make_manager(world, tmp_path, universe=())
     r = run(m.close_short_call(jc))
     assert r.filled and a.position(jc) is None
+
+
+def test_falls_back_to_non_marginable_buying_power(world, tmp_path):
+    m = _setup(world, tmp_path)
+    real = m.broker.get_account
+
+    async def no_options_bp():
+        acct = await real()
+        return acct.model_copy(update={"options_buying_power": None})
+
+    m.broker.get_account = no_options_bp
+    world.alpaca.cash = 300.0  # fake: non_marginable_buying_power = max(cash, 0)
+    why = run(m._options_bp_problem(500.0))
+    assert why and "non_marginable_buying_power" in why
+    assert run(m._options_bp_problem(200.0)) is None
