@@ -112,9 +112,6 @@ def test_day_one_buys_with_perplexity_out_and_fmp_limited(world, monkeypatch):
     assert _daily_close(world), "no daily close summary was delivered"
 
 
-@pytest.mark.xfail(strict=True, reason="A14d: Daily Close Summary has no entry funnel yet; the stages are only "
-                   "journalled (research_pipeline.py research.entry_funnel, execution.py:543 execution.buy_funnel). "
-                   "Owner: alerts_reporting")
 @pytest.mark.world_start(_START)
 def test_day_one_daily_summary_shows_the_entry_funnel(world, monkeypatch):
     _run_day_one(world, monkeypatch)
