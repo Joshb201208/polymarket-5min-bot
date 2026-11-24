@@ -395,7 +395,11 @@ class ResearchPipeline:
                     reason = "broker_book_unavailable"
                 else:
                     reason = "handoff_input_unavailable"
-                code = self._retry_handoff(key, intent, reason)
+                review = self.store.work_state(f"{key}:reanchor")
+                if review is not None and review["status"] == "started" and self.clock() < intent.expires_at:
+                    code = self._finish_handoff(key, intent, "handoff_reanchor_unavailable", reasons=(reason,))
+                else:
+                    code = self._retry_handoff(key, intent, reason)
             outcomes[code] += 1
             if code == "handoff_promoted":
                 funnel.buy_candidates += 1
@@ -454,9 +458,14 @@ class ResearchPipeline:
                 return "handoff_position_changed", None
             return None, holding
 
-        def gate_rejection():
+        def gate_rejection(*, check_material_news=False, needs_review=False):
             gate = self.gate.is_entry_eligible(symbol, self.clock())
             if not gate.ok:
+                if gate.reasons == ("llm_unavailable",):
+                    if check_material_news:
+                        return None  # First determine whether this handoff even needs a model.
+                    if needs_review:
+                        return refuse("handoff_reanchor_unavailable", "llm_unavailable")
                 if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
                     return self._retry_handoff(key, intent, gate.reasons[0])
                 return refuse("handoff_gate_refused", *gate.reasons)
@@ -464,6 +473,10 @@ class ResearchPipeline:
                     or type(gate.effective_conviction) is not int
                     or gate.effective_conviction < intent.meta["minimum_conviction"]):
                 return refuse("handoff_gate_refused", "buy_thesis_or_conviction_changed")
+            if intent.position_id is not None:
+                grade, may_initialize = self.ledger.top_up_baseline(intent.position_id)
+                if not may_initialize and (grade is None or gate.effective_conviction < grade):
+                    return refuse("handoff_gate_refused", "top_up_baseline_changed")
             return None
 
         if self.store.pending_buy(reanchor_key) is not None:
@@ -482,7 +495,7 @@ class ResearchPipeline:
         code, holding = check_identity()
         if code:
             return refuse(code)
-        if rejection := gate_rejection():
+        if rejection := gate_rejection(check_material_news=True):
             return rejection
         material_since = getattr(self.sources, "handoff_material_news", None)
         current = self.ledger.current_thesis(symbol)
@@ -494,7 +507,7 @@ class ResearchPipeline:
         if self.clock() >= session.closes_at - timedelta(minutes=10):
             self.store.finish_pending_buy(key, "waiting", retry_at=intent.expires_at)
             return "handoff_execution_window_closed"
-        if rejection := gate_rejection():
+        if rejection := gate_rejection(needs_review=bool(material) or intent.reference_price is None):
             return rejection
         if material and intent.meta.get("handoff_reviewed"):
             return refuse("handoff_reanchor_unavailable", "new_material_news_after_single_review")
@@ -752,10 +765,11 @@ class ResearchPipeline:
                     rejected.append("research_direction_changed")
         qualifies = not rejected
         defer = scheduled and set(rejected) == {"quote_stale_or_unavailable"}
-        baseline_grade = baseline.payload.get("effective_conviction") if baseline else None
+        baseline_grade, may_initialize = self.ledger.top_up_baseline(position_id) if position_id else (None, False)
         reaffirmed = (
-            position_id is not None and baseline is not None and type(baseline_grade) is int
-            and record.effective_conviction >= baseline_grade and record.draft.thesis_change in {"strengthened", "unchanged"}
+            position_id is not None and record.draft.thesis_change in {"strengthened", "unchanged"}
+            and record.effective_conviction >= 8
+            and (may_initialize or (baseline_grade is not None and record.effective_conviction >= baseline_grade))
         )
         if (qualifies or defer) and direction is Direction.BUY and (not holding or reaffirmed):
             intent = self._intent(key, symbol, "buy", position_id, (thesis_id,), price, evidence_ids, kind, session,
@@ -763,6 +777,7 @@ class ResearchPipeline:
                                    "effective_conviction": record.effective_conviction,
                                    "minimum_conviction": floor,
                                    "last_filled_conviction": baseline_grade,
+                                   "first_reaffirmation": may_initialize,
                                    "sector": security.sector, "thesis_change": record.draft.thesis_change,
                                    "signal_at": record.generated_at.isoformat(),
                                    "baseline_thesis_id": baseline.thesis_id if baseline else None})
