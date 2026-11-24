@@ -9,6 +9,7 @@ import pytest
 
 from tests.scenarios.v1_restore_support import (
     Harness,
+    Reply,
     monday_hold_catchup,
     tuesday_prescan_with_stale_quote,
 )
@@ -111,3 +112,45 @@ def test_handoff_does_not_buy_through_a_gap_above_the_drift_limit_without_re_rev
         assert len(h.calls) - before <= 1  # bounded: at most one targeted re-review
 
     _run(world, monkeypatch, body)
+
+
+def test_adverse_story_at_0845_stops_the_handoff_buy(world, monkeypatch):
+    async def body(h):
+        await h.advance(17, 8, 45)
+        h.story(minutes_ago=0)  # breaks between the 08:00 prescan and the open
+        h.reply = Reply(direction="HOLD", conviction=3, thesis_change="weakened")  # any re-review now sees it
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        await h.execute(6)
+        await h.catchup()
+        await h.execute(2)
+        assert not h.buys(), h.intent_states()
+
+    _run(world, monkeypatch, body)
+
+
+def test_sunday_weekly_handoff_and_monday_catchup_buy_once(world, monkeypatch):
+    """Sunday's weekly BUY (no session, stale quote) is handed to Monday; Monday's catch-up must not buy it twice."""
+    h = Harness(world, monkeypatch).install()
+
+    async def go():
+        try:
+            await h.start()
+            h.story()
+            row = await h.run_research("weekly")
+            assert row.detail["entry_funnel"]["passed_conviction"] == 1, row.detail
+            h.world.assert_no_orders()
+            await h.advance(16, 9, 35)
+            h.fresh_quote()
+            await h.execute(3)
+            await h.catchup()
+            await h.execute(3)
+            await h.restart()
+            await h.advance(16, 10, 5)
+            h.fresh_quote()
+            await h.execute(3)
+            assert len(h.buys()) == 1, h.intent_states()
+        finally:
+            await h.stop()
+
+    asyncio.run(go())

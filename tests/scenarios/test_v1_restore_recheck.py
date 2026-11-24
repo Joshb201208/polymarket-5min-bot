@@ -73,3 +73,14 @@ def test_gate_not_ok_with_direction_buy_is_refused_at_submit(world, monkeypatch)
         assert not h.buys(), h.intent_states()
 
     _run(world, monkeypatch, body, conviction=7)
+
+
+def test_queued_buy_still_submits_when_alpaca_news_is_forbidden(world, monkeypatch):
+    async def body(h):
+        h.world.alpaca.fail("/v1beta1/news", "status", status=403, times=None)  # Finnhub still serves news
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        await h.execute(4)
+        assert len(h.buys()) == 1, h.intent_states()
+
+    _run(world, monkeypatch, body)
