@@ -61,6 +61,11 @@ NEWS_SECONDS = 180
 MARKET_MOVE_SLOT_SECONDS = 30 * 60
 MARKET_MOVE_STATE_KEY = "scheduler.market_move"
 MAX_JOB_ATTEMPTS = 3
+OPTIONS_RESCAN_STATE_KEY = "options.rescan_requests"
+OPTIONS_RESCAN_QUEUED = "queued"
+OPTIONS_RESCAN_ALREADY_QUEUED = "already_queued"
+OPTIONS_RESCAN_OUTSIDE_WINDOW = "outside_options_window"
+OPTIONS_RESCAN_NO_MANAGER = "no_options_manager"
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
 
@@ -813,6 +818,7 @@ class StockAgentScheduler:
                     self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
             if self._should_run_options_scan(now_et):
                 self._schedule_job("options", day_key, self._run_options_job, timeout=180)
+            self._drive_options_rescans(now_et)
             if self.options is not None:
                 await self._drive_options_monitor(now_et)
 
@@ -1272,6 +1278,93 @@ class StockAgentScheduler:
         if outcomes and not any(getattr(outcome, "final", True) for outcome in outcomes):
             return JobOutcome(JobStatus.FAILED, detail={"reason": "option_scan_temporarily_blocked"})
         return None
+
+    # ── Market-move options re-scan hook (V1 restore, Part 4) ───────────
+
+    def request_options_rescan(self, rescan_key: str, now_et: datetime | None = None) -> str:
+        """Ask for one extra options entry scan this session (market-move rescan).
+
+        Returns "queued", "already_queued", "outside_options_window" or "no_options_manager".
+        Only persists the request, so a restart keeps it and the caller never waits on the
+        options manager. The scan itself runs later as the ordinary "options" job in its own
+        window (see _drive_options_rescans), with the daily scan's 180 s timeout: one options
+        scan at a time, the options protection lane skipped while it runs, drained (not
+        cancelled) on shutdown, never in the stock stop/order lane. Every entry rule of the
+        daily scan still applies inside OptionsManager.scan: one structure per underlying,
+        open-structure and max-loss budgets, cool-downs, research gate, risk check, options
+        buying power, market gate. Requests never carry over to another session.
+        """
+        key = str(rescan_key).strip()
+        if not key:
+            raise ValueError("rescan_key required")
+        if self.options is None:
+            return OPTIONS_RESCAN_NO_MANAGER
+        now_et = (now_et or _now_et()).astimezone(ET)
+        if not self._options_window_open(now_et):
+            return OPTIONS_RESCAN_OUTSIDE_WINDOW  # refused at both ends, never carried over (lead ruling)
+        day = now_et.date().isoformat()
+        state = self.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {}) or {}
+        keys = list(state.get("keys", ())) if state.get("session") == day else []
+        if key in keys:
+            return OPTIONS_RESCAN_ALREADY_QUEUED
+        keys.append(key)
+        self.ledger.risk_state_set(OPTIONS_RESCAN_STATE_KEY, {"session": day, "keys": keys})
+        return OPTIONS_RESCAN_QUEUED
+
+    @staticmethod
+    def options_rescan_window(day: str, rescan_key: str) -> str:
+        return f"{day}:rescan:{rescan_key}"
+
+    def _options_window(self, now_et: datetime) -> tuple[datetime, datetime] | None:
+        """Today's options-entry window: open + 15 min until min(15:00 ET, close - 10 min)."""
+        session = self.calendar.session_on(now_et.date())
+        if session is None:
+            return None
+        until = min(datetime.combine(now_et.date(), time(15, 0), ET), session.closes_at - timedelta(minutes=10))
+        return session.opens_at + timedelta(minutes=15), until
+
+    def _options_window_open(self, now_et: datetime) -> bool:
+        window = self._options_window(now_et)
+        return bool(window and self._is_market_open(now_et) and window[0] <= now_et < window[1])
+
+    def _drive_options_rescans(self, now_et: datetime) -> None:
+        """Start the next pending options re-scan when the daily scan rules allow a scan now;
+        once the window has closed, journal every request that never ran as SKIPPED."""
+        if self.options is None or self._shutdown:
+            return
+        day = now_et.date().isoformat()
+        state = self.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {}) or {}
+        if state.get("session") != day:
+            return
+        pending = []
+        for key in state.get("keys", ()):
+            window = self.options_rescan_window(day, key)
+            row = self.ledger.job_status("options", window)
+            if row is not None and (row.status in {JobStatus.DONE, JobStatus.SKIPPED}
+                                    or row.attempts >= MAX_JOB_ATTEMPTS):
+                continue
+            pending.append((window, row))
+        if not pending:
+            return
+        window_bounds = self._options_window(now_et)
+        if window_bounds is not None and now_et < window_bounds[0]:
+            return  # requests are only accepted inside the window; nothing can be pending yet
+        if window_bounds is None or now_et >= window_bounds[1]:
+            if "options" in self._job_tasks:
+                return  # never mark a re-scan while an options job is still running
+            for window, row in pending:  # the window has closed for today
+                if row is None:
+                    self.ledger.start_job("options", window)
+                self.ledger.finish_job("options", window, JobStatus.SKIPPED,
+                                       detail={"reason": OPTIONS_RESCAN_OUTSIDE_WINDOW})
+                logger.info("Options re-scan %s skipped: %s", window, OPTIONS_RESCAN_OUTSIDE_WINDOW)
+            return
+        if "options" in self._job_tasks or not self._should_run_options_scan(now_et):
+            return
+        window, row = pending[0]
+        if row is not None and row.eligible_retry_at and row.eligible_retry_at > _now_utc():
+            return  # keep order: a retrying re-scan is not overtaken by a later one
+        self._schedule_job("options", window, self._run_options_job, timeout=180)
 
     async def _drive_options_monitor(self, now: datetime):
         if self._options_task is not None:
