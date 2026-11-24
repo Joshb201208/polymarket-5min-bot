@@ -93,6 +93,10 @@ class Harness:
         self.world.news([self.symbol], f"Issuer updates outlook {now.isoformat()}",
                         summary="The issuer publishes new guidance.", at=now - timedelta(minutes=minutes_ago))
 
+    def quotes_go_stale(self):
+        """Broker quotes age normally in session (the fake keeps them fresh by default)."""
+        self.world.alpaca.behaviour.quotes_stay_fresh_in_session = False
+
     def fresh_quote(self, price: float = 100.0):
         self.world.price(self.symbol, price, spread=0.02)
 
@@ -123,6 +127,8 @@ class Harness:
             for task in tuple(s._job_tasks.values()):
                 await task
             await s._collect_finished_jobs()
+            if s._order_task is not None and not s._order_task.done():
+                await s._order_task  # the order lane runs as its own task; let this pass finish
             self.world.clock.advance(seconds=30)
 
     # ------------------------------------------------------------------ observations

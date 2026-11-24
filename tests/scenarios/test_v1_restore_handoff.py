@@ -68,6 +68,7 @@ def test_handoff_restart_mid_target_session_buys_once(world, monkeypatch):
 
 def test_handoff_retries_a_transient_quote_gap_within_the_target_day(world, monkeypatch):
     async def body(h):
+        h.quotes_go_stale()
         await h.advance(17, 9, 35)  # no fresh quote yet: the handoff must wait, not die
         await h.execute(2)
         assert not h.buys()
@@ -81,6 +82,7 @@ def test_handoff_retries_a_transient_quote_gap_within_the_target_day(world, monk
 
 def test_handoff_expires_at_the_target_close_and_never_buys_later(world, monkeypatch):
     async def body(h):
+        h.quotes_go_stale()
         for hh, mm in ((9, 35), (12, 0), (15, 49)):
             await h.advance(17, hh, mm)  # never a fresh quote on the target day
             await h.execute()
