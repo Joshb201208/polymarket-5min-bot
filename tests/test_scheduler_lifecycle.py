@@ -314,6 +314,38 @@ def test_margin_trim_persists_and_continues_to_target(tmp_path, monkeypatch, at_
     asyncio.run(check())
 
 
+def test_tick_checks_fresh_margin_at_close_before_daily_report(tmp_path, monkeypatch):
+    async def check():
+        close = datetime(2026, 11, 30, 16, tzinfo=ET)
+        now = close + timedelta(seconds=30)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        sched._engine_resumed = sched._reconciled = True
+        sched._last_reconcile_at = now
+        session = Session(now.date(), close.replace(hour=9, minute=30), close)
+        sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, session)
+        snapshot = SimpleNamespace(as_of=now)
+        calls = []
+
+        async def evaluate(snap, when, *, at_close=False):
+            calls.append((snap, when, at_close))
+
+        async def drive(now):
+            return None
+
+        monkeypatch.setattr(sched.ledger, "last_snapshot", lambda: snapshot)
+        monkeypatch.setattr(sched, "_evaluate_margin_guard", evaluate)
+        monkeypatch.setattr(sched, "_drive_order_lane", drive)
+        try:
+            await sched._tick(now)
+            assert calls == [(snapshot, now, True)]
+            assert "drawdown_close" not in sched._job_tasks
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
 def test_entrypoint_flock_excludes_second_scheduler_and_sigterm_stops_first(tmp_path, monkeypatch):
     async def check():
         started = asyncio.Event()

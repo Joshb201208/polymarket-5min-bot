@@ -738,8 +738,18 @@ class StockAgentScheduler:
             return
         now_et = _now_et()
         day_key = now_et.date().isoformat()
+        snapshot = self.ledger.last_snapshot()
         if self._is_market_open(now_et):
-            await self._evaluate_margin_guard(self.ledger.last_snapshot(), now_et)
+            await self._evaluate_margin_guard(snapshot, now_et)
+        else:
+            # Check the first fresh post-close broker read, without waiting for
+            # report cut-off. The later close job rechecks from its own book.
+            market = self.calendar.state
+            session = self.calendar.session_on(now_et.date())
+            if (market.source is MarketSource.LIVE and market.status is MarketStatus.CLOSED
+                    and session is not None and session.closes_at <= now_et < session.closes_at + timedelta(minutes=5)
+                    and snapshot is not None and snapshot.as_of >= session.closes_at):
+                await self._evaluate_margin_guard(snapshot, now_et, at_close=True)
         await self._drive_order_lane(now_et)
         try:
             self._schedule_research_catchup(now_et)
