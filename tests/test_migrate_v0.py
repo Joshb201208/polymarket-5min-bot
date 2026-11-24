@@ -72,8 +72,14 @@ def test_reconcile_after_migration_uses_broker_fill_dates(tmp_path):
     b.pos("HHH", 5, 200)
     led = make_ledger(tmp_path, broker=b)
     migrate_v0(tmp_path, led.store)
+    hhh = led.open_position_meta("HHH")
+    assert hhh.opened_source == "v0" and hhh.entry_thesis_id is None
+    assert led.top_up_baseline(hhh.position_id) == (None, True)
     snap = run(led.refresh("first", rebuild=True))
-    assert led.open_position_meta("HHH").opened_at.date().isoformat() == "2026-04-23"
+    reconciled = led.open_position_meta("HHH")
+    assert reconciled.opened_at.date().isoformat() == "2026-04-23"
+    assert reconciled.position_id == hhh.position_id and reconciled.opened_source == "v0_verified"
+    assert led.top_up_baseline(reconciled.position_id) == (None, True)
     assert led.open_position_meta("AAA").opened_source == "v0_verified"
     assert led.open_position_meta("BBB") is None                 # ledger-only position closed
     assert any(d.kind.value == "entry_date_corrected" and d.symbol == "HHH" for d in snap.diffs)

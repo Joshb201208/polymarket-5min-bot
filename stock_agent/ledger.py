@@ -776,7 +776,9 @@ class Ledger:
         grade = filled_thesis_grade(entry)
         may_initialize = (
             grade is None and meta is not None and meta.entry_intent_id is None
-            and meta.opened_source in {"v0", "import", "assignment"}
+            # Reconcile may verify a migrated entry date from broker fills;
+            # that does not supply the legacy research conviction.
+            and meta.opened_source in {"v0", "v0_verified", "import", "assignment"}
             and (entry is None or entry.source == "v0")
         )
         return grade, may_initialize
