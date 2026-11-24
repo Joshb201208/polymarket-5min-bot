@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from stock_agent.ledger import IntentStatus
+from stock_agent.ledger import IntentStatus, NewIntent
 from tests.fakes import ET
-from tests.scenarios.v1_restore_support import Harness, monday_hold_catchup, tuesday_prescan_with_stale_quote
+from tests.scenarios.v1_restore_support import Harness, Reply, monday_hold_catchup, tuesday_prescan_with_stale_quote
 
 pytestmark = pytest.mark.world_start(datetime(2026, 11, 15, 17, tzinfo=ET))
 
@@ -65,14 +65,14 @@ def test_completed_close_is_used_at_submit_not_replaced_by_opening_quote(world, 
     _run(world, monkeypatch, body, anchored=True)
 
 
-@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("interrupted", [None, "before-stage", "after-stage"])
 def test_unanchored_buy_uses_at_most_one_targeted_review_after_restart(world, monkeypatch, interrupted):
     async def body(h):
         before = len(h.calls)
         await h.advance(17, 9, 35)
         h.fresh_quote(104)
         h.story()
-        if interrupted:
+        if interrupted == "before-stage":
             original = h.scheduler.research.analyst.evaluate
 
             async def interrupt_after_response(*args, **kwargs):
@@ -80,6 +80,17 @@ def test_unanchored_buy_uses_at_most_one_targeted_review_after_restart(world, mo
                 raise asyncio.CancelledError
 
             monkeypatch.setattr(h.scheduler.research.analyst, "evaluate", interrupt_after_response)
+            with pytest.raises(asyncio.CancelledError):
+                await _sweep(h)
+        elif interrupted == "after-stage":
+            original = h.scheduler.research._finish_handoff
+
+            def interrupt_before_parent_flip(key, intent, code, **kwargs):
+                if code == "handoff_reanchored":
+                    raise asyncio.CancelledError
+                return original(key, intent, code, **kwargs)
+
+            monkeypatch.setattr(h.scheduler.research, "_finish_handoff", interrupt_before_parent_flip)
             with pytest.raises(asyncio.CancelledError):
                 await _sweep(h)
         else:
@@ -90,15 +101,66 @@ def test_unanchored_buy_uses_at_most_one_targeted_review_after_restart(world, mo
         await h.advance(17, 9, 36)
         h.fresh_quote(104)
         result = await _sweep(h)
-        expected = "handoff_reanchor_unavailable" if interrupted else "handoff_promoted"
-        assert result.detail["handoff_outcomes"] == {expected: 1}
+        expected = {"handoff_reanchor_unavailable": 1} if interrupted == "before-stage" else {"handoff_promoted": 1}
+        if interrupted == "after-stage":
+            expected["handoff_reanchored"] = 1
+        assert result.detail["handoff_outcomes"] == expected
         await h.scheduler._run_execution_cycle()
         assert len(h.calls) == before + 1
-        assert len(h.buys()) == (0 if interrupted else 1)
+        assert len(h.buys()) == (0 if interrupted == "before-stage" else 1)
         (intent,) = h.intents()
-        if not interrupted:
+        if interrupted != "before-stage":
             assert intent.reference_price == Decimal("104")
             assert intent.meta["reference_price_kind"] == "quote"
         assert not (await _sweep(h)).detail["handoff_outcomes"]
 
     _run(world, monkeypatch, body)
+
+
+def test_handoff_will_not_compete_with_a_buy_queued_during_rollback(world, monkeypatch):
+    async def body(h):
+        # b00dfcd does not see research_pending_buys and may queue an unrelated
+        # conventional pre-market buy for the same symbol while rolled back.
+        h.scheduler.ledger.enqueue_intents((NewIntent("AAPL", "buy", "weekly:rollback:synthetic"),))
+        await h.restart()
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        result = await _sweep(h)
+        assert result.detail["handoff_outcomes"] == {"handoff_buy_pending": 1}
+        assert [i.dedupe_key for i in h.intents() if not i.terminal] == ["weekly:rollback:synthetic"]
+        assert not (await _sweep(h)).detail["handoff_outcomes"]
+
+    _run(world, monkeypatch, body, anchored=True)
+
+
+@pytest.mark.parametrize(("headline", "new_direction"), [
+    ("AAPL cuts revenue guidance after revised quarterly results", "HOLD"),
+    ("AAPL cuts revenue guidance after revised quarterly results", "BUY"),
+    ("Why AAPL stock moved today", None),
+])
+def test_handoff_rechecks_new_material_news_only(world, monkeypatch, headline, new_direction):
+    async def body(h):
+        before = len(h.calls)
+        await h.advance(17, 9, 35)
+        h.fresh_quote(104)
+        world.news(["AAPL"], headline, at=world.clock.now() - timedelta(minutes=50))
+        if new_direction is not None:
+            h.reply = Reply(direction=new_direction)
+        result = await _sweep(h)
+        if new_direction is None:
+            assert result.detail["handoff_outcomes"] == {"handoff_promoted": 1}
+            assert len(h.calls) == before
+        elif new_direction == "HOLD":
+            assert result.detail["handoff_outcomes"] == {"handoff_reanchor_unavailable": 1}
+            assert len(h.calls) == before + 1
+            assert h.intents()[0].status == IntentStatus.SKIPPED
+            return
+        else:
+            assert result.detail["handoff_outcomes"] == {"handoff_reanchored": 1}
+            assert len(h.calls) == before + 1
+            assert (await _sweep(h)).detail["handoff_outcomes"] == {"handoff_promoted": 1}
+        assert h.intents()[0].reference_price == Decimal("100")
+        await h.scheduler._run_execution_cycle()
+        assert not h.buys()  # Existing gap rule still uses the original close.
+
+    _run(world, monkeypatch, body, anchored=True)

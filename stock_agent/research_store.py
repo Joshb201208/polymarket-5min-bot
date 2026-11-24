@@ -285,8 +285,12 @@ class ResearchStore:
 
     def protects_scheduled_buy(self, symbol: str, session_date: str) -> bool:
         return bool(self.store.query(
-            """SELECT 1 FROM research_pending_buys WHERE symbol=? AND session_date=?
-               AND status IN ('waiting','handoff_promoted') LIMIT 1""",
+            """SELECT 1 FROM research_pending_buys p JOIN current_thesis t
+               ON t.symbol=p.symbol AND t.thesis_id=p.thesis_id
+               WHERE p.symbol=? AND p.session_date=? AND
+               (p.status='waiting' OR (p.status='handoff_promoted' AND EXISTS (
+                   SELECT 1 FROM order_intents i WHERE i.intent_id=p.intent_id AND i.status='queued'
+               ))) LIMIT 1""",
             (symbol, session_date),
         ))
 
