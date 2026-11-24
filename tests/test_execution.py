@@ -1119,7 +1119,7 @@ def test_stale_margin_trim_from_an_earlier_episode_is_skipped(world, tmp_path, m
     a = world.alpaca
     eng = _margin_setup(world, tmp_path, monkeypatch)
     run(eng.ledger.refresh("t"))
-    eng._kv_set(eng.MARGIN_EPISODE_KEY, {"opened_at": "2026-11-23T15:00:00+00:00"})
+    eng.ledger.risk_state_set(eng.MARGIN_EPISODE_KEY, {"opened_at": "2026-11-23T15:00:00+00:00"})
     res = run(eng.exit(_margin_intent(eng, margin_episode="2026-11-20T15:00:00+00:00")))
     assert res.status == IntentStatus.SKIPPED and "earlier margin episode" in res.reason
     assert a.position("AAA").qty == 10
