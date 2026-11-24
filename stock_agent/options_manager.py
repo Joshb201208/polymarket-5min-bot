@@ -187,12 +187,14 @@ class OptionsManager:
         self._universe = universe or (lambda: ())
         self._risk_controls = risk_controls or (lambda: RiskControls())
         self._bad_marks: set[str] = set()
+        self._spot_at: dict[str, datetime] = {}  # actual time of the last accepted underlying quote
         self._capital_lock = capital_lock
         self._closed_queue: list[str] = []
         self._ex_dividend = ex_dividend
         self.journal = journal
         self.alerts = alerts
         self.settings = settings or load_options_settings(config)
+        self._config = config
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = asyncio.Lock()
         self.structures: list[Structure] = []
@@ -284,9 +286,13 @@ class OptionsManager:
             return f"OPTIONS_MODE={self.mode.value}"
         if self.load_error or self.meta.get("rebuild"):
             return "options book is being rebuilt from the broker"
-        bad = [s for s in self.structures if s.st in (StructState.UNKNOWN, StructState.REPAIR)]
+        # A structure in repair/unknown only blocks its own underlying (it is live) unless its
+        # risk is uncapped: then nothing new opens until the repair or the evidence clears it.
+        bad = [s for s in self.structures if s.st in (StructState.UNKNOWN, StructState.REPAIR) and s.max_loss is None]
         if bad:
-            return f"{len(bad)} structure(s) need attention ({', '.join(sorted({s.st.value for s in bad}))})"
+            return (f"{len(bad)} structure(s) with uncapped risk need attention "
+                    f"({', '.join(sorted({f'{s.underlying} {s.st.value}' for s in bad}))}); "
+                    "clears when the repair order fills or broker activity explains the legs")
         return None
 
     # -------------------------------------------------------------- helpers
@@ -419,6 +425,7 @@ class OptionsManager:
             return None, "no quote"
         if at is None or (now - at).total_seconds() > self.settings.max_quote_age_s:
             return None, "stale quote"
+        self._spot_at[symbol.upper()] = at
         return px, ""
 
     async def _quotes(self, symbols: Sequence[str], contracts: dict[str, dict] | None = None) -> dict[str, ContractQuote]:
@@ -524,9 +531,9 @@ class OptionsManager:
             return ScanOutcome(sym, None, f"{len(live)} structures open")
         if in_cooldown(self.cooldowns.get(sym), today):
             return ScanOutcome(sym, None, f"cool-down until {self.cooldowns[sym].until}")
+        if c.story_id and self.is_story_handled(c.story_id):  # news stories and research ideas alike
+            return ScanOutcome(sym, None, "story already handled")
         if c.source == "news":
-            if c.story_id and self.is_story_handled(c.story_id):
-                return ScanOutcome(sym, None, "story already handled")
             if self._news_opens_today(today) >= s.max_news_opens_per_session:
                 return ScanOutcome(sym, None, "news-driven option opens for this session used up")
         # ---- fresh underlying quote first: it also refreshes the shared price
@@ -549,6 +556,8 @@ class OptionsManager:
             return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}")
         account = await self.broker.get_account()
         level = account.options_trading_level
+        if level is not None and level < 2:
+            return ScanOutcome(sym, None, f"options level {level} does not allow buying options", final=False)
         kind = "call" if direction is Direction.BULLISH else "put"
         contracts = await self.broker.get_option_contracts(
             sym, type=kind, expiration_gte=today + timedelta(days=s.min_dte),
@@ -563,13 +572,13 @@ class OptionsManager:
             return ScanOutcome(sym, None, "no expiry fits the window")
         chosen = {x["symbol"]: x for x in contracts if x.get("expiration_date") == exp.isoformat()}
         quotes = await self._quotes(sorted(chosen), chosen)
+        # level 2 allows long calls/puts only, level 3 adds spreads (A14: fall back, don't block)
+        shapes = ("single", "spread") if level is None or level >= 3 else ("single",)
         prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
                               chain=list(quotes.values()), today=today, now=now, s=s,
-                              trading_days=self._calendar_days)
+                              trading_days=self._calendar_days, shapes=shapes)
         if isinstance(prop, Rejection):
             return ScanOutcome(sym, None, prop.reason)
-        if prop.strategy.is_spread and level is not None and level < 3:
-            return ScanOutcome(sym, None, f"options level {level} does not allow spreads")
         # ---- sizing and risk
         if el.generated_at is None:
             return ScanOutcome(sym, None, "thesis has no generation time")
@@ -590,11 +599,19 @@ class OptionsManager:
         if sizing.qty < 1:
             return ScanOutcome(sym, None, sizing.reason)
         sid = new_structure_id()
+        # re-read the underlying just before the risk check: the risk layer judges the
+        # analysis price by its real quote time (option quotes were checked by mark_problem)
+        spot2, why = await self._spot_now(sym, self._now())
+        if spot2 is None:
+            return ScanOutcome(sym, None, f"underlying {why}", final=False)
+        if abs(spot2 - spot) > spot * s.max_underlying_move_pct:
+            return ScanOutcome(sym, None, f"underlying moved {spot:.2f} -> {spot2:.2f} while pricing", final=False)
+        spot, quote_at = spot2, self._spot_at[sym.upper()]
         intent = TradeIntent(
             kind=TradeKind.OPTION_OPEN, symbol=sym, qty=Decimal(sizing.qty),
             raw_conviction=el.raw_conviction, effective_conviction=conv, minimum_conviction=s.min_effective_conviction,
             option_max_loss=Decimal(str(sizing.max_loss)), option_cash_debit=Decimal(str(sizing.debit_cash)),
-            structure_id=sid, signal_at=el.generated_at, quote_at=now, analysis_price=Decimal(str(spot)),
+            structure_id=sid, signal_at=el.generated_at, quote_at=quote_at, analysis_price=Decimal(str(spot)),
         )
         # final risk recheck -> write-ahead reservation under the shared capital lock, so an
         # equity lane can't size from the same free cash at the same moment
@@ -606,7 +623,13 @@ class OptionsManager:
             )
             try:
                 snap = await _maybe(self._snapshot())
-                verdict = self.risk.evaluate_trade(snap, intent, now=now, controls=full_controls)
+                bp_why = await self._options_bp_problem(sizing.debit_cash)
+                if bp_why:
+                    return ScanOutcome(sym, None, bp_why, final=False)
+                # re-sample the clock after every await: the snapshot and quote are judged
+                # against the real time of the risk check, never the scan's start
+                risk_now = self._now()
+                verdict = self.risk.evaluate_trade(snap, intent, now=risk_now, controls=full_controls)
             except BrokerError:
                 raise
             except Exception as e:  # risk unavailable -> no entry
@@ -628,12 +651,42 @@ class OptionsManager:
             self._save()  # write-ahead: from here the commitment is visible to every lane
         return await self._submit_open(st, prop, now)
 
+    def _margin_enabled(self) -> bool:
+        cfg = self._config
+        if cfg is None:
+            from stock_agent.config import Config as cfg  # noqa: N813
+        return bool(getattr(cfg, "MARGIN_ENABLED", True))
+
+    async def _options_bp_problem(self, debit: float) -> str | None:
+        """Long options cannot be bought on margin (A13h): the debit must fit the broker's
+        options buying power (fallback: non-marginable buying power, then cash). Never
+        margin buying power. With MARGIN_ENABLED=false the old cash-only rule applies. The broker already nets its open orders out of buying power
+        (https://docs.alpaca.markets/us/docs/orders-at-alpaca, stated for buying power in
+        general); our pending structures not yet acknowledged by the broker are also deducted."""
+        account = await self.broker.get_account()
+        source, bp = None, None
+        names = ("options_buying_power", "non_marginable_buying_power", "cash") if self._margin_enabled() else ("cash",)
+        for name in names:
+            v = _f(getattr(account, name, None))
+            if v is not None:
+                source, bp = name, v
+                break
+        if bp is None:
+            return "options buying power unavailable"
+        reserved = round(sum(st.max_loss or 0.0 for st in self.live()
+                             if st.st is StructState.PENDING and not st.open_order_id), 2)
+        free = bp - reserved
+        if debit > free + 1e-9:
+            return (f"options buying power: debit {debit:.2f} exceeds {source} {bp:.2f}"
+                    + (f" less {reserved:.2f} reserved for pending option orders" if reserved else ""))
+        return None
+
     def _new_structure(self, sid, prop: Proposal, qty, max_loss, c: OptionCandidate, el, now) -> Structure:
         return Structure(
             id=sid, underlying=prop.underlying, strategy=prop.strategy.value, direction=prop.direction.value,
             qty=qty, expiry=prop.expiry.isoformat(),
             legs=[Leg(lg.symbol, lg.side, lg.type, lg.strike, lg.expiry.isoformat(), lg.ratio) for lg in prop.legs],
-            state=StructState.PENDING.value, source=c.source if c.source in ("news", "scan") else "scan",
+            state=StructState.PENDING.value, source=c.source if c.source in ("news", "scan", "research") else "scan",
             thesis_id=el.thesis_id, conviction=el.effective_conviction, story_id=c.story_id,
             opened_at=now.isoformat(), width=prop.width, max_loss=max_loss, limit_debit=prop.limit_debit,
             entry_greeks={"delta": prop.delta, "iv": prop.iv, "spot": prop.spot, "mid_debit": prop.mid_debit,

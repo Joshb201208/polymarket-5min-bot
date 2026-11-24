@@ -345,7 +345,7 @@ def test_failed_reconcile_changes_nothing(world, tmp_path):
     assert m.get(out[0].opened).st is StructState.OPEN
 
 
-def test_missing_legs_without_evidence_become_unknown_and_block(world, tmp_path):
+def test_missing_legs_without_evidence_become_unknown_and_block_only_that_name(world, tmp_path):
     m, out = _open_spread(world, tmp_path)
     st = m.get(out[0].opened)
     a = world.alpaca
@@ -354,11 +354,24 @@ def test_missing_legs_without_evidence_become_unknown_and_block(world, tmp_path)
     rep = run(m.reconcile())
     assert st.st is StructState.UNKNOWN and st.realized_pnl is None
     assert st.id in rep.unknown
-    assert m.open_blocker()
+    # A14: its max loss stays reserved and AAA stays blocked, but other names may open
+    assert m.open_blocker() is None
+    assert any(c.structure_id == st.id and c.max_loss > 0 for c in m.commitments())
+    m.gate.set("AAA")
+    m._universe = lambda: ["AAA"]
+    assert run(m.scan())[0].reason == "already holds a structure on this underlying"
     seed_chain(world, "BBB")
     m.gate.set("BBB")
     m._universe = lambda: ["BBB"]
-    assert run(m.scan())[0].opened is None
+    assert run(m.scan())[0].opened
+
+
+def test_uncapped_repair_blocks_all_entries_with_a_clear_reason(world, tmp_path):
+    m, out = _open_spread(world, tmp_path)
+    st = m.get(out[0].opened)
+    st.state, st.max_loss = StructState.REPAIR.value, None
+    why = m.open_blocker()
+    assert why and "uncapped risk" in why and "clears when" in why
 
 
 def test_expiry_evidence_closes_with_pnl(world, tmp_path):

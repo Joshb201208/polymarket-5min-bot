@@ -2,7 +2,7 @@
 
 This checklist covers one-time follow-ups that live outside the codebase: provider API dashboards, GitHub repository settings, and optional droplet cleanup.
 
-**No immediate action is required for the revamped bot to run.** With your existing server `.env` unchanged, the revamped service starts cleanly in `PAPER` mode (`https://paper-api.alpaca.markets`) with defined-risk options enabled (`OPTIONS_MODE=defined_risk`), ignores leftover variables from the retired Polymarket/NBA/Events bot, silences noisy HTTP URL logs, and redacts API keys before writing logs.
+**No immediate action is required for the revamped bot to run.** With your existing server `.env` unchanged, the revamped service starts cleanly in `PAPER` mode (`https://paper-api.alpaca.markets`) with overnight Reg T margin enabled (`MARGIN_ENABLED=true`, `MAX_GROSS_EXPOSURE_PCT=2.0`) and defined-risk options enabled (`OPTIONS_MODE=defined_risk`), ignores leftover variables from the retired Polymarket/NBA/Events bot as well as retired `MAX_TOTAL_EXPOSURE_PCT=1.00`, silences noisy HTTP URL logs, and redacts API keys before writing logs.
 
 > **Public-repo safety note:** This document lists **setting names and file locations only** — never paste secret values into git commits, issues, or pull requests.
 
@@ -39,10 +39,20 @@ Rotate or revoke each item below in its provider dashboard:
 
 ## 3. Clean Up `/root/polymarket-bot/.env` on the Droplet (When Convenient)
 
-The revamped configuration loader ignores unknown environment variables so existing deployments keep running, but 28 settings from the removed Polymarket/NBA/NHL/Events bot remain in `/root/polymarket-bot/.env` — including an unused wallet key.
+The revamped configuration loader ignores unknown environment variables (and ignores retired `MAX_TOTAL_EXPOSURE_PCT` with a one-line startup notice), so existing deployments keep running. When convenient, remove the 28 retired settings (27 from the removed Polymarket/NBA/NHL/Events bots — including an unused wallet key — plus retired `MAX_TOTAL_EXPOSURE_PCT`) and any empty `TELEGRAM_*` lines.
 
-1. **Before deleting `PRIVATE_KEY` and `FUNDER_ADDRESS`:** Verify that the old Polymarket wallet holds zero balance (or transfer any remaining funds to a fresh wallet), then delete both lines from `/root/polymarket-bot/.env`.
-2. **Delete all 28 unused old-bot variable names** (note `TIPRANKS_EMAIL` and `TIPRANKS_PASSWORD` each appear twice in the file):
+1. **Before deleting `PRIVATE_KEY` and `FUNDER_ADDRESS`:** Verify that the old Polymarket wallet holds zero balance (or transfer any remaining funds to a fresh wallet).
+2. **Recommended automated cleanup (`scripts/clean_server_env.py`):**
+   - Preview variable names to remove without touching disk (never prints any values):
+     ```bash
+     python3 /root/polymarket-bot/scripts/clean_server_env.py /root/polymarket-bot/.env --dry-run
+     ```
+   - Write a mode-`0600` timestamped sibling backup (`.env.bak.<UTC_timestamp>`) and atomically clean `.env` (verifies all 9 required runtime keys remain non-empty before writing):
+     ```bash
+     python3 /root/polymarket-bot/scripts/clean_server_env.py /root/polymarket-bot/.env --apply
+     chmod 600 /root/polymarket-bot/.env
+     ```
+3. **Exact 28 retired variable names removed unconditionally** (`TIPRANKS_EMAIL` and `TIPRANKS_PASSWORD` each appear twice in the legacy file; empty `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` lines are also removed only when empty):
    - `TRADING_MODE`
    - `POLYMARKET_API_KEY`
    - `POLYMARKET_API_SECRET`
@@ -52,6 +62,7 @@ The revamped configuration loader ignores unknown environment variables so exist
    - `STARTING_BANKROLL`
    - `MAX_BET_PCT`
    - `MAX_GAME_EXPOSURE_PCT`
+   - `MAX_TOTAL_EXPOSURE_PCT` *(retired; replaced by `MARGIN_ENABLED` and `MAX_GROSS_EXPOSURE_PCT`)*
    - `SCAN_INTERVAL`
    - `EXIT_CHECK_INTERVAL`
    - `PRE_TIPOFF_MINUTES`
@@ -67,14 +78,10 @@ The revamped configuration loader ignores unknown environment variables so exist
    - `LOG_LEVEL` *(replaced by `STOCK_LOG_LEVEL`)*
    - `NHL_TRADING_MODE`
    - `TWITTER_BEARER_TOKEN`
-   - `TIPRANKS_EMAIL` *(duplicated twice; remove if not using TipRanks login)*
-   - `TIPRANKS_PASSWORD` *(duplicated twice; remove if not using TipRanks login)*
+   - `TIPRANKS_EMAIL` *(duplicated twice)*
+   - `TIPRANKS_PASSWORD` *(duplicated twice)*
    - `EVENTS_STARTING_BANKROLL`
-3. **Keep active `stock_agent` variables:** `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_BASE_URL`, `STOCK_AGENT_MODE`, `DISCORD_BOT_TOKEN`, `OPENAI_API_KEY`, `PERPLEXITY_API_KEY`, `ANTHROPIC_API_KEY` *(now wired into the research fallback chain)*, `FMP_API_KEY`, `FINNHUB_API_KEY`, and `MAX_TOTAL_EXPOSURE_PCT`.
-4. **Ensure strict file permissions:**
-   ```bash
-   chmod 600 /root/polymarket-bot/.env
-   ```
+4. **Required active `stock_agent` variables kept:** `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `STOCK_AGENT_MODE`, `DISCORD_BOT_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` *(wired into the research fallback chain)*, `PERPLEXITY_API_KEY`, `FMP_API_KEY`, and `FINNHUB_API_KEY` (plus any optional `ALPACA_BASE_URL` or new settings you configure).
 
 ---
 
@@ -98,7 +105,12 @@ None of these need to be added unless you want to override a default:
 
 | Setting Name | Default | What It Controls |
 | :--- | :--- | :--- |
-| `OPTIONS_MODE` | `defined_risk` | Valid values: `off`, `close_only`, `defined_risk`. `defined_risk` allows vertical debit spreads, protective puts, and covered calls against settled shares while blocking naked shorts and cash-secured puts; `close_only` manages and exits existing contracts without opening new ones; `off` disables options completely. |
+| `MARGIN_ENABLED` | `true` | Enables overnight Reg T margin borrowing for long-only equities (`regt_buying_power`, never intraday 4x DTBP). Set `MARGIN_ENABLED=false` to restore `1.0x` cash-only rules. |
+| `MAX_GROSS_EXPOSURE_PCT` | `2.0` | Gross long equity exposure cap as a multiple of equity (`<= 2.0`; automatically `1.0` when `MARGIN_ENABLED=false`). Replaces retired `MAX_TOTAL_EXPOSURE_PCT`. |
+| `MARGIN_MIN_EXCESS_PCT` | `0.25` | Refuses new equity buys if projected maintenance excess `(equity - maintenance_margin) / equity` after the trade would be below `25%` of equity. |
+| `MARGIN_TRIM_EXCESS_PCT` | `0.15` | Fires a critical alert and trims positions back to `>= 25%` excess if maintenance excess drops below `15%` of equity. |
+| `MARGIN_INTEREST_RATE_PCT` | `6.5` | Annualized margin interest rate (percentage points) used to report returns net of estimated overnight debit interest when broker interest activities are absent. |
+| `OPTIONS_MODE` | `defined_risk` | Valid values: `off`, `close_only`, `defined_risk`. `defined_risk` allows defined-risk debit structures (funded from `options_buying_power`, never margin) while blocking naked shorts; `close_only` manages and exits existing contracts without opening new ones; `off` disables options completely. |
 | `STOCK_TRADING_PAUSED` | `false` | Entry-only kill switch: blocks new equity/option openings while exits, stop-loss repairs, reconciliation, and alerts continue. Creating `/root/polymarket-bot/data/PAUSED` (or `data/stock_agent/PAUSED`) pauses entries immediately without restarting the service. |
 | `STOCK_LOG_LEVEL` | `INFO` | Application log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). `httpx`/`httpcore` request logs remain clamped at `WARNING`, and rotating logs are written under `data/stock_agent/logs/stock_agent.log` (10 MB x 12 files). |
 | `HEARTBEAT_PING_URL` | *(empty)* | Optional dead-man's-switch URL (e.g. Healthchecks.io or Uptime Kuma) pinged periodically so an external monitor alerts you if the droplet goes offline. |

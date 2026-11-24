@@ -57,7 +57,7 @@ class ExecSettings:
     gtc_life_days: int = 90                 # Alpaca cancels GTC orders after 90 days
     max_model_exits_per_session: int = 4    # A8; hard stops / covers / normalise are uncapped
     uncapped_exit_rules: frozenset[str] = frozenset({"hard_stop", "cover_short", "normalise", "assignment",
-                                                     "risk_limit"})
+                                                     "risk_limit", "margin_buffer"})
 
 
 @dataclass
@@ -69,6 +69,7 @@ class ExecResult:
     avg_price: float | None = None
     reason: str = ""
     order_id: str | None = None
+    code: str = ""  # machine-readable skip/hold reason for the entry funnel (A14d)
 
 
 @dataclass
@@ -114,6 +115,11 @@ def _D(x: Any) -> Decimal:
     return Decimal(repr(float(x or 0)))
 
 
+def _is_own(o: Any) -> bool:
+    """Orders this bot placed carry its `sa-` client order id prefix."""
+    return str(getattr(o, "client_order_id", "") or "").startswith("sa-")
+
+
 def _floor(x: Any) -> int:
     from decimal import ROUND_FLOOR
 
@@ -143,6 +149,7 @@ class ExecutionEngine:
         capital_lock: Any = None,
         research_gate: Any = None,
         notifier: Any = None,
+        margin_controls: Callable[[Any], Any] | None = None,
         config: Any = Config,
         settings: ExecSettings | None = None,
         now: Callable[[], datetime] | None = None,
@@ -158,6 +165,7 @@ class ExecutionEngine:
         self._market_gate = market_gate
         self._capital_lock = capital_lock
         self._research_gate = research_gate
+        self._margin_controls = margin_controls  # scheduler: snapshot -> RiskControls (held convictions)
         self._notifier = notifier  # AlertService-like: send_normalise_plan / send_normalise_result
         self.config = config
         self.s = settings or ExecSettings()
@@ -300,6 +308,7 @@ class ExecutionEngine:
             it = self.ledger.intent_by_client_order_id(base) or self.ledger.intent_by_client_order_id(cid)
             if it is not None and it.status == IntentStatus.SUBMITTING:
                 self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=order_id)
+                self._funnel(it, "ordered", order_id=order_id)
         except Exception:
             logger.exception("could not mark intent for %s submitted", cid)
 
@@ -423,8 +432,21 @@ class ExecutionEngine:
         cur = self.ledger.get_intent(it.intent_id)
         if cur is not None and cur.status == IntentStatus.SUBMITTING:
             self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=order.id)
-        self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id,
-                               meta={"filled_qty": filled, "avg_price": price, "order_status": order.status})
+        meta = {"filled_qty": filled, "avg_price": price, "order_status": order.status}
+        code = ""
+        if status == IntentStatus.REJECTED:
+            code = "broker_rejected"
+        elif status != IntentStatus.FILLED and it.side == "buy":
+            code = "unfilled_cancelled"
+        if code:
+            meta.update(self._code_meta(code, f"order ended {order.status} with nothing filled"))
+        if cur is not None and cur.status == IntentStatus.SUBMITTING:
+            self._funnel(it, "ordered", order_id=order.id)
+        self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id, meta=meta)
+        if status == IntentStatus.FILLED:
+            self._funnel(it, "filled", qty=filled, avg_price=price, order_id=order.id)
+        elif code:
+            self._funnel(it, "skipped", code, f"order ended {order.status}")
         if status == IntentStatus.REJECTED:
             # Accepted (HTTP 200) but rejected afterwards by the broker: as loud as a refused submit.
             await self.alert("warning" if it.side == "buy" and it.kind != "cover" else "critical",
@@ -438,7 +460,7 @@ class ExecutionEngine:
                 logger.warning("ledger refresh after %s fill failed: %s", it.symbol, e)
             await self._protect_symbol(it.symbol, fill_price=price)
             self._journal_entry_fill(it, filled, price, order.id)
-        return ExecResult(it.intent_id, it.symbol, status, filled, price, order.status, order.id)
+        return ExecResult(it.intent_id, it.symbol, status, filled, price, order.status, order.id, code=code)
 
     def _journal_entry_fill(self, it: OrderIntent, filled: float, price: float | None,
                            fill_id: str | None = None) -> None:
@@ -464,7 +486,15 @@ class ExecutionEngine:
         if self._draining:
             return out
         due = self.ledger.due_intents(self.now())
-        due.sort(key=lambda i: (0 if i.side == "sell" or i.kind == "cover" else 1, i.created_at))
+        def urgency(i: OrderIntent) -> int:
+            if i.kind == "cover":
+                return 0  # an accidental short first
+            if i.side == "sell" and (i.origin == "margin_buffer" or (i.meta or {}).get("rule") in (
+                    "hard_stop", "margin_buffer")):
+                return 1  # A13e: margin trims are not delayed by older ordinary exits
+            return 2 if i.side == "sell" else 3
+
+        due.sort(key=lambda i: (urgency(i), i.created_at))
         for it in due:
             if it.kind == "option_structure":
                 continue  # the options module executes its own structures
@@ -502,23 +532,61 @@ class ExecutionEngine:
         except ExecutionError as e:
             return await self._defer_or_skip(intent, str(e))
 
-    def _skip(self, intent: OrderIntent, reason: str) -> ExecResult:
+    # A14d entry-funnel codes (agreed with alerts_reporting). Persisted as intent
+    # meta {"skip_code", "skip_reason"} on every skipped/held/refused intent.
+    SKIP_CODES = frozenset({
+        "cleanup_pending", "books_untrusted", "market_closed", "price_ran_away", "quote_unavailable",
+        "symbol_blocked", "short_open", "research_stale", "position_changed", "risk_size_zero",
+        "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
+        "intent_expired", "duplicate", "nothing_to_sell", "exit_cap", "other"})
+
+    def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
+        """Journal event `execution.buy_funnel` for the daily entry funnel (A14d). Never raises."""
+        if it.side != "buy" or it.kind == "cover":
+            return
+        try:
+            self.ledger.journal.append("execution.buy_funnel", intent_id=it.intent_id, symbol=it.symbol,
+                                       origin=it.origin, stage=stage, code=code or None,
+                                       reason=reason[:500] or None,
+                                       session_date=self.session_date().isoformat(), **extra)
+        except Exception:
+            logger.exception("buy funnel journal failed")
+
+    @staticmethod
+    def _code_meta(code: str, reason: str, **extra: Any) -> dict:
+        return {"skip_code": code, "skip_reason": reason[:500], **extra}
+
+    @staticmethod
+    def _error_code(reason: str) -> str:
+        r = reason.lower()
+        if "quote" in r or "price service" in r or "symbol changed" in r:
+            return "quote_unavailable"
+        if "risk controls" in r or "drawdown state" in r:
+            return "risk_controls_unavailable"
+        return "other"
+
+    def _skip(self, intent: OrderIntent, reason: str, code: str = "other", **extra: Any) -> ExecResult:
         cur = self.ledger.get_intent(intent.intent_id)
+        meta = self._code_meta(code, reason, **extra)
         if cur is not None and cur.status == IntentStatus.QUEUED:
-            self.ledger.ack_intent(intent.intent_id, IntentStatus.SKIPPED, error=reason)
+            self.ledger.ack_intent(intent.intent_id, IntentStatus.SKIPPED, error=reason, meta=meta)
         elif cur is not None and cur.status == IntentStatus.SUBMITTING:
-            self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=reason)
-        logger.info("intent %s %s %s skipped: %s", intent.intent_id, intent.side, intent.symbol, reason)
-        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=reason)
+            self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=reason, meta=meta)
+        logger.info("intent %s %s %s skipped [%s]: %s", intent.intent_id, intent.side, intent.symbol, code, reason)
+        self._funnel(intent, "skipped", code, reason)
+        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=reason, code=code)
 
     async def _defer_or_skip(self, intent: OrderIntent, reason: str) -> ExecResult:
+        code = self._error_code(reason)
         cur = self.ledger.get_intent(intent.intent_id)
         if cur is not None and cur.status == IntentStatus.SUBMITTING:
             # nothing was sent: back to the queue for one more try in 5 minutes
             self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=reason,
-                                   next_attempt_at=self.now() + timedelta(minutes=5))
-            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=reason)
-        return self._skip(intent, reason)
+                                   next_attempt_at=self.now() + timedelta(minutes=5),
+                                   meta=self._code_meta(code, reason))
+            self._funnel(intent, "held", code, reason)
+            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=reason, code=code)
+        return self._skip(intent, reason, code)
 
     async def _broker_failure(self, intent: OrderIntent, e: BrokerError) -> ExecResult:
         cur = self.ledger.get_intent(intent.intent_id)
@@ -555,16 +623,32 @@ class ExecutionEngine:
                              f"{intent.side} {intent.symbol}: {e}. Not resubmitting until the broker "
                              f"confirms order {intent.client_order_id}.", key=f"ambiguous-{intent.intent_id}")
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.AMBIGUOUS, reason=str(e))
+        if (intent.side == "buy" and intent.kind != "cover" and e.insufficient_buying_power
+                and cur is not None and cur.status == IntentStatus.SUBMITTING):
+            # The broker says the overnight funds are not there: a clean, final skip for
+            # this intent (no retry loop). The next research/risk cycle sizes afresh.
+            why = f"broker: insufficient buying power ({e.message})"
+            self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=why,
+                                   meta=self._code_meta("insufficient_buying_power", why))
+            self._funnel(intent, "skipped", "insufficient_buying_power", why)
+            await self.alert("info", f"{intent.symbol}: buy skipped, not enough buying power",
+                             f"The broker refused the buy for lack of buying power; not retrying this intent.",
+                             key=f"nobp-{self.session_date().isoformat()}")
+            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=why,
+                              code="insufficient_buying_power")
         if cur is not None and cur.status == IntentStatus.SUBMITTING:
             if e.retryable:
                 self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=str(e),
                                        next_attempt_at=self.now() + timedelta(minutes=5))
             else:
-                self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=str(e))
+                self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=str(e),
+                                       meta=self._code_meta("broker_rejected", str(e)))
+                self._funnel(intent, "skipped", "broker_rejected", str(e))
         await self.alert("warning" if intent.side == "buy" else "critical",
                          f"{intent.symbol}: {intent.side} failed", f"Broker refused or failed: {e}",
                          key=f"fail-{intent.intent_id}")
-        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.REJECTED, reason=str(e))
+        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.REJECTED, reason=str(e),
+                          code="broker_rejected")
 
     # -------------------------------------------------------------------- buy
     @property
@@ -573,19 +657,20 @@ class ExecutionEngine:
 
     async def buy(self, intent: OrderIntent) -> ExecResult:
         if not self.normalised:
-            return await self._hold(intent, "account clean-up has not finished; entries are held")
+            return await self._hold(intent, "account clean-up has not finished; entries are held",
+                                    code="cleanup_pending")
         block = self.ledger.trading_block()
         if block:
-            return await self._hold(intent, f"trading blocked: {block}")
+            return await self._hold(intent, f"trading blocked: {block}", code="books_untrusted")
         gate = await self._gate("entry")
         if not gate.allowed:
-            return await self._hold(intent, f"market gate: {gate.reason}", gate.next_open)
+            return await self._hold(intent, f"market gate: {gate.reason}", gate.next_open, code="market_closed")
         q = await self._quote(intent.symbol)
         ask = _f(q.ask) or _f(q.price)
         ref = _f(intent.reference_price)
         if ref > 0 and ask > ref * (1 + self.s.max_price_drift_pct):
             return self._skip(intent, f"price {ask:.2f} ran more than {self.s.max_price_drift_pct:.0%} above "
-                                      f"the analysed {ref:.2f}")
+                                      f"the analysed {ref:.2f}", "price_ran_away")
         limit = round_price(ask * (1 + self.s.buy_limit_offset_pct))
         try:
             async with (self._capital_lock or contextlib.nullcontext()):
@@ -611,13 +696,14 @@ class ExecutionEngine:
     async def _authorise_and_submit_buy(self, intent: OrderIntent, q: Any, limit: float, ask: float):
         snap = await self._snapshot("pre-buy")
         if intent.symbol in getattr(snap, "blocked_symbols", frozenset()):
-            return self._skip(intent, "symbol blocked by reconcile")
+            return self._skip(intent, "symbol blocked by reconcile", "symbol_blocked")
         h = snap.holding(intent.symbol)
         if h is not None and h.qty < 0:
-            return self._skip(intent, "account is short this symbol; cover first")
+            return self._skip(intent, "account is short this symbol; cover first", "short_open")
         why = await self._research_recheck(intent, h)
         if why:
-            return self._skip(intent, why)
+            code = "position_changed" if why.startswith("top-up") else "research_stale"
+            return self._skip(intent, why, code)
         dist = await self._stop_distance(intent.symbol, ask)
         ti = self._trade_intent(intent, snap, limit, q, dist, add=h is not None and h.qty > 0)
         controls = self._risk_controls()
@@ -627,25 +713,32 @@ class ExecutionEngine:
         if qty < 1:
             why = self.risk.evaluate_trade(snap, replace(ti, qty=Decimal(1)), now=self.now(), controls=controls)
             return self._skip(intent, "risk sizing gave less than one share"
-                              + (": " + "; ".join(why.reasons) if why.reasons else ""))
+                              + (": " + "; ".join(why.reasons) if why.reasons else ""), "risk_size_zero",
+                              risk_reasons=list(why.reasons or ()))
 
         ti = replace(ti, qty=Decimal(qty))
         verdict = self.risk.evaluate_trade(snap, ti, now=self.now(), controls=controls)
         if not verdict.ok:
-            return self._skip(intent, "risk: " + "; ".join(verdict.reasons))
+            return self._skip(intent, "risk: " + "; ".join(verdict.reasons), "risk_refused",
+                              risk_reasons=list(verdict.reasons or ()))
+        try:  # A14d: record that risk passed before anything can fail at the broker
+            self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, meta={"passed_risk": True})
+        except LedgerError:
+            pass  # not QUEUED any more: claim below reports it
+        self._funnel(intent, "passed_risk", qty=qty)
         try:
             claimed = self.ledger.claim_intent(intent.intent_id)
         except LedgerError as e:
-            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e))
+            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e), code="duplicate")
         # Sizing takes bar/quote/book round trips; the entry window can close meanwhile
         # (e.g. a 12:50 half-day cutoff). Re-check right before the order goes out.
         gate = await self._gate("entry")
         if not gate.allowed:
             nxt = gate.next_open or (self.now() + timedelta(minutes=5))
-            self.ledger.ack_intent(claimed.intent_id, IntentStatus.QUEUED,
-                                   error=f"market gate at submit: {gate.reason}", next_attempt_at=nxt)
-            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED,
-                              reason=f"market gate at submit: {gate.reason}")
+            why = f"market gate at submit: {gate.reason}"
+            self.ledger.ack_intent(claimed.intent_id, IntentStatus.QUEUED, error=why, next_attempt_at=nxt,
+                                   meta=self._code_meta("market_closed", why))
+            return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=why, code="market_closed")
         if verdict.allowed_existing_breaches if hasattr(verdict, "allowed_existing_breaches") else ():
             self.ledger.journal.append("risk.allowed_existing_breaches", intent_id=claimed.intent_id,
                                        symbol=intent.symbol, breaches=[
@@ -686,19 +779,31 @@ class ExecutionEngine:
             if hasattr(g, "__await__"):
                 g = await g
         except Exception as e:
-            return f"research gate unavailable: {e}"
+            # A14a: a broken recheck must not block every buy. Degrade to the ledger's
+            # current thesis: the intent still has to come from the newest thesis.
+            logger.warning("research gate unavailable at submit (%s); using the ledger thesis", e)
+            try:
+                cur = self.ledger.current_thesis(intent.symbol)
+            except Exception as le:
+                return f"research gate and ledger thesis both unavailable: {e}; {le}"
+            if cur is None or cur.thesis_id not in set(intent.thesis_ids or ()):
+                return "research gate unavailable and the ledger has a newer thesis"
+            return None
         if not g or getattr(g, "direction", None) != "BUY":
             return "research gate no longer has a BUY for this symbol"
         if getattr(g, "thesis_id", None) not in set(intent.thesis_ids or ()):
             return "research gate's current thesis is not the one this intent was made from"
         return None
 
-    async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None) -> ExecResult:
+    async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None,
+                    code: str = "other") -> ExecResult:
         nxt = until or (self.now() + timedelta(minutes=5))
         if intent.expires_at is not None and nxt >= intent.expires_at:
-            return self._skip(intent, reason + " (intent would expire)")
-        self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=reason, next_attempt_at=nxt)
-        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=reason)
+            return self._skip(intent, reason + " (intent would expire)", "intent_expired", held_by=code)
+        self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=reason, next_attempt_at=nxt,
+                               meta=self._code_meta(code, reason))
+        self._funnel(intent, "held", code, reason)
+        return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=reason, code=code)
 
     @staticmethod
     def _signal_at(intent: OrderIntent) -> datetime:
@@ -779,6 +884,37 @@ class ExecutionEngine:
             return "fresh risk plan sells nothing"
         return qty
 
+    MARGIN_EPISODE_KEY = "a13.margin_trim_episode"  # owned by the scheduler: {"opened_at": iso} or {}
+
+    async def _replan_margin_trim(self, intent: OrderIntent) -> float | str:
+        """A13e: a queued margin-buffer trim is re-planned on a fresh book right before it
+        sells (risk.plan_margin_trim, force=True): same symbol, never more than the fresh
+        or the queued quantity, never shares backing a short call."""
+        from stock_agent.risk_manager import TradeKind
+
+        planner = getattr(self.risk, "plan_margin_trim", None)
+        if planner is None:
+            return "risk has no margin trim planner"
+        want_ep = (intent.meta or {}).get("margin_episode")
+        if want_ep is not None:
+            cur_ep = (self._kv_get(self.MARGIN_EPISODE_KEY, {}) or {}).get("opened_at")
+            if cur_ep != want_ep:
+                return "margin trim belongs to an earlier margin episode"
+        snap = await self._snapshot(f"margin trim replan {intent.symbol}")
+        try:
+            controls = self._margin_controls(snap) if self._margin_controls else self._risk_controls()
+        except Exception as e:
+            logger.warning("margin controls unavailable, using entry controls: %s", e)
+            controls = self._risk_controls()
+        plan = tuple(planner(snap, controls=controls, force=True) or ())
+        if not plan:
+            return "margin trim no longer needed on the fresh book"
+        rec = plan[0]  # weakest first: only the fresh plan's FIRST leg may sell now
+        if rec.kind != TradeKind.SELL or str(rec.symbol).upper() != intent.symbol.upper():
+            return f"fresh margin plan now trims {rec.symbol} first, not this leg"
+        qty = float(rec.qty)
+        return qty if qty > 0 else "fresh margin plan sells nothing of this symbol"
+
     async def exit(self, intent: OrderIntent) -> ExecResult:
         """Sell (part of) a long. Cancel our stop, confirm, sell, re-protect any rest."""
         rule = str((intent.meta or {}).get("rule") or "model")
@@ -807,24 +943,35 @@ class ExecutionEngine:
         want = (intent.meta or {}).get("qty")
         want_qty = float(want) if want is not None else pos.qty
         want_qty = min(want_qty, pos.qty)
-        if intent.kind == "trim" and intent.origin in ("limit_drift", "option_delivery"):
+        if intent.kind == "trim" and intent.origin in ("limit_drift", "option_delivery", "margin_buffer"):
             block = self.ledger.trading_block()
             if block:
-                return await self._hold(intent, f"risk trim waits for trusted books: {block}")
-            fresh = await self._replan_trim(intent)
+                return await self._hold(intent, f"risk trim waits for trusted books: {block}", code="books_untrusted")
+            fresh = await (self._replan_margin_trim(intent) if intent.origin == "margin_buffer"
+                           else self._replan_trim(intent))
             if isinstance(fresh, str):
                 return self._skip(intent, fresh)
             want_qty = min(want_qty, fresh)
+        margin_trim = intent.origin == "margin_buffer"
+        if margin_trim:
+            # A13e: sized on the broker position read AFTER the fresh replan; never the
+            # shares backing a short call, never shares reserved by someone else's order.
+            pos = await self.broker.get_position(intent.symbol)
+            if pos is None or not pos.is_long:
+                return self._skip(intent, "no long position at the broker", "nothing_to_sell")
+            want_qty = min(want_qty, pos.qty, float(await self._free_shares(intent.symbol, pos, own_only=True)))
         if want_qty <= 0:
-            return self._skip(intent, "nothing to sell")
-        await self._release_short_calls(intent.symbol, pos, want_qty)
+            return self._skip(intent, "nothing to sell", "nothing_to_sell")
+        if not margin_trim:  # a margin trim never closes a short call to free shares
+            await self._release_short_calls(intent.symbol, pos, want_qty)
         try:
             claimed = self.ledger.claim_intent(intent.intent_id, check_thesis=False)
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e))
         capped = rule not in self.s.uncapped_exit_rules
         try:
-            filled, avg, last = await self._sell_qty(intent.symbol, want_qty, claimed.client_order_id, reason=rule)
+            filled, avg, last = await self._sell_qty(intent.symbol, want_qty, claimed.client_order_id, reason=rule,
+                                                     own_only=margin_trim)
         except BaseException:
             if capped:  # an order may have reached the broker: count it, never under-count
                 self._count_model_exit()
@@ -866,11 +1013,18 @@ class ExecutionEngine:
                                meta={"filled_qty": filled, "avg_price": avg})
         return ExecResult(it.intent_id, it.symbol, status, filled, avg, last.status, last.id)
 
+    async def _free_shares(self, symbol: str, pos: BrokerPosition, *, own_only: bool = False) -> Decimal:
+        """Shares we could sell after cancelling sell orders (only the bot's own when
+        own_only); excludes shares the broker holds as cover for short calls."""
+        free = pos.qty_available + sum(_f(o.remaining_qty) for o in await self._open_orders(symbol)
+                                       if o.side == "sell" and not _is_option(o.symbol)
+                                       and (not own_only or _is_own(o)))
+        return _D(min(free, pos.qty))
+
     async def _release_short_calls(self, symbol: str, pos: BrokerPosition, want_qty: float) -> None:
         """A6: shares backing a short call are never sold; close the call first if needed."""
-        free = pos.qty_available + sum(_f(o.remaining_qty) for o in await self._open_orders(symbol)
-                                       if o.side == "sell" and not _is_option(o.symbol))
-        if _D(want_qty) <= _D(free):
+        free = await self._free_shares(symbol, pos)
+        if _D(want_qty) <= free:
             return
         if self.options is None:
             raise ExecutionError("shares are locked by a short call and no options manager is available")
@@ -888,11 +1042,11 @@ class ExecutionEngine:
                     out.append(p)
         return out
 
-    async def _sell_qty(self, symbol: str, qty: float, cid: str, *, reason: str
+    async def _sell_qty(self, symbol: str, qty: float, cid: str, *, reason: str, own_only: bool = False
                         ) -> tuple[float, float | None, BrokerOrder | None]:
         """Cancel our sell orders, confirm, then sell up to `qty` (capped at free shares)."""
         for o in await self._open_orders(symbol):
-            if o.side == "sell":
+            if o.side == "sell" and (not own_only or _is_own(o)):
                 await self._cancel_confirm(o)
         pos = await self.broker.get_position(symbol)
         if pos is None or not pos.is_long:
@@ -967,7 +1121,8 @@ class ExecutionEngine:
             cid = f"{base}-{attempt}"
         self._kv_set(f"exec.cover_attempt.{base}", attempt)
         qty = abs(pos.qty)
-        await self._check_cover_funded(symbol, qty)
+        # A13i: covering an accidental short always reduces risk; it no longer has to be
+        # paid from cash (margin may fund it). Only the broker can refuse it.
         req = OrderRequest(symbol=symbol, side="buy", qty=qty, type="market", time_in_force="day",
                            client_order_id=cid, position_intent="buy_to_close")
         try:
@@ -982,28 +1137,6 @@ class ExecutionEngine:
             await self.alert("critical", f"{symbol}: short not fully covered",
                              f"Filled {_f(final.filled_qty):g} of {qty:g} ({final.status}).", key=f"cover-{symbol}")
         return final
-
-    async def _check_cover_funded(self, symbol: str, qty: float) -> None:
-        """A cover must be paid from cash, never borrowed (B3). Raises ExecutionError."""
-        from stock_agent.risk_manager import TradeIntent, TradeKind
-
-        try:
-            q = await self._quote(symbol)
-            price = (_f(q.ask) or _f(q.price)) * (1 + self.s.buy_limit_offset_pct)
-        except ExecutionError:
-            price = 0.0
-        if price <= 0:
-            pos = await self.broker.get_position(symbol)
-            price = _f(pos.current_price if pos else 0) * 1.02
-        snap = await self._snapshot("pre-cover")
-        ti = TradeIntent(kind=TradeKind.BUY_TO_COVER, symbol=symbol, qty=Decimal(str(qty)),
-                         price=Decimal(str(round(price, 4))))
-        verdict = self.risk.evaluate_trade(snap, ti, now=self.now())
-        if not verdict.ok:
-            await self.alert("critical", f"{symbol}: short cannot be covered from cash",
-                             f"Buying back {qty:g} would need borrowing ({'; '.join(verdict.reasons)}). "
-                             "No order sent.", key=f"cover-funds-{symbol}")
-            raise ExecutionError("cover not funded: " + "; ".join(verdict.reasons))
 
     async def _execute_cover_intent(self, intent: OrderIntent) -> ExecResult:
         try:
@@ -1050,9 +1183,12 @@ class ExecutionEngine:
                                 *, fill_price: float | None = None, fresh_price: bool = False) -> None:
         sym = pos.symbol
         stops = [o for o in orders if o.is_sell_stop]
-        other_sells = [o for o in orders if o.side == "sell" and not o.is_sell_stop]
+        # Only OUR working exit defers protection (it re-protects when it finishes).
+        # Someone else's resting sell holds its own shares (excluded from qty_available);
+        # the free rest is still protected beside it.
+        other_sells = [o for o in orders if o.side == "sell" and not o.is_sell_stop and _is_own(o)]
         if other_sells:
-            rep.kept.append(sym)  # an exit is working; it re-protects when it finishes
+            rep.kept.append(sym)
             return
         stop_held = sum(_f(o.remaining_qty) for o in stops)
         coverable = _floor(_D(pos.qty_available) + _D(stop_held))
