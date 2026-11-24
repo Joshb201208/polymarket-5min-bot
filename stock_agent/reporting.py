@@ -34,6 +34,9 @@ from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot, EquityMark, Holding, Ledger
 from stock_agent.logging_setup import redact_text
 from stock_agent.performance import (
+    InterestSeries,
+    margin_interest,
+    margin_rate,
     SHADOW_POST_STOP_SESSIONS,
     day_pnl,
     drawdown,
@@ -318,6 +321,75 @@ class ReportBuilder:
         self.benchmark = benchmark_tracker or BenchmarkTracker(price_service)
         self._clock = clock or _default_now
 
+    # ------------------------------------------------------- margin (A13j)
+    def _interest_series(self, marks: Sequence[EquityMark]) -> InterestSeries | None:
+        if self.ledger is None or not hasattr(self.ledger, "store"):
+            return None
+        try:
+            acts = [json.loads(r[0]) for r in self.ledger.store.query(
+                "SELECT raw_json FROM broker_activities WHERE activity_type IN ('INT','INTNRA','INTTW')")]
+            return margin_interest(marks, acts, rate=margin_rate(self.config))
+        except Exception as e:  # reporting must not die on the cost estimate
+            logger.warning("Margin interest series unavailable (%s)", type(e).__name__)
+            return None
+
+    def _margin_dict(self, snap: BookSnapshot | None, bm: BenchmarkSnapshot,
+                     interest: InterestSeries | None, session_date: date) -> dict[str, Any]:
+        def f(x: Decimal | None, nd: int = 2) -> float | None:
+            return round(float(x), nd) if x is not None else None
+
+        excess = snap.margin_excess_pct if snap is not None else None
+        week_start = session_date - timedelta(days=7)
+        out: dict[str, Any] = {
+            "borrowed": f(snap.borrowed) if snap is not None else None,
+            "leverage_now": f(snap.leverage, 3) if snap is not None else None,
+            "avg_leverage_week": f(bm.avg_leverage_week, 3),
+            "avg_leverage_since_launch": f(bm.avg_leverage_since_launch, 3),
+            "margin_excess_pct": f(excess * 100) if excess is not None else None,
+            "regt_buying_power": f(snap.regt_buying_power) if snap is not None else None,
+            "interest_rate_pct": f(interest.rate * 100, 3) if interest is not None else None,
+            "interest_basis": interest.basis if interest is not None else "none",
+            "interest_accrued_unposted_est": f(interest.unposted(session_date)) if interest is not None else None,
+            "interest_cost_week": f(interest.period_cost(week_start, session_date)) if interest is not None else None,
+            "interest_posted_total": f(interest.actual_cost(None, session_date)) if interest is not None else None,
+            "session_after_cost_pct": f(bm.portfolio_session_after_cost_pct),
+            "week_after_cost_pct": f(bm.portfolio_week_after_cost_pct),
+            "since_launch_after_cost_pct": f(bm.portfolio_since_launch_after_cost_pct),
+        }
+        out["display"] = self._margin_lines(snap, bm, interest, session_date, include_week=True)
+        return out
+
+    def _margin_lines(self, snap: BookSnapshot | None, bm: BenchmarkSnapshot, interest: InterestSeries | None,
+                      session_date: date, *, include_week: bool = False) -> str:
+        """Borrowed amount, leverage (now and average), margin excess and returns after
+        ESTIMATED borrowing cost. Broker-reported equity is never adjusted."""
+        if snap is None:
+            return "N/A (no verified account snapshot)"
+
+        def lev(x: Decimal | None) -> str:
+            return f"{float(x):.2f}x" if x is not None else "N/A"
+
+        avg = bm.avg_leverage_week if include_week else bm.avg_leverage_since_launch
+        avg_lbl = "this week" if include_week else "since launch"
+        excess = snap.margin_excess_pct
+        lines = [
+            f"Borrowed {_fmt_money(snap.borrowed)} | Leverage {lev(snap.leverage)} now, avg {lev(avg)} {avg_lbl} "
+            "(QQQ/SPY are unlevered)",
+            "Margin excess: " + (f"{float(excess) * 100:.1f}% of equity (equity above broker maintenance)"
+                                 if excess is not None else "N/A (broker maintenance figure not reported)"),
+        ]
+        if interest is not None:
+            rate = f"{float(interest.rate) * 100:.2f}%/yr"
+            lines.append(
+                f"Interest: est. accrued not yet posted {_fmt_money(interest.unposted(session_date), decimals=2)} "
+                f"({rate}, /360) | posted by broker {_fmt_money(interest.actual_cost(None, session_date), decimals=2)}")
+            parts = [f"today {_fmt_pct(bm.portfolio_session_after_cost_pct)}"]
+            if include_week:
+                parts.append(f"week {_fmt_pct(bm.portfolio_week_after_cost_pct)}")
+            parts.append(f"since launch {_fmt_pct(bm.portfolio_since_launch_after_cost_pct)}")
+            lines.append("After est. borrowing cost: " + " | ".join(parts))
+        return "\n".join(lines)
+
     def _session_close(self, session_date: date) -> datetime:
         """Regular close of ``session_date`` (market calendar when covered, else 16:00 ET)."""
         cal = self.calendar
@@ -587,6 +659,7 @@ class ReportBuilder:
             day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None)
         )
         dd_pct, hwm, _, dd_desc = self._persisted_or_computed_drawdown(marks, ret_eq)
+        interest = self._interest_series(marks)
 
         bm = await self.benchmark.compute(
             as_of_date=session_date,
@@ -594,6 +667,7 @@ class ReportBuilder:
             flows=flows,
             live_equity=ret_eq,
             fallback_starting_capital=self._fallback_starting_capital(),
+            interest=interest,
         )
 
         long_holdings = [h for h in snap.holdings if h.qty > ZERO]
@@ -626,7 +700,8 @@ class ReportBuilder:
         # 1. Account & Benchmark Embed
         header_fields = [
             {"name": "Account Value", "value": f"**{_fmt_money(snap.equity, decimals=2)}**", "inline": True},
-            {"name": "Cash Reserve", "value": f"{_fmt_money(snap.cash)} ({cash_pct:.1f}%)", "inline": True},
+            {"name": "Cash Reserve" if snap.cash >= ZERO else "Cash (Debit Balance)",
+             "value": f"{_fmt_money(snap.cash)} ({cash_pct:.1f}%)", "inline": True},
             {"name": "Stock Exposure", "value": f"{_fmt_money(snap.long_mv)} ({stock_pct:.1f}%)", "inline": True},
             {"name": "Options Value", "value": f"{_fmt_money(opt_mv_f, decimals=0)} ({len(snap.legs)} leg(s))", "inline": True},
             {"name": "Change Since Prior Close", "value": prev_label, "inline": True},
@@ -645,6 +720,8 @@ class ReportBuilder:
                 "value": self._benchmark_lines(bm),
                 "inline": False,
             },
+            {"name": "Borrowing & Leverage", "value": self._margin_lines(snap, bm, interest, session_date),
+             "inline": False},
         ]
 
         embeds: list[dict[str, Any]] = [
@@ -930,12 +1007,14 @@ class ReportBuilder:
             else None
         )
 
+        interest = self._interest_series(marks)
         bm = await self.benchmark.compute(
             as_of_date=session_date,
             marks=marks,
             flows=flows,
             live_equity=ret_eq,
             fallback_starting_capital=self._fallback_starting_capital(),
+            interest=interest,
         )
 
         # Separate Stock vs Option P&L
@@ -1009,6 +1088,8 @@ class ReportBuilder:
                 "value": f"{dd_desc}" + (f" (Current {_fmt_pct(dd_pct)}, Peak {_fmt_money(hwm)})" if dd_pct is not None else ""),
                 "inline": False,
             },
+            {"name": "Borrowing & Leverage", "value": self._margin_lines(snap, bm, interest, session_date),
+             "inline": False},
             {
                 "name": "What We Did Today & Why",
                 "value": "\n".join(did_lines),
@@ -1185,6 +1266,7 @@ class ReportBuilder:
             gross_exp_pct = None
 
         resolved_cutover = self._resolve_cutover_date(cutover_date, marks)
+        interest = self._interest_series(marks)
         bm = await self.benchmark.compute(
             as_of_date=session_date,
             marks=marks,
@@ -1192,6 +1274,7 @@ class ReportBuilder:
             live_equity=ret_live_eq,
             cutover_date=resolved_cutover,
             fallback_starting_capital=self._fallback_starting_capital(),
+            interest=interest,
         )
 
         # Persisted drawdown state/latch first; fallback to marks
@@ -1286,6 +1369,7 @@ class ReportBuilder:
             "orders_and_stops": orders_stats,
             "news_and_inputs": news_inputs,
             "what_we_learned": learned,
+            "margin": self._margin_dict(snap, bm, interest, session_date),
         }
 
         embeds = self._format_weekly_embeds(scorecard, bm, dd_label, now_et)
@@ -1801,6 +1885,8 @@ class ReportBuilder:
             "fields": [
                 {"name": "Account Value & Cash", "value": f"**{_fmt_money(acc['equity'], decimals=2)}** (Cash {cash_pct_s}, Gross Exp {exp_pct_s})", "inline": False},
                 {"name": "Returns vs QQQ & SPY", "value": self._benchmark_lines(bm, include_week=True, include_cutover=True, cutover_date=cut_dt), "inline": False},
+                {"name": "Borrowing & Leverage", "value": sc["margin"]["display"] if sc.get("margin") else "N/A",
+                 "inline": False},
                 {
                     "name": "Drawdown & Risk Controls",
                     "value": (
