@@ -67,9 +67,6 @@ def test_gap_down_under_15pct_excess_raises_a_critical_alert(world):
     assert alerts[0].at <= et(2026, 11, 23, 9, 31)                      # at the open
 
 
-@pytest.mark.xfail(strict=True, reason="A13: execution.py:900 reads a13.margin_trim_episode with store.kv_get, "
-                   "the scheduler writes it with ledger.risk_state_set (scheduler.py:408), so every margin "
-                   "trim is skipped as 'earlier margin episode'. Owner: broker_execution")
 @pytest.mark.world_start(et(2026, 11, 23, 7, 0))
 def test_gap_down_trims_back_to_25pct_and_keeps_stops_right(world):
     a, runner = _gap_down_day(world)
