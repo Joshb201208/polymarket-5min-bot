@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 from stock_agent.broker import AlpacaClient, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, round_price
 from stock_agent.config import Config
-from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent
+from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent, TopUpAlreadyToday
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -538,7 +538,8 @@ class ExecutionEngine:
         "cleanup_pending", "books_untrusted", "market_closed", "price_ran_away", "quote_unavailable",
         "symbol_blocked", "short_open", "research_stale", "position_changed", "risk_size_zero",
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
-        "intent_expired", "duplicate", "nothing_to_sell", "exit_cap", "other"})
+        "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
+        "nothing_to_sell", "exit_cap", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
         """Journal event `execution.buy_funnel` for the daily entry funnel (A14d). Never raises."""
@@ -700,12 +701,31 @@ class ExecutionEngine:
         h = snap.holding(intent.symbol)
         if h is not None and h.qty < 0:
             return self._skip(intent, "account is short this symbol; cover first", "short_open")
+        add = h is not None and h.qty > 0
+        if (add or intent.position_id) and (
+            not add or h.meta is None or h.meta.position_id != intent.position_id
+        ):
+            return self._skip(intent, "top-up no longer matches the live position", "position_changed")
         why = await self._research_recheck(intent, h)
         if why:
             code = "position_changed" if why.startswith("top-up") else "research_stale"
             return self._skip(intent, why, code)
+        add_payload = None
+        last_filled_conviction = None
+        if add:
+            thesis = self.ledger.get_thesis(intent.thesis_ids[0]) if len(intent.thesis_ids) == 1 else None
+            draft = thesis.payload.get("draft") if thesis is not None else None
+            if thesis is None or thesis.symbol != intent.symbol or not isinstance(draft, dict) or (
+                draft.get("direction") != "BUY"
+            ):
+                return self._skip(intent, "top-up requires a linked BUY thesis", "top_up_thesis_direction")
+            add_payload = thesis.payload
+            last_fill = self.ledger.last_filled_thesis(intent.position_id)
+            if last_fill is not None:
+                last_filled_conviction = last_fill.payload.get("effective_conviction")
         dist = await self._stop_distance(intent.symbol, ask)
-        ti = self._trade_intent(intent, snap, limit, q, dist, add=h is not None and h.qty > 0)
+        ti = self._trade_intent(intent, limit, q, dist, add_payload=add_payload,
+                                last_filled_conviction=last_filled_conviction)
         controls = self._risk_controls()
         qty = int(self.risk.propose_equity_qty(snap, ti, now=self.now(), controls=controls))
         from dataclasses import replace
@@ -727,7 +747,9 @@ class ExecutionEngine:
             pass  # not QUEUED any more: claim below reports it
         self._funnel(intent, "passed_risk", qty=qty)
         try:
-            claimed = self.ledger.claim_intent(intent.intent_id)
+            claimed = self.ledger.claim_intent(intent.intent_id, top_up_session=self.session_date() if add else None)
+        except TopUpAlreadyToday as e:
+            return self._skip(intent, str(e), "top_up_already_today")
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e), code="duplicate")
         # Sizing takes bar/quote/book round trips; the entry window can close meanwhile
@@ -818,10 +840,18 @@ class ExecutionEngine:
                 pass
         return intent.created_at
 
-    def _trade_intent(self, intent: OrderIntent, snap: Any, limit: float, q: Any, dist: Any, *, add: bool):
+    def _trade_intent(self, intent: OrderIntent, limit: float, q: Any, dist: Any, *,
+                      add_payload=None, last_filled_conviction=None):
         from stock_agent.risk_manager import TradeIntent, TradeKind
 
         m = dict(intent.meta or {})
+        add = add_payload is not None
+        if add:
+            # The thesis/grade used for approval comes from the ledger, not
+            # a stale or optimistic copy in a queued order's metadata.
+            m.update(raw_conviction=add_payload.get("raw_conviction"),
+                     effective_conviction=add_payload.get("effective_conviction"),
+                     thesis_change=add_payload["draft"].get("thesis_change"))
         kw: dict[str, Any] = dict(
             kind=TradeKind.ADD if add else TradeKind.BUY,
             symbol=intent.symbol,
@@ -830,7 +860,8 @@ class ExecutionEngine:
             sector=m.get("sector"),
             raw_conviction=m.get("raw_conviction"),
             effective_conviction=m.get("effective_conviction", m.get("conviction")),
-            last_filled_conviction=m.get("last_filled_conviction"),
+            last_filled_conviction=last_filled_conviction,
+            thesis_change=m.get("thesis_change") if add else None,
             stop_distance=dist.fraction,
             analysis_price=intent.reference_price,
             signal_at=self._signal_at(intent),

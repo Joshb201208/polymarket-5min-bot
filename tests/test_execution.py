@@ -3,7 +3,7 @@ import asyncio
 import uuid
 from datetime import timedelta
 
-from stock_agent.ledger import IntentStatus
+from stock_agent.ledger import IntentStatus, NewIntent, ThesisRole
 from tests.exec_helpers import enqueue, make_engine
 
 
@@ -302,7 +302,13 @@ def test_top_up_releases_stop_then_reprotects_whole_position(world, tmp_path, mo
             return RiskVerdict(True)
 
     eng.risk = AddThree()
-    res = run(eng.execute_intent(enqueue(eng, "AAA", "buy", ref=50)))
+    thesis = eng.ledger.record_thesis("AAA", {"draft": {"direction": "BUY"}},
+                                     ThesisRole.HELD_REVIEW, activate=True)
+    [intent_id] = eng.ledger.enqueue_intents([NewIntent(
+        "AAA", "buy", "test-top-up-stop", position_id=eng.ledger.open_position_meta("AAA").position_id,
+        thesis_ids=(thesis,),
+    )])
+    res = run(eng.execute_intent(eng.ledger.get_intent(intent_id)))
     assert res.status == IntentStatus.FILLED, res
     pos = a.position("AAA")
     stops = _stops(a, "AAA")

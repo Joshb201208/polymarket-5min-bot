@@ -57,6 +57,10 @@ class LedgerError(Exception):
     """Misuse of the ledger API (bad role, unknown intent, illegal transition)."""
 
 
+class TopUpAlreadyToday(LedgerError):
+    """Another top-up for this position filled or is still unresolved this session."""
+
+
 # =========================================================================
 # Book snapshot (broker truth + local metadata)
 # =========================================================================
@@ -734,12 +738,12 @@ class Ledger:
     def last_filled_thesis(self, position_id: str) -> ThesisRecord | None:
         """Thesis of the most recent filled buy intent for this position."""
         rows = self.store.query(
-            "SELECT thesis_ids_json FROM order_intents WHERE position_id=? AND side='buy' AND status IN"
-            " ('filled','partially_filled') ORDER BY updated_at DESC LIMIT 1", (position_id,))
+            "SELECT thesis_ids_json FROM order_intents WHERE position_id=? AND kind='equity' AND side='buy'"
+            " AND status IN ('filled','partially_filled') ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (position_id,))
         if rows:
             ids = json.loads(rows[0][0] or "[]")
-            if ids:
-                return self.get_thesis(ids[0])
+            return self.get_thesis(ids[0]) if ids else None
         return self.entry_thesis(position_id)
 
     def theses_for(self, symbol: str, limit: int = 20) -> list[ThesisRecord]:
@@ -872,7 +876,8 @@ class Ledger:
                             error=last_error, attempts=it.attempts)
         return it
 
-    def claim_intent(self, intent_id: str, *, check_thesis: bool = True) -> OrderIntent:
+    def claim_intent(self, intent_id: str, *, check_thesis: bool = True,
+                     top_up_session: date | None = None) -> OrderIntent:
         """Mark SUBMITTING before the HTTP call. Raises ``LedgerError`` when the
         intent is not QUEUED, is expired, or (buys) its thesis was superseded."""
         it = self.get_intent(intent_id)
@@ -893,7 +898,36 @@ class Ledger:
             if not row or row[0][0] is not None:
                 self._transition(intent_id, IntentStatus.CANCELLED, last_error="position closed or replaced")
                 raise LedgerError(f"intent {intent_id}: position {it.position_id} is no longer open")
+        if top_up_session is not None:
+            return self._claim_top_up(it, top_up_session)
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
+
+    def _claim_top_up(self, it: OrderIntent, session: date) -> OrderIntent:
+        if not it.position_id or it.side != "buy" or it.kind != "equity":
+            raise LedgerError("only a buy matched to an open stock position can claim a top-up")
+        session_key = session.isoformat()
+        with self.store.transaction() as c:
+            rows = c.execute(
+                "SELECT intent_id, status, session_date, meta_json FROM order_intents"
+                " WHERE position_id=? AND kind='equity' AND side='buy' AND intent_id<>?",
+                (it.position_id, it.intent_id),
+            )
+            for row in rows:
+                meta = json.loads(row["meta_json"] or "{}")
+                status = IntentStatus(row["status"])
+                if status in (IntentStatus.SUBMITTING, IntentStatus.SUBMITTED, IntentStatus.AMBIGUOUS,
+                              IntentStatus.PARTIALLY_FILLED):
+                    # A working/uncertain buy may still fill. Do not place a
+                    # second order, even if the unresolved state crosses midnight.
+                    raise TopUpAlreadyToday("a previous top-up still has an unresolved order")
+                if meta.get("top_up_session", row["session_date"]) == session_key and (
+                    status == IntentStatus.FILLED or (_dec(meta.get("filled_qty")) or Decimal(0)) > 0
+                ):
+                    raise TopUpAlreadyToday("this position already had a top-up fill this session")
+            # The existing intent metadata is backward compatible. Claim and
+            # tag in one write, before contacting the broker or releasing the stop.
+            return self._transition(it.intent_id, IntentStatus.SUBMITTING, bump_attempts=True,
+                                    meta={"top_up_session": session_key})
 
     def ack_intent(self, intent_id: str, status: IntentStatus | str, *, broker_order_id: str | None = None,
                    error: str | None = None, next_attempt_at: datetime | None = None,
@@ -1027,5 +1061,5 @@ __all__ = [
     "BookSnapshot", "CashFlow", "Diff", "DiffKind", "EquityMark", "Holding", "IntentStatus", "JobRun",
     "JobStatus", "Ledger", "LedgerError", "NewIntent", "NON_ACTIONABLE_ROLES", "OpenOrder", "OptionLeg",
     "OrderIntent", "PositionMeta", "Severity", "StaleBook", "StateUnavailable", "TERMINAL_INTENT",
-    "ThesisRecord", "ThesisRole", "client_order_id_for", "new_id", "replace",
+    "ThesisRecord", "ThesisRole", "TopUpAlreadyToday", "client_order_id_for", "new_id", "replace",
 ]
