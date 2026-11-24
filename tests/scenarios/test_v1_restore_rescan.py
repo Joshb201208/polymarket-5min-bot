@@ -312,3 +312,18 @@ def test_protection_lane_keeps_placing_stops_while_a_rescan_runs(world, monkeypa
         await asyncio.wait_for(rescan, 30)
 
     _run(world, monkeypatch, body)
+
+
+def test_adjacent_slot_move_after_a_late_claim_is_sampled_when_the_cooldown_ends(world, monkeypatch):
+    """Sampling jitter must not swallow the next window: claim at 09:32:30, crash by 10:00 → rescan at 10:02:30."""
+
+    async def body(h, t):
+        t.spy = 102.0
+        await sample(h, 9, 32, 30)
+        assert rescans(h) == [f"2026-11-{DAY}:0"]
+        t.spy = 99.0  # -2.9% over the window
+        await sample(h, 10, 0, 30)  # 28 minutes after the claim: too early to sample this slot
+        await sample(h, 10, 2, 30)  # exactly 30 minutes after the claim, still inside the slot's sample window
+        assert rescans(h) == [f"2026-11-{DAY}:0", f"2026-11-{DAY}:1"]
+
+    _run(world, monkeypatch, body)
