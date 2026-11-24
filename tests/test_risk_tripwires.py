@@ -1,63 +1,26 @@
 """Risk tripwires.
 
-These tests pin the limits and sizing behaviour the bot runs with TODAY. They
-do not say today's behaviour is right; the audit decides that. They exist so
-that nobody (human or AI) changes how much the bot can buy, or where it sends
-orders, without noticing.
+These tests pin configured limits and deterministic risk helpers. Projected
+order sizing, concentration, cash and broker book behavior are covered in
+test_risk_projection.py.
 
 If one of these fails, trading behaviour has changed. Stop and confirm that
 the change is an approved plan item before editing the test, and call the
 change out at the top of the pull request.
 """
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 
 import pytest
 
-from stock_agent import options_engine, options_portfolio
 from stock_agent.config import Config
-from stock_agent.models import PortfolioState, Position, Thesis
-from stock_agent.risk_manager import RiskManager
-
-NOW = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
-
-
-def make_position(symbol: str, value: float, sector: str = "Unknown", price: float = 100.0) -> Position:
-    """A position worth `value` dollars at `price` per share."""
-    thesis = Thesis(
-        symbol=symbol,
-        direction="BUY",
-        conviction=8,
-        summary="test",
-        bull_case="test",
-        bear_case="test",
-        catalysts=[],
-        risks=[],
-        generated_at=NOW,
-    )
-    return Position(
-        symbol=symbol,
-        shares=int(value / price),
-        entry_price=price,
-        entry_date=NOW,
-        current_price=price,
-        stop_loss=price * 0.93,
-        thesis=thesis,
-        sector=sector,
-        last_updated=NOW,
-    )
-
-
-def make_state(positions: list[Position], total: float = 100_000.0) -> PortfolioState:
-    """A portfolio worth `total` dollars: the given positions plus cash."""
-    invested = sum(p.shares * p.current_price for p in positions)
-    return PortfolioState(positions=positions, cash=total - invested)
-
-
-@pytest.fixture
-def risk() -> RiskManager:
-    return RiskManager(Config())
-
+from stock_agent.risk_manager import (
+    CanonicalSector, DrawdownState, ShadowDailyBar, ShadowEntryAnchor, StopDistance,
+    atr14, classify_symbol, normalize_sector, shadow_stop_results, stop_fraction, stop_price,
+    update_drawdown,
+)
 
 # ── Where orders go ───────────────────────────────────────────────────────
 
@@ -75,11 +38,21 @@ def test_default_broker_endpoint_is_the_paper_endpoint():
 
 def test_equity_limit_values():
     assert Config.MAX_POSITION_PCT == 0.15
-    assert Config.MAX_TOTAL_EXPOSURE == 1.00
+    assert Config.MARGIN_ENABLED is True
+    assert Config.MAX_GROSS_EXPOSURE_PCT == 2.00
+    assert Config.MARGIN_MIN_EXCESS_PCT == 0.25
+    assert Config.MARGIN_TRIM_EXCESS_PCT == 0.15
+    assert Config.MARGIN_INTEREST_RATE_PCT == 6.5
     assert Config.MAX_POSITIONS == 20
     assert Config.MAX_SECTOR_PCT == 0.40
     assert Config.MAX_CLUSTER_PCT == 0.48
     assert Config.MIN_CONVICTION == 7
+    assert Config.MIN_FREE_CASH_PCT == 0.02
+    assert Config.MAX_INITIAL_STOP_RISK_PCT == 0.01
+    assert Config.DRAWDOWN_ALERT_PCT == 0.10
+    assert Config.DRAWDOWN_THROTTLE_PCT == 0.15
+    assert Config.DRAWDOWN_PAUSE_PCT == 0.20
+    assert Config.DRAWDOWN_RECOVERY_SESSIONS == 5
 
 
 def test_conviction_size_map():
@@ -105,125 +78,142 @@ def test_options_limit_values_in_config():
     assert Config.OPTIONS_AUTO_CLOSE_DTE == 3
 
 
-def test_options_limit_values_in_the_options_modules():
-    # The options code carries its own copies of these limits.
-    assert options_engine.MAX_OPTIONS_POSITIONS == 10
-    assert options_engine.MAX_SINGLE_TRADE_PCT == 0.07
-    assert options_engine.MAX_TOTAL_OPTIONS_EXPOSURE_PCT == 0.15
-    assert options_engine.MIN_REWARD_TO_RISK == 1.5
-    assert options_engine.SHARES_PER_CONTRACT == 100
-    assert (options_engine.CC_MIN_DTE, options_engine.CC_MAX_DTE) == (14, 35)
-    assert (options_engine.SPREAD_MIN_DTE, options_engine.SPREAD_MAX_DTE) == (14, 45)
-    assert options_portfolio.EXPIRY_ALERT_DTE == 3
-    assert options_portfolio.PROFIT_TAKE_PCT == 50.0
+@pytest.mark.parametrize(("name", "expected"), [
+    (" Financial Services ", CanonicalSector.FINANCIALS),
+    ("consumer-cyclical", CanonicalSector.CONSUMER_DISCRETIONARY),
+    ("Technology", CanonicalSector.INFORMATION_TECHNOLOGY),
+    ("healthcare", CanonicalSector.HEALTH_CARE),
+    ("basic materials", CanonicalSector.MATERIALS),
+    ("nonsense", CanonicalSector.UNKNOWN),
+    (None, CanonicalSector.UNKNOWN),
+])
+def test_canonical_sector_aliases(name, expected):
+    assert normalize_sector(name) == expected
 
 
-# ── Sizing ────────────────────────────────────────────────────────────────
+def test_common_issuer_and_overlapping_cluster_classification():
+    assert classify_symbol("goog", "Technology") == classify_symbol("GOOGL", "Communication Services")
+    assert classify_symbol("BRK-A").issuer == classify_symbol("brk.b").issuer
+    assert set(classify_symbol("NVDA").clusters) == {"Semiconductors", "MegaCapTech"}
 
 
-@pytest.mark.parametrize(
-    "conviction, expected_shares",
-    [(7, 50), (8, 70), (9, 80), (10, 100)],
-)
-def test_position_size_by_conviction(risk, conviction, expected_shares):
-    # $100,000 portfolio, $100 share price.
-    assert risk.calculate_position_size(100_000, 100.0, conviction) == expected_shares
+@dataclass
+class Bar:
+    high: int
+    low: int
+    close: int
 
 
-def test_position_size_for_unlisted_conviction_uses_the_smallest_tier(risk):
-    assert risk.calculate_position_size(100_000, 100.0, 5) == 50
-    assert risk.calculate_position_size(100_000, 100.0, 11) == 50
+def test_atr_uses_prior_close_then_wilder_smoothing():
+    first = Bar(101, 99, 100)
+    normal = Bar(104, 102, 103)
+    bars = [first, *([normal] * 14), Bar(118, 115, 117)]
+    seeded = (Decimal(4) + Decimal(2) * 13) / 14
+    assert atr14(bars) == (seeded * 13 + 15) / 14
+    assert atr14(bars[:14]) is None
+    assert atr14([*bars, Bar(101, 99, 1)]) is None
 
 
-@pytest.mark.parametrize("portfolio_value, price", [(100_000, 0), (100_000, -5), (0, 100), (-1, 100)])
-def test_position_size_is_zero_for_bad_inputs(risk, portfolio_value, price):
-    assert risk.calculate_position_size(portfolio_value, price, 9) == 0
+@pytest.mark.parametrize(("atr", "expected", "fallback"), [
+    (None, "0.07", True), (Decimal("NaN"), "0.07", True),
+    (Decimal(1), "0.07", False), (Decimal(4), "0.10", False),
+    (Decimal(8), "0.12", False),
+])
+def test_atr_stop_distance_widens_with_usable_bars(atr, expected, fallback):
+    assert stop_fraction(Decimal(100), atr) == StopDistance(Decimal(expected), fallback)
 
 
-def test_position_size_rounds_down_to_whole_shares(risk):
-    assert risk.calculate_position_size(100_000, 333.0, 7) == 15  # $5,000 / $333
+def test_fill_stop_uses_conservative_valid_tick():
+    assert stop_price(Decimal("100.06"), StopDistance(Decimal("0.12"), False)) == Decimal("88.06")
 
 
-# ── Stop-loss ─────────────────────────────────────────────────────────────
+def test_drawdown_pauses_throttles_and_automatically_recovers():
+    state = update_drawdown(DrawdownState(), "2026-10-01", Decimal(100))
+    assert not state.alert and not state.paused
+    state = update_drawdown(state, "2026-10-02", Decimal(90))
+    assert state.alert and not state.throttled
+    state = update_drawdown(state, "2026-10-05", Decimal(85))
+    assert state.throttled and not state.paused
+    state = update_drawdown(state, "2026-10-06", Decimal(80))
+    assert state.paused
+    for day in ("07", "08"):
+        state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
+    assert state.recovery_closes == 2
+    state = update_drawdown(state, "2026-10-09", Decimal(85))
+    assert state.recovery_closes == 0
+    for day in ("12", "13", "14", "15"):
+        state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
+        assert state.paused
+    assert update_drawdown(state, "2026-10-15", Decimal(90)) == state
+    state = update_drawdown(state, "2026-10-16", Decimal(86))
+    assert state.alert and not state.throttled and not state.paused
+    state = update_drawdown(state, "2026-10-19", Decimal(101))
+    assert state.high_water == 101 and not state.alert
 
 
-@pytest.mark.parametrize(
-    "beta, expected_stop",
-    [
-        (None, 93.0),   # no beta: minimum stop distance (7%)
-        (0.0, 93.0),    # non-positive beta treated as missing
-        (1.0, 93.0),    # 5% would be below the floor, clamped to 7%
-        (2.0, 90.0),    # 10%
-        (3.0, 88.0),    # 15% clamped to the 12% ceiling
-    ],
-)
-def test_stop_loss_price(risk, beta, expected_stop):
-    assert risk.get_stop_loss_price(100.0, beta) == expected_stop
+def test_drawdown_uses_returns_not_deposits_or_withdrawals_across_restarts():
+    state = update_drawdown(DrawdownState(), "2026-11-23", Decimal(100),
+                            net_external_flow=Decimal(100))
+    # The first close is the cut-over baseline even if the account was funded then.
+    assert state.high_water == 100 and not state.drawdown
+    state = update_drawdown(state, "2026-11-24", Decimal(140), net_external_flow=Decimal(40))
+    assert state.last_equity == 140 and state.high_water == 100
+    restored = DrawdownState.from_record(state.to_record())
+    assert restored == state
+    assert update_drawdown(restored, "2026-11-24", Decimal(140), net_external_flow=Decimal(40)) == state
+
+    withdrawal = update_drawdown(restored, "2026-11-25", Decimal(90), net_external_flow=Decimal(-50))
+    assert withdrawal.high_water == 100 and not withdrawal.drawdown and not withdrawal.paused
+    gain = update_drawdown(withdrawal, "2026-11-27", Decimal(99))
+    assert gain.high_water == 110 and not gain.drawdown
+    # A real 20% loss still pauses entries even though a cash deposit raised raw equity.
+    loss = update_drawdown(gain, "2026-11-30", Decimal("109.20"), net_external_flow=Decimal(30))
+    assert loss.drawdown == Decimal("0.20") and loss.paused
 
 
-def test_stop_loss_trigger(risk):
-    assert risk.should_stop_loss(100.0, 93.0) is True
-    assert risk.should_stop_loss(100.0, 93.01) is False
+def test_legacy_drawdown_record_uses_implied_raw_equity_for_first_adjusted_interval():
+    old = DrawdownState(Decimal(100), Decimal("0.10"), last_session="2026-11-23")
+    assert old.to_record()["version"] == 1
+    restored = DrawdownState.from_record(old.to_record())
+    next_close = update_drawdown(restored, "2026-11-24", Decimal(60), net_external_flow=Decimal(-30))
+    assert next_close.high_water == 100 and next_close.drawdown == Decimal("0.10")
+    assert next_close.to_record()["version"] == 2 and next_close.last_equity == 60
 
 
-# ── Whether a buy is allowed ──────────────────────────────────────────────
+def test_missing_expected_close_breaks_drawdown_recovery_streak():
+    state = DrawdownState(Decimal(100), Decimal(".14"), True, 4, "2026-10-14")
+    result = update_drawdown(state, "2026-10-16", Decimal(86), previous_session="2026-10-15")
+    assert result.paused and result.recovery_closes == 1
 
 
-def test_new_position_allowed_in_an_empty_portfolio(risk):
-    allowed, reason = risk.can_open_position(make_state([]), "XYZ", "Utilities", 100.0, 8)
-    assert (allowed, reason) == (True, "OK")
+def test_drawdown_state_roundtrip_never_resets_a_corrupt_latch_as_cutover():
+    assert DrawdownState.from_record(None) == DrawdownState()
+    state = DrawdownState(Decimal(100), Decimal(".14"), True, 3, "2026-10-14")
+    assert DrawdownState.from_record(state.to_record()) == state
+    with pytest.raises(ValueError):
+        DrawdownState.from_record({**state.to_record(), "paused": "false"})
+    with pytest.raises(ValueError):
+        DrawdownState.from_record({**state.to_record(), "last_session": "bad"})
 
 
-def test_per_symbol_cap_blocks_adding_to_an_oversized_position(risk):
-    state = make_state([make_position("XYZ", 20_000)])  # 20% of the portfolio
-    allowed, reason = risk.can_open_position(state, "XYZ", "Utilities", 100.0, 10)
-    assert allowed is False
-    assert "hard cap" in reason
-
-
-def test_no_add_once_a_position_is_near_its_conviction_target(risk):
-    state = make_state([make_position("XYZ", 4_600)])  # 4.6%; target for conviction 7 is 5%
-    allowed, _ = risk.can_open_position(state, "XYZ", "Utilities", 100.0, 7)
-    assert allowed is False
-
-
-def test_add_allowed_while_a_position_is_well_below_target(risk):
-    state = make_state([make_position("XYZ", 2_000)])  # 2%
-    allowed, reason = risk.can_open_position(state, "XYZ", "Utilities", 100.0, 7)
-    assert (allowed, reason) == (True, "ADD_TO_EXISTING")
-
-
-def test_position_count_limit_blocks_new_positions(risk):
-    held = [make_position(f"S{i:02d}", 1_000) for i in range(Config.MAX_POSITIONS)]
-    allowed, reason = risk.can_open_position(make_state(held), "NEW", "Utilities", 100.0, 8)
-    assert allowed is False
-    assert "Max positions" in reason
-
-
-def test_sector_cap_blocks_a_new_position_in_a_full_sector(risk):
-    held = [make_position(f"U{i}", 9_000, sector="Utilities") for i in range(5)]  # 45%
-    allowed, reason = risk.can_open_position(make_state(held), "UNEW", "Utilities", 100.0, 8)
-    assert allowed is False
-    assert "Sector" in reason
-
-
-def test_cluster_cap_blocks_a_new_position_in_a_full_cluster(risk):
-    semis = ["AMD", "AVGO", "TSM", "ASML", "MU"]
-    held = [make_position(s, 10_000, sector="Unknown") for s in semis]  # 50% in one cluster
-    # Sector passed as "Unknown" and symbols mapped to Technology by SECTOR_MAP,
-    # so give the candidate a different sector to isolate the cluster rule.
-    allowed, reason = risk.can_open_position(make_state(held), "INTC", "Other", 100.0, 8)
-    assert allowed is False
-    assert "Cluster" in reason
-
-
-def test_buy_blocked_when_cash_cannot_cover_one_share(risk):
-    state = PortfolioState(positions=[make_position("AAA", 10_000)], cash=50.0)
-    allowed, reason = risk.can_open_position(state, "XYZ", "Utilities", 100.0, 8)
-    assert allowed is False
-    assert "Insufficient cash" in reason
-
-
-def test_buy_blocked_when_portfolio_value_is_zero(risk):
-    allowed, _ = risk.can_open_position(PortfolioState(positions=[], cash=0.0), "XYZ", "Utilities", 100.0, 8)
-    assert allowed is False
+def test_shadow_stops_skip_entry_session_and_use_gap_or_stop_level():
+    day1, day2, day3, day4 = (date(2026, 11, day) for day in (16, 17, 18, 19))
+    anchor = ShadowEntryAnchor("test", "ALFA", day1, Decimal(100), Decimal(50),
+                               Decimal(".09"), Decimal(91))
+    bars = (
+        ShadowDailyBar(day1, 87, 101, 80, 100),
+        ShadowDailyBar(day2, 96, 99, 92, 94),
+        ShadowDailyBar(day3, 89, 100, 88, 95),
+        ShadowDailyBar(day4, 96, 106, 95, 105),
+    )
+    results = {result.variant: result for result in shadow_stop_results(anchor, bars)}
+    assert [(results[name].exit_session, results[name].price) for name in
+            ("fixed_7", "fixed_10", "fixed_12", "atr_placed", "no_stop")] == [
+        (day2, Decimal(93)), (day3, Decimal(89)), (day3, Decimal(88)),
+        (day3, Decimal(89)), (None, Decimal(105)),
+    ]
+    assert results["fixed_7"].pnl == -350
+    assert results["atr_placed"].return_fraction == Decimal("-.11")
+    assert results["no_stop"].through_session == day4 and not results["no_stop"].stopped
+    assert not shadow_stop_results(anchor, bars[:1])
+    assert not shadow_stop_results(anchor, (*bars, ShadowDailyBar(day2, 96, 99, 90, 94)))

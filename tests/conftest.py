@@ -29,6 +29,10 @@ _OVERRIDES = (
     "TIPRANKS_MIN_SMART_SCORE",
     "TIPRANKS_UNIVERSE_LIMIT",
     "STOCK_LOG_LEVEL",
+    "OPTIONS_MODE",
+    "STOCK_AGENT_LIVE_CONFIRMED",
+    "STOCK_TRADING_PAUSED",
+    "RISK_PAUSE_NEW_BUYS",
 )
 # Credentials are blanked so no test can reach a real account by accident.
 _CREDENTIALS = (
@@ -41,6 +45,11 @@ _CREDENTIALS = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "DISCORD_BOT_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "TIPRANKS_API_KEY",
+    "TIPRANKS_API_TOKEN",
+    "TIPRANKS_EMAIL",
+    "TIPRANKS_PASSWORD",
 )
 
 for _name in _OVERRIDES:
@@ -50,3 +59,38 @@ for _name in _CREDENTIALS:
 
 # State files go to a throwaway directory, never to data/stock_agent.
 os.environ["STOCK_DATA_DIR"] = tempfile.mkdtemp(prefix="stock_agent_tests_")
+
+
+# ---------------------------------------------------------------- fakes
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _empty_owner_focus(monkeypatch, tmp_path_factory):
+    """Tests never depend on the owner's real watch list.
+
+    `stock_agent/owner_focus.json` changes whenever the owner updates it, so
+    every test starts from an empty list and passes its own symbols in.
+    """
+    from stock_agent import research_focus
+
+    empty = tmp_path_factory.mktemp("focus") / "owner_focus.json"
+    empty.write_text("[]")
+    monkeypatch.setitem(research_focus.load_focus.__kwdefaults__, "path", empty)
+
+
+@pytest.fixture
+def world(request, monkeypatch, tmp_path):
+    """The simulated outside world (clock, broker, providers), installed.
+
+    Starts Monday 23 Nov 2026 09:00 ET, or at the aware datetime given by
+    `@pytest.mark.world_start(dt)`. Every HTTP request the code makes is
+    answered by a fake; state files go to this test's own tmp_path.
+    """
+    from tests.fakes.world import FakeWorld
+
+    mark = request.node.get_closest_marker("world_start")
+    w = FakeWorld(start=mark.args[0]) if mark else FakeWorld()
+    w.install(monkeypatch, data_dir=tmp_path)
+    yield w
+    w.assert_no_unexpected_hosts()

@@ -1,0 +1,5 @@
+# Direct runtime dependencies for stock_agent (Python 3.12+, 1 GB RAM droplet).
+# Pin exact versions (including transitive dependencies) in requirements.txt.
+httpx>=0.28,<1.0
+pydantic>=2.12,<3.0
+python-dotenv>=1.2,<2.0

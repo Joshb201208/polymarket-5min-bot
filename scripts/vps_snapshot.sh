@@ -119,7 +119,7 @@ else
 fi
 
 # ── Bot state files ───────────────────────────────────────────────────────
-DATA_DIR="$BOT_DIR/data/stock_agent"
+DATA_DIR="${STOCK_DATA_DIR:-$BOT_DIR/data/stock_agent}"
 if [ -d "$DATA_DIR" ]; then
   run state/listing.txt bash -c "ls -la --time-style=long-iso -R '$DATA_DIR' | head -n 400"
   run state/sizes.txt du -ah "$DATA_DIR"
@@ -129,8 +129,25 @@ if [ -d "$DATA_DIR" ]; then
 else
   echo "Data directory not found: $DATA_DIR" > "$OUT/state/listing.txt"
 fi
+python3 "$SCRIPT_DIR/snapshot_ledger.py" "${STATE_DB_PATH:-$DATA_DIR/state.db}" \
+  > "$OUT/state/ledger-summary.json" 2> "$OUT/state/ledger-summary.errors"
+for name in runtime-health.json deploy-status.json; do
+  if [ -r "$BOT_DIR/data/$name" ]; then
+    cp -p "$BOT_DIR/data/$name" "$OUT/deploy/$name"
+  fi
+done
 
 # ── Logs ──────────────────────────────────────────────────────────────────
+mkdir -p "$OUT/logs/files"
+copied_logs=0
+for log in "$DATA_DIR/logs/stock_agent.log" "$DATA_DIR/logs"/stock_agent.log.[0-9]*; do
+  [ -f "$log" ] && [ ! -L "$log" ] || continue
+  name="${log##*/}"
+  [[ "$name" =~ ^stock_agent\.log(\.[0-9]+)?$ ]] || continue
+  tail -c 1048576 -- "$log" > "$OUT/logs/files/$name.tail"
+  copied_logs=$((copied_logs + 1))
+  [ "$copied_logs" -lt 12 ] || break
+done
 if command -v journalctl >/dev/null 2>&1; then
   journalctl -u "$SERVICE" --since "$LOG_DAYS days ago" --no-pager -o short-iso \
     2>/dev/null | tail -n 250000 > "$OUT/logs/journal.log"
@@ -347,8 +364,8 @@ redaction-report.txt  what was scrubbed, and the leak check result
 system/               memory, disk, uptime, processes
 service/              systemd status, restart count, start/stop history
 deploy/               git state on the server, cron, auto-update log, pip freeze
-state/                the bot's JSON state files and their sizes
-logs/                 the service journal (last $LOG_DAYS days) and an error digest
+state/                bounded read-only ledger summary, JSON state files and sizes
+logs/                 service journal (last $LOG_DAYS days), rotated file-log tails and error digest
 network/              listening ports, firewall, nginx, ssh settings
 alpaca/               read-only account report: summary.md plus raw JSON
 EOF

@@ -1,49 +1,47 @@
 import asyncio
+import inspect
 import logging
-from datetime import datetime, time, timedelta, timezone
+import sqlite3
+from collections.abc import Mapping
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
+from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
+from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
-from stock_agent.data_feed import DataFeed
-from stock_agent.executor import Executor
-from stock_agent.models import (
-    CompanyData,
-    DailySummary,
-    Position,
-    Signal,
-    Thesis,
-    Trade,
+from stock_agent.execution import ExecutionEngine
+from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsService
+from stock_agent.heartbeat import HeartbeatClient
+from stock_agent.health import ProviderHealthRegistry
+from stock_agent.http_safety import DataHttpClient
+from stock_agent.ledger import JobStatus, NewIntent
+from stock_agent.llm_client import LLMClient
+from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.news_service import NewsService
+from stock_agent.options_book import KvOptionsStore, import_legacy_options
+from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
+from stock_agent.performance import DEPOSIT_KINDS, close_session
+from stock_agent.price_service import PriceService
+from stock_agent.research_gate import ResearchGate
+from stock_agent.research_focus import focus_symbols
+from stock_agent.research_health import ResearchInputHealth
+from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline
+from stock_agent.research_sources import ResearchSources
+from stock_agent.research_store import ResearchStore
+from stock_agent.risk_manager import (
+    DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, TradeKind, update_drawdown,
 )
-from stock_agent.portfolio import Portfolio
-from stock_agent.risk_manager import RiskManager
-from stock_agent.screener import Screener
+from stock_agent.runtime_status import RuntimeStatus, notify_systemd
+from stock_agent.state_boot import build_ledger, prepare_ledger
+from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
-from stock_agent.macro_monitor import MacroMonitor, REGIME_AGGRESSIVE_DEPLOY, REGIME_DIP_OPPORTUNITY, REGIME_CAUTIOUS
-from stock_agent.options_data import OptionsDataFeed
-from stock_agent.options_engine import OptionsEngine
-from stock_agent.options_executor import OptionsExecutor
-from stock_agent.options_portfolio import OptionsPortfolio
-from stock_agent.options_models import OptionSide, OptionOrderType
-from stock_agent.tipranks_client import (
-    build_tipranks_lookup,
-    adjust_conviction_with_tipranks,
-    format_tipranks_context,
-    format_tipranks_telegram_clause,
-)
-from stock_agent.news_feed import build_news_lookup, format_news_context
-from stock_agent.sentiment import (
-    build_sentiment_lookup,
-    format_sentiment_context,
-    adjust_conviction_with_sentiment,
-)
-from stock_agent.analyst_trends import (
-    build_analyst_lookup,
-    format_analyst_context,
-    adjust_conviction_with_analysts,
-)
-from stock_agent.research_notes import load_notes, format_research_notes_context
+from stock_agent.macro_monitor import MacroMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +55,11 @@ try:
 except KeyError:
     SGT = ZoneInfo("Singapore")
 
-MARKET_OPEN = time(9, 30)
-MARKET_CLOSE = time(16, 0)
+TICK_SECONDS = 30
+NEWS_SECONDS = 180
+MAX_JOB_ATTEMPTS = 3
+EXECUTION_DRAIN_SECONDS = 70
+SHUTDOWN_DRAIN_SECONDS = 75
 
 
 def _now_et() -> datetime:
@@ -70,29 +71,120 @@ def _now_utc() -> datetime:
 
 
 class StockAgentScheduler:
-    def __init__(self):
-        self.config = Config()
-        self.data_feed = DataFeed(self.config)
-        self.analyst = Analyst(self.config)
-        self.screener = Screener(self.config)
-        self.portfolio = Portfolio(self.config)
-        self.risk_manager = RiskManager(self.config)
-        self.executor = Executor(self.config)
-        self.telegram = TelegramReporter(self.config)
-        self.discord = DiscordReporter(self.config)
-        self.macro = MacroMonitor(self.config)
-        self.options_data = OptionsDataFeed(self.config)
-        self.options_engine = OptionsEngine(self.config, self.macro, self.options_data)
-        self.options_executor = OptionsExecutor(self.config)
-        self.options_portfolio = OptionsPortfolio(self.config, self.options_data)
+    def __init__(self, config: Config | None = None, *, services: SimpleNamespace | None = None):
+        self.config = config if config is not None else Config()
+        def service(name, factory):
+            supplied = getattr(services, name, None)
+            return supplied if supplied is not None else factory()
+
+        self.broker = service("broker", lambda: AlpacaClient(config=self.config))
+        self.ledger = service("ledger", lambda: build_ledger(
+            self.config.DATA_DIR, broker=self.broker, alert=self._queue_ledger_alert, clock=_now_utc,
+        ))
+        self.store = self.ledger.store
+        self.journal = self.ledger.journal
+        self.discord = service("discord", lambda: DiscordReporter(self.config))
+        self.telegram = service("telegram", lambda: TelegramReporter(self.config))
+        self.alerts = service("alerts", lambda: AlertService(
+            self.config, discord=self.discord, telegram=self.telegram, journal=self.journal, clock=_now_utc,
+        ))
+        if isinstance(self.alerts, AlertService) and hasattr(self.ledger, "set_exit_fill_handler"):
+            self.ledger.set_exit_fill_handler(self.alerts.alert_stop_filled)   # REQ-061: stop fills -> #trades
+        self.heartbeat = service("heartbeat", lambda: HeartbeatClient(self.config, clock=_now_utc))
+        self.http = service("http", lambda: DataHttpClient(self.config))
+        self.risk = service("risk", lambda: RiskManager(self.config))
+        self.calendar = service("calendar", lambda: MarketCalendar(
+            self.broker, self.config.DATA_DIR / "market-calendar.json", namespace=self.config.MODE,
+            now=_now_utc,
+        ))
+        self.health = service("health", lambda: ProviderHealthRegistry(
+            self.config, store=self.store, defer_load=True, now=_now_utc,
+            on_transition=getattr(self.alerts, "handle_health_transition", None),
+        ))
+        self.assets = service("assets", lambda: AssetRegistry(
+            self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
+            on_rename=self._on_asset_rename, defer_load=True,
+        ))
+        self.prices = service("prices", lambda: PriceService(
+            self.http, config=self.config, store=self.store, calendar=self.calendar,
+            assets=self.assets, report=self._provider_health, now=_now_utc,
+        ))
+        self.price_service = self.prices
+        self.health_registry = self.health
+        self._universe_symbols: tuple[str, ...] = ()
+        self.fundamentals = service("fundamentals", lambda: FundamentalsService(
+            self.http, config=self.config, health=self.health, assets=self.assets, prices=self.prices,
+            focus_symbols=self._pollable_focus, now=_now_utc, universe_size=self.config.UNIVERSE_SIZE,
+        ))
+        self.news = service("news", self._build_news_service)
+        self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
+        self.llm = service("llm", lambda: LLMClient(
+            self.config, spend=self.research_store, on_failure=self._on_research_failure, now=_now_utc,
+            health=self.health,
+        ))
+        self.analyst = service("analyst", lambda: Analyst(self.llm))
+        self.research_sources = service("research_sources", lambda: ResearchSources(
+            self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
+            cached_company=getattr(self.fundamentals, "cached_company", None),
+            fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
+        ))
+        self.research_health = service("research_health", lambda: ResearchInputHealth(
+            self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
+            research_store=self.research_store,
+        ))
+        self.research_gate = service("research_gate", lambda: ResearchGate(
+            self.ledger, self.research_health, self.config,
+        ))
+        self.research = service("research", lambda: ResearchPipeline(
+            self.config, self.ledger, self.calendar, self.analyst, self.research_store,
+            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus, alerts=self.alerts,
+        ))
+        self.capital_lock = asyncio.Lock()
+        self._asset_lock = asyncio.Lock()
+        self.engine = service("engine", lambda: ExecutionEngine(
+            self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
+            bars=self._stop_bars, controls=self._risk_controls, margin_controls=self._margin_controls,
+            market_gate=self.market_gate, config=self.config, now=_now_utc,
+            capital_lock=self.capital_lock, research_gate=self.research_gate, notifier=self.alerts,
+        ))
+        self.options_store = service("options_store", lambda: KvOptionsStore(self.store))
+        self.options = service("options", lambda: OptionsManager(
+            broker=self.broker, store=self.options_store, gate=self.research_gate, risk=self.risk,
+            snapshot=self._options_snapshot, calendar=self.calendar, market_gate=self.market_gate,
+            spot=self._option_spot, cover_short=getattr(self.engine, "cover_short", None),
+            universe=self._option_universe, risk_controls=self._risk_controls, journal=self.journal,
+            alerts=self.alerts, config=self.config, now=_now_utc,
+            capital_lock=self.capital_lock, defer_load=True,
+        ))
+        if isinstance(self.engine, ExecutionEngine):
+            self.engine.options = self.options
+        self.runtime = service("runtime", lambda: RuntimeStatus.for_data_dir(self.config.DATA_DIR))
+        self.pause_file: Path = service("pause_file", lambda: self.config.DATA_DIR / "pause-trading")
+        self._stop_event = asyncio.Event()
+        self._normalised = False
+        self._engine_resumed = False
+        self._state_ready = False
+        self._reconciled = False
+        self._needs_rebuild = False
+        self._last_news_at: datetime | None = None
+        self._last_reconcile_at: datetime | None = None
+        self._last_close_report = None
+        self._job_tasks: dict[str, asyncio.Task] = {}
+        self._order_task: asyncio.Task | None = None
+        self._options_task: asyncio.Task | None = None
+        self._telemetry_task: asyncio.Task | None = None
+        self._last_issue: dict[str, datetime] = {}
+        self._pending_ledger_alerts: set[asyncio.Task] = set()
+        self.macro = service("macro", lambda: MacroMonitor(
+            self.config, prices=self.prices, store=self.store, defer_load=True,
+            alert=self._alert, report=self._provider_health, now=_now_utc,
+        ))
         self._shutdown = False
         self._last_monitor_time: datetime | None = None
         self._daily_summary_sent_today: str | None = None
         self._daily_prescan_done_today: str | None = None
         self._midweek_analysis_done_this_week: str | None = None
         self._earnings_check_done_today: str | None = None
-        self._first_run_done = False
-        self._pending_signals: list[Signal] = []
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
         self._options_scan_done_today: str | None = None
@@ -103,221 +195,1031 @@ class StockAgentScheduler:
         self._event_scan_cooldown: datetime | None = None  # Don’t fire twice in 30 min
 
     def shutdown(self):
-        logger.info("Shutdown requested")
-        self._shutdown = True
+        if not self._shutdown:
+            logger.info("Shutdown requested")
+            self._shutdown = True
+            self._stop_event.set()
+
+    async def _alert(self, severity: str, title: str, body: str, *, key: str | None = None):
+        now = _now_utc()
+        if key and key in self._last_issue and now - self._last_issue[key] < timedelta(minutes=30):
+            return
+        if key:
+            self._last_issue[key] = now
+        if self.alerts is not None:
+            try:
+                routing = {"channel_key": "announcements"} if (
+                    key == "normalise-plan" and isinstance(self.alerts, AlertService)
+                ) else {}
+                result = self.alerts.alert(severity, title, body, key=key, **routing)
+                if inspect.isawaitable(result):
+                    async with asyncio.timeout(2):
+                        await result
+            except Exception:
+                logger.warning("Could not queue alert: %s", title)
+        else:
+            logger.log(logging.WARNING if severity != "info" else logging.INFO, "%s: %s", title, body)
+
+    def _queue_ledger_alert(self, severity: str, title: str, body: str, *, key: str | None = None) -> None:
+        if isinstance(self.alerts, AlertService):
+            self.alerts.alert(severity, title, body, key=key)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("Ledger alert outside scheduler loop: %s", title)
+            return
+        task = loop.create_task(self._alert(severity, title, body, key=key))
+        self._pending_ledger_alerts.add(task)
+        task.add_done_callback(self._pending_ledger_alerts.discard)
+
+    async def _report_exception(self, where: str, exc: Exception, *, critical: bool = False) -> None:
+        if isinstance(self.alerts, AlertService):
+            self.alerts.alert_unhandled_exception(where, type(exc).__name__, critical=critical)
+        else:
+            await self._alert("critical" if critical else "warning", f"{where} failed", type(exc).__name__,
+                              key=f"exception:{where}")
+
+    def _entries_enabled(self) -> bool:
+        return not self._entry_safety_locks()
+
+    def _entry_safety_locks(self) -> dict[str, tuple[str, str]]:
+        if self._shutdown:
+            return {"shutdown": ("service shutdown", "the service restarts and reaches readiness")}
+        locks = {}
+        if not self._normalised:
+            locks["first_run_normalise"] = (
+                "first-run account cleanup incomplete",
+                "the bot finishes corrective orders, verifies broker no-shorting and reconciles cleanly",
+            )
+        if not self._reconciled:
+            locks["broker_reconcile"] = (
+                "broker reconciliation not clean",
+                "a fresh read of the account, positions, orders and activities resolves the discrepancies",
+            )
+        if self._manually_paused():
+            locks["operator_pause"] = (
+                "operator entry pause",
+                "every active pause-trading file is removed and any configured pause is turned off",
+            )
+        try:
+            if block := self.ledger.trading_block():
+                locks["ledger_trading_block"] = (
+                    f"ledger trading block: {block}",
+                    "a clean broker reconcile or rebuild clears the ledger block",
+                )
+            if self._drawdown_state().paused:
+                pct = getattr(self.config, "DRAWDOWN_THROTTLE_PCT", .15)
+                closes = getattr(self.config, "DRAWDOWN_RECOVERY_SESSIONS", 5)
+                locks["drawdown_pause"] = (
+                    "drawdown halt",
+                    f"drawdown is below {pct:.0%} for {closes} consecutive trusted closes",
+                )
+        except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
+            locks["risk_state_unavailable"] = (
+                "required ledger or risk state unavailable",
+                "the risk state is readable and valid and the broker reconciles cleanly",
+            )
+        return locks
+
+    def get_entry_locks(self) -> list[dict[str, str]]:
+        locks = self._entry_safety_locks()
+        try:
+            status = getattr(self.health, "status", None)
+            news = status("news", "poll") if status is not None else None
+            if news is not None and news.state in {"unhealthy", "plan_blocked", "disabled"}:
+                locks["news_health"] = (
+                    "required news coverage unavailable",
+                    "a successful fresh news poll covers the candidate",
+                )
+            check_llm = getattr(self.llm, "is_healthy", None)
+            if check_llm is not None and not check_llm():
+                locks["llm_health"] = (
+                    "no usable configured model route",
+                    "at least one valid model route recovers or its cooldown ends",
+                )
+            snapshot = self.ledger.last_snapshot()
+            flags = getattr(snapshot, "account_flags", {})
+            if any(flags.get(flag) is True for flag in ("account_blocked", "trading_blocked", "trade_suspended_by_user")):
+                locks["broker_account_block"] = (
+                    "broker account has a trading restriction",
+                    "the broker removes the restriction and a fresh account reconcile confirms it",
+                )
+            account_status = flags.get("status")
+            if account_status and str(account_status).lower() != "active":
+                locks["broker_account_inactive"] = (
+                    "broker account is not active",
+                    "the broker reports ACTIVE on a fresh account reconcile",
+                )
+            if snapshot is not None and abs(_now_utc() - snapshot.as_of) <= timedelta(seconds=120):
+                margin = self.risk.margin_status(snapshot)
+                target = Decimal(str(self.config.MARGIN_MIN_EXCESS_PCT))
+                if margin is not None and margin.margin_call:
+                    locks["margin_call"] = (
+                        "broker reports a margin call",
+                        "a fresh broker reconcile confirms the margin call is cleared",
+                    )
+                if margin is not None and margin.excess_pct < target:
+                    locks["margin_buffer"] = (
+                        f"margin excess {margin.excess_pct:.1%} is below the entry minimum {target:.0%}",
+                        f"a fresh broker book and projected order both meet the {target:.0%} margin buffer",
+                    )
+                unpriced = [holding.symbol for holding in snapshot.holdings
+                            if holding.qty and (not holding.price_ok or holding.price is None or holding.price <= 0)]
+                if unpriced:
+                    locks["unpriced_stock"] = (
+                        f"stock price missing or invalid for {', '.join(unpriced)}",
+                        "a fresh broker reconcile supplies a valid mark or confirms the position is closed",
+                    )
+        except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
+            locks.setdefault("risk_state_unavailable", (
+                "entry health could not be verified", "health state is readable and required inputs are healthy",
+            ))
+        return [{"code": code, "lock": label, "clears_when": clears} for code, (label, clears) in locks.items()]
+
+    async def _alert_entry_locks(self) -> None:
+        locks = [lock for lock in self.get_entry_locks() if lock["code"] != "shutdown"]
+        if not locks:
+            return
+        notify = getattr(self.alerts, "alert_entries_locked", None)
+        if notify is not None:
+            try:
+                notify(locks, session_date=_now_et().date())
+                return
+            except Exception:
+                logger.warning("Could not queue structured entry-lock alert")
+        for lock in locks:
+            await self._alert("warning", f"Entries locked: {lock['lock']}",
+                              f"Clears when {lock['clears_when']}.", key=f"entry-lock:{lock['code']}")
+
+    def _risk_controls(self) -> RiskControls:
+        commitments = getattr(self.options, "risk_commitments", None)
+        return RiskControls(pause_new_buys=self._manually_paused(),
+                            drawdown=self._drawdown_state(),
+                            option_commitments=commitments() if commitments is not None else ())
+
+    def _margin_controls(self, snapshot) -> RiskControls:
+        convictions = {}
+        for holding in snapshot.holdings:
+            if holding.qty <= 0:
+                continue
+            thesis = self.ledger.current_thesis(
+                holding.symbol, max_age=timedelta(hours=self.config.RESEARCH_THESIS_MAX_AGE_H),
+            )
+            if (thesis is None or not thesis.actionable) and holding.meta is not None:
+                thesis = self.ledger.last_filled_thesis(holding.meta.position_id)
+            if thesis is not None and thesis.actionable:
+                grade = thesis.payload.get("effective_conviction")
+                if type(grade) is int and 1 <= grade <= 10:
+                    convictions[holding.symbol] = grade
+        commitments = getattr(self.options, "risk_commitments", None)
+        return RiskControls(
+            option_commitments=commitments() if commitments is not None else (),
+            holding_convictions=convictions,
+        )
+
+    async def _evaluate_margin_guard(self, snapshot, now: datetime, *, at_close: bool = False) -> None:
+        try:
+            await self._queue_margin_trim(snapshot, now, at_close=at_close)
+        except Exception as exc:
+            # Margin-state failure must not prevent stops or first-run repairs.
+            await self._report_exception("Margin guard", exc, critical=True)
+
+    async def _queue_margin_trim(self, snapshot, now: datetime, *, at_close: bool) -> None:
+        # Reconciliation can mark the book indicative solely due to an
+        # unrelated instrument mark. The guard uses broker account figures;
+        # the planner independently excludes unpriced stock from its sells.
+        if snapshot is None or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=120):
+            return
+        status = self.risk.margin_status(snapshot)
+        if status is None:
+            return
+        key = "a13.margin_trim_episode"
+        record = self.ledger.risk_state_get(key, {})
+        episode = record.get("opened_at")
+        target = Decimal(str(self.config.MARGIN_MIN_EXCESS_PCT))
+        if status.excess_pct >= target and not status.margin_call:
+            if episode:
+                self.ledger.risk_state_set(key, {})
+            return
+        if not episode and not status.needs_trim:
+            return
+        if not episode:
+            episode = snapshot.as_of.isoformat()
+            self.ledger.risk_state_set(key, {"opened_at": episode})
+
+        session = self.calendar.next_session(now.date()) if at_close else self.calendar.session_on(now.date())
+        queued = False
+        self.ledger.expire_intents(_now_utc())
+        existing = self.ledger.list_intents(origin="margin_buffer")
+        latest_execution = max(
+            (row.updated_at or row.created_at for row in existing if row.broker_order_id),
+            default=None,
+        )
+        if (session is not None and not self.ledger.trading_block()
+                and (latest_execution is None or snapshot.as_of > latest_execution)
+                and not any(not row.terminal for row in existing)):
+            plans = self.risk.plan_margin_trim(snapshot, controls=self._margin_controls(snapshot), force=True)
+            for plan in plans:
+                if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
+                    continue
+                # One live leg at a time. With unchanged holdings, avoid
+                # hammering a failed order during the same five-minute bucket.
+                slot = int(max(now, session.opens_at).timestamp()) // 300
+                event = f"{episode}:{session.date}:{holding.qty}:{slot}"
+                intents = self._trim_intents(
+                    snapshot, (plan,), "margin_buffer", event, session, eligible_at=None if at_close else now,
+                    margin_episode=episode,
+                )
+                if not intents or any(row.dedupe_key == intents[0].dedupe_key for row in existing):
+                    break
+                self.ledger.enqueue_intents(intents, job="margin_guard")
+                if not at_close:
+                    self._last_monitor_time = None
+                queued = True
+                break
+        minimum = f"{target:.0%}"
+        context = "Broker reports a margin call. " if status.margin_call else ""
+        when = "the next regular open plus five minutes" if at_close else "the current session"
+        action = (f"A trim is queued for {when}, subject to revalidation." if queued else
+                  "The guard will re-evaluate and queue eligible shares; any pending trim is left in place.")
+        await self._alert(
+            "critical", "Margin buffer breached",
+            f"{context}Margin excess is {status.excess_pct:.1%} of equity. {action} "
+            f"The trim episode clears at or above the required {minimum} buffer once any margin call clears.",
+            key=f"margin-buffer:{episode}",
+        )
+
+    def _drawdown_state(self) -> DrawdownState:
+        return DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY), config=self.config)
+
+    def _manually_paused(self) -> bool:
+        if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
+            return True
+        if isinstance(self.runtime, RuntimeStatus) and self.runtime.path.with_name("pause-trading").exists():
+            return True
+        configured = getattr(self.config, "is_trading_paused", None)
+        return bool(configured is not None and configured(self.config.DATA_DIR))
+
+    async def _on_research_failure(self, error) -> None:
+        await self._alert("warning", "Research provider unavailable", f"{error.provider}: {error.kind}",
+                          key=f"research-provider:{error.provider}:{error.kind}")
+
+    def _provider_health(self, provider: str, capability: str, ok: bool, error: str | None) -> None:
+        report = getattr(self.health, "report", None)
+        if report is not None:
+            report(provider, capability, ok, error)
+
+    async def _on_asset_rename(self, event: SymbolRenameEvent) -> None:
+        self.ledger.register_symbol_alias(event.old_symbol, event.new_symbol, source="asset_registry",
+                                          effective=event.process_date)
+        await self._alert(
+            "warning", "Broker confirmed a symbol change",
+            f"{event.old_symbol} now trades as {event.new_symbol}; a fresh thesis is needed for new entries.",
+            key=f"symbol-rename:{event.old_symbol}:{event.new_symbol}:{event.process_date}",
+        )
+
+    def _tracked_symbols(self) -> tuple[str, ...]:
+        current = self.ledger.last_snapshot()
+        held = (position.symbol for position in current.holdings) if current else ()
+        catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
+        return tuple(dict.fromkeys([
+            *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
+            *self._universe_symbols, *catalogue,
+        ]))
+
+    def _resolve_symbols(self, symbols) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            resolved for symbol in symbols if (resolved := self.assets.resolve_symbol(symbol))
+        ))
+
+    def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
+
+    def _build_news_service(self) -> NewsService:
+        return NewsService(
+            self.http, config=self.config, store=self.store, defer_load=True, health=self.health,
+            assets=self.assets, enable_sec_filings=bool(getattr(self.config, "SEC_USER_AGENT", "")),
+            now=_now_utc,
+        )
+
+    async def _refresh_assets(self, *, force: bool = False):
+        if isinstance(self.assets, AssetRegistry) and not (
+            self.config.ALPACA_API_KEY and self.config.ALPACA_SECRET_KEY
+        ):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "assets_credentials_missing"})
+        async with self._asset_lock:
+            symbols = (*self._tracked_symbols(), *(m.symbol for m in self.ledger.all_open_meta()
+                                                   if m.asset_class == "us_equity"))
+            await self.assets.refresh(tuple(dict.fromkeys(symbols)), force=force)
+        if not self.assets.active_symbols():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "active_assets_unavailable"})
+        return None
+
+    async def _list_universe(self) -> tuple[str, ...]:
+        candidates = await self.fundamentals.list_universe()
+        self._universe_symbols = self._resolve_symbols((*self.config.PRIORITY_SYMBOLS, *candidates))[
+            :self.config.UNIVERSE_SIZE
+        ]
+        return self._universe_symbols
+
+    async def _stop_bars(self, symbol: str):
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if getter is None:
+            return ()
+        return (await getter([symbol], sessions=60)).get(symbol, ())
+
+    async def _shadow_bars(self, symbol, start, end):
+        return (await self.prices.get_daily_bars([symbol], start_date=start, end_date=end)).get(symbol, ())
+
+    async def _options_snapshot(self):
+        return await self.ledger.refresh("option entry recheck")
+
+    async def _option_spot(self, symbol: str):
+        quote = (await self.prices.get_quotes([symbol], purpose="order_sizing")).quotes.get(symbol)
+        return quote if quote is not None and getattr(quote, "symbol", symbol) == symbol else None
+
+    def _option_universe(self) -> tuple[str, ...]:
+        current = self.ledger.last_snapshot()
+        held = (position.symbol for position in current.holdings) if current else ()
+        candidates = self._universe_symbols or self.assets.active_symbols()[:self.config.UNIVERSE_SIZE]
+        return self._resolve_symbols((*held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS, *candidates))
+
+    async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:
+        if purpose != "protection" and self._shutdown:
+            return GateDecision(False, "shutdown in progress")
+        if purpose == "entry" and (locks := self._entry_safety_locks()):
+            return GateDecision(False, "; ".join(locks))
+        decision = await self.calendar.market_gate(purpose, rule=rule)
+        # A signal or pause can arrive while awaiting the fresh market clock.
+        if purpose == "entry" and (locks := self._entry_safety_locks()):
+            return GateDecision(False, "; ".join(locks))
+        if purpose != "protection" and self._shutdown:
+            return GateDecision(False, "shutdown in progress")
+        return decision
+
+    async def _reconcile_scheduler(self, reason: str) -> bool:
+        try:
+            async with asyncio.timeout(30):
+                await self.ledger.refresh(reason, rebuild=self._needs_rebuild or bool(self.ledger.trading_block()))
+            self._needs_rebuild = False
+            result = self.ledger.last_reconcile()
+            self._reconciled = not self.ledger.trading_block() and bool(result is None or result.get("clean"))
+            if self._engine_resumed and self._reconciled:
+                self._normalised = self.engine.normalised
+            self._last_reconcile_at = _now_utc()
+            self._provider_health("alpaca", "broker", True, None)
+        except Exception as exc:
+            self._reconciled = False
+            self._provider_health("alpaca", "broker", False, type(exc).__name__)
+            await self._alert("critical", "Broker reconciliation unavailable",
+                              f"{reason}: {type(exc).__name__}. New entries are blocked.",
+                              key="reconcile-unavailable")
+        return self._reconciled
+
+    def _publish_runtime(self):
+        self.runtime.publish(self.calendar.state, ready=self._state_ready, reconciled=self._reconciled,
+                             entries_enabled=self._entries_enabled())
+
+    async def startup(self) -> None:
+        """Prepare the single-writer ledger and resume broker lifecycle before any orders."""
+        if self._state_ready or self._shutdown:
+            return
+        mode = self.config.MODE.upper()
+        logger.info("Stock Agent starting in %s mode", mode)
+        expected = {
+            "PAPER": "https://paper-api.alpaca.markets",
+            "LIVE": "https://api.alpaca.markets",
+        }.get(mode)
+        if expected is None or self.config.ALPACA_BASE_URL.rstrip("/") != expected:
+            raise ValueError("trading mode does not match broker host")
+        boot = prepare_ledger(self.ledger, self.config.DATA_DIR, options_importer=import_legacy_options)
+        self._needs_rebuild = boot.needs_rebuild
+        if isinstance(self.health, ProviderHealthRegistry):
+            self.health.load_state()
+        if isinstance(self.assets, AssetRegistry):
+            self.assets.load_state()
+        if isinstance(self.news, NewsService):
+            self.news.load_state()
+        if isinstance(self.macro, MacroMonitor):
+            self.macro.load_state()
+        if isinstance(self.options, OptionsManager):
+            self.options.load_state()
+        if not boot.health.ok:
+            await self._alert("critical", "State needs broker rebuild",
+                              "The previous state was quarantined; new entries stay blocked until recovery.")
+        self.ledger.mark_submitting_ambiguous()
+        await self.calendar.refresh()
+        # Resolve aliases for yesterday's book before reconcile can archive an old ticker.
+        if not self._shutdown and self.ledger.all_open_meta():
+            try:
+                async with asyncio.timeout(8):
+                    await self._refresh_assets()
+            except Exception as exc:
+                await self._alert("warning", "Startup asset refresh pending", type(exc).__name__,
+                                  key="assets-startup")
+        if not self._shutdown and self.engine is not None:
+            try:
+                # Bind lost HTTP replies to broker order IDs before a reconcile
+                # can record one of our own fills as an unexplained import.
+                await self._resume_execution()
+            except TimeoutError:
+                await self._alert("warning", "Order recovery is still pending",
+                                  "The scheduler will keep retrying; new entries are blocked.",
+                                  key="order-resume")
+        if not self._shutdown and self._engine_resumed:
+            await self._reconcile_scheduler("startup")
+        if not self._shutdown and self._last_reconcile_at is not None and isinstance(self.options, OptionsManager):
+            try:
+                async with asyncio.timeout(8):
+                    await self.options.reconcile(_now_utc())
+            except Exception as exc:
+                await self._alert("warning", "Option startup reconcile pending", type(exc).__name__,
+                                  key="options-startup")
+        if self._shutdown:
+            return
+        self._state_ready = True
+        self._publish_runtime()
+        startup_at = _now_et()
+        self._schedule_job("assets_startup", startup_at.isoformat(), self._refresh_assets, timeout=30)
+        notify_systemd("READY=1\nSTATUS=Scheduler running; entry gates checked separately")
+        await self._alert("info", "Stock agent started",
+                          f"{mode}; broker reconciled: {self._reconciled}; entries enabled: {self._entries_enabled()}")
+        await self._alert_entry_locks()
 
     async def run(self):
-        """Main entry point — runs forever."""
-        logger.info("Stock Agent starting in %s mode", self.config.MODE)
+        """Validate and recover before scheduling money work; exit promptly on SIGTERM."""
         try:
-            await asyncio.gather(
-                self.telegram.send_message(
-                    f"\U0001f680 <b>Stock Agent started</b> in <code>{self.config.MODE}</code> mode"
-                ),
-                self.discord.send_startup(self.config.MODE, self.portfolio.state.cash),
-                return_exceptions=True,
-            )
-        except Exception as e:
-            logger.error("Failed to send startup message: %s", e)
-
-        # Backfill missing sectors on existing positions
-        await self._backfill_sectors()
-
-        try:
+            await self.startup()
             while not self._shutdown:
-                now = _now_et()
                 try:
-                    await self._tick(now)
-                except Exception as e:
-                    logger.exception("Error in main tick: %s", e)
+                    await self._tick_until_stopped()
+                    if self._shutdown:
+                        break
+                    self._publish_runtime()
+                    notify_systemd("WATCHDOG=1")
+                    self._schedule_notifications()
+                except Exception as exc:
+                    logger.error("Scheduler cycle failed: %s", type(exc).__name__)
+                    await self._report_exception("scheduler tick", exc)
+                if not self._shutdown:
                     try:
-                        await asyncio.gather(
-                            self.telegram.send_error_alert(str(e)),
-                            self.discord.send_error(str(e), context="Main tick"),
-                            return_exceptions=True,
-                        )
-                    except Exception:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=TICK_SECONDS)
+                    except TimeoutError:
                         pass
-
-                await asyncio.sleep(60)
+        except Exception as exc:
+            await self._report_exception("scheduler startup", exc, critical=True)
+            raise
         finally:
             await self._cleanup()
 
+    def _schedule_notifications(self) -> None:
+        if self._telemetry_task is not None:
+            if not self._telemetry_task.done():
+                return
+            if not self._telemetry_task.cancelled() and self._telemetry_task.exception() is not None:
+                logger.warning("Notification lane exited unexpectedly")
+        self._telemetry_task = asyncio.create_task(self._notification_tick(), name="stock-agent:notifications")
+
+    async def _notification_tick(self) -> None:
+        if isinstance(self.runtime, RuntimeStatus) and isinstance(self.alerts, AlertService):
+            event = self.runtime.deployment_event()
+            if event and event["at"] != self.store.kv_get("deploy.last_notified"):
+                if self.alerts.alert_deploy_event(
+                    event["event"], self.runtime.sha, reason=str(event.get("reason") or ""),
+                    rollback=event["event"] == "rollback",
+                ):
+                    self.store.kv_set("deploy.last_notified", event["at"])
+        try:
+            async with asyncio.timeout(6):
+                note = "broker sync healthy" if self._reconciled else "broker sync needs attention"
+                await self.heartbeat.tick(self.alerts, note=note)
+        except Exception as exc:
+            logger.warning("Heartbeat did not complete: %s", type(exc).__name__)
+        try:
+            async with asyncio.timeout(8):
+                await self.alerts.flush(max_budget_sec=7)
+        except Exception as exc:
+            logger.warning("Alert delivery deferred: %s", type(exc).__name__)
+
+    async def _tick_until_stopped(self) -> None:
+        tick = asyncio.create_task(self._tick(_now_et()))
+        stopping = asyncio.create_task(self._stop_event.wait())
+        try:
+            done, _ = await asyncio.wait({tick, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if tick in done:
+                tick.result()
+        finally:
+            # This coordinator only refreshes reads and launches owned, detached work.
+            # The execution lanes are not cancelled here.
+            for pending in (tick, stopping):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(tick, stopping, return_exceptions=True)
+
     async def _tick(self, now_et: datetime):
-        """Single tick of the main loop."""
-        # ── First run: execute any pending signals from pre-market scan ──
-        if not self._first_run_done:
-            self._first_run_done = True
-            if self._pending_signals:
-                logger.info("Executing %d pending signals from pre-market scan", len(self._pending_signals))
-                await self._execute_signals(self._pending_signals)
-                self._pending_signals.clear()
-
-        # ── Macro conditions check: Mon-Fri, 7-8 AM ET (before everything else) ──
-        if self._should_run_macro_check(now_et):
-            logger.info("Running macro conditions check")
-            await self._run_macro_check()
-
-        # ── Weekly analysis: Sunday, between 6-8 PM ET ──
-        if self._should_run_weekly(now_et):
-            logger.info("Starting weekly analysis cycle")
-            await self._run_weekly_analysis()
-
-        # ── Mid-week analysis: Wednesday, between 6-8 PM ET ──
-        if self._should_run_midweek(now_et):
-            logger.info("Starting mid-week analysis cycle")
-            await self._run_midweek_analysis()
-
-        # ── Morning brief: Mon-Fri, 8:15-8:45 AM ET (after macro check, before scan) ──
-        if self._should_send_morning_brief(now_et):
-            logger.info("Sending morning brief")
-            await self._send_morning_brief()
-
-        # ── Daily pre-market scan: Mon-Fri, 8-9 AM ET ──
-        if self._should_run_daily_prescan(now_et):
-            logger.info("Starting daily pre-market scan")
-            await self._run_daily_prescan()
-
-        # ── Options scan: Mon-Fri, 9:00-9:30 AM ET (after prescan, before market open) ──
-        if self._should_run_options_scan(now_et):
-            logger.info("Starting options scan")
-            await self._run_options_scan()
-
-        # ── Earnings-reactive scan: Mon-Fri, check for recent earnings ──
-        if self._should_run_earnings_check(now_et):
-            logger.info("Starting earnings-reactive scan")
-            await self._run_earnings_reactive()
-
-        # ── Market monitoring during open hours ──
+        """Run protection and maintenance first; research never holds this critical path."""
+        if self._shutdown:
+            return
+        await self.calendar.refresh()
+        if self._shutdown:
+            return
+        if not self._engine_resumed and self._last_reconcile_at is None:
+            try:
+                await self._resume_execution()
+            except TimeoutError:
+                return
+        if not self._reconciled or self._last_reconcile_at is None or (
+            _now_utc() - self._last_reconcile_at >= timedelta(seconds=90)
+        ):
+            await self._reconcile_scheduler("scheduler tick")
+        await self._collect_finished_jobs()
+        if self._shutdown:
+            return
+        now_et = _now_et()
+        day_key = now_et.date().isoformat()
+        snapshot = self.ledger.last_snapshot()
         if self._is_market_open(now_et):
-            # Execute any pending signals once market opens
-            if self._pending_signals:
-                logger.info("Market open — executing %d pending signals", len(self._pending_signals))
-                executed = await self._execute_signals(self._pending_signals)
-                self._pending_signals.clear()
+            await self._evaluate_margin_guard(snapshot, now_et)
+        else:
+            # Check the first fresh post-close broker read, without waiting for
+            # report cut-off. The later close job rechecks from its own book.
+            market = self.calendar.state
+            session = self.calendar.session_on(now_et.date())
+            if (market.source is MarketSource.LIVE and market.status is MarketStatus.CLOSED
+                    and session is not None and session.closes_at <= now_et < session.closes_at + timedelta(minutes=5)
+                    and snapshot is not None and snapshot.as_of >= session.closes_at):
+                await self._evaluate_margin_guard(snapshot, now_et, at_close=True)
+        await self._drive_order_lane(now_et)
+        try:
+            self._schedule_research_catchup(now_et)
+        except (ValueError, StateUnavailable, sqlite3.Error) as exc:
+            await self._report_exception("Research catch-up", exc)
+        if self._is_market_open(now_et):
+            if self._shutdown:
+                return
+            if self.research is not None and self._should_check_events():
+                self._last_news_at = now_et
+                slot = str(int(now_et.timestamp()) // NEWS_SECONDS)
+                self._schedule_job("live_news", f"{day_key}:{slot}", self._run_news_slot, timeout=150)
+                if "catchup" not in self._job_tasks:
+                    self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
+            if self._should_run_options_scan(now_et):
+                self._schedule_job("options", day_key, self._run_options_job, timeout=180)
+            if self.options is not None:
+                await self._drive_options_monitor(now_et)
 
-            if self._should_monitor(now_et):
-                logger.info("Running market monitoring")
-                await self._run_market_monitoring()
-                # Check options positions for auto-close triggers
-                await self._check_options_positions()
-                # Check for major market events that should trigger immediate re-scan
-                await self._check_for_market_event()
+        # Re-read the clock after the protection lane and schedule by actual session.
+        now_et = _now_et()
+        day_key = now_et.date().isoformat()
+        if self._state_ready and (self._is_market_open(now_et) or self._in_preopen(
+            now_et, start_minutes=180, end_minutes=0,
+        )):
+            await self._alert_entry_locks()
+        jobs = (
+            ("assets", self._should_refresh_assets, self._refresh_session_assets, 90),
+            ("macro", self._should_run_macro_check, self._run_macro_check, 120),
+            ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
+            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
+            ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
+            ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 55),
+            ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
+            ("shadow_close", self._should_run_shadow_close, self._run_shadow_close, 240),
+            ("weekly", self._should_run_weekly, self._run_weekly_analysis, 1500),
+            ("midweek", self._should_run_midweek, self._run_midweek_analysis, 1500),
+        )
+        for name, due, callback, timeout in jobs:
+            if name in {"earnings", "prescan", "weekly", "midweek"} and self.research is None:
+                continue
+            if name in {"weekly", "prescan", "midweek"} and "catchup" in self._job_tasks:
+                continue
+            if not self._shutdown and due(now_et):
+                key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
+                self._schedule_job(name, key, callback, timeout=timeout, replay=name not in {
+                    "morning_brief", "daily_summary",
+                })
 
-        # ── Daily summary at market close ──
-        if self._should_send_daily_summary(now_et):
-            logger.info("Sending daily summary")
-            await self._send_daily_summary()
+    async def _run_news_slot(self):
+        return await self._run_held_news_check(self.ledger.snapshot())
+
+    async def _close_drawdown(self):
+        now = _now_et()
+        market = await self.calendar.refresh()
+        session = self.calendar.session_on(now.date())
+        if (market.source is not MarketSource.LIVE or market.status is not MarketStatus.CLOSED
+                or session is None or now < session.closes_at):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_clock_unverified"})
+        snapshot = await self.ledger.refresh("drawdown close")
+        if (snapshot.equity <= 0 or snapshot.as_of < session.closes_at
+                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        await self._evaluate_margin_guard(snapshot, now, at_close=True)
+        if snapshot.quality != "live" or self.ledger.trading_block():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        previous = self.calendar.previous_session(session.date)
+        if previous is None:
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
+        marks = self.ledger.equity_marks("close", since=session.date)
+        mark = next((item for item in marks if item.session_date == session.date), None)
+        if mark is None:
+            self._last_close_report = await close_session(self.ledger, snapshot, session.date)
+        try:
+            state = self._drawdown_state()
+        except ValueError:
+            await self._alert("critical", "Invalid persisted drawdown",
+                              "Existing high-water record retained; entries stay blocked.",
+                              key="invalid-drawdown")
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_record_invalid"})
+        try:
+            day = session.date.isoformat()
+            net_flow = Decimal(0)
+            if state.last_session is not None and state.last_session < day:
+                last_day = date.fromisoformat(state.last_session)
+                net_flow = sum(
+                    (flow.amount for flow in self.ledger.cash_flows()
+                     if flow.kind in DEPOSIT_KINDS and last_day < flow.date <= session.date),
+                    Decimal(0),
+                )
+            updated = update_drawdown(
+                state, day, mark.equity if mark else snapshot.equity,
+                previous_session=previous.date.isoformat(), net_external_flow=net_flow, config=self.config,
+            )
+        except (ValueError, InvalidOperation):
+            await self._alert("critical", "Drawdown close could not be verified",
+                              "External cash flows could not be reconciled to the close. "
+                              "The existing high-water record was retained.",
+                              key=f"invalid-drawdown-close:{session.date}")
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_close_invalid"})
+        risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
+        if updated == state:
+            return risk_result
+        self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
+        before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
+        alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
+        if before != (alert, throttled, updated.paused):
+            await self._alert(
+                "critical" if updated.paused else "warning" if alert else "info",
+                "Drawdown controls changed",
+                f"Drawdown: {updated.drawdown:.1%}; throttled: {throttled}; paused: {updated.paused}.",
+                key=f"drawdown:{session.date}",
+            )
+        return risk_result
+
+    async def _evaluate_close_limits(self, snapshot, session_date: date, previous_session: date):
+        controls = self._risk_controls()
+        breaches = self.risk.evaluate_portfolio(snapshot, controls=controls, include_pending=False)
+        if any(breach.kind == "invalid_risk_input" for breach in breaches):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_risk_input_unverified"})
+        key = "a6.close_drift"
+        state = self.ledger.risk_state_get(key, {})
+        counts = {(kind, scope): n for kind, scope, n in state.get("counts", ())}
+        day = session_date.isoformat()
+        if state.get("session") != day:
+            previous = counts if state.get("session") == previous_session.isoformat() else {}
+            counts = self.risk.advance_drift_counters(breaches, previous)
+            self.ledger.risk_state_set(key, {"session": day, "counts": [
+                [kind, scope, n] for (kind, scope), n in sorted(counts.items())
+            ]})
+        if breaches:
+            await self._alert("warning", "Portfolio at or beyond risk limits", "\n".join(
+                f"{b.kind} {b.key}: {b.value} (limit {b.cap})" for b in breaches
+            ), key=f"risk-limit-close:{day}")
+        plans = self.risk.plan_remediation(snapshot, consecutive_closes=counts, controls=controls)
+        if any(plan.kind is TradeKind.SELL for plan in plans):
+            following = self.calendar.next_session(session_date)
+            if following is None:
+                return JobOutcome(JobStatus.FAILED, detail={"reason": "trim_session_unverified"})
+            intents = self._trim_intents(
+                snapshot, plans, "limit_drift", day, following,
+                consecutive_closes=[[kind, scope, n] for (kind, scope), n in sorted(counts.items())],
+            )
+            return JobOutcome(JobStatus.DONE, intents=intents)
+        return None
+
+    def _trim_intents(
+        self, snapshot, plans, source: str, event: str, session, *, eligible_at=None, **proof,
+    ) -> tuple[NewIntent, ...]:
+        intents = []
+        for plan in plans:
+            if plan.kind is not TradeKind.SELL or not (holding := snapshot.holding(plan.symbol)):
+                continue
+            intents.append(NewIntent(
+                symbol=plan.symbol, side="sell", kind="trim", origin=source,
+                dedupe_key=f"{'a13' if source == 'margin_buffer' else 'a6'}:{source}:{event}:{plan.symbol}",
+                position_id=holding.meta.position_id if holding.meta else None,
+                reference_price=plan.price,
+                session_date=session.date, next_attempt_at=eligible_at or session.opens_at + timedelta(minutes=5),
+                expires_at=session.closes_at,
+                meta={"rule": {"option_delivery": "assignment", "margin_buffer": "margin_buffer"}.get(
+                    source, "risk_limit"),
+                      "qty": str(plan.qty), "reason": plan.reason, **proof},
+            ))
+        return tuple(intents)
+
+    async def _queue_delivery_trims(self, now: datetime) -> None:
+        session = self.calendar.session_on(now.date())
+        if (session is None or now < session.opens_at + timedelta(minutes=5)
+                or now >= session.closes_at or not (await self.market_gate("exit", rule="assignment")).allowed):
+            return
+        previous = self.calendar.previous_session(session.date)
+        if previous is None:
+            return
+        deliveries = self.store.query(
+            "SELECT activity_id, symbol, ts FROM broker_activities WHERE activity_type='OPTRD'"
+            " AND qty>0 AND LOWER(COALESCE(side,'')) NOT LIKE 'sell%'"
+            " AND ts>=? ORDER BY ts, activity_id", (previous.date.isoformat(),),
+        )
+        if not deliveries:
+            return
+        key = "a6.delivery_processed"
+        processed = self.ledger.risk_state_get(key, {})
+        retained = {row["activity_id"]: processed[row["activity_id"]] for row in deliveries
+                    if row["activity_id"] in processed}
+        pending = [row for row in deliveries if row["activity_id"] not in retained]
+        if not pending:
+            return
+        snapshot = await self.ledger.refresh("option delivery risk check")
+        if snapshot.quality != "live" or self.ledger.trading_block() or snapshot.equity <= 0:
+            return
+        controls = self._risk_controls()
+        if any(b.kind == "invalid_risk_input" for b in self.risk.evaluate_portfolio(
+            snapshot, controls=controls, include_pending=False,
+        )):
+            return
+        for row in pending:
+            activity, symbol, ts = row["activity_id"], row["symbol"], row["ts"]
+            try:
+                delivered_at = datetime.fromisoformat(ts) if "T" in ts else None
+                delivered_day = (delivered_at.astimezone(ET).date() if delivered_at and delivered_at.tzinfo
+                                 else date.fromisoformat(ts[:10]))
+            except ValueError:
+                continue
+            if delivered_day > session.date or (delivered_at and delivered_at.tzinfo
+                                                  and delivered_at >= session.opens_at):
+                continue
+            if symbol and (holding := snapshot.holding(symbol)) and holding.qty > 0:
+                plans = self.risk.plan_remediation(snapshot, broker_action=True, broker_symbol=symbol,
+                                                   controls=controls)
+                intents = self._trim_intents(snapshot, plans, "option_delivery", session.date.isoformat(), session,
+                                            delivery_symbol=symbol)
+                if intents:
+                    self.ledger.enqueue_intents(intents)
+                    await self._alert("warning", f"Option delivery triggered a trim for {symbol}",
+                                      "Queued for execution against the reconciled book.",
+                                      key=f"option-delivery:{activity}")
+            retained[activity] = ts
+        if retained != processed:
+            self.ledger.risk_state_set(key, retained)
+
+    def _summary_ready(self, now: datetime) -> bool:
+        if not self._should_send_daily_summary(now):
+            return False
+        close = self.ledger.job_status("drawdown_close", now.date().isoformat())
+        return bool(close and (close.status is JobStatus.DONE or (
+            close.status is JobStatus.FAILED and close.attempts >= MAX_JOB_ATTEMPTS
+        )))
+
+    def _should_run_shadow_close(self, now: datetime) -> bool:
+        session = self.calendar.session_on(now.date())
+        return bool(session and now >= session.closes_at + timedelta(minutes=16))
+
+    def _should_refresh_assets(self, now: datetime) -> bool:
+        session = self.calendar.session_on(now.date())
+        return bool(session and session.opens_at - timedelta(hours=6) <= now < session.closes_at)
+
+    async def _refresh_session_assets(self):
+        return await self._refresh_assets(force=True)
+
+    async def _run_shadow_close(self):
+        day = _now_et().date()
+        snapshot = self.ledger.last_snapshot()
+        if snapshot is None or not any(m.session_date == day for m in self.ledger.equity_marks("close", since=day)):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "trusted_close_pending"})
+        report = await close_session(self.ledger, snapshot, day, daily_bars=self._shadow_bars)
+        self._last_close_report = report
+        missing = sum(w.startswith("shadow stop") for w in report.warnings)
+        return JobOutcome(JobStatus.FAILED if missing else JobStatus.DONE,
+                          detail={"shadow_rows": report.shadow_rows, "warnings": missing})
+
+    def _schedule_job(self, name, window_key, callback, *, timeout, replay=True):
+        if self._shutdown or name in self._job_tasks:
+            return
+        row = self.ledger.job_status(name, window_key)
+        if row is not None:
+            if row.status in {JobStatus.DONE, JobStatus.SKIPPED} or row.attempts >= MAX_JOB_ATTEMPTS:
+                return
+            if row.status is JobStatus.STARTED and not replay:
+                # An external notification/order may have succeeded before the crash.
+                self.ledger.finish_job(name, window_key, JobStatus.SKIPPED, detail={"reason": "interrupted"})
+                if isinstance(self.alerts, AlertService):
+                    self.alerts.alert_skipped_cycle(name, "interrupted; replay would risk a duplicate notification")
+                return
+            if row.eligible_retry_at and row.eligible_retry_at > _now_utc():
+                return
+        attempt = self.ledger.start_job(name, window_key).attempts
+        self._job_tasks[name] = asyncio.create_task(
+            self._run_scheduled_job(name, window_key, callback, timeout, attempt),
+            name=f"stock-agent:{name}",
+        )
+
+    async def _run_scheduled_job(self, name, window_key, callback, timeout, attempt):
+        try:
+            async with asyncio.timeout(timeout):
+                outcome = await callback()
+            status = JobStatus(getattr(outcome, "status", JobStatus.DONE))
+            intents = getattr(outcome, "intents", ())
+            detail = getattr(outcome, "detail", {})
+            if not isinstance(detail, Mapping):
+                detail = {"reason": str(detail)[:160]}
+            retry = _now_utc() + timedelta(minutes=5 * attempt) if status is JobStatus.FAILED else None
+            self.ledger.finish_job(name, window_key, status, intents=intents, detail=detail, eligible_retry_at=retry)
+            if status is JobStatus.SKIPPED and isinstance(self.alerts, AlertService):
+                self.alerts.alert_skipped_cycle(name, str(detail.get("reason") or "schedule gate declined"))
+            elif status is JobStatus.FAILED:
+                await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
+                                  key=f"job-result:{name}")
+        except Exception as exc:
+            self.ledger.finish_job(name, window_key, JobStatus.FAILED,
+                                   detail={"error": type(exc).__name__},
+                                   eligible_retry_at=_now_utc() + timedelta(minutes=5 * attempt))
+            await self._report_exception(name, exc)
+
+    async def _collect_finished_jobs(self):
+        for name, task in tuple(self._job_tasks.items()):
+            if task.done():
+                del self._job_tasks[name]
+                if not task.cancelled() and task.exception() is not None:
+                    await self._alert("critical", f"{name} could not persist its outcome",
+                                      type(task.exception()).__name__, key=f"job-write:{name}")
+
+    async def _drive_order_lane(self, now: datetime):
+        if self._order_task is not None:
+            if not self._order_task.done():
+                return
+            if not self._order_task.cancelled() and self._order_task.exception() is not None:
+                await self._alert("warning", "Order lane did not complete",
+                                  type(self._order_task.exception()).__name__, key="order-lane")
+            self._order_task = None
+        if (self.engine is not None and self._last_reconcile_at is not None
+                and not self._shutdown and self._should_monitor(now)):
+            self._last_monitor_time = now
+            self._order_task = asyncio.create_task(self._run_execution_cycle(), name="stock-agent:protection")
+
+    async def _run_options_job(self):
+        outcomes = await self._run_options_scan()
+        if outcomes and not any(getattr(outcome, "final", True) for outcome in outcomes):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": "option_scan_temporarily_blocked"})
+        return None
+
+    async def _drive_options_monitor(self, now: datetime):
+        if self._options_task is not None:
+            if not self._options_task.done():
+                return
+            if not self._options_task.cancelled() and self._options_task.exception() is not None:
+                await self._alert("warning", "Option protection did not complete",
+                                  type(self._options_task.exception()).__name__, key="options-monitor")
+        if "options" not in self._job_tasks and not self._shutdown:
+            self._options_task = asyncio.create_task(
+                self._run_options_lane(now), name="stock-agent:options-protection",
+            )
+        else:
+            self._options_task = None
+
+    async def _run_options_lane(self, now: datetime):
+        await self._check_options_positions()
+        if not self._entries_enabled():
+            return
+        ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        if not ideas:
+            return
+        if not (await self.market_gate("entry")).allowed:
+            return
+        candidates = [OptionCandidate(idea.symbol, source=getattr(idea, "source", "news"), story_id=idea.story_id,
+                                      direction_hint=idea.direction.value) for idea in ideas]
+        await self.options.scan(_now_utc(), candidates=candidates)
+        handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
+        if handled:
+            self.research_store.acknowledge_options(tuple(sorted(handled)))
+
+    async def _run_execution_cycle(self):
+        if not self._engine_resumed:
+            try:
+                await self._resume_execution()
+            except TimeoutError:
+                await self._alert("warning", "Order recovery is still pending",
+                                  "Existing protection remains in place; new entries are blocked.",
+                                  key="order-resume")
+                return
+        if self._shutdown:
+            return
+        try:
+            async with asyncio.timeout(8):
+                await self._queue_delivery_trims(_now_et())
+        except Exception as exc:
+            await self._alert("warning", "Option delivery risk check did not complete",
+                              type(exc).__name__, key="option-delivery-check")
+        await self._run_market_monitoring()
+        if self.engine.normalised and not self._normalised:
+            self._normalised = await self._reconcile_scheduler("normalise completed")
+
+    async def _resume_execution(self):
+        async with asyncio.timeout(30):
+            await self.engine.resume()
+        self._engine_resumed = True
+        if self._reconciled:
+            self._normalised = self.engine.normalised
 
     # ── Schedule checks ──────────────────────────────────────────────
 
     def _should_run_macro_check(self, now_et: datetime) -> bool:
-        """Run macro conditions check Mon-Fri, 6:30-7:30 AM ET (before pre-market scan)."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._macro_check_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(6, 30) <= current_time <= time(7, 30)
+        return self._in_preopen(now_et, start_minutes=180, end_minutes=120)
 
     def _should_run_options_scan(self, now_et: datetime) -> bool:
-        """Run options scan Mon-Fri, 9:45 AM - 2:00 PM ET.
-
-        Wide window so restarts during market hours don't miss it.
-        Runs after market open for live bid/ask quotes on calls.
-        """
-        if now_et.weekday() >= 5:
+        if (self.options is None or "catchup" in self._job_tasks
+                or not self._entries_enabled() or not self._is_market_open(now_et)):
             return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._options_scan_done_today == today_str:
+        session = self.calendar.session_on(now_et.date())
+        if session is None or (self._options_task is not None and not self._options_task.done()):
             return False
-        current_time = now_et.time()
-        return time(9, 45) <= current_time <= time(14, 0)
+        until = min(datetime.combine(now_et.date(), time(15, 0), ET), session.closes_at - timedelta(minutes=10))
+        return session.opens_at + timedelta(minutes=15) <= now_et < until
 
     def _should_send_morning_brief(self, now_et: datetime) -> bool:
-        """Send morning brief Mon-Fri, 8:15-8:45 AM ET (8:15-8:45 PM SGT)."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._morning_brief_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(8, 15) <= current_time <= time(8, 45)
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and session.opens_at - timedelta(minutes=75) <= now_et <
+                    session.opens_at + timedelta(hours=1))
 
     def _should_run_weekly(self, now_et: datetime) -> bool:
-        """Run weekly analysis on Sunday between 6-8 PM ET."""
-        if now_et.weekday() != self.config.WEEKLY_ANALYSIS_DAY:
-            return False
-        if not (18 <= now_et.hour <= 20):
-            return False
-        # Only once per week
-        last = self.portfolio.state.last_weekly_analysis
-        if last:
-            last_et = last.astimezone(ET) if last.tzinfo else last.replace(tzinfo=timezone.utc).astimezone(ET)
-            if (now_et - last_et).days < 5:
-                return False
-        return True
+        return self._research_window(now_et, "weekly")
 
     def _should_run_midweek(self, now_et: datetime) -> bool:
-        """Run mid-week analysis on Wednesday between 6-8 PM ET."""
-        if now_et.weekday() != self.config.MIDWEEK_ANALYSIS_DAY:
-            return False
-        if not (18 <= now_et.hour <= 20):
-            return False
-        # Only once per week
-        week_key = now_et.strftime("%Y-W%W")
-        if self._midweek_analysis_done_this_week == week_key:
-            return False
-        return True
+        return self._research_window(now_et, "midweek")
 
     def _should_run_daily_prescan(self, now_et: datetime) -> bool:
-        """Run daily pre-market scan Mon-Fri, 8-9 AM ET."""
-        if now_et.weekday() >= 5:  # Weekend
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._daily_prescan_done_today == today_str:
-            return False
-        # Between 8:00 AM and 9:00 AM ET
-        current_time = now_et.time()
-        return time(8, 0) <= current_time <= time(9, 0)
+        return self._in_preopen(now_et, start_minutes=90, end_minutes=30)
 
     def _should_run_earnings_check(self, now_et: datetime) -> bool:
-        """Check for earnings-reactive opportunities Mon-Fri, 7-8 AM ET."""
-        if now_et.weekday() >= 5:
-            return False
-        if not getattr(self.config, "EARNINGS_CHECK_ENABLED", True):
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._earnings_check_done_today == today_str:
-            return False
-        current_time = now_et.time()
-        return time(7, 0) <= current_time <= time(8, 0)
+        return self.config.EARNINGS_CHECK_ENABLED and self._in_preopen(now_et, start_minutes=150, end_minutes=90)
 
     def _is_market_open(self, now_et: datetime) -> bool:
-        """Check if US stock market is currently open."""
-        if now_et.weekday() >= 5:  # Saturday or Sunday
-            return False
-        current_time = now_et.time()
-        return MARKET_OPEN <= current_time <= MARKET_CLOSE
+        return self.calendar.is_open(now_et)
 
     def _should_monitor(self, now_et: datetime) -> bool:
-        """Check if enough time has passed since last monitoring run."""
-        if not self._last_monitor_time:
+        if self._last_monitor_time is None:
             return True
-        elapsed = (now_et - self._last_monitor_time).total_seconds()
-        return elapsed >= self.config.SCAN_INTERVAL_MINUTES * 60
+        elapsed = now_et.timestamp() - self._last_monitor_time.timestamp()
+        return elapsed >= TICK_SECONDS or elapsed < 0
 
     def _should_send_daily_summary(self, now_et: datetime) -> bool:
-        """Send daily summary once per day after market close."""
-        if now_et.weekday() >= 5:
-            return False
-        today_str = now_et.strftime("%Y-%m-%d")
-        if self._daily_summary_sent_today == today_str:
-            return False
-        # Between 4:05 PM and 4:30 PM ET
-        current_time = now_et.time()
-        return time(16, 5) <= current_time <= time(16, 30)
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and now_et >= session.closes_at + timedelta(minutes=5))
+
+    def _in_preopen(self, now_et: datetime, *, start_minutes: int, end_minutes: int) -> bool:
+        session = self.calendar.session_on(now_et.date())
+        return bool(session and session.opens_at - timedelta(minutes=start_minutes) <= now_et <
+                    session.opens_at - timedelta(minutes=end_minutes))
+
+    def _research_anchor(self, now_et: datetime, job: str):
+        weekday = self.config.WEEKLY_ANALYSIS_DAY if job == "weekly" else self.config.MIDWEEK_ANALYSIS_DAY
+        return now_et.date() - timedelta(days=(now_et.weekday() - weekday) % 7)
+
+    def _research_week_key(self, now_et: datetime, job: str) -> str:
+        return self._research_anchor(now_et, job).isoformat()
+
+    def _research_window(self, now_et: datetime, job: str) -> bool:
+        anchor = self._research_anchor(now_et, job)
+        if now_et.date() == anchor:
+            return 18 <= now_et.hour < 21
+        next_session = self.calendar.next_session(anchor)
+        return bool(next_session and next_session.date == now_et.date() and
+                    self._in_preopen(now_et, start_minutes=180, end_minutes=30))
+
+    def _schedule_research_catchup(self, now: datetime) -> None:
+        fresh = getattr(self.research, "has_fresh_thesis_set", None)
+        if (fresh is None or not self._reconciled
+                or any(name in self._job_tasks for name in ("catchup", "weekly", "midweek", "prescan"))):
+            return
+        in_session = self._is_market_open(now)
+        if not in_session and not self._in_preopen(now, start_minutes=180, end_minutes=0):
+            return
+        session = self.calendar.session_on(now.date())
+        if session is None or (in_session and now >= session.closes_at - timedelta(minutes=10)):
+            return
+        if fresh(_now_utc()):
+            return
+        phase = "regular" if in_session else "preopen"
+        self._schedule_job("catchup", f"{session.date}:{phase}",
+                           lambda: self._run_research_catchup(phase), timeout=1500)
+
+    async def _run_research_catchup(self, phase: str):
+        if phase == "regular":
+            # Regime observation can only raise the floor and never places orders.
+            try:
+                async with asyncio.timeout(15):
+                    await self._check_for_market_event()
+            except Exception as exc:
+                await self._report_exception("Catch-up regime observation", exc)
+        return await self.research.run("weekly", work_scope=f"catchup-{phase}")
 
     # ── Weekly analysis ──────────────────────────────────────────────
 
@@ -359,1632 +1261,433 @@ class StockAgentScheduler:
             logger.exception("Macro check failed: %s", e)
 
     async def _run_weekly_analysis(self):
-        """Full weekly research cycle."""
-        try:
-            await asyncio.gather(
-                self.telegram.send_message("\U0001f50d <b>Weekly Analysis Starting</b>"),
-                self.discord.send_system_log("INFO", "Weekly analysis cycle starting"),
-                return_exceptions=True,
-            )
-
-            # 0a. Reconcile with Alpaca (source of truth) BEFORE any risk decisions.
-            await self._sync_portfolio_from_alpaca()
-
-            # 0. Run TipRanks scraper and load data (supplementary — never blocks)
-            tipranks_stocks = await self._load_tipranks_data()
-            tipranks_lookup = tipranks_stocks if isinstance(tipranks_stocks, dict) else {}
-
-            # 1. Screen universe
-            symbols = await self.data_feed.screen_universe()
-            if not symbols:
-                await asyncio.gather(
-                    self.telegram.send_message("\u26a0\ufe0f Universe screening returned no symbols"),
-                    self.discord.send_system_log("WARNING", "Universe screening returned no symbols"),
-                    return_exceptions=True,
-                )
-                return
-
-            # Merge TipRanks discovery symbols into candidate universe
-            existing_universe_symbols = {s.upper() for s in symbols}
-            candidate_symbols = list(symbols)
-            tr_new_symbols = [
-                sym for sym in tipranks_lookup
-                if sym not in existing_universe_symbols
-                and self.config.TIPRANKS_MIN_SMART_SCORE <= (tipranks_lookup[sym].get("smart_score") or 0)
-            ]
-            # TipRanks-only symbols still go through full thesis + risk checks
-            candidate_symbols.extend(tr_new_symbols)
-            logger.info(
-                "TipRanks added %d new discovery symbols to universe", len(tr_new_symbols)
-            )
-            symbols = candidate_symbols
-
-            self.portfolio.set_universe(symbols)
-            logger.info("Universe: %d symbols", len(symbols))
-
-            # 2. Fetch fundamentals for all candidates
-            companies = await self._fetch_fundamentals(symbols)
-            if not companies:
-                await asyncio.gather(
-                    self.telegram.send_message("\u26a0\ufe0f No fundamental data retrieved"),
-                    self.discord.send_system_log("WARNING", "No fundamental data retrieved"),
-                    return_exceptions=True,
-                )
-                return
-
-            # 3. GPT-4.1 Nano screening
-            ranked = await self.screener.screen_candidates(companies)
-            top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
-            logger.info("Top %d for deep analysis: %s", len(top_symbols), top_symbols)
-
-            # Send screener results to Discord
-            try:
-                await self.discord.send_screener_results(ranked[:25])
-            except Exception as e:
-                logger.error("Failed to send screener results to Discord: %s", e)
-
-            # 4. Deep analysis with Perplexity Sonar Pro
-            signals = await self._deep_analyze(top_symbols, companies, tipranks_stocks)
-
-            # 5. Re-analyze existing positions
-            await self._re_analyze_existing_positions(companies)
-
-            # 6. Queue signals — execute at next market open (weekly runs Sunday evening, market is closed)
-            if self._is_market_open(_now_et()):
-                executed_signals = await self._execute_signals(signals)
-            else:
-                # Store for execution at next market open
-                self._pending_signals.extend(signals)
-                executed_signals = []
-                logger.info(
-                    "Market closed — queued %d signals for next open: %s",
-                    len(signals), [s.symbol for s in signals]
-                )
-
-            # 7. Report
-            stats = self.portfolio.calculate_stats()
-            await asyncio.gather(
-                self.telegram.send_weekly_report(
-                    portfolio_value=self.portfolio.get_portfolio_value(),
-                    cash=self.portfolio.state.cash,
-                    positions=self.portfolio.state.positions,
-                    signals=executed_signals,
-                    stats=stats,
-                ),
-                self.discord.send_weekly_report(
-                    portfolio_value=self.portfolio.get_portfolio_value(),
-                    cash=self.portfolio.state.cash,
-                    positions=self.portfolio.state.positions,
-                    signals=executed_signals,
-                    stats=stats,
-                ),
-                self.discord.send_eli5_weekly(self.portfolio.state, executed_signals),
-                return_exceptions=True,
-            )
-
-            self.portfolio.set_last_weekly_analysis(_now_utc())
-            logger.info("Weekly analysis complete — %d signals, %d executed", len(signals), len(executed_signals))
-
-        except Exception as e:
-            logger.exception("Weekly analysis failed: %s", e)
-            await asyncio.gather(
-                self.telegram.send_error_alert(f"Weekly analysis failed: {e}"),
-                self.discord.send_error(str(e), context="Weekly analysis"),
-                return_exceptions=True,
-            )
-
-    # ── Mid-week analysis (Wednesday) ────────────────────────────────
+        return await self._run_research("weekly")
 
     async def _run_midweek_analysis(self):
-        """Mid-week re-analysis: re-screen universe and re-analyze positions.
-        Similar to weekly but lighter — focuses on refreshing theses and
-        looking for new opportunities that emerged Mon-Wed.
-        """
-        try:
-            now = _now_et()
-            week_key = now.strftime("%Y-W%W")
-            self._midweek_analysis_done_this_week = week_key
-
-            await self.discord.send_system_log("INFO", "Mid-week analysis starting (Wednesday refresh)")
-
-            # 0a. Reconcile with Alpaca (source of truth) BEFORE any risk decisions.
-            await self._sync_portfolio_from_alpaca()
-
-            # 0. Load TipRanks data if available
-            tipranks_stocks = await self._load_tipranks_data()
-            tipranks_lookup = tipranks_stocks if isinstance(tipranks_stocks, dict) else {}
-
-            # 1. Screen universe (same as weekly)
-            symbols = await self.data_feed.screen_universe()
-            if not symbols:
-                await self.discord.send_system_log("WARNING", "Mid-week: universe screening returned no symbols")
-                return
-
-            # Merge TipRanks discovery symbols into candidate universe
-            existing_universe_symbols = {s.upper() for s in symbols}
-            candidate_symbols = list(symbols)
-            tr_new_symbols = [
-                sym for sym in tipranks_lookup
-                if sym not in existing_universe_symbols
-                and self.config.TIPRANKS_MIN_SMART_SCORE <= (tipranks_lookup[sym].get("smart_score") or 0)
-            ]
-            # TipRanks-only symbols still go through full thesis + risk checks
-            candidate_symbols.extend(tr_new_symbols)
-            logger.info(
-                "Mid-week: TipRanks added %d new discovery symbols to universe",
-                len(tr_new_symbols),
-            )
-            symbols = candidate_symbols
-
-            self.portfolio.set_universe(symbols)
-            logger.info("Mid-week universe: %d symbols", len(symbols))
-
-            # 2. Fetch fundamentals
-            companies = await self._fetch_fundamentals(symbols)
-            if not companies:
-                return
-
-            # 3. Screen
-            ranked = await self.screener.screen_candidates(companies)
-            top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
-
-            try:
-                await self.discord.send_screener_results(ranked[:25])
-            except Exception:
-                pass
-
-            # 4. Deep analysis for new opportunities
-            signals = await self._deep_analyze(top_symbols, companies, tipranks_stocks)
-
-            # 5. Re-analyze all existing positions with fresh data
-            await self._re_analyze_existing_positions(companies)
-
-            # 6. Queue or execute signals
-            if self._is_market_open(_now_et()):
-                executed = await self._execute_signals(signals)
-            else:
-                self._pending_signals.extend(signals)
-                executed = []
-                logger.info(
-                    "Mid-week: market closed — queued %d signals for next open: %s",
-                    len(signals), [s.symbol for s in signals]
-                )
-
-            await self.discord.send_system_log(
-                "INFO",
-                f"Mid-week analysis complete — {len(signals)} signals, {len(executed)} executed",
-            )
-            logger.info("Mid-week analysis complete — %d signals, %d executed", len(signals), len(executed))
-
-        except Exception as e:
-            logger.exception("Mid-week analysis failed: %s", e)
-            await self.discord.send_error(str(e), context="Mid-week analysis")
-
-    # ── Daily pre-market scan ────────────────────────────────────────
+        return await self._run_research("midweek")
 
     async def _run_daily_prescan(self):
-        """Daily pre-market scan: quick check for overnight developments
-        and material events on held positions. Lighter than full analysis.
-        """
-        try:
-            now = _now_et()
-            self._daily_prescan_done_today = now.strftime("%Y-%m-%d")
-
-            await self.discord.send_system_log("INFO", "Daily pre-market scan starting")
-
-            # 1. Update prices on all positions
-            positions = self.portfolio.state.positions
-            if positions:
-                symbols = [p.symbol for p in positions]
-                prices = await self.data_feed.get_batch_quotes(symbols)
-                self.portfolio.update_prices(prices)
-
-                # 2. Check for overnight material events on held positions
-                for pos in list(positions):
-                    try:
-                        event_check = await self.analyst.check_for_material_events(
-                            pos.symbol, pos.thesis.symbol if pos.thesis else pos.symbol
-                        )
-                        if event_check.get("material_event"):
-                            severity = event_check.get("severity", 0)
-                            impact = event_check.get("thesis_impact", "neutral")
-                            event_desc = event_check.get("event", "Unknown event")
-
-                            logger.info(
-                                "Pre-market event for %s: %s (severity=%d, impact=%s)",
-                                pos.symbol, event_desc, severity, impact,
-                            )
-
-                            try:
-                                await self.discord.send_material_event(
-                                    pos.symbol, event_desc, impact, severity,
-                                )
-                            except Exception:
-                                pass
-
-                            # Severe negative → queue for sell at market open
-                            if severity >= 7 and impact == "negative":
-                                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                                if company:
-                                    new_thesis = await self.analyst.re_analyze_position(
-                                        pos.symbol, company, pos.thesis
-                                    )
-                                    if new_thesis and new_thesis.direction == "SELL":
-                                        # If market is open, execute immediately; otherwise queue
-                                        if self._is_market_open(now):
-                                            await self._execute_sell(
-                                                pos, reason=f"Pre-market event: {event_desc}"
-                                            )
-                                        else:
-                                            logger.info(
-                                                "Queuing sell for %s at market open: %s",
-                                                pos.symbol, event_desc,
-                                            )
-                                    elif new_thesis:
-                                        self.portfolio.update_thesis(pos.symbol, new_thesis)
-                    except Exception as e:
-                        logger.error("Pre-market event check failed for %s: %s", pos.symbol, e)
-
-            # 3. Quick scan for new high-conviction opportunities
-            # Only look at a smaller universe for speed
-            try:
-                symbols = await self.data_feed.screen_universe()
-                if symbols:
-                    # Quick screen — top 10 only for daily scan
-                    companies = await self._fetch_fundamentals(symbols[:30])
-                    if companies:
-                        ranked = await self.screener.screen_candidates(companies)
-                        top_5 = [r["symbol"] for r in ranked[:5]]
-                        # Only analyze top 5 and only if conviction would be high
-                        for sym in top_5:
-                            # Skip if already holding
-                            if any(p.symbol == sym for p in self.portfolio.state.positions):
-                                continue
-                            company = next((c for c in companies if c.symbol == sym), None)
-                            if company:
-                                try:
-                                    rn = format_research_notes_context(sym, load_notes())
-                                    thesis = await self.analyst.analyze_stock(
-                                        sym, company, research_notes_context=rn,
-                                    )
-                                    if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
-                                        # High conviction from daily scan — queue signal
-                                        pv = self.portfolio.get_portfolio_value()
-                                        signal = Signal(
-                                            symbol=sym,
-                                            action="BUY",
-                                            conviction=thesis.conviction,
-                                            thesis=thesis,
-                                            entry_price=company.price,
-                                            position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
-                                                thesis.conviction, 0.03
-                                            ),
-                                            generated_at=_now_utc(),
-                                        )
-                                        self._pending_signals.append(signal)
-                                        logger.info(
-                                            "Daily scan: queued BUY signal for %s (conviction=%d)",
-                                            sym, thesis.conviction,
-                                        )
-                                except Exception as e:
-                                    logger.error("Daily scan analysis failed for %s: %s", sym, e)
-            except Exception as e:
-                logger.error("Daily scan universe screening failed: %s", e)
-
-            if self._pending_signals:
-                await self.discord.send_system_log(
-                    "INFO",
-                    f"Daily pre-market scan complete — {len(self._pending_signals)} signals queued for market open",
-                )
-            else:
-                await self.discord.send_system_log("INFO", "Daily pre-market scan complete — no new signals")
-
-            logger.info("Daily pre-market scan complete")
-
-        except Exception as e:
-            logger.exception("Daily pre-market scan failed: %s", e)
-            await self.discord.send_error(str(e), context="Daily pre-market scan")
-
-    # ── Earnings-reactive scanning ───────────────────────────────────
+        return await self._run_research("prescan")
 
     async def _run_earnings_reactive(self):
-        """Check for stocks that just reported earnings (last 1-2 days).
-        If a held position reported, re-analyze thesis.
-        If a non-held high-quality stock had a blowout quarter, flag it.
-        """
-        try:
-            now = _now_et()
-            self._earnings_check_done_today = now.strftime("%Y-%m-%d")
+        return await self._run_research("earnings")
 
-            await self.discord.send_system_log("INFO", "Earnings-reactive scan starting")
+    async def _run_held_news_check(self, snapshot):
+        return await self._run_research("news", snapshot)
 
-            lookback = getattr(self.config, "EARNINGS_LOOKBACK_DAYS", 2)
+    async def _run_research(self, kind, snapshot=None):
+        research = getattr(self, "research", None)
+        if research is None:
+            from stock_agent.ledger import JobStatus
+            from stock_agent.research_pipeline import JobOutcome
 
-            # 1. Check held positions for recent earnings
-            for pos in list(self.portfolio.state.positions):
-                try:
-                    earnings = await self.data_feed.get_recent_earnings(
-                        pos.symbol, lookback_days=lookback
-                    )
-                    if not earnings:
-                        continue
-
-                    logger.info("Earnings detected for held position %s", pos.symbol)
-                    await self.discord.send_system_log(
-                        "INFO", f"Earnings detected for {pos.symbol} — re-analyzing thesis"
-                    )
-
-                    # Re-analyze with fresh post-earnings data
-                    company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                    if company:
-                        new_thesis = await self.analyst.re_analyze_position(
-                            pos.symbol, company, pos.thesis
-                        )
-                        if new_thesis:
-                            self.portfolio.update_thesis(pos.symbol, new_thesis)
-                            if new_thesis.direction == "SELL":
-                                logger.info("Post-earnings thesis broken for %s — selling", pos.symbol)
-                                await self._execute_sell(
-                                    pos, reason=f"Post-earnings thesis broken: {new_thesis.summary[:80]}"
-                                )
-                            else:
-                                try:
-                                    await self.discord.send_thesis(new_thesis)
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.error("Earnings check failed for %s: %s", pos.symbol, e)
-
-            # 2. Check universe for blowout earnings (new opportunities)
-            try:
-                universe = self.portfolio.state.universe or []
-                for sym in universe[:30]:  # Limit to avoid excessive API calls
-                    # Skip already held
-                    if any(p.symbol == sym for p in self.portfolio.state.positions):
-                        continue
-                    try:
-                        earnings = await self.data_feed.get_recent_earnings(
-                            sym, lookback_days=lookback
-                        )
-                        if not earnings:
-                            continue
-                        # Only interested in strong beats
-                        if not earnings.get("beat", False):
-                            continue
-                        surprise_pct = earnings.get("surprise_pct", 0)
-                        if surprise_pct < 10:  # Only big beats (>10% surprise)
-                            continue
-
-                        logger.info(
-                            "Blowout earnings for %s: %+.1f%% surprise",
-                            sym, surprise_pct,
-                        )
-
-                        company = await self.data_feed.get_company_fundamentals(sym)
-                        if company:
-                            rn = format_research_notes_context(sym, load_notes())
-                            thesis = await self.analyst.analyze_stock(
-                                sym, company, research_notes_context=rn,
-                            )
-                            if thesis and thesis.direction == "BUY" and thesis.conviction >= 8:
-                                signal = Signal(
-                                    symbol=sym,
-                                    action="BUY",
-                                    conviction=thesis.conviction,
-                                    thesis=thesis,
-                                    entry_price=company.price,
-                                    position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
-                                        thesis.conviction, 0.03
-                                    ),
-                                    generated_at=_now_utc(),
-                                )
-                                self._pending_signals.append(signal)
-                                logger.info(
-                                    "Earnings-reactive: queued BUY for %s (conviction=%d, surprise=%+.1f%%)",
-                                    sym, thesis.conviction, surprise_pct,
-                                )
-                                await self.discord.send_system_log(
-                                    "INFO",
-                                    f"Earnings beat for {sym} ({surprise_pct:+.1f}%) — "
-                                    f"BUY signal queued (conviction {thesis.conviction})",
-                                )
-                    except Exception as e:
-                        logger.debug("Earnings check for %s failed: %s", sym, e)
-            except Exception as e:
-                logger.error("Earnings-reactive universe scan failed: %s", e)
-
-            await self.discord.send_system_log(
-                "INFO",
-                f"Earnings-reactive scan complete — {len(self._pending_signals)} pending signals",
-            )
-            logger.info("Earnings-reactive scan complete")
-
-        except Exception as e:
-            logger.exception("Earnings-reactive scan failed: %s", e)
-            await self.discord.send_error(str(e), context="Earnings-reactive scan")
-
-    # ── Shared helpers ───────────────────────────────────────────────
-
-    async def _sync_portfolio_from_alpaca(self) -> None:
-        """Pull live positions + account from Alpaca and overwrite local state.
-
-        This makes Alpaca the source of truth for share counts, avg entry
-        prices, and cash (including margin balances). Runs at the top of
-        every weekly / mid-week cycle so risk checks see real weights.
-        """
-        try:
-            account = await self.executor.get_account()
-            positions = await self.executor.get_positions()
-            if account is None and not positions:
-                logger.warning("Alpaca sync: no account + no positions returned — skipping")
-                return
-            self.portfolio.sync_from_alpaca(positions or [], account)
-        except Exception as exc:
-            logger.exception("Alpaca sync failed — continuing with local state: %s", exc)
-
-    async def _load_tipranks_data(self) -> dict:
-        """Fetch TipRanks Smart Score data via API screener."""
-        if not self.config.TIPRANKS_ENABLED:
-            return {}
-        try:
-            lookup = build_tipranks_lookup(
-                min_score=self.config.TIPRANKS_MIN_SMART_SCORE,
-                limit=self.config.TIPRANKS_UNIVERSE_LIMIT,
-            )
-            logger.info("TipRanks lookup built: %d symbols", len(lookup))
-            return lookup
-        except Exception as exc:
-            logger.warning("TipRanks lookup failed: %s \u2014 continuing without", exc)
-            return {}
-
-    async def _fetch_fundamentals(self, symbols: list[str]) -> list[CompanyData]:
-        """Fetch fundamentals for a list of symbols."""
-        companies: list[CompanyData] = []
-        for sym in symbols:
-            try:
-                data = await self.data_feed.get_company_fundamentals(sym)
-                if data:
-                    companies.append(data)
-            except Exception as e:
-                logger.warning("Failed to fetch fundamentals for %s: %s", sym, e)
-        logger.info("Fetched fundamentals for %d companies", len(companies))
-        return companies
-
-    async def _deep_analyze(
-        self,
-        top_symbols: list[str],
-        companies: list[CompanyData],
-        tipranks_stocks=None,
-    ) -> list[Signal]:
-        """Run deep Perplexity Sonar Pro analysis on top symbols. Returns signals."""
-        signals: list[Signal] = []
-        # Normalise TipRanks input: accept the new dict[symbol -> data] lookup
-        # or the legacy list of TipRanks objects. Empty/None -> empty dict.
-        if isinstance(tipranks_stocks, dict):
-            tipranks_lookup = tipranks_stocks
-        elif tipranks_stocks:
-            tipranks_lookup = {}
-            for s in tipranks_stocks:
-                sym_key = getattr(s, "symbol", None)
-                if sym_key:
-                    tipranks_lookup[sym_key.upper()] = {
-                        "symbol": sym_key.upper(),
-                        "smart_score": getattr(s, "smart_score", None),
-                        "sector": getattr(s, "sector", None),
-                        "market_cap": getattr(s, "market_cap", None),
-                        "analyst_consensus": getattr(s, "analyst_consensus", None),
-                        "analyst_price_target_upside": getattr(
-                            s, "analyst_target_upside",
-                            getattr(s, "analyst_price_target_upside", None),
-                        ),
-                        "hedge_fund_signal": getattr(s, "hedge_fund_signal", None),
-                        "insider_signal": getattr(s, "insider_signal", None),
-                        "news_sentiment": getattr(s, "news_sentiment", None),
-                    }
-        else:
-            tipranks_lookup = {}
-
-        # Finnhub enrichment layers — built once per _deep_analyze run.
-        enrichment_symbols = list({s.upper() for s in top_symbols})
-        try:
-            news_lookup, sentiment_lookup, analyst_lookup = await asyncio.gather(
-                build_news_lookup(enrichment_symbols),
-                build_sentiment_lookup(enrichment_symbols),
-                build_analyst_lookup(enrichment_symbols),
-                return_exceptions=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Finnhub enrichment layer failed: %s", exc)
-            news_lookup, sentiment_lookup, analyst_lookup = {}, {}, {}
-        logger.info(
-            "Finnhub enrichment built: news=%d sentiment=%d analyst=%d",
-            len(news_lookup), len(sentiment_lookup), len(analyst_lookup),
-        )
-
-        # Load research notes once per cycle (cheap; reads a small dir)
-        try:
-            research_notes = load_notes()
-            if research_notes:
-                logger.info(
-                    "Loaded %d active research note(s): %s",
-                    len(research_notes),
-                    ", ".join(n.source for n in research_notes),
-                )
-        except Exception as e:
-            logger.warning("Failed to load research notes: %s", e)
-            research_notes = []
-
-        for sym in top_symbols:
-            company = next((c for c in companies if c.symbol == sym), None)
-            if not company:
-                continue
-
-            try:
-                sym_u = sym.upper()
-                # Build TipRanks context for this symbol if available
-                tr_data = tipranks_lookup.get(sym_u)
-                tipranks_context = format_tipranks_context(sym, tr_data)
-
-                # Finnhub enrichment contexts
-                news_items = news_lookup.get(sym_u)
-                sentiment_data = sentiment_lookup.get(sym_u)
-                analyst_data = analyst_lookup.get(sym_u)
-                news_context = format_news_context(sym, news_items)
-                sentiment_context = format_sentiment_context(sym, sentiment_data)
-                analyst_context = format_analyst_context(sym, analyst_data)
-                research_notes_context = format_research_notes_context(sym, research_notes)
-
-                thesis = await self.analyst.analyze_stock(
-                    sym,
-                    company,
-                    tipranks_context=tipranks_context,
-                    news_context=news_context,
-                    sentiment_context=sentiment_context,
-                    analyst_context=analyst_context,
-                    research_notes_context=research_notes_context,
-                )
-                if not thesis:
-                    continue
-
-                # Enrich conviction with TipRanks Smart Score (additive, clamped).
-                if thesis and tr_data:
-                    thesis.conviction = adjust_conviction_with_tipranks(
-                        thesis.conviction, tr_data
-                    )
-                # Additive nudges from Finnhub (each clamped [1,10] internally).
-                if sentiment_data:
-                    thesis.conviction = adjust_conviction_with_sentiment(
-                        thesis.conviction, sentiment_data
-                    )
-                if analyst_data:
-                    thesis.conviction = adjust_conviction_with_analysts(
-                        thesis.conviction, analyst_data
-                    )
-
-                self.portfolio.update_thesis(sym, thesis)
-
-                # Send thesis and analysis to Discord
-                try:
-                    await asyncio.gather(
-                        self.discord.send_thesis(thesis),
-                        self.discord.send_analysis_report(
-                            sym,
-                            thesis.summary
-                            + "\n\n**Bull Case:** "
-                            + thesis.bull_case
-                            + "\n\n**Bear Case:** "
-                            + thesis.bear_case,
-                            thesis.sources,
-                        ),
-                        return_exceptions=True,
-                    )
-                except Exception:
-                    pass
-
-                if thesis.direction == "BUY" and thesis.conviction >= self.macro.get_effective_min_conviction():
-                    signal = Signal(
-                        symbol=sym,
-                        action="BUY",
-                        conviction=thesis.conviction,
-                        thesis=thesis,
-                        entry_price=company.price,
-                        position_size_pct=self.config.CONVICTION_SIZE_MAP.get(
-                            thesis.conviction, 0.03
-                        ),
-                        generated_at=_now_utc(),
-                    )
-                    signals.append(signal)
-                    logger.info("BUY signal: %s conviction=%d", sym, thesis.conviction)
-            except Exception as e:
-                logger.error("Analysis failed for %s: %s", sym, e)
-
-        return signals
-
-    async def _re_analyze_existing_positions(self, companies: list[CompanyData]):
-        """Re-analyze all existing positions with fresh data."""
-        for pos in list(self.portfolio.state.positions):
-            try:
-                company = next((c for c in companies if c.symbol == pos.symbol), None)
-                if not company:
-                    company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                if not company:
-                    continue
-
-                new_thesis = await self.analyst.re_analyze_position(
-                    pos.symbol, company, pos.thesis
-                )
-                if not new_thesis:
-                    continue
-
-                self.portfolio.update_thesis(pos.symbol, new_thesis)
-
-                # If thesis is now SELL, generate exit signal
-                if new_thesis.direction == "SELL":
-                    logger.info("Thesis broken for %s — selling", pos.symbol)
-                    await self._execute_sell(
-                        pos, reason=f"Thesis broken: {new_thesis.summary[:100]}"
-                    )
-            except Exception as e:
-                logger.error("Re-analysis failed for %s: %s", pos.symbol, e)
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "research_not_configured"})
+        return await research.run(kind, snapshot)
 
     # ── Market monitoring ────────────────────────────────────────────
 
     async def _run_market_monitoring(self):
-        """Check positions during market hours."""
-        try:
-            self._last_monitor_time = _now_et()
-            positions = self.portfolio.state.positions
-            if not positions:
-                logger.debug("No positions to monitor")
-                return
-
-            # 1. Update prices
-            symbols = [p.symbol for p in positions]
-            prices = await self.data_feed.get_batch_quotes(symbols)
-            self.portfolio.update_prices(prices)
-
-            # 2. Check stop-losses (belt-and-suspenders with Alpaca bracket orders)
-            alerts = self.risk_manager.check_position_health(self.portfolio.state)
-            for alert in alerts:
-                sym = alert["symbol"]
-                pos = self.portfolio.get_position(sym)
-                if pos:
-                    logger.warning("Stop-loss triggered for %s", sym)
-                    await self._execute_sell(pos, reason=alert["reason"])
-
-            # 3. Check for material events (only every other check to save API costs)
-            if self._should_check_events():
-                for pos in list(self.portfolio.state.positions):
-                    try:
-                        event_check = await self.analyst.check_for_material_events(
-                            pos.symbol, pos.thesis.symbol
-                        )
-                        if event_check.get("material_event"):
-                            severity = event_check.get("severity", 0)
-                            impact = event_check.get("thesis_impact", "neutral")
-                            event_desc = event_check.get("event", "Unknown event")
-
-                            logger.info(
-                                "Material event for %s: %s (severity=%d, impact=%s)",
-                                pos.symbol, event_desc, severity, impact,
-                            )
-
-                            # Send to Discord market-monitor
-                            try:
-                                await self.discord.send_material_event(
-                                    pos.symbol, event_desc, impact, severity,
-                                )
-                            except Exception:
-                                pass
-
-                            # Severe negative event → full re-analysis
-                            if severity >= 7 and impact == "negative":
-                                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                                if company:
-                                    new_thesis = await self.analyst.re_analyze_position(
-                                        pos.symbol, company, pos.thesis
-                                    )
-                                    if new_thesis and new_thesis.direction == "SELL":
-                                        await self._execute_sell(
-                                            pos,
-                                            reason=f"Material event: {event_desc}",
-                                        )
-                                    elif new_thesis:
-                                        self.portfolio.update_thesis(pos.symbol, new_thesis)
-                    except Exception as e:
-                        logger.error("Event check failed for %s: %s", pos.symbol, e)
-
-            self.portfolio.set_last_daily_check(_now_utc())
-            logger.info("Market monitoring complete — %d positions checked", len(positions))
-
-        except Exception as e:
-            logger.exception("Market monitoring failed: %s", e)
+        """Broker safety and queued orders: engine.monitor_tick only (clean-up,
+        resolve accepted orders, cover any short, one broker stop per long,
+        queued exits then entries). No software stop sell, no legacy APIs; the
+        research hook is dispatched separately by the execution cycle."""
+        self._last_monitor_time = _now_et()
+        if self.engine is None:
+            logger.error("Execution engine not wired; no monitoring")
+            return None
+        return await self.engine.monitor_tick()
 
     def _should_check_events(self) -> bool:
-        """Only check material events every other monitoring cycle to manage API costs."""
-        if not self._last_monitor_time:
-            return True
-        # Check events on even hours only
-        return _now_et().hour % 2 == 0
+        now = _now_et()
+        return self._is_market_open(now) and (
+            self._last_news_at is None or now.timestamp() - self._last_news_at.timestamp() >= NEWS_SECONDS
+        )
 
     # ── Daily summary ────────────────────────────────────────────────
 
     async def _send_daily_summary(self):
-        """End-of-day summary."""
+        """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""
         try:
+            from stock_agent.reporting import ReportBuilder, _safe_report_reason
+
             now = _now_et()
-            self._daily_summary_sent_today = now.strftime("%Y-%m-%d")
-
-            pv = self.portfolio.get_portfolio_value()
-            exposure = self.portfolio.get_exposure()
-
-            # Calculate day P&L (compare to previous summary or starting capital)
-            prev_value = self.portfolio.state.starting_capital
-            if self.portfolio.state.daily_summaries:
-                prev_value = self.portfolio.state.daily_summaries[-1].portfolio_value
-
-            day_pnl = pv - prev_value
-            day_pnl_pct = day_pnl / prev_value if prev_value > 0 else 0
-            total_pnl = pv - self.portfolio.state.starting_capital
-            total_pnl_pct = total_pnl / self.portfolio.state.starting_capital if self.portfolio.state.starting_capital > 0 else 0
-
-            # Trades executed today
-            today_str = now.strftime("%Y-%m-%d")
-            trades_today = [
-                t for t in self.portfolio.state.trade_history
-                if t.timestamp.strftime("%Y-%m-%d") == today_str
-            ]
-
-            summary = DailySummary(
-                date=now.strftime("%b %d, %Y (%a)"),
-                portfolio_value=pv,
-                cash=self.portfolio.state.cash,
-                total_exposure=sum(p.current_price * p.shares for p in self.portfolio.state.positions),
-                exposure_pct=exposure,
-                num_positions=len(self.portfolio.state.positions),
-                day_pnl=day_pnl,
-                day_pnl_pct=day_pnl_pct,
-                total_pnl=total_pnl,
-                total_pnl_pct=total_pnl_pct,
-                trades_today=trades_today,
-                positions=list(self.portfolio.state.positions),
-                signals=[],
+            day_key = now.strftime("%Y-%m-%d")
+            self._daily_summary_sent_today = day_key
+            snap = self.ledger.last_snapshot() if self.ledger is not None else None
+            snap_stale = (
+                snap is None
+                or snap.as_of.astimezone(ET).date() != now.date()
+                or (now - snap.as_of.astimezone(ET)) > timedelta(minutes=15)
             )
-
-            self.portfolio.add_daily_summary(summary)
-            await asyncio.gather(
-                self.telegram.send_daily_summary(summary),
-                self.discord.send_daily_summary(summary),
-                self.discord.send_eli5_daily(summary),
-                return_exceptions=True,
-            )
-            logger.info("Daily summary sent — PV=$%.0f, Day P&L=$%+.0f", pv, day_pnl)
-
-        except Exception as e:
-            logger.exception("Daily summary failed: %s", e)
-            await asyncio.gather(
-                self.telegram.send_error_alert(f"Daily summary failed: {e}"),
-                self.discord.send_error(str(e), context="Daily summary"),
-                return_exceptions=True,
-            )
-
-    # ── Trade execution ──────────────────────────────────────────────
-
-    async def _execute_signals(self, signals: list[Signal]) -> list[Signal]:
-        """Execute BUY signals that pass risk checks."""
-        executed: list[Signal] = []
-
-        # Check PDT compliance first
-        if not self.risk_manager.check_pdt_compliance(self.portfolio.state.trade_history):
-            logger.warning("PDT limit reached — skipping new buys")
-            await asyncio.gather(
-                self.telegram.send_message("\u26a0\ufe0f PDT limit reached — no new trades today"),
-                self.discord.send_risk_alert("PDT_WARNING", "PDT day-trade limit reached — no new trades today"),
-                return_exceptions=True,
-            )
-            return executed
-
-        for signal in signals:
-            if signal.action != "BUY":
-                continue
-
-            sym = signal.symbol
-            # Get sector from company fundamentals (FMP profile)
-            company_sector = "Unknown"
-            try:
-                company_data = await self.data_feed.get_company_fundamentals(sym)
-                if company_data and company_data.sector:
-                    company_sector = company_data.sector
-            except Exception:
-                pass
-
-            price = signal.entry_price or 0
-            if price <= 0:
-                quote = await self.data_feed.get_stock_quote(sym)
-                if quote:
-                    price = quote["price"]
-                else:
-                    logger.warning("Cannot get price for %s — skipping", sym)
-                    continue
-
-            ok, reason = self.risk_manager.can_open_position(
-                self.portfolio.state, sym, company_sector, price,
-                conviction=signal.conviction,
-            )
-            if not ok:
-                logger.warning("Risk check BLOCKED %s (sector=%s): %s", sym, company_sector, reason)
+            if snap_stale and self.ledger is not None and hasattr(self.ledger, "refresh"):
                 try:
-                    await self.discord.send_system_log(
-                        "WARNING", f"Trade blocked for {sym}: {reason}"
-                    )
-                except Exception:
-                    pass
-                continue
+                    snap = await self.ledger.refresh("daily_summary")
+                except Exception as exc:
+                    logger.warning("Daily summary refresh fallback failed (%s)", type(exc).__name__)
 
-            is_add_on = (reason == "ADD_TO_EXISTING")
-            pv = self.portfolio.get_portfolio_value()
+            raw_cr = getattr(self, "_last_close_report", None)
+            close_report = raw_cr if getattr(raw_cr, "session_date", None) == now.date() else None
+            entry_locks = None
+            lock_fn = getattr(self, "get_entry_locks", None)
+            if callable(lock_fn):
+                try:
+                    entry_locks = lock_fn()
+                except Exception as exc:
+                    logger.warning("Could not read scheduler entry locks (%s)", type(exc).__name__)
 
-            if is_add_on:
-                # Calculate how many MORE shares to reach effective target weight.
-                # Effective target = min(conviction-size, hard cap) — so a single
-                # add can never take us above config.MAX_POSITION_PCT, even if
-                # conviction target is higher.
-                existing = self.portfolio.get_position(sym)
-                if not existing:
-                    continue
-                conviction_target = self.config.CONVICTION_SIZE_MAP.get(
-                    signal.conviction, 0.05
-                )
-                hard_cap = self.config.MAX_POSITION_PCT
-                target_pct = min(conviction_target, hard_cap)
-                target_value = pv * target_pct
-                current_value = existing.current_price * existing.shares
-                additional_value = target_value - current_value
-                qty = int(additional_value / price)
-                if qty <= 0:
-                    logger.info("Add-on for %s: already at target weight — skipping", sym)
-                    continue
-                logger.info(
-                    "Adding to %s: %d more shares (%.1f%% → %.1f%% target, cap %.0f%%)",
-                    sym, qty, current_value / pv * 100, target_pct * 100, hard_cap * 100,
-                )
-            else:
-                qty = self.risk_manager.calculate_position_size(pv, price, signal.conviction)
-                if qty <= 0:
-                    logger.info("Position size 0 for %s — skipping", sym)
-                    continue
-
-            # Volatility-adjusted stop-loss
-            beta = getattr(signal.thesis, "beta", None)
-            stop_loss = self.risk_manager.get_stop_loss_price(price, beta)
-            if hasattr(signal.thesis, "stop_loss_price"):
-                signal.thesis.stop_loss_price = stop_loss
-
-            # Execute order
-            order = await self.executor.place_buy(sym, qty, stop_loss)
-            if not order:
-                logger.error("Order execution failed for %s", sym)
-                continue
-
-            # Record position and trade
-            now = _now_utc()
-            if is_add_on:
-                # Update existing position shares
-                existing = self.portfolio.get_position(sym)
-                if existing:
-                    existing.shares += qty
-                    existing.market_value = existing.current_price * existing.shares
-                    existing.last_updated = now
-                    self.portfolio._save()
-            else:
-                position = Position(
-                    symbol=sym,
-                    shares=qty,
-                    entry_price=price,
-                    entry_date=now,
-                    current_price=price,
-                    market_value=price * qty,
-                    stop_loss=stop_loss,
-                    thesis=signal.thesis,
-                    sector=company_sector,
-                    last_updated=now,
-                )
-                self.portfolio.add_position(position)
-
-            action_type = "Add-on" if is_add_on else "New thesis"
-            trade = Trade(
-                symbol=sym,
-                action="BUY",
-                shares=qty,
-                price=price,
-                timestamp=now,
-                reason=f"{action_type}: {signal.thesis.summary[:100]}",
-            )
-            self.portfolio.log_trade(trade)
-
-            await asyncio.gather(
-                self.telegram.send_trade_alert(trade, signal.thesis),
-                self.discord.send_trade_alert(trade, signal.thesis),
-                self.discord.send_eli5_trade(trade, signal.thesis, is_buy=True),
-                return_exceptions=True,
-            )
-            executed.append(signal)
-            logger.info("Executed BUY: %s x%d @ $%.2f", sym, qty, price)
-
-        return executed
-
-    async def _execute_sell(self, position: Position, reason: str):
-        """Sell an entire position."""
-        try:
-            # Get current price
-            quote = await self.data_feed.get_stock_quote(position.symbol)
-            sell_price = quote["price"] if quote else position.current_price
-
-            order = await self.executor.place_sell(position.symbol, position.shares)
-            if not order:
-                logger.error("Sell order failed for %s", position.symbol)
-                return
-
-            pnl = (sell_price - position.entry_price) * position.shares
-            pnl_pct = (sell_price - position.entry_price) / position.entry_price if position.entry_price > 0 else 0
-            hold_days = (_now_utc() - position.entry_date).days
-
-            trade = Trade(
-                symbol=position.symbol,
-                action="SELL",
-                shares=position.shares,
-                price=sell_price,
-                timestamp=_now_utc(),
-                reason=reason,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                hold_days=hold_days,
+            builder = ReportBuilder(
+                self.config,
+                ledger=self.ledger,
+                price_service=getattr(self, "prices", None),
+                health_registry=getattr(self, "health", None),
+                options_store=getattr(self, "options_store", None),
+                calendar=getattr(self, "calendar", None),
+                research_store=getattr(self, "research_store", None),
+                clock=_now_utc,
             )
 
-            # Remove position first (log_trade also removes, but be explicit)
-            self.portfolio.remove_position(position.symbol)
-            self.portfolio.log_trade(trade)
-
-            tr_clause = format_tipranks_telegram_clause(
-                self._tipranks_lookup.get(position.symbol.upper())
-            )
-            alert_tasks = [
-                self.telegram.send_trade_alert(trade),
-                self.discord.send_trade_alert(trade),
-                self.discord.send_eli5_trade(trade, position.thesis, is_buy=False),
-            ]
-            if tr_clause:
-                alert_tasks.append(self.telegram.send_message(tr_clause.lstrip(" |").strip()))
-            await asyncio.gather(*alert_tasks, return_exceptions=True)
-            logger.info(
-                "Executed SELL: %s x%d @ $%.2f — P&L: $%+,.0f (%.1f%%)",
-                position.symbol, position.shares, sell_price, pnl, pnl_pct * 100,
-            )
-
-        except Exception as e:
-            logger.exception("Sell execution failed for %s: %s", position.symbol, e)
-            await asyncio.gather(
-                self.telegram.send_error_alert(f"Sell failed for {position.symbol}: {e}"),
-                self.discord.send_error(str(e), context=f"Sell execution for {position.symbol}"),
-                return_exceptions=True,
-            )
-
-    # ── Options Trading ─────────────────────────────────────────────
-
-    async def _run_options_scan(self):
-        """Daily options scan: find and execute options opportunities."""
-        try:
-            now = _now_et()
-            self._options_scan_done_today = now.strftime("%Y-%m-%d")
-
-            await self.discord.send_system_log("INFO", "Options scan starting")
-
-            # Reconcile options portfolio against Alpaca FIRST — mark expired/
-            # closed legs so we don't double-count them in the "skip underlyings
-            # with existing positions" block below.
-            portfolio_value = self.portfolio.get_portfolio_value()
+            daily_status = "skipped"
             try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                sync_result = await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
+                embeds = await builder.build_daily_summary(
+                    snapshot=snap,
+                    close_report=close_report,
+                    as_of=now,
+                    entry_locks=entry_locks,
                 )
-                if sync_result["closed"]:
-                    logger.info(
-                        "Options reconcile: %d positions closed, $%.0f realized P&L captured",
-                        sync_result["closed"], sync_result["realized_pnl"],
+                if self.alerts is not None:
+                    enq = self.alerts.alert(
+                        "info",
+                        f"Daily Summary — {day_key}",
+                        "",
+                        key=f"daily_summary:{day_key}",
+                        channel_key="daily_pnl",
+                        embeds=embeds,
                     )
+                    daily_status = "enqueued" if enq else "suppressed"
+                elif self.discord is not None:
+                    ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                    if ch:
+                        ok = await self.discord._send_multi_embed(ch, embeds)
+                        daily_status = "delivered" if ok else "delivery_failed"
             except Exception as e:
-                logger.warning("Options Alpaca reconcile failed (non-fatal): %s", e)
-
-            # Refresh remaining open options with latest prices
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Build inputs for the options engine
-            stock_positions = {
-                p.symbol: p.shares for p in self.portfolio.state.positions
-            }
-
-            # Build screener candidates: (symbol, conviction, price, target_price)
-            screener_candidates: list[tuple[str, int, float, float | None]] = []
-
-            # Track underlyings already in options portfolio to prevent duplicates
-            import re as _re
-            existing_options_underlyings: set[str] = set()
-            for op in self.options_portfolio.state.positions:
-                m = _re.match(r'([A-Z]+)', op.contract_symbol)
-                if m:
-                    existing_options_underlyings.add(m.group(1))
-            if existing_options_underlyings:
-                logger.info(
-                    "Skipping options scan for underlyings with existing positions: %s",
-                    existing_options_underlyings,
-                )
-
-            universe = self.portfolio.state.universe or []
-            for sym in universe[:30]:
-                if sym in existing_options_underlyings:
-                    continue  # Already have an options position on this underlying
+                daily_status = f"degraded:{type(e).__name__}"
+                reason = _safe_report_reason(e, self.config)
+                logger.error("Daily summary failed (%s)", type(e).__name__)
+                fallback_embeds = [
+                    {
+                        "title": f"📊 Daily Summary — {day_key}",
+                        "description": f"report unavailable: {reason}",
+                        "color": 0xEF4444,
+                    }
+                ]
                 try:
-                    company = await self.data_feed.get_company_fundamentals(sym)
-                    if not company or company.price <= 0:
-                        continue
-                    # Get conviction from active theses if available
-                    thesis = self.portfolio.state.active_theses.get(sym)
-                    conviction = 6  # default
-                    target_price = None
-                    if isinstance(thesis, dict):
-                        conviction = thesis.get("conviction", 6)
-                        target_price = thesis.get("target_price")
-                    screener_candidates.append((sym, conviction, company.price, target_price))
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "warning",
+                            f"Daily Summary — {day_key}",
+                            f"report unavailable: {reason}",
+                            key=f"daily_summary_unavailable:{day_key}",
+                            channel_key="daily_pnl",
+                            embeds=fallback_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, fallback_embeds)
+                except Exception as alert_err:
+                    logger.warning("Daily summary fallback alert failed (%s)", type(alert_err).__name__)
+
+            # Emit the weekly paper-test scorecard on Friday (or if Friday is a holiday, Thursday)
+            is_week_end = now.weekday() == 4
+            cal = getattr(self, "calendar", None)
+            if not is_week_end and now.weekday() == 3 and cal is not None:
+                try:
+                    is_week_end = cal.session_on(now.date() + timedelta(days=1)) is None
                 except Exception:
-                    continue
+                    is_week_end = False
 
-            current_exposure = self.options_portfolio.total_exposure_pct
-
-            # Filter stock_positions to exclude underlyings with existing options
-            filtered_stock_positions = {
-                sym: shares for sym, shares in stock_positions.items()
-                if sym not in existing_options_underlyings
-            }
-
-            # Run the engine
-            signals = await self.options_engine.scan_opportunities(
-                portfolio_value=portfolio_value,
-                open_options_count=self.options_portfolio.open_position_count,
-                current_options_exposure=current_exposure,
-                stock_positions=filtered_stock_positions,
-                screener_candidates=screener_candidates,
-            )
-
-            # Execute each signal
-            signals_executed = 0
-            for signal in signals:
+            if is_week_end:
                 try:
-                    if signal.leg2_contract_symbol:
-                        # Spread order
-                        order = await self.options_executor.place_spread_order(
-                            long_symbol=signal.contract_symbol,
-                            short_symbol=signal.leg2_contract_symbol,
-                            qty=signal.qty,
-                            order_type=OptionOrderType.MARKET,
-                        )
-                    else:
-                        # Single-leg order — resolve side to proper enum
-                        side_str = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
-                        side_enum = OptionSide.SELL if side_str == "sell" else OptionSide.BUY
-                        order = await self.options_executor.place_option_order(
-                            contract_symbol=signal.contract_symbol,
-                            qty=signal.qty,
-                            side=side_enum,
-                            order_type=OptionOrderType.MARKET,
-                            limit_price=None,
-                        )
-
-                    if order:
-                        # Use max_debit as fill price proxy; fall back to 0.0
-                        fill_price = getattr(signal, 'max_debit_per_contract', None) or \
-                                     getattr(signal, 'min_credit_per_contract', None) or 0.0
-                        regime = self.macro.get_current_regime()
-                        pos = self.options_portfolio.open_position(
-                            signal=signal,
-                            filled_price=fill_price,
-                            portfolio_value=portfolio_value,
-                            regime=regime,
-                        )
-                        signals_executed += 1
-                        logger.info(
-                            "Options: executed %s on %s — %s",
-                            signal.strategy.value, signal.underlying_symbol, signal.contract_symbol,
-                        )
+                    wk_embeds, _ = await builder.build_weekly_scorecard(
+                        snapshot=snap,
+                        as_of=now,
+                        entry_locks=entry_locks,
+                    )
+                    if wk_embeds and cal is not None and hasattr(cal, "session_on"):
                         try:
-                            embed = self.options_portfolio.format_position_alert(pos, "OPENED")
-                            await self.discord.send_embed(
-                                self.discord.channels.get("trades", ""), embed
-                            )
+                            sess = cal.session_on(now.date())
+                            if sess is not None and now < sess.closes_at.astimezone(ET) + timedelta(minutes=16):
+                                wk_embeds[0] = dict(wk_embeds[0])
+                                wk_embeds[0]["description"] = (
+                                    str(wk_embeds[0].get("description") or "")
+                                    + " Note: generated before post-close shadow replay (+16m) window completed."
+                                ).strip()
                         except Exception:
                             pass
-                except Exception as e:
-                    logger.error("Options execution failed for %s: %s", signal.contract_symbol, e)
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "info",
+                            f"Weekly Scorecard — {day_key}",
+                            "",
+                            key=f"weekly_scorecard:{now.strftime('%Y-%W')}",
+                            channel_key="daily_pnl",
+                            embeds=wk_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, wk_embeds)
+                except Exception as wk_err:
+                    reason = _safe_report_reason(wk_err, self.config)
+                    logger.error("Weekly scorecard failed (%s)", type(wk_err).__name__)
+                    wk_fallback = [
+                        {
+                            "title": f"📈 Weekly Scorecard — {day_key}",
+                            "description": f"report unavailable: {reason}",
+                            "color": 0xEF4444,
+                        }
+                    ]
+                    try:
+                        if self.alerts is not None:
+                            self.alerts.alert(
+                                "warning",
+                                f"Weekly Scorecard — {day_key}",
+                                f"report unavailable: {reason}",
+                                key=f"weekly_scorecard_unavailable:{now.strftime('%Y-%W')}",
+                                channel_key="daily_pnl",
+                                embeds=wk_fallback,
+                            )
+                        elif self.discord is not None:
+                            ch = self.discord.channels.get("daily_pnl") or self.discord.channels.get("announcements", "")
+                            if ch:
+                                await self.discord._send_multi_embed(ch, wk_fallback)
+                    except Exception as alert_err:
+                        logger.warning("Weekly scorecard fallback alert failed (%s)", type(alert_err).__name__)
 
-            await self.discord.send_system_log(
-                "INFO",
-                f"Options scan complete — {signals_executed} trades executed, "
-                f"{self.options_portfolio.open_position_count} open options positions",
-            )
-            logger.info("Options scan complete — %d executed", signals_executed)
+            if self.alerts is not None:
+                try:
+                    sent = await self.alerts.flush()
+                    logger.info(
+                        "Daily summary outcome=%s (outbox flushed=%s)",
+                        daily_status,
+                        sent,
+                    )
+                except Exception as flush_err:
+                    logger.warning("Daily summary outbox flush failed (%s)", type(flush_err).__name__)
+            else:
+                logger.info("Daily summary outcome=%s", daily_status)
+        except Exception as outer_err:
+            logger.error("Daily summary outer guard caught %s", type(outer_err).__name__)
 
-        except Exception as e:
-            logger.exception("Options scan failed: %s", e)
-            await self.discord.send_error(str(e), context="Options scan")
+    async def _run_options_scan(self):
+        """Once-per-session options entry scan via OptionsManager.
+
+        The manager owns everything else: mode, market gate, research gate,
+        risk, sizing, the write-ahead book and confirmed orders. Without a
+        manager no options orders are placed (the legacy path is not used).
+        Returns the manager's ScanOutcomes; exceptions propagate to the caller,
+        which records the job status and retries.
+        """
+        now = _now_utc()
+        if self.options is None:
+            logger.warning("Options scan skipped: no OptionsManager wired")
+            return []
+        outcomes = await self.options.scan(now)
+        self._options_scan_done_today = now.astimezone(ET).strftime("%Y-%m-%d")
+        opened = [o for o in outcomes if getattr(o, "opened", None)]
+        logger.info("Options scan: %d candidates, %d opened", len(outcomes), len(opened))
+        return outcomes
 
     async def _check_options_positions(self):
-        """Monitor options positions and send expiry alerts.
-
-        Note: Auto-close via order submission is disabled because Alpaca paper
-        trading rejects SELL orders on long options as 'uncovered'. Positions
-        will be managed to expiry or closed manually. Only expiry warnings
-        (3 DTE) are sent as alerts.
-        """
-        try:
-            if not self.options_portfolio.state.positions:
-                return
-
-            # Reconcile with Alpaca first (catch expirations/assignments)
-            portfolio_value = self.portfolio.get_portfolio_value()
-            try:
-                live_opts = await self.options_executor.get_option_positions()
-                opt_acts = await self.options_executor.get_option_activities()
-                await self.options_portfolio.sync_from_alpaca(
-                    alpaca_option_positions=live_opts,
-                    alpaca_option_activities=opt_acts,
-                    portfolio_value=portfolio_value,
-                )
-            except Exception as e:
-                logger.warning("Intraday options reconcile failed: %s", e)
-
-            # Refresh prices on remaining open positions
-            await self.options_portfolio.refresh_positions(portfolio_value)
-
-            # Expiry alerts only (3 DTE warning)
-            expiry_alerts = self.options_portfolio.get_expiry_alerts()
-            for pos in expiry_alerts:
-                try:
-                    await self.discord.send_embed(
-                        self.discord.channels.get("risk", ""),
-                        {
-                            "title": "\u26a0\ufe0f Options Expiry Alert",
-                            "description": (
-                                f"**{pos.contract_symbol}** expires in **{pos.dte} days**\n"
-                                f"Strategy: {pos.strategy.value}\n"
-                                f"Unrealized P&L tracked internally only — "
-                                f"positions will run to expiry.\n"
-                                f"Strike: ${getattr(pos, 'strike', '?')}  "
-                                f"Expiry: {getattr(pos, 'expiration_date', '?')}"
-                            ),
-                            "color": 0xF59E0B,
-                        },
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.error("Options position check failed: %s", e)
-
-    # ── Event-Triggered Scanning ────────────────────────────────────────────
+        """Exit manager and repair pass: reconcile with the broker, then apply
+        exits (T-2 time exit, targets, thesis break, ex-dividend) and repairs.
+        Returns the MonitorOutcome; exceptions propagate to the caller."""
+        if self.options is None:
+            return None
+        return await self.options.monitor(_now_utc())
 
     async def _check_for_market_event(self):
-        """After each market monitoring cycle, check if a major event occurred.
-
-        Triggers an immediate full analysis cycle (re-scan + re-analyze positions)
-        when ANY of these thresholds are crossed since the last check:
-
-        - SPX moved > 1.5% in either direction
-        - VIX spiked > 3 points
-        - Macro regime changed
-        - Oil (crude) moved > 3%
-
-        Cooldown of 30 minutes prevents back-to-back triggers.
-        """
-        try:
-            # Respect cooldown
-            now = _now_et()
-            if self._event_scan_cooldown:
-                elapsed = (now - self._event_scan_cooldown).total_seconds()
-                if elapsed < 1800:  # 30-minute cooldown
-                    return
-
-            # Run a fresh macro check to get current values
-            snap = await self.macro.check_conditions()
-
-            # Compare against last known values
-            spx_now = snap.spx_price
-            vix_now = snap.vix_level
-            regime_now = snap.regime
-
-            events_detected: list[str] = []
-
-            # SPX move > 1.5%
-            if self._last_event_spx > 0 and spx_now > 0:
-                spx_move_pct = abs(spx_now - self._last_event_spx) / self._last_event_spx * 100
-                if spx_move_pct >= 1.5:
-                    events_detected.append(
-                        f"SPX moved {spx_move_pct:+.1f}% ({self._last_event_spx:,.0f} → {spx_now:,.0f})"
-                    )
-
-            # VIX spike > 3 points
-            if self._last_event_vix > 0 and vix_now > 0:
-                vix_change = vix_now - self._last_event_vix
-                if abs(vix_change) >= 3.0:
-                    events_detected.append(
-                        f"VIX moved {vix_change:+.1f} pts ({self._last_event_vix:.1f} → {vix_now:.1f})"
-                    )
-
-            # Regime change
-            if self._last_event_regime and regime_now != self._last_event_regime:
-                events_detected.append(
-                    f"Regime changed: {self._last_event_regime} → {regime_now}"
-                )
-
-            # Update last known values
-            self._last_event_spx = spx_now
-            self._last_event_vix = vix_now
-            self._last_event_regime = regime_now
-
-            if not events_detected:
-                return
-
-            # Something significant happened — trigger immediate full scan
-            self._event_scan_cooldown = now
-            event_summary = " | ".join(events_detected)
-
-            logger.info("MARKET EVENT DETECTED: %s — triggering immediate scan", event_summary)
-
-            # Notify Discord
-            await self.discord.send_embed(
-                self.discord.channels.get("announcements", ""),
-                {
-                    "title": "\u26a1 Market Event — Immediate Scan Triggered",
-                    "description": (
-                        f"Significant market movement detected. Running full analysis now.\n\n"
-                        f"**Events:**\n" + "\n".join(f"\u2022 {e}" for e in events_detected)
-                    ),
-                    "color": 0xF59E0B,
-                    "fields": [
-                        {"name": "Regime", "value": regime_now.replace('_', ' ').title(), "inline": True},
-                        {"name": "SPX", "value": f"${spx_now:,.0f}", "inline": True},
-                        {"name": "VIX", "value": f"{vix_now:.1f}", "inline": True},
-                    ],
-                },
+        """A healthy regime change can alert, but cannot open a trade job."""
+        research = getattr(self, "research", None)
+        if research is None:
+            return
+        change = await research.observe_regime()
+        if change is not None:
+            before, after = change
+            await self._alert(
+                "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
+                key=f"market_regime_{before}_{after}",
             )
-
-            # 1. Re-analyze all existing positions with fresh data
-            if self.portfolio.state.positions:
-                symbols = [p.symbol for p in self.portfolio.state.positions]
-                companies = await self._fetch_fundamentals(symbols)
-                await self._re_analyze_existing_positions(companies)
-
-            # 2. Run a fresh universe screen and deep analysis for new opportunities
-            symbols = await self.data_feed.screen_universe()
-            if symbols:
-                self.portfolio.set_universe(symbols)
-                companies = await self._fetch_fundamentals(symbols)
-                if companies:
-                    ranked = await self.screener.screen_candidates(companies)
-                    top_symbols = [r["symbol"] for r in ranked[: self.macro.get_effective_analysis_depth()]]
-                    signals = await self._deep_analyze(top_symbols, companies)
-                    # Execute signals if market is open
-                    if self._is_market_open(now):
-                        executed = await self._execute_signals(signals)
-                    else:
-                        self._pending_signals.extend(signals)
-                        executed = []
-
-            # 3. Re-run options scan if in market hours
-            if self._is_market_open(now):
-                self._options_scan_done_today = None  # Reset so it runs again
-                await self._run_options_scan()
-
-            logger.info(
-                "Event-triggered scan complete — event: %s",
-                event_summary,
-            )
-
-        except Exception as e:
-            logger.error("Event check failed: %s", e)
 
     # ── Morning Brief ────────────────────────────────────────────────
 
     async def _send_morning_brief(self):
-        """Comprehensive morning brief posted to #announcements.
-
-        Includes: portfolio status, market regime, yesterday's activity,
-        today's outlook, key levels, and what the bot plans to do.
-        """
+        """Honest morning brief posted to #announcements from reconciled state."""
         try:
+            from stock_agent.reporting import ReportBuilder, _safe_report_reason
+
             now = _now_et()
-            self._morning_brief_done_today = now.strftime("%Y-%m-%d")
-            today_str = now.strftime("%A, %B %d, %Y")
-            sgt_str = datetime.now(SGT).strftime("%I:%M %p SGT")
-
-            embeds: list[dict] = []
-
-            # ── 1. PORTFOLIO STATUS ──────────────────────────────
-            # Sync from Alpaca for accurate data
-            alpaca_account = await self.executor.get_account()
-            alpaca_positions = await self.executor.get_positions()
-
-            if alpaca_account:
-                equity = float(alpaca_account.get("equity", 0))
-                cash = float(alpaca_account.get("cash", 0))
-                last_equity = float(alpaca_account.get("last_equity", 0))
-                day_pnl = equity - last_equity
-                day_pnl_pct = (day_pnl / last_equity * 100) if last_equity > 0 else 0
-                starting = self.portfolio.state.starting_capital
-                total_pnl = equity - starting
-                total_pnl_pct = (total_pnl / starting * 100) if starting > 0 else 0
-                invested = equity - cash
-                exposure_pct = (invested / equity * 100) if equity > 0 else 0
-
-                # Also sync internal portfolio
-                if alpaca_positions:
-                    self.portfolio.sync_from_alpaca(alpaca_positions, alpaca_account)
-
-                pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
-                day_emoji = "\u2705" if day_pnl >= 0 else "\u274c"
-
-                portfolio_fields = [
-                    {"name": "Portfolio Value", "value": f"**${equity:,.2f}**", "inline": True},
-                    {"name": "Cash Available", "value": f"${cash:,.0f}", "inline": True},
-                    {"name": "Exposure", "value": f"{exposure_pct:.1f}% (${invested:,.0f})", "inline": True},
-                    {"name": f"{day_emoji} Yesterday P&L", "value": f"${day_pnl:+,.2f} ({day_pnl_pct:+.2f}%)", "inline": True},
-                    {"name": f"{pnl_emoji} Total P&L", "value": f"${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)", "inline": True},
-                    {"name": "Positions", "value": f"{len(alpaca_positions)} / {self.config.MAX_POSITIONS} slots", "inline": True},
-                ]
-
-                # Position table
-                if alpaca_positions:
-                    # Sort by unrealized P&L descending
-                    sorted_pos = sorted(
-                        alpaca_positions,
-                        key=lambda p: float(p.get("unrealized_pl", 0)),
-                        reverse=True,
-                    )
-                    pos_lines = []
-                    for p in sorted_pos:
-                        sym = p.get("symbol", "?")
-                        upnl = float(p.get("unrealized_pl", 0))
-                        upnl_pct = float(p.get("unrealized_plpc", 0)) * 100
-                        cur = float(p.get("current_price", 0))
-                        mv = float(p.get("market_value", 0))
-                        emoji = "\u2705" if upnl >= 0 else "\u274c"
-                        pos_lines.append(
-                            f"{emoji} **{sym}** ${cur:,.2f} | ${upnl:+,.0f} ({upnl_pct:+.1f}%) | ${mv:,.0f}"
-                        )
-                    pos_text = "\n".join(pos_lines)
-                    if len(pos_text) <= 1024:
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Open Positions", "value": pos_text, "inline": False}
-                        )
-                    else:
-                        # Split into two fields
-                        mid = len(pos_lines) // 2
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Positions (1/2)", "value": "\n".join(pos_lines[:mid]), "inline": False}
-                        )
-                        portfolio_fields.append(
-                            {"name": "\U0001f4bc Positions (2/2)", "value": "\n".join(pos_lines[mid:]), "inline": False}
-                        )
-
-                embeds.append({
-                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
-                    "description": f"Good {'morning' if now.hour < 12 else 'evening'}. Here's your daily update. ({sgt_str})",
-                    "color": 0x3B82F6,
-                    "fields": portfolio_fields,
-                })
-            else:
-                embeds.append({
-                    "title": f"\u2615 Morning Brief \u2014 {today_str}",
-                    "description": "Could not fetch Alpaca account data.",
-                    "color": 0xEF4444,
-                })
-
-            # ── 2. MARKET REGIME ─────────────────────────────────
-            macro_snap = self.macro.get_last_snapshot()
-            if macro_snap:
-                regime_embed = self.macro.format_discord_brief(macro_snap)
-                regime_embed["title"] = "\U0001f30d Market Conditions"
-                embeds.append(regime_embed)
-            else:
-                # Run a fresh check if none exists
+            day_key = now.strftime("%Y-%m-%d")
+            self._morning_brief_done_today = day_key
+            snap = self.ledger.last_snapshot() if self.ledger is not None else None
+            snap_stale = (
+                snap is None
+                or (now - snap.as_of.astimezone(ET)) > timedelta(minutes=15)
+            )
+            if snap_stale and self.ledger is not None and hasattr(self.ledger, "refresh"):
                 try:
-                    macro_snap = await self.macro.check_conditions()
-                    regime_embed = self.macro.format_discord_brief(macro_snap)
-                    regime_embed["title"] = "\U0001f30d Market Conditions"
-                    embeds.append(regime_embed)
-                except Exception as e:
-                    logger.warning("Could not fetch macro data for morning brief: %s", e)
+                    snap = await self.ledger.refresh("morning_brief")
+                except Exception as exc:
+                    logger.warning("Morning brief refresh fallback failed (%s)", type(exc).__name__)
 
-            # ── 3. YESTERDAY RECAP ───────────────────────────────
-            yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-            yesterday_trades = [
-                t for t in self.portfolio.state.trade_history
-                if t.timestamp.strftime("%Y-%m-%d") == yesterday_str
-            ]
+            macro_embed: dict | None = None
+            macro_svc = getattr(self, "macro", None)
+            if macro_svc is not None:
+                try:
+                    macro_snap = macro_svc.get_last_snapshot()
+                    if macro_snap is None:
+                        macro_snap = await macro_svc.check_conditions()
+                    if macro_snap is not None:
+                        macro_embed = macro_svc.format_discord_brief(macro_snap)
+                        macro_embed["title"] = "\U0001f30d Market Conditions"
+                except Exception as exc:
+                    logger.warning("Could not fetch macro data for morning brief (%s)", type(exc).__name__)
 
-            recap_lines = []
-            if yesterday_trades:
-                for t in yesterday_trades:
-                    pnl_str = ""
-                    if t.pnl is not None:
-                        pnl_str = f" \u2192 ${t.pnl:+,.0f}"
-                    recap_lines.append(f"\u2022 **{t.action}** {t.symbol} x{t.shares} @ ${t.price:.2f}{pnl_str}")
-            else:
-                recap_lines.append("No trades executed yesterday. The bot held steady.")
-
-            # What scans ran
-            scan_info = []
-            day_of_week = now.weekday()
-            yesterday_dow = (now - timedelta(days=1)).weekday()
-            if yesterday_dow == 6:  # Sunday
-                scan_info.append("\u2022 Weekly full analysis ran (Sunday cycle)")
-            if yesterday_dow == 2:  # Wednesday
-                scan_info.append("\u2022 Mid-week analysis ran (Wednesday refresh)")
-            if yesterday_dow < 5:  # Weekday
-                scan_info.append("\u2022 Daily pre-market scan completed")
-                scan_info.append("\u2022 Market monitoring ran every 30 min during market hours")
-
-            recap_text = "**Trades:**\n" + "\n".join(recap_lines)
-            if scan_info:
-                recap_text += "\n\n**Bot Activity:**\n" + "\n".join(scan_info)
-
-            embeds.append({
-                "title": "\U0001f4cb Yesterday's Recap",
-                "description": recap_text,
-                "color": 0x6B7280,
-            })
-
-            # ── 4. TODAY'S OUTLOOK ───────────────────────────────
-            outlook_lines = []
-
-            # What's scheduled today
-            if day_of_week < 5:  # Weekday
-                outlook_lines.append("\u2022 **6:30 AM ET** \u2014 Macro conditions check")
-                outlook_lines.append("\u2022 **7:00 AM ET** \u2014 Earnings-reactive scan")
-                outlook_lines.append("\u2022 **8:00 AM ET** \u2014 Daily pre-market scan")
-                outlook_lines.append("\u2022 **9:30 AM - 4:00 PM ET** \u2014 Market monitoring (every 30 min)")
-                outlook_lines.append("\u2022 **4:05 PM ET** \u2014 Daily summary")
-            if day_of_week == 2:  # Wednesday
-                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Mid-week full analysis (Wednesday refresh)")
-            if day_of_week == 6:  # Sunday
-                outlook_lines.append("\u2022 **6:00 PM ET** \u2014 \U0001f50d Weekly full analysis")
-
-            # Regime-driven behavior
-            regime = self.macro.get_current_regime()
-            min_conv = self.macro.get_effective_min_conviction()
-            scan_depth = self.macro.get_effective_universe_size()
-            analysis_depth = self.macro.get_effective_analysis_depth()
-
-            outlook_lines.append("")
-            outlook_lines.append(f"**Active Regime:** {regime.replace('_', ' ').title()}")
-            outlook_lines.append(f"**Conviction Threshold:** {min_conv}/10")
-            outlook_lines.append(f"**Scan Depth:** {scan_depth} stocks \u2192 analyze top {analysis_depth}")
-
-            # Available slots and firepower
-            open_slots = self.config.MAX_POSITIONS - len(self.portfolio.state.positions)
-            if open_slots > 0 and alpaca_account:
-                outlook_lines.append(f"**Open Slots:** {open_slots} positions available")
-                outlook_lines.append(f"**Buying Power:** ${cash:,.0f} ready to deploy")
-            elif open_slots <= 0:
-                outlook_lines.append("**Slots:** Fully invested \u2014 no new positions unless one is sold")
-
-            # Pending signals
-            if self._pending_signals:
-                outlook_lines.append(f"\n**\U0001f4e1 {len(self._pending_signals)} signal(s) queued** for market open")
-                for sig in self._pending_signals[:5]:
-                    outlook_lines.append(f"  \u2022 {sig.action} {sig.symbol} (conviction {sig.conviction})")
-
-            embeds.append({
-                "title": "\U0001f3af Today's Plan",
-                "description": "\n".join(outlook_lines),
-                "color": 0x8B5CF6,
-            })
-
-            # ── 5. KEY LEVELS ────────────────────────────────────
-            from stock_agent.macro_monitor import (
-                SPX_SUPPORT_LOW, SPX_SUPPORT_HIGH,
-                SPX_RESISTANCE_1, SPX_RESISTANCE_2, SPX_RESISTANCE_CONFIRM,
-                QQQ_RESISTANCE_1, QQQ_RESISTANCE_2,
+            builder = ReportBuilder(
+                self.config,
+                ledger=self.ledger,
+                price_service=getattr(self, "prices", None),
+                health_registry=getattr(self, "health", None),
+                options_store=getattr(self, "options_store", None),
+                calendar=getattr(self, "calendar", None),
+                research_store=getattr(self, "research_store", None),
+                clock=_now_utc,
             )
 
-            spx_price = macro_snap.spx_price if macro_snap else 0
-            qqq_price = macro_snap.qqq_price if macro_snap else 0
+            entry_locks = None
+            lock_fn = getattr(self, "get_entry_locks", None)
+            if callable(lock_fn):
+                try:
+                    entry_locks = lock_fn()
+                except Exception as exc:
+                    logger.warning("Could not read scheduler entry locks (%s)", type(exc).__name__)
 
-            levels_text = (
-                f"**S&P 500** (current: ${spx_price:,.0f})\n"
-                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-                f"\U0001f534 Support: {SPX_SUPPORT_LOW:,} - {SPX_SUPPORT_HIGH:,} (buy zone)\n"
-                f"\U0001f7e1 Resistance 1: {SPX_RESISTANCE_1:,}\n"
-                f"\U0001f7e1 Resistance 2: {SPX_RESISTANCE_2:,}\n"
-                f"\U0001f7e2 Trend Confirmed: {SPX_RESISTANCE_CONFIRM:,}\n"
-                f"\n"
-                f"**QQQ** (current: ${qqq_price:,.2f})\n"
-                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-                f"\U0001f7e1 Resistance 1: {QQQ_RESISTANCE_1}\n"
-                f"\U0001f7e1 Resistance 2: {QQQ_RESISTANCE_2}\n"
-            )
-
-            embeds.append({
-                "title": "\U0001f4ca Key Levels to Watch",
-                "description": levels_text,
-                "color": 0xF59E0B,
-            })
-
-            # ── POST TO DISCORD ──────────────────────────────────
-            # Post to announcements channel as multi-embed message
-            ch = self.discord.channels.get("announcements", "")
-            if ch:
-                # Discord allows max 10 embeds — we should have 5
-                await self.discord._send_multi_embed(ch, embeds)
-
-            logger.info("Morning brief sent — %d embeds", len(embeds))
-
-        except Exception as e:
-            logger.exception("Morning brief failed: %s", e)
-
-    # ── Sector backfill ──────────────────────────────────────────────
-
-    async def _backfill_sectors(self):
-        """Backfill sectors on positions marked 'Unknown'.
-
-        Uses Config.SECTOR_MAP first (fast, deterministic) then falls back to
-        FMP for symbols we haven't hardcoded.
-        """
-        sector_map = getattr(self.config, "SECTOR_MAP", {}) or {}
-        updated = 0
-        for pos in self.portfolio.state.positions:
-            if pos.sector and pos.sector != "Unknown":
-                continue
-            # 1. Hardcoded map (fast path)
-            mapped = sector_map.get(pos.symbol)
-            if mapped:
-                pos.sector = mapped
-                updated += 1
-                logger.info("Backfilled sector for %s from SECTOR_MAP: %s", pos.symbol, mapped)
-                continue
-            # 2. FMP lookup for unknowns
+            brief_status = "skipped"
             try:
-                company = await self.data_feed.get_company_fundamentals(pos.symbol)
-                if company and company.sector and company.sector != "Unknown":
-                    pos.sector = company.sector
-                    updated += 1
-                    logger.info("Backfilled sector for %s from FMP: %s", pos.symbol, company.sector)
+                embeds = await builder.build_morning_brief(
+                    snapshot=snap,
+                    as_of=now,
+                    macro_embed=macro_embed,
+                    entry_locks=entry_locks,
+                )
+                if self.alerts is not None:
+                    enq = self.alerts.alert(
+                        "info",
+                        f"Morning Brief — {day_key}",
+                        "",
+                        key=f"morning_brief:{day_key}",
+                        channel_key="announcements",
+                        embeds=embeds,
+                    )
+                    brief_status = "enqueued" if enq else "suppressed"
+                elif self.discord is not None:
+                    ch = self.discord.channels.get("announcements", "")
+                    if ch:
+                        ok = await self.discord._send_multi_embed(ch, embeds)
+                        brief_status = "delivered" if ok else "delivery_failed"
             except Exception as e:
-                logger.warning("Sector backfill failed for %s: %s", pos.symbol, e)
-        if updated:
-            self.portfolio._save()
-            logger.info("Backfilled sectors for %d positions", updated)
+                brief_status = f"degraded:{type(e).__name__}"
+                reason = _safe_report_reason(e, self.config)
+                logger.error("Morning brief failed (%s)", type(e).__name__)
+                fallback_embeds = [
+                    {
+                        "title": f"☕ Morning Brief — {day_key}",
+                        "description": f"report unavailable: {reason}",
+                        "color": 0xEF4444,
+                    }
+                ]
+                try:
+                    if self.alerts is not None:
+                        self.alerts.alert(
+                            "warning",
+                            f"Morning Brief — {day_key}",
+                            f"report unavailable: {reason}",
+                            key=f"morning_brief_unavailable:{day_key}",
+                            channel_key="announcements",
+                            embeds=fallback_embeds,
+                        )
+                    elif self.discord is not None:
+                        ch = self.discord.channels.get("announcements", "")
+                        if ch:
+                            await self.discord._send_multi_embed(ch, fallback_embeds)
+                except Exception as alert_err:
+                    logger.warning("Morning brief fallback alert failed (%s)", type(alert_err).__name__)
+
+            if self.alerts is not None:
+                try:
+                    sent = await self.alerts.flush()
+                    logger.info(
+                        "Morning brief outcome=%s (outbox flushed=%s)",
+                        brief_status,
+                        sent,
+                    )
+                except Exception as flush_err:
+                    logger.warning("Morning brief outbox flush failed (%s)", type(flush_err).__name__)
+            else:
+                logger.info("Morning brief outcome=%s", brief_status)
+        except Exception as outer_err:
+            logger.error("Morning brief outer guard caught %s", type(outer_err).__name__)
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
     async def _cleanup(self):
-        """Graceful cleanup of all resources."""
-        logger.info("Cleaning up resources...")
-        try:
-            await asyncio.gather(
-                self.telegram.send_message("\U0001f6d1 <b>Stock Agent shutting down</b>"),
-                self.discord.send_shutdown("Graceful shutdown"),
-                return_exceptions=True,
-            )
-        except Exception:
-            pass
+        """Cut off new work, drain order paths, then release network and database resources."""
+        self.shutdown()
+        notify_systemd("STOPPING=1\nSTATUS=Draining trading tasks")
+        passive = [task for name, task in self._job_tasks.items() if name != "options"]
+        if self._telemetry_task is not None:
+            passive.append(self._telemetry_task)
+        for task in passive:
+            task.cancel()
+        active = [task for task in (self._order_task, self._options_task, self._job_tasks.get("options"))
+                  if task is not None]
+        if self.engine is not None:
+            active.append(asyncio.create_task(self.engine.drain(EXECUTION_DRAIN_SECONDS)))
+        all_tasks = set(passive + active)
+        if all_tasks:
+            done, pending = await asyncio.wait(all_tasks, timeout=SHUTDOWN_DRAIN_SECONDS)
+            if pending:
+                await self._alert("critical", "Shutdown drain deadline exceeded",
+                                  "Unresolved broker intents will be recovered by client order ID on startup.",
+                                  key="shutdown-drain")
+                for task in pending:
+                    task.cancel()
+                finished, _ = await asyncio.wait(pending, timeout=2)
+                done.update(finished)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+        self._state_ready = False
+        self._publish_runtime()
+        await self._alert("info", "Stock agent stopped", "In-flight order recovery remains durable.")
+        if self._pending_ledger_alerts:
+            _, pending_alerts = await asyncio.wait(self._pending_ledger_alerts, timeout=2)
+            for task in pending_alerts:
+                task.cancel()
 
-        for resource in [self.data_feed, self.analyst, self.screener, self.executor, self.telegram, self.discord, self.macro, self.options_data, self.options_executor]:
-            try:
-                await resource.close()
-            except Exception:
-                pass
-
+        seen = set()
+        dynamic = ("telegram", "discord", "macro", "alerts", "prices", "news", "llm", "broker", "http", "heartbeat")
+        for name in dynamic:
+            resource = getattr(self, name, None)
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+            if close is not None:
+                try:
+                    async with asyncio.timeout(1):
+                        await close()
+                except Exception:
+                    logger.warning("Service resource did not close: %s", name)
+        self.store.close()
         logger.info("Cleanup complete")

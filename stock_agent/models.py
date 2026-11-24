@@ -127,17 +127,3 @@ class DailySummary(BaseModel):
     trades_today: list[Trade]
     positions: list[Position]
     signals: list[Signal]
-
-
-class PortfolioState(BaseModel):
-    """Complete portfolio state — persisted to JSON."""
-    positions: list[Position] = []
-    trade_history: list[Trade] = []
-    daily_summaries: list[DailySummary] = []
-    cash: float = 100000.0
-    starting_capital: float = 100000.0
-    last_universe_refresh: Optional[datetime] = None
-    universe: list[str] = []
-    active_theses: dict = {}
-    last_weekly_analysis: Optional[datetime] = None
-    last_daily_check: Optional[datetime] = None

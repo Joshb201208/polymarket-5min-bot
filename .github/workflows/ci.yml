@@ -1,8 +1,8 @@
 name: CI
 
 # Runs on pull requests so a broken change is caught before it is merged.
-# It also runs on master, but note: the droplet deploys master on its own
-# timer and does not wait for this to pass.
+# The in-place updater requires this workflow's successful master push run
+# and successful test job for the exact candidate SHA.
 
 on:
   pull_request:
@@ -42,3 +42,20 @@ jobs:
 
       - name: Tests
         run: python -m pytest
+
+  # Secret scan over the full history with the repo's .gitleaks.toml.
+  # https://github.com/gitleaks/gitleaks-action (v3, Node 24; no license key
+  # needed for personal-account repos, required for organization repos).
+  # https://github.com/actions/checkout/releases/tag/v6
+  secret-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml

@@ -1,0 +1,83 @@
+{
+  "positions": [
+    {
+      "position_id": "o1",
+      "strategy": "BULL_CALL_SPREAD",
+      "underlying_symbol": "AAA",
+      "contract_symbol": "AAA261127C00100000",
+      "contract_id": "c1",
+      "option_type": "call",
+      "side": "buy",
+      "strike": 100.0,
+      "expiration_date": "2026-11-27",
+      "multiplier": 100,
+      "qty": 1,
+      "leg2_contract_symbol": "AAA261127C00110000",
+      "leg2_contract_id": "c2",
+      "leg2_option_type": "call",
+      "leg2_side": "sell",
+      "leg2_strike": 110.0,
+      "leg2_qty": 1,
+      "entry_price": 3.0,
+      "current_price": 3.0,
+      "entry_cost": 300.0,
+      "unrealized_pnl": 0.0,
+      "unrealized_pnl_pct": 0.0,
+      "realized_pnl": 0.0,
+      "greeks": {
+        "delta": 0.3
+      },
+      "opened_at": "2026-11-09T14:45:00.000000Z",
+      "closed_at": null,
+      "is_open": true,
+      "close_reason": null,
+      "max_profit": 700.0,
+      "max_loss": 300.0,
+      "regime_at_entry": "NORMAL"
+    }
+  ],
+  "closed_positions": [
+    {
+      "position_id": "o0",
+      "strategy": "BULL_CALL_SPREAD",
+      "underlying_symbol": "BBB",
+      "contract_symbol": "BBB261127C00100000",
+      "contract_id": "c1",
+      "option_type": "call",
+      "side": "buy",
+      "strike": 100.0,
+      "expiration_date": "2026-11-27",
+      "multiplier": 100,
+      "qty": 1,
+      "leg2_contract_symbol": "BBB261127C00110000",
+      "leg2_contract_id": "c2",
+      "leg2_option_type": "call",
+      "leg2_side": "sell",
+      "leg2_strike": 110.0,
+      "leg2_qty": 1,
+      "entry_price": 3.0,
+      "current_price": 3.0,
+      "entry_cost": 300.0,
+      "unrealized_pnl": 0.0,
+      "unrealized_pnl_pct": 0.0,
+      "realized_pnl": 0.0,
+      "greeks": {
+        "delta": 0.3
+      },
+      "opened_at": "2026-11-09T14:45:00.000000Z",
+      "closed_at": "2026-04-23T15:00:00.000000Z",
+      "is_open": false,
+      "close_reason": "expired",
+      "max_profit": 700.0,
+      "max_loss": 300.0,
+      "regime_at_entry": "NORMAL"
+    }
+  ],
+  "total_options_value": 300.0,
+  "total_options_exposure_pct": 0.03,
+  "total_unrealized_pnl": 0.0,
+  "total_realized_pnl": 0.0,
+  "portfolio_delta": 0.3,
+  "portfolio_theta": -0.1,
+  "last_updated": "2026-11-19T20:30:00Z"
+}

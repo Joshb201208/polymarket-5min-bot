@@ -1,0 +1,32 @@
+[
+  {
+    "symbol": "NVDA",
+    "note": "CEO reinstated 23 Nov; board investigation and reported SEC scrutiny continue. Bullish only if deliveries, orders and margins are corroborated; bearish only on a primary-source disclosure worsening accounting, export or demand. A rebound alone is not a trigger.",
+    "added": "2026-11-23",
+    "expires": "2026-12-04"
+  },
+  {
+    "symbol": "AMD",
+    "note": "Needs a customer-confirmed accelerator deployment or a dated, material order. No independent demand evidence or a widening export constraint invalidates the idea. Check semiconductor cluster headroom before any add.",
+    "added": "2026-11-23",
+    "expires": "2026-12-09"
+  },
+  {
+    "symbol": "MU",
+    "note": "Earnings call 17 Dec. Needs HBM shipments, pricing and gross-margin guidance to confirm demand, not NVDA sympathy. A material guide cut or documented inventory build supports a bearish defined-risk idea.",
+    "added": "2026-11-23",
+    "expires": "2026-12-21"
+  },
+  {
+    "symbol": "ANET",
+    "note": "Read-through from server and networking peers only queues research. Needs company or named-customer evidence that AI Ethernet orders convert to revenue without margin erosion.",
+    "added": "2026-11-23",
+    "expires": "2026-12-09"
+  },
+  {
+    "theme": "AI infrastructure financing",
+    "note": "Watch cash conversion, new debt and lease terms, and delayed capacity to tell durable demand from funding stress. A liquidity shock is a reason to re-score cluster risk, not to open proxy shorts on banks.",
+    "added": "2026-11-23",
+    "expires": "2026-12-10"
+  }
+]

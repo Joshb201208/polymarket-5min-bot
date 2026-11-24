@@ -1,25 +1,39 @@
 import asyncio
-import logging
+import fcntl
 import signal
 
+from stock_agent.config import Config, Settings, SettingsError, load_settings
+from stock_agent.logging_setup import configure_logging
 from stock_agent.scheduler import StockAgentScheduler
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+async def _serve(config: Settings) -> None:
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with (config.DATA_DIR / "agent.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("Another stock-agent process holds the state directory lock") from exc
+        scheduler = StockAgentScheduler(config)
+        loop = asyncio.get_running_loop()
+        signals = (signal.SIGTERM, signal.SIGINT)
+        for signum in signals:
+            loop.add_signal_handler(signum, scheduler.shutdown)
+        try:
+            await scheduler.run()
+        finally:
+            for signum in signals:
+                loop.remove_signal_handler(signum)
 
-    scheduler = StockAgentScheduler()
 
-    def handle_signal(sig, frame):
-        scheduler.shutdown()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    asyncio.run(scheduler.run())
+def main() -> None:
+    try:
+        settings = load_settings(load_dotenv_file=True, require_runtime_secrets=True, warn_retired=True)
+    except SettingsError as exc:
+        raise SystemExit(str(exc)) from None
+    configure_logging(settings)
+    runtime_config = Config(**{name: getattr(settings, name) for name in Settings.model_fields})
+    asyncio.run(_serve(runtime_config))
 
 
 if __name__ == "__main__":
