@@ -110,3 +110,24 @@ def test_failed_close_limits_does_not_send_missed_close_notice_if_drawdown_appli
             await sched._cleanup()
 
     asyncio.run(check())
+
+
+def test_terminal_notice_counts_sessions_with_no_job_since_last_applied_close(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 13, 30, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        tuesday, wednesday, friday = date(2026, 11, 24), date(2026, 11, 25), now.date()
+        mapping = {friday: SimpleNamespace(date=wednesday), wednesday: SimpleNamespace(date=tuesday)}
+        monkeypatch.setattr(sched.calendar, "previous_session", mapping.get)
+        applied = update_drawdown(DrawdownState(), tuesday.isoformat(), Decimal(100), config=sched.config)
+        sched.ledger.risk_state_set(DRAWDOWN_STATE_KEY, applied.to_record())
+        try:
+            assert sched.ledger.job_status("drawdown_close", wednesday.isoformat()) is None
+            detail = sched._terminal_close_failure(friday.isoformat(), {"reason": "close_unpriced_stock"})
+            assert detail["missed_close_streak"] == 2
+            assert detail["missed_close_streak_lower_bound"] is False
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())

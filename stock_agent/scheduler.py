@@ -1152,22 +1152,27 @@ class StockAgentScheduler:
             key = prior.date.isoformat()
             if last_applied is not None and key <= last_applied:
                 break
-            try:
-                row = self.ledger.job_status("drawdown_close", key)
-            except (ValueError, StateUnavailable, sqlite3.Error):
-                lower_bound = True
-                break
-            if row is None or row.status is not JobStatus.FAILED or row.attempts < MAX_JOB_ATTEMPTS:
-                break
-            saved_streak = row.detail.get("missed_close_streak")
-            if type(saved_streak) is int and saved_streak > 0:
-                # A prior terminal job already counted earlier sessions, including
-                # those now outside the broker calendar cache's lookback window.
-                streak += saved_streak
-                lower_bound = bool(row.detail.get("missed_close_streak_lower_bound"))
-                break
-            if row.detail.get("reason") == "close_risk_input_unverified":
-                break
+            if last_applied is None:
+                # Without a verifiable baseline, count only observed terminal
+                # misses. A missing job row does not establish an earlier miss.
+                try:
+                    row = self.ledger.job_status("drawdown_close", key)
+                except (ValueError, StateUnavailable, sqlite3.Error):
+                    lower_bound = True
+                    break
+                if row is None or row.status is not JobStatus.FAILED or row.attempts < MAX_JOB_ATTEMPTS:
+                    lower_bound = True
+                    break
+                saved_streak = row.detail.get("missed_close_streak")
+                if type(saved_streak) is int and saved_streak > 0:
+                    streak += saved_streak
+                    lower_bound = bool(row.detail.get("missed_close_streak_lower_bound"))
+                    break
+                if row.detail.get("reason") == "close_risk_input_unverified":
+                    lower_bound = True
+                    break
+            # When the state is readable and has a date, every later trading
+            # session missed the update, including days the process did not run.
             streak += 1
             day = prior.date
             prior = self.calendar.previous_session(day)
