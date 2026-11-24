@@ -135,19 +135,21 @@ def test_drawdown_pauses_throttles_and_automatically_recovers():
     state = update_drawdown(state, "2026-10-05", Decimal(85))
     assert state.throttled and not state.paused
     state = update_drawdown(state, "2026-10-06", Decimal(80))
+    assert state.throttled and not state.paused
+    state = update_drawdown(state, "2026-10-07", Decimal(79))
     assert state.paused
-    for day in ("07", "08"):
+    for day in ("08", "09"):
         state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
     assert state.recovery_closes == 2
-    state = update_drawdown(state, "2026-10-09", Decimal(85))
+    state = update_drawdown(state, "2026-10-12", Decimal(85))
     assert state.recovery_closes == 0
-    for day in ("12", "13", "14", "15"):
+    for day in ("13", "14", "15", "16"):
         state = update_drawdown(state, f"2026-10-{day}", Decimal(86))
         assert state.paused
-    assert update_drawdown(state, "2026-10-15", Decimal(90)) == state
-    state = update_drawdown(state, "2026-10-16", Decimal(86))
+    assert update_drawdown(state, "2026-10-16", Decimal(90)) == state
+    state = update_drawdown(state, "2026-10-19", Decimal(86))
     assert state.alert and not state.throttled and not state.paused
-    state = update_drawdown(state, "2026-10-19", Decimal(101))
+    state = update_drawdown(state, "2026-10-20", Decimal(101))
     assert state.high_water == 101 and not state.alert
 
 
@@ -166,9 +168,11 @@ def test_drawdown_uses_returns_not_deposits_or_withdrawals_across_restarts():
     assert withdrawal.high_water == 100 and not withdrawal.drawdown and not withdrawal.paused
     gain = update_drawdown(withdrawal, "2026-11-27", Decimal(99))
     assert gain.high_water == 110 and not gain.drawdown
-    # A real 20% loss still pauses entries even though a cash deposit raised raw equity.
+    # A real 20% loss throttles even though a deposit increased raw equity.
     loss = update_drawdown(gain, "2026-11-30", Decimal("109.20"), net_external_flow=Decimal(30))
-    assert loss.drawdown == Decimal("0.20") and loss.paused
+    assert loss.drawdown == Decimal("0.20") and loss.throttled and not loss.paused
+    breach = update_drawdown(loss, "2026-12-01", Decimal(108))
+    assert breach.decision_drawdown > Decimal("0.20") and breach.paused
 
 
 def test_legacy_drawdown_record_uses_implied_raw_equity_for_first_adjusted_interval():
