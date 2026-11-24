@@ -21,7 +21,7 @@ from decimal import Decimal
 import pytest
 
 from stock_agent.ledger import JobStatus
-from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, update_drawdown
 from stock_agent.scheduler import MAX_JOB_ATTEMPTS
 
 GS_CALL = "GS261127C00920000"
@@ -99,6 +99,12 @@ async def run_attempts(sched, world, day: int, attempts: int = 1, *, hour: int =
             await sched.alerts.flush()  # alerts are queued; the fake Discord/Telegram see them after a flush
         world.clock.advance(minutes=16)
     return sched.ledger.job_status("drawdown_close", key)
+
+
+def seed_last_trusted_close(sched, world, day: str = "2026-11-20") -> None:
+    """A trusted close on the previous session (Fri 20 Nov), so the missed-close streak is exact, not 'at least'."""
+    state = update_drawdown(DrawdownState(), day, broker_equity(world), config=sched.config)
+    sched.ledger.risk_state_set(DRAWDOWN_STATE_KEY, state.to_record())
 
 
 def broker_equity(world) -> Decimal:
@@ -401,6 +407,7 @@ def test_final_attempt_alert_fires_once_with_cause_and_streak(world):
     seed_23nov(world)
 
     async def body(sched):
+        seed_last_trusted_close(sched, world)
         world.clock.set_et(2026, 11, 23, 16, 5)
         world.alpaca.set_price("PDD", 0.0)  # an unpriced STOCK keeps the close untrusted
         row = await run_attempts(sched, world, 23, attempts=MAX_JOB_ATTEMPTS - 1)
@@ -426,6 +433,7 @@ def test_final_attempt_alert_names_the_trading_block(world, monkeypatch):
     seed_23nov(world)
 
     async def body(sched):
+        seed_last_trusted_close(sched, world)
         world.clock.set_et(2026, 11, 23, 16, 5)
         await sched.ledger.refresh("fixture")
         monkeypatch.setattr(sched.ledger, "trading_block", lambda: "test: operator block")
@@ -441,6 +449,7 @@ def test_streak_resets_after_a_recorded_close(world):
     seed_23nov(world)
 
     async def body(sched):
+        seed_last_trusted_close(sched, world)
         world.clock.set_et(2026, 11, 23, 16, 5)
         world.alpaca.set_price("PDD", 0.0)
         await run_attempts(sched, world, 23, attempts=MAX_JOB_ATTEMPTS)
