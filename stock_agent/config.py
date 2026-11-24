@@ -15,6 +15,7 @@ How to add a setting (for peer modules):
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -141,7 +142,6 @@ _DEFAULT_CONVICTION_SIZE_MAP: dict[int, float] = {
 # Field name -> environment variable name when they differ.
 _ENV_ALIASES: dict[str, str] = {
     "MODE": "STOCK_AGENT_MODE",
-    "MAX_TOTAL_EXPOSURE": "MAX_TOTAL_EXPOSURE_PCT",
     "DATA_DIR": "STOCK_DATA_DIR",
     "LOG_LEVEL": "STOCK_LOG_LEVEL",
     "HEARTBEAT_URL": "STOCK_HEARTBEAT_URL",
@@ -203,6 +203,7 @@ class Settings(BaseModel):
         "STOCK_AGENT_LIVE_CONFIRMED",
         "STOCK_TRADING_PAUSED",
         "RISK_PAUSE_NEW_BUYS",
+        "MARGIN_ENABLED",
         "EARNINGS_CHECK_ENABLED",
         "FMP_QUOTES_ENABLED",
         "TIPRANKS_ENABLED",
@@ -270,7 +271,11 @@ class Settings(BaseModel):
 
     # ── Risk limits (owned by risk_limits) ─────────────────────────────────────────
     MAX_POSITION_PCT: float = Field(default=0.15, gt=0.0, le=1.0)
-    MAX_TOTAL_EXPOSURE: float = Field(default=1.00, gt=0.0, le=1.0)
+    MARGIN_ENABLED: bool = True
+    MAX_GROSS_EXPOSURE_PCT: float = Field(default=2.00, gt=0.0, le=2.0)
+    MARGIN_MIN_EXCESS_PCT: float = Field(default=0.25, gt=0.0, lt=1.0)
+    MARGIN_TRIM_EXCESS_PCT: float = Field(default=0.15, gt=0.0, lt=1.0)
+    MARGIN_INTEREST_RATE_PCT: float = Field(default=6.5, ge=0.0, le=100.0)
     MAX_POSITIONS: int = Field(default=20, ge=1)
     MAX_SECTOR_PCT: float = Field(default=0.40, gt=0.0, le=1.0)
     MAX_CLUSTER_PCT: float = Field(default=0.48, gt=0.0, le=1.0)
@@ -442,7 +447,13 @@ class Settings(BaseModel):
             raise ValueError(
                 "CONVICTION_SIZE_MAP tiers must not exceed MAX_POSITION_PCT."
             )
+        if self.MARGIN_TRIM_EXCESS_PCT >= self.MARGIN_MIN_EXCESS_PCT:
+            raise ValueError("MARGIN_TRIM_EXCESS_PCT must be less than MARGIN_MIN_EXCESS_PCT.")
         return self
+
+    @property
+    def effective_max_gross_exposure_pct(self) -> float:
+        return self.MAX_GROSS_EXPOSURE_PCT if self.MARGIN_ENABLED else 1.0
 
     @property
     def trading_base_url(self) -> str:
@@ -501,7 +512,11 @@ class Settings(BaseModel):
                 "max_position_pct": self.MAX_POSITION_PCT,
                 "max_sector_pct": self.MAX_SECTOR_PCT,
                 "max_cluster_pct": self.MAX_CLUSTER_PCT,
-                "max_total_exposure": self.MAX_TOTAL_EXPOSURE,
+                "margin_enabled": self.MARGIN_ENABLED,
+                "max_gross_exposure_pct": self.effective_max_gross_exposure_pct,
+                "margin_min_excess_pct": self.MARGIN_MIN_EXCESS_PCT,
+                "margin_trim_excess_pct": self.MARGIN_TRIM_EXCESS_PCT,
+                "margin_interest_rate_pct": self.MARGIN_INTEREST_RATE_PCT,
                 "max_positions": self.MAX_POSITIONS,
                 "min_conviction": self.MIN_CONVICTION,
                 "research_weekly_budget_usd": self.RESEARCH_WEEKLY_BUDGET_USD,
@@ -543,6 +558,7 @@ def load_settings(
     env_file: Path | None = None,
     load_dotenv_file: bool = False,
     require_runtime_secrets: bool = False,
+    warn_retired: bool = False,
 ) -> Settings:
     """Load and validate ``Settings`` from ``environ`` (and optional ``.env`` file).
 
@@ -623,6 +639,10 @@ def load_settings(
                 "Set them in the environment or .env before starting stock_agent."
             )
 
+    if warn_retired and "MAX_TOTAL_EXPOSURE_PCT" in merged:
+        logging.getLogger(__name__).warning(
+            "MAX_TOTAL_EXPOSURE_PCT is retired and ignored; use MAX_GROSS_EXPOSURE_PCT."
+        )
     return settings
 
 
@@ -640,6 +660,10 @@ class _ConfigMeta(type):
     @property
     def LIVE_TRADING_CONFIRMED(cls) -> bool:
         return bool(getattr(cls, "STOCK_AGENT_LIVE_CONFIRMED", False))
+
+    @property
+    def effective_max_gross_exposure_pct(cls) -> float:
+        return cls.MAX_GROSS_EXPOSURE_PCT if cls.MARGIN_ENABLED else 1.0
 
 
 class Config(metaclass=_ConfigMeta):
@@ -680,6 +704,10 @@ class Config(metaclass=_ConfigMeta):
     @property
     def LIVE_TRADING_CONFIRMED(self) -> bool:
         return bool(self.STOCK_AGENT_LIVE_CONFIRMED)
+
+    @property
+    def effective_max_gross_exposure_pct(self) -> float:
+        return self.MAX_GROSS_EXPOSURE_PCT if self.MARGIN_ENABLED else 1.0
 
     def is_trading_paused(self, data_dir: Path | None = None) -> bool:
         if self.STOCK_TRADING_PAUSED or self.RISK_PAUSE_NEW_BUYS:

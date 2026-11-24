@@ -84,7 +84,7 @@ def test_starts_cleanly_with_only_todays_server_env_names() -> None:
     assert s.MODE == "PAPER"
     assert s.trading_base_url == PAPER_ALPACA_BASE_URL
     assert s.OPTIONS_MODE == "defined_risk"
-    assert s.MAX_TOTAL_EXPOSURE == 1.00
+    assert s.MAX_GROSS_EXPOSURE_PCT == 2.00
     assert s.OPENAI_API_KEY == "test-openai-key"
     assert s.ANTHROPIC_API_KEY == "test-anthropic-key"
     assert not hasattr(s, "PRIVATE_KEY")
@@ -184,7 +184,9 @@ def test_runtime_secret_check_fails_fast_naming_missing_keys() -> None:
     [
         ({"MAX_POSITION_PCT": "15"}, "MAX_POSITION_PCT"),
         ({"MAX_POSITION_PCT": "15%"}, "MAX_POSITION_PCT"),
-        ({"MAX_TOTAL_EXPOSURE_PCT": "1.5"}, "MAX_TOTAL_EXPOSURE_PCT"),
+        ({"MAX_GROSS_EXPOSURE_PCT": "2.01"}, "MAX_GROSS_EXPOSURE_PCT"),
+        ({"MARGIN_ENABLED": "maybe"}, "MARGIN_ENABLED"),
+        ({"MARGIN_TRIM_EXCESS_PCT": ".26"}, "MARGIN_TRIM_EXCESS_PCT"),
         ({"OPTIONS_ENABLED": "maybe"}, "OPTIONS_ENABLED"),
         ({"STOCK_TRADING_PAUSED": "sometimes"}, "STOCK_TRADING_PAUSED"),
         ({"STOCK_AGENT_MODE": "SIM"}, "STOCK_AGENT_MODE"),
@@ -199,6 +201,18 @@ def test_invalid_percentage_or_bool_fails_fast_with_setting_name(
     with pytest.raises(SettingsError) as exc_info:
         load_settings(env)
     assert expected_name in str(exc_info.value)
+
+
+def test_retired_gross_cap_ignored_and_warned_once_at_startup(caplog):
+    env = {"MAX_TOTAL_EXPOSURE_PCT": "retired-value", "MAX_GROSS_EXPOSURE_PCT": "1.75"}
+    load_settings(env)  # Import/utility loads do not emit another notice.
+    s = load_settings(env, warn_retired=True)
+    assert s.MARGIN_ENABLED and s.effective_max_gross_exposure_pct == 1.75
+    assert not hasattr(s, "MAX_TOTAL_EXPOSURE")
+    notices = [r.message for r in caplog.records if "MAX_TOTAL_EXPOSURE_PCT" in r.message]
+    (notice,) = notices
+    assert "retired-value" not in notice
+    assert load_settings(env | {"MARGIN_ENABLED": "false"}).effective_max_gross_exposure_pct == 1.00
 
 
 def test_options_mode_precedence_and_legacy_options_enabled_mapping() -> None:
@@ -381,6 +395,13 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "OPTIONS_MODE",
         "STOCK_TRADING_PAUSED",
         "STOCK_AGENT_LIVE_CONFIRMED",
+        "MARGIN_ENABLED",
+        "MAX_GROSS_EXPOSURE_PCT",
+        "MARGIN_MIN_EXCESS_PCT",
+        "MARGIN_TRIM_EXCESS_PCT",
+        "MARGIN_INTEREST_RATE_PCT",
+        "MAX_TOTAL_EXPOSURE_PCT",
+        "clean_server_env.py",
     ):
         assert required_term in checklist, f"OWNER_CHECKLIST.md missing {required_term}"
 
@@ -391,6 +412,13 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "OPTIONS_MODE",
         "close_only",
         "owner_focus.json",
+        "MARGIN_ENABLED",
+        "MAX_GROSS_EXPOSURE_PCT",
+        "MARGIN_MIN_EXCESS_PCT",
+        "MARGIN_TRIM_EXCESS_PCT",
+        "MARGIN_INTEREST_RATE_PCT",
+        "MAX_TOTAL_EXPOSURE_PCT",
+        "clean_server_env.py",
     ):
         assert required_readme in readme, f"README.md missing {required_readme}"
 
@@ -398,6 +426,14 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
     assert "close_only" in env_example_text
     assert "`legacy`" not in env_example_text
     assert "`legacy`" not in readme
+    for margin_var in (
+        "MARGIN_ENABLED=true",
+        "MAX_GROSS_EXPOSURE_PCT=2.0",
+        "MARGIN_MIN_EXCESS_PCT=0.25",
+        "MARGIN_TRIM_EXCESS_PCT=0.15",
+        "MARGIN_INTEREST_RATE_PCT=6.5",
+    ):
+        assert margin_var in env_example_text
 
     for deleted_module in (
         "data_feed.py",
@@ -410,8 +446,8 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         "options_executor.py",
         "options_models.py",
         "options_portfolio.py",
+        "portfolio.py",
     ):
         assert deleted_module not in readme, f"README.md still references {deleted_module}"
-
 
 

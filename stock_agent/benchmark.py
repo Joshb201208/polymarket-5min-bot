@@ -25,7 +25,13 @@ from decimal import Decimal
 from typing import Any
 
 from stock_agent.ledger import CashFlow, EquityMark
-from stock_agent.performance import flows_between, previous_close
+from stock_agent.performance import (
+    InterestSeries,
+    after_cost_marks,
+    average_leverage,
+    flows_between,
+    previous_close,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +163,15 @@ class BenchmarkSnapshot:
     information_ratio_vs_qqq: Decimal | None
     stats_early: bool = True   # paired sample below MATURE_PAIRED_SESSIONS: label vol/beta/IR "early"
     active_vs_qqq_week_pct: Decimal | None = None
+    # A13j: returns after ESTIMATED margin interest (None when no series was given) and the
+    # bot's average leverage over the same window, so unlevered QQQ/SPY compare honestly
+    portfolio_session_after_cost_pct: Decimal | None = None
+    portfolio_week_after_cost_pct: Decimal | None = None
+    portfolio_cutover_after_cost_pct: Decimal | None = None
+    portfolio_since_launch_after_cost_pct: Decimal | None = None
+    avg_leverage_week: Decimal | None = None
+    avg_leverage_cutover: Decimal | None = None
+    avg_leverage_since_launch: Decimal | None = None
 
 
 class BenchmarkTracker:
@@ -180,6 +195,7 @@ class BenchmarkTracker:
         live_equity: Decimal | None = None,
         cutover_date: date | None = None,
         fallback_starting_capital: Decimal | None = None,
+        interest: InterestSeries | None = None,
     ) -> BenchmarkSnapshot:
         bars_by_sym: dict[str, list[Any]] = {}
         quotes_by_sym: dict[str, Any] = {}
@@ -253,26 +269,40 @@ class BenchmarkTracker:
 
         # Session: same convention as performance.day_pnl (flows dated after the previous
         # close and on/before today are removed, so a deposit is never a gain).
-        port_session_pct: Decimal | None = None
-        if effective_eq is not None and prev_mark is not None and prev_mark.equity > ZERO:
-            flow = flows_between(flows, prev_mark.session_date, as_of_date)
-            port_session_pct = _pct_change(effective_eq - flow, prev_mark.equity)
+        def session_pct(prev_eq: Decimal | None, end_eq: Decimal | None) -> Decimal | None:
+            if end_eq is None or prev_mark is None or prev_eq is None or prev_eq <= ZERO:
+                return None
+            return _pct_change(end_eq - flows_between(flows, prev_mark.session_date, as_of_date), prev_eq)
 
-        def window(anchor: date | None) -> Decimal | None:
+        def window(anchor: date | None, use_marks: Sequence[EquityMark] = marks,
+                   end_eq: Decimal | None = effective_eq) -> Decimal | None:
             # The terminal point must be dated as_of_date (today's close mark or live
             # equity); never end the bot's window on an older mark while the benchmark
             # side ends today.
-            if anchor is None or effective_eq is None:
+            if anchor is None or end_eq is None:
                 return None
             return flow_adjusted_return_pct(
-                marks, flows, start_date=anchor, as_of_date=as_of_date, live_equity=effective_eq
+                use_marks, flows, start_date=anchor, as_of_date=as_of_date, live_equity=end_eq
             )
 
+        port_session_pct = session_pct(prev_mark.equity if prev_mark else None, effective_eq)
         port_week_pct = window(week_anchor_date)
         port_cutover_pct = window(cutover_anchor)
         launch_marks = [m for m in sorted_closes if m.session_date <= self.launch_baseline_date]
         launch_anchor = launch_marks[-1].session_date if launch_marks else None
         port_launch_pct = window(launch_anchor)
+
+        # After ESTIMATED borrowing cost (A13j): same windows on marks reduced by the
+        # unposted estimated interest; broker-reported figures above are unchanged.
+        after: dict[str, Decimal | None] = {"session": None, "week": None, "cutover": None, "launch": None}
+        if interest is not None:
+            adj = after_cost_marks(marks, interest)
+            adj_eq = effective_eq - interest.unposted(as_of_date) if effective_eq is not None else None
+            prev_adj = prev_mark.equity - interest.unposted(prev_mark.session_date) if prev_mark else None
+            after = {"session": session_pct(prev_adj, adj_eq),
+                     "week": window(week_anchor_date, adj, adj_eq),
+                     "cutover": window(cutover_anchor, adj, adj_eq),
+                     "launch": window(launch_anchor, adj, adj_eq)}
 
         def active(port: Decimal | None, bench: Decimal | None, same_window: bool, sym: SymbolBenchmark):
             if port is None or bench is None or not same_window or sym.stale:
@@ -315,6 +345,16 @@ class BenchmarkTracker:
             beta_to_qqq=beta_qqq,
             information_ratio_vs_qqq=ir_qqq,
             stats_early=paired_n < MATURE_PAIRED_SESSIONS,
+            portfolio_session_after_cost_pct=after["session"],
+            portfolio_week_after_cost_pct=after["week"],
+            portfolio_cutover_after_cost_pct=after["cutover"],
+            portfolio_since_launch_after_cost_pct=after["launch"],
+            avg_leverage_week=average_leverage(sorted_closes, week_anchor_date, as_of_date)
+            if week_anchor_date else None,
+            avg_leverage_cutover=average_leverage(sorted_closes, cutover_anchor, as_of_date)
+            if cutover_anchor else None,
+            avg_leverage_since_launch=average_leverage(sorted_closes, launch_anchor, as_of_date)
+            if launch_anchor else None,
             active_vs_qqq_week_pct=active_week,
         )
 

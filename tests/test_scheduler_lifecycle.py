@@ -16,12 +16,12 @@ from stock_agent import scheduler as module
 from stock_agent.asset_registry import SymbolRenameEvent
 from stock_agent.broker import OrderRequest
 from stock_agent.config import Config
-from stock_agent.ledger import BookSnapshot, CashFlow, JobStatus, NewIntent
+from stock_agent.ledger import BookSnapshot, CashFlow, Holding, IntentStatus, JobStatus, NewIntent
 from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketState, MarketStatus, Session
 from stock_agent.news_service import NewsService
-from stock_agent.research_pipeline import OptionIdea
+from stock_agent.research_pipeline import JobOutcome, OptionIdea
 from stock_agent.research_schemas import Direction
-from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, TradeIntent, TradeKind
 from stock_agent.state_store import StateStore
 from tests.exec_helpers import FakePrices, enqueue
 
@@ -101,7 +101,11 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
         now = datetime(2026, 11, 27, 10, tzinfo=ET)
         sched, _ = build(tmp_path, monkeypatch, now)
         sched.store.open()
-        assert not (await sched.market_gate("entry")).allowed
+        denied = await sched.market_gate("entry")
+        assert not denied.allowed and "first_run_normalise" in denied.reason and "broker_reconcile" in denied.reason
+        locks = {lock["code"]: lock for lock in sched.get_entry_locks()}
+        assert "corrective orders" in locks["first_run_normalise"]["clears_when"]
+        assert "fresh read" in locks["broker_reconcile"]["clears_when"]
         assert (await sched.market_gate("exit")).allowed
         assert (await sched.market_gate("exit", rule="cover_short")).allowed
         assert (await sched.market_gate("protection")).allowed
@@ -109,6 +113,9 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
         assert (await sched.market_gate("entry")).allowed
         sched.pause_file.touch()
         assert not (await sched.market_gate("entry")).allowed
+        assert "pause-trading file" in next(
+            lock["clears_when"] for lock in sched.get_entry_locks() if lock["code"] == "operator_pause"
+        )
         assert (await sched.market_gate("exit")).allowed
         sched.pause_file.unlink()
         monkeypatch.setattr(sched.config, "STOCK_TRADING_PAUSED", True, raising=False)
@@ -118,6 +125,223 @@ def test_pause_and_normalise_only_block_entries(tmp_path, monkeypatch):
         assert not (await sched.market_gate("exit")).allowed
         assert (await sched.market_gate("protection")).allowed
         await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_entry_lock_alert_names_required_health_and_cleanup(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 10, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        reported = []
+        sched.alerts = SimpleNamespace(alert_entries_locked=lambda locks, *, session_date: reported.append(
+            (locks, session_date),
+        ))
+        sched.llm = SimpleNamespace(is_healthy=lambda: True)
+        try:
+            sched.health.record_news_poll(("AAPL",), now, source="secondary", degraded=True)
+            await sched._alert_entry_locks()
+            locks, day = reported[-1]
+            assert day == now.date()
+            assert {lock["code"] for lock in locks} == {"first_run_normalise", "broker_reconcile"}
+
+            sched._normalised = sched._reconciled = True
+            await sched._alert_entry_locks()
+            assert len(reported) == 1
+
+            sched.health.record_news_poll(("AAPL",), now, source="failed", ok=False)
+            sched.llm.is_healthy = lambda: False
+            await sched._alert_entry_locks()
+            locks = {lock["code"]: lock for lock in reported[-1][0]}
+            assert set(locks) == {"news_health", "llm_health"}
+            assert "successful fresh news poll" in locks["news_health"]["clears_when"]
+            assert "model route" in locks["llm_health"]["clears_when"]
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_monday_evening_catchup_waits_for_tuesday_then_retries_at_open(tmp_path, monkeypatch):
+    async def check():
+        monday = datetime(2026, 11, 23, 19, tzinfo=ET)
+        tuesday = monday + timedelta(days=1)
+        current = monday
+        events = []
+        fresh = False
+
+        async def research_run(kind, *, work_scope):
+            nonlocal fresh
+            events.append((kind, work_scope, current))
+            fresh = work_scope == "catchup-regular"
+            intents = (NewIntent(
+                symbol="AAPL", side="buy", dedupe_key="catchup:AAPL", origin="scheduled", session_date=current.date(),
+                next_attempt_at=current + timedelta(minutes=5),
+            ),) if fresh else ()
+            return JobOutcome(JobStatus.DONE, intents=intents)
+
+        async def check_regime():
+            events.append("regime")
+
+        sched, _ = build(tmp_path, monkeypatch, monday, research=SimpleNamespace(
+            has_fresh_thesis_set=lambda now: fresh, run=research_run,
+        ))
+        sched.store.open()
+        monkeypatch.setattr(module, "_now_et", lambda: current)
+        monkeypatch.setattr(module, "_now_utc", lambda: current)
+        monkeypatch.setattr(sched, "_check_for_market_event", check_regime)
+        sched._reconciled = sched._normalised = True
+
+        try:
+            sched._schedule_research_catchup(current)
+            assert not sched._job_tasks
+            session = Session(tuesday.date(), tuesday.replace(hour=9, minute=30), tuesday.replace(hour=16))
+            sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, session)
+            current = tuesday.replace(hour=6, minute=29)
+            sched._schedule_research_catchup(current)
+            assert not sched._job_tasks
+
+            current += timedelta(minutes=1)
+            sched._schedule_research_catchup(current)
+            await sched._job_tasks["catchup"]
+            await sched._collect_finished_jobs()
+            assert events == [("weekly", "catchup-preopen", tuesday.replace(hour=6, minute=30))]
+            sched._schedule_research_catchup(current)
+            assert not sched._job_tasks  # persisted preopen job cannot replay
+
+            current = session.opens_at
+            sched.calendar.state = MarketState(MarketStatus.OPEN, MarketSource.LIVE, session)
+            sched._schedule_research_catchup(current)
+            assert not sched._should_run_options_scan(current + timedelta(minutes=15))
+            await sched._job_tasks["catchup"]
+            await sched._collect_finished_jobs()
+            assert events[1:] == ["regime", ("weekly", "catchup-regular", current)]
+            assert sched.ledger.job_status("catchup", f"{tuesday.date()}:regular").status is JobStatus.DONE
+            assert not sched.ledger.due_intents(current + timedelta(minutes=4, seconds=59))
+            purchase, = sched.ledger.due_intents(current + timedelta(minutes=5))
+            assert purchase.symbol == "AAPL" and purchase.side == "buy" and purchase.job == "catchup"
+            sched._schedule_research_catchup(current + timedelta(minutes=15))
+            assert not sched._job_tasks
+            assert sched._should_run_options_scan(current + timedelta(minutes=15))
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("at_close", [False, True])
+def test_margin_trim_persists_and_continues_to_target(tmp_path, monkeypatch, at_close):
+    async def check():
+        now = datetime(2026, 11, 30, 16 if at_close else 10, tzinfo=ET)
+        holding = Holding("AAPL", Decimal(50), Decimal(50), Decimal(110), Decimal(100), True,
+                          Decimal(5000), Decimal(100))
+        snap = BookSnapshot(now, "margin-book", Decimal(1000), Decimal(-4000), Decimal(5000), Decimal(0),
+                            Decimal(0), None, None, (holding,), (), (), (), quality="indicative")
+        excess = Decimal(".14")
+        enabled = True
+        plans = []
+        alerts = []
+
+        def status(snapshot):
+            if enabled:
+                return SimpleNamespace(needs_trim=excess < Decimal(".15"), margin_call=False, excess_pct=excess)
+            return None
+
+        def plan(snapshot, *, controls, force):
+            plans.append((snapshot.as_of, force))
+            return [TradeIntent(TradeKind.SELL, "AAPL", Decimal(5), Decimal(100), reason="margin_buffer")]
+
+        def open_scheduler(t):
+            scheduler, _ = build(tmp_path, monkeypatch, t)
+            scheduler.store.open()
+            monkeypatch.setattr(scheduler.config, "MARGIN_MIN_EXCESS_PCT", .25, raising=False)
+            monkeypatch.setattr(scheduler.risk, "margin_status", status, raising=False)
+            monkeypatch.setattr(scheduler.risk, "plan_margin_trim", plan, raising=False)
+            scheduler.alerts = SimpleNamespace(alert=lambda severity, title, body, **kw: alerts.append(
+                (severity, title, body),
+            ))
+            tomorrow = now + timedelta(days=1) if at_close else now
+            session = Session(tomorrow.date(), tomorrow.replace(hour=9, minute=30), tomorrow.replace(hour=16))
+            scheduler.calendar.state = MarketState(
+                MarketStatus.CLOSED if at_close else MarketStatus.OPEN, MarketSource.LIVE, session,
+            )
+            return scheduler, session
+
+        sched, session = open_scheduler(now)
+        try:
+            enabled = False
+            await sched._evaluate_margin_guard(snap, now, at_close=at_close)
+            assert not sched.ledger.list_intents() and not alerts
+            enabled = True
+            sched.pause_file.touch()
+            await sched._evaluate_margin_guard(snap, now, at_close=at_close)
+            first, = sched.ledger.list_intents()
+            assert first.status is IntentStatus.QUEUED and first.origin == "margin_buffer"
+            assert first.meta["qty"] == "5" and first.meta["rule"] == "margin_buffer"
+            assert first.next_attempt_at == (session.opens_at + timedelta(minutes=5) if at_close else now)
+            assert alerts[0][0] == "critical" and "14.0%" in alerts[0][2]
+        finally:
+            await sched._cleanup()
+
+        tick = now + timedelta(seconds=30)
+        sched, _ = open_scheduler(tick)
+        try:
+            await sched._evaluate_margin_guard(snap, tick, at_close=at_close)
+            assert [row.intent_id for row in sched.ledger.list_intents()] == [first.intent_id]
+            assert plans == [(now, True)]
+            if at_close:
+                return
+            sched.ledger.claim_intent(first.intent_id, check_thesis=False)
+            sched.ledger.ack_intent(first.intent_id, IntentStatus.FILLED, broker_order_id="first-fill")
+            excess = Decimal(".20")
+            await sched._evaluate_margin_guard(snap, tick)
+            assert len(plans) == 1  # no second leg planned off a pre-fill book
+            tick += timedelta(seconds=1)
+            monkeypatch.setattr(module, "_now_utc", lambda: tick)
+            reduced = replace(holding, qty=Decimal(45))
+            fresh = replace(snap, as_of=tick, holdings=(reduced,))
+            await sched._evaluate_margin_guard(fresh, tick)
+            second, = [row for row in sched.ledger.list_intents() if not row.terminal]
+            assert second.meta["margin_episode"] == first.meta["margin_episode"]
+            assert plans[-1] == (tick, True)
+            excess = Decimal(".25")
+            await sched._evaluate_margin_guard(fresh, tick)
+            assert sched.ledger.risk_state_get("a13.margin_trim_episode") == {}
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_tick_checks_fresh_margin_at_close_before_daily_report(tmp_path, monkeypatch):
+    async def check():
+        close = datetime(2026, 11, 30, 16, tzinfo=ET)
+        now = close + timedelta(seconds=30)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        sched._engine_resumed = sched._reconciled = True
+        sched._last_reconcile_at = now
+        session = Session(now.date(), close.replace(hour=9, minute=30), close)
+        sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, session)
+        snapshot = SimpleNamespace(as_of=now)
+        calls = []
+
+        async def evaluate(snap, when, *, at_close=False):
+            calls.append((snap, when, at_close))
+
+        async def drive(now):
+            return None
+
+        monkeypatch.setattr(sched.ledger, "last_snapshot", lambda: snapshot)
+        monkeypatch.setattr(sched, "_evaluate_margin_guard", evaluate)
+        monkeypatch.setattr(sched, "_drive_order_lane", drive)
+        try:
+            await sched._tick(now)
+            assert calls == [(snapshot, now, True)]
+            assert "drawdown_close" not in sched._job_tasks
+        finally:
+            await sched._cleanup()
 
     asyncio.run(check())
 

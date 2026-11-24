@@ -56,6 +56,7 @@ class OptionsSettings:
     min_reward_risk: float = 1.0
     max_quote_age_s: int = 120
     max_leg_spread_pct: float = 0.15
+    max_underlying_move_pct: float = 0.01  # spot may move this much between pricing and the risk check
     min_open_interest: int = 100
     limit_slippage_frac: float = 0.25  # of the distance from mid to the natural price
     # exits
