@@ -71,7 +71,13 @@ async def _default_startup(agent) -> None:
 
 
 async def _default_step(agent, now_et: datetime) -> None:
+    """One pass of StockAgentScheduler.run()'s loop body: the tick, then the
+    runtime file and the notification lane (alert delivery, heartbeat)."""
     await agent._tick(now_et)
+    for name in ("_publish_runtime", "_schedule_notifications"):
+        fn = getattr(agent, name, None)
+        if fn is not None:
+            fn()
 
 
 async def _default_shutdown(agent) -> None:
