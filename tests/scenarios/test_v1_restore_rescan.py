@@ -327,3 +327,34 @@ def test_adjacent_slot_move_after_a_late_claim_is_sampled_when_the_cooldown_ends
         assert rescans(h) == [f"2026-11-{DAY}:0", f"2026-11-{DAY}:1"]
 
     _run(world, monkeypatch, body)
+
+
+def test_rescan_requests_one_options_scan_that_survives_a_restart(world, monkeypatch):
+    """The rescan asks the options hook once per window (inside the options window: open+15 onwards); a restart
+    neither loses nor duplicates the request."""
+
+    async def body(h, t):
+        from stock_agent.scheduler import OPTIONS_RESCAN_STATE_KEY
+
+        await sample(h, 9, 31)  # 09:31 < open+15: any request here would be refused, so keep it flat
+        t.spy = 102.0
+        await sample(h, 10, 1)
+        window = f"2026-11-{DAY}:1"
+        row = h.scheduler.ledger.job_status(RESCAN, window)
+        assert row.detail.get("options_rescan") == "queued", row.detail
+        assert h.scheduler.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {})["keys"] == [window]
+        await h.restart()
+        t.install(h)
+        assert h.scheduler.request_options_rescan(window) == "already_queued"
+        await sample(h, 10, 2)
+        assert h.scheduler.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {})["keys"] == [window]
+        await h.restart()
+        t.install(h)
+        await sample(h, 10, 3)
+        # The extra scan runs as the ordinary "options" job in its own window (here the fake options book is not
+        # ready, so it ends retryable), and the request is still the single key after both restarts.
+        options_window = h.scheduler.options_rescan_window(f"2026-11-{DAY}", window)
+        assert h.scheduler.ledger.job_status("options", options_window) is not None
+        assert h.scheduler.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {})["keys"] == [window]
+
+    _run(world, monkeypatch, body)
