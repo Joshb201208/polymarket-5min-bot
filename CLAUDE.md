@@ -120,6 +120,17 @@ State is JSON under `data/stock_agent/` (`portfolio.json`,
 - TipRanks Smart Score is a discovery and conviction input, never a sole buy
   trigger.
 - Stop-loss is volatility-adjusted and clamped to 7–12%.
+- Portfolio drawdown controls (`DRAWDOWN_ROLLING_SESSIONS=252`,
+  `DRAWDOWN_PAUSE_MAX_SESSIONS=21`, `DRAWDOWN_RECOVERY_SESSIONS=5`) use the
+  rolling 252-session flow-adjusted peak for policy decisions while still
+  storing and reporting all-time peak and all-time fall from peak: alert at 10%
+  rolling drawdown; cut new stock sizes in half, block new margin borrowing,
+  and pause new options at 15% rolling drawdown; and on a fresh crossing above
+  20% rolling drawdown, pause new entries for at most 21 governed sessions or
+  until rolling drawdown stays below 15% for 5 consecutive closes (after cap
+  expiry, the 15% throttle continues whenever rolling drawdown remains at least
+  15%, and only a fresh crossing from at most 20% to above 20% starts a new
+  pause).
 - Expired in-the-money option legs are valued at intrinsic value, not zero.
 - Covered calls target out-of-the-money strikes only.
 

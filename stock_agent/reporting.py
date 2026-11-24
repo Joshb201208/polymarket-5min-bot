@@ -23,6 +23,7 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -105,23 +106,66 @@ def _safe_report_reason(exc: BaseException, config: Any | None = None) -> str:
     return label[:180]
 
 
-def _read_persisted_drawdown(ledger: Any | None, config: Any = Config) -> DrawdownState | None:
-    """Read the persisted DrawdownState record from risk_state[DRAWDOWN_STATE_KEY] if present."""
+@dataclass(frozen=True)
+class _DrawdownReportSnapshot:
+    decision_dd_pct: Decimal | None
+    rolling_hwm: Decimal | None
+    all_time_dd_pct: Decimal | None
+    all_time_hwm: Decimal | None
+    tier: str
+    label: str
+    paused: bool
+    pause_sessions_remaining: int
+    rolling_window_sessions: int
+
+
+def _read_persisted_drawdown_checked(
+    ledger: Any | None,
+    config: Any = Config,
+) -> tuple[DrawdownState | None, bool]:
+    """Read ``risk_state[DRAWDOWN_STATE_KEY]``, returning ``(state, corrupt)``."""
     if ledger is None or not hasattr(ledger, "risk_state_get"):
-        return None
+        return None, False
     try:
         raw = ledger.risk_state_get(DRAWDOWN_STATE_KEY)
     except Exception:
-        return None
+        return None, True
+    if raw is None:
+        return None, False
     if not isinstance(raw, Mapping):
-        return None
+        return None, True
     try:
         st = DrawdownState.from_record(raw, config=config)
     except Exception:
-        return None
-    if st.last_session is None and not st.paused and st.high_water <= ZERO and st.drawdown <= ZERO:
-        return None
+        return None, True
+    if (
+        st.last_session is None
+        and not st.paused
+        and st.high_water <= ZERO
+        and st.drawdown <= ZERO
+        and st.decision_drawdown <= ZERO
+        and not st.rolling_closes
+    ):
+        return None, False
+    return st, False
+
+
+def _read_persisted_drawdown(ledger: Any | None, config: Any = Config) -> DrawdownState | None:
+    """Read the persisted DrawdownState record from risk_state[DRAWDOWN_STATE_KEY] if present."""
+    st, _ = _read_persisted_drawdown_checked(ledger, config=config)
     return st
+
+
+def _format_pause_lift_condition(st: DrawdownState, config: Any = Config) -> str:
+    """Plain-English condition explaining both ways an active drawdown pause lifts."""
+    rem = st.pause_sessions_remaining(config=config)
+    close_lbl = "close is" if rem == 1 else "closes are"
+    thr_pct = float(getattr(config, "DRAWDOWN_THROTTLE_PCT", 0.15)) * 100.0
+    rec_target = int(getattr(config, "DRAWDOWN_RECOVERY_SESSIONS", 5))
+    return (
+        f"{rem} more trusted session {close_lbl} recorded, or rolling drawdown stays below "
+        f"{thr_pct:.0f}% for {rec_target} consecutive closes ({st.recovery_closes}/{rec_target} recovery closes recorded)"
+    )
 
 
 def describe_drawdown_tier(
@@ -134,21 +178,25 @@ def describe_drawdown_tier(
     """Map persisted drawdown state/latch (or fallback drawdown %) to control tier and label."""
     st = persisted if persisted is not None else _read_persisted_drawdown(ledger, config=config)
     rec_target = int(getattr(config, "DRAWDOWN_RECOVERY_SESSIONS", 5))
+    max_pause_sessions = int(getattr(config, "DRAWDOWN_PAUSE_MAX_SESSIONS", 21))
+    thr_pct = float(getattr(config, "DRAWDOWN_THROTTLE_PCT", 0.15)) * 100.0
+    pause_frac = Decimal(str(getattr(config, "DRAWDOWN_PAUSE_PCT", "0.20")))
     if st is not None:
-        if st.paused or st.drawdown >= Decimal(str(getattr(config, "DRAWDOWN_PAUSE_PCT", "0.20"))):
-            rec_note = (
-                f" ({st.recovery_closes}/{rec_target} recovery closes recorded)"
-                if st.paused and st.recovery_closes > 0
+        if st.paused:
+            lift_cond = _format_pause_lift_condition(st, config=config)
+            return (
+                "halt_20pct",
+                f"20% Drawdown Stop — new entries paused; lifts when {lift_cond}",
+            )
+        if st.is_throttled(config=config):
+            cap_note = (
+                f" ({max_pause_sessions}-session pause cap elapsed; fresh crossing above {float(pause_frac) * 100:.0f}% required to re-pause)"
+                if st.decision_drawdown > pause_frac
                 else ""
             )
             return (
-                "halt_20pct",
-                f"20% Drawdown Stop — new entries paused until drawdown stays above -15% for {rec_target} closes{rec_note}",
-            )
-        if st.is_throttled(config=config):
-            return (
                 "throttle_15pct",
-                "15% Drawdown Guard — new stock sizes cut in half, no new margin borrowing, and new option trades paused",
+                f"15% Drawdown Guard{cap_note} — new stock sizes cut in half, no new margin borrowing, and new option trades paused",
             )
         if st.should_alert(config=config):
             return (
@@ -164,17 +212,17 @@ def describe_drawdown_tier(
         except Exception:
             halted = False
     dd = float(drawdown_pct) if drawdown_pct is not None else 0.0
-    if halted or dd <= -20.0:
+    if halted or dd < -float(pause_frac) * 100.0:
         return (
             "halt_20pct",
-            f"20% Drawdown Stop — new entries paused until drawdown stays above -15% for {rec_target} closes",
+            f"20% Drawdown Stop — new entries paused for up to {max_pause_sessions} sessions or until rolling drawdown stays below {thr_pct:.0f}% for {rec_target} closes",
         )
-    if dd <= -15.0:
+    if dd <= -thr_pct:
         return (
             "throttle_15pct",
             "15% Drawdown Guard — new stock sizes cut in half, no new margin borrowing, and new option trades paused",
         )
-    if dd <= -10.0:
+    if dd <= -float(getattr(config, "DRAWDOWN_ALERT_PCT", 0.10)) * 100.0:
         return (
             "alert_10pct",
             "10% Drawdown Watch — normal rules active with heightened monitoring",
@@ -533,21 +581,78 @@ class ReportBuilder:
         close_dates = sorted(m.session_date for m in marks if m.quality == "close")
         return close_dates[0] if close_dates else None
 
+    def _drawdown_snapshot(
+        self,
+        marks: Sequence[EquityMark],
+        ret_eq: Decimal | None,
+    ) -> _DrawdownReportSnapshot:
+        """Read persisted DrawdownState (both rolling decision & all-time); fall back to marks."""
+        rolling_window = int(getattr(self.config, "DRAWDOWN_ROLLING_SESSIONS", 252))
+        st = _read_persisted_drawdown(self.ledger, config=self.config)
+        calc_dd, calc_hwm = drawdown(marks, ret_eq)
+        if st is not None:
+            all_time_dd_pct = (-st.drawdown * Decimal(100)).quantize(Decimal("0.01"))
+            decision_dd_pct = (-st.decision_drawdown * Decimal(100)).quantize(Decimal("0.01"))
+            all_time_hwm = st.high_water if st.high_water > ZERO else calc_hwm
+            rolling_hwm = st.rolling_high_water if st.rolling_high_water > ZERO else all_time_hwm
+            tier, label = describe_drawdown_tier(
+                decision_dd_pct,
+                self.ledger,
+                config=self.config,
+                persisted=st,
+            )
+            return _DrawdownReportSnapshot(
+                decision_dd_pct=decision_dd_pct,
+                rolling_hwm=rolling_hwm,
+                all_time_dd_pct=all_time_dd_pct,
+                all_time_hwm=all_time_hwm,
+                tier=tier,
+                label=label,
+                paused=bool(st.paused),
+                pause_sessions_remaining=st.pause_sessions_remaining(config=self.config),
+                rolling_window_sessions=rolling_window,
+            )
+
+        close_marks = sorted((m for m in marks if m.quality == "close"), key=lambda m: m.session_date)
+        rolling_marks = close_marks[-rolling_window:] if len(close_marks) > rolling_window else close_marks
+        roll_dd, roll_hwm = drawdown(rolling_marks, ret_eq) if rolling_marks or ret_eq is not None else (calc_dd, calc_hwm)
+        decision_dd_pct = roll_dd if roll_dd is not None else calc_dd
+        rolling_hwm = roll_hwm if roll_hwm is not None else calc_hwm
+        tier, label = describe_drawdown_tier(decision_dd_pct, self.ledger, config=self.config)
+        return _DrawdownReportSnapshot(
+            decision_dd_pct=decision_dd_pct,
+            rolling_hwm=rolling_hwm,
+            all_time_dd_pct=calc_dd,
+            all_time_hwm=calc_hwm,
+            tier=tier,
+            label=label,
+            paused=tier == "halt_20pct",
+            pause_sessions_remaining=0,
+            rolling_window_sessions=rolling_window,
+        )
+
     def _persisted_or_computed_drawdown(
         self,
         marks: Sequence[EquityMark],
         ret_eq: Decimal | None,
     ) -> tuple[Decimal | None, Decimal | None, str, str]:
         """Read persisted DrawdownState (risk_manager.DRAWDOWN_STATE_KEY) first; fall back to marks."""
-        st = _read_persisted_drawdown(self.ledger, config=self.config)
-        calc_dd, calc_hwm = drawdown(marks, ret_eq)
-        if st is not None:
-            dd_pct = (-st.drawdown * Decimal(100)).quantize(Decimal("0.01"))
-            hwm = st.high_water if st.high_water > ZERO else calc_hwm
-            tier, label = describe_drawdown_tier(dd_pct, self.ledger, config=self.config, persisted=st)
-            return dd_pct, hwm, tier, label
-        tier, label = describe_drawdown_tier(calc_dd, self.ledger, config=self.config)
-        return calc_dd, calc_hwm, tier, label
+        snap = self._drawdown_snapshot(marks, ret_eq)
+        return snap.all_time_dd_pct, snap.all_time_hwm, snap.tier, snap.label
+
+    @staticmethod
+    def _format_dual_drawdown_detail(dd_snap: _DrawdownReportSnapshot) -> str:
+        if dd_snap.all_time_dd_pct is None and dd_snap.decision_dd_pct is None:
+            return ""
+        roll_part = (
+            f"Rolling {dd_snap.rolling_window_sessions}-session decision drawdown {_fmt_pct(dd_snap.decision_dd_pct)}"
+            + (f" (window peak {_fmt_money(dd_snap.rolling_hwm)})" if dd_snap.rolling_hwm is not None else "")
+        )
+        all_part = (
+            f"All-time fall from peak {_fmt_pct(dd_snap.all_time_dd_pct)}"
+            + (f" ({_fmt_money(dd_snap.all_time_hwm)} peak)" if dd_snap.all_time_hwm is not None else "")
+        )
+        return f"\n{roll_part} | {all_part}"
 
     def _unavailable_embed(self, title: str, exc: BaseException) -> list[dict[str, Any]]:
         reason = _safe_report_reason(exc, self.config)
@@ -662,7 +767,7 @@ class ReportBuilder:
         overnight_pnl, overnight_pct = (
             day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None)
         )
-        dd_pct, hwm, _, dd_desc = self._persisted_or_computed_drawdown(marks, ret_eq)
+        dd_snap = self._drawdown_snapshot(marks, ret_eq)
         interest = self._interest_series(marks)
 
         bm = await self.benchmark.compute(
@@ -716,7 +821,7 @@ class ReportBuilder:
             },
             {
                 "name": "Safety & Drawdown Status",
-                "value": f"{dd_desc}" + (f" (Drawdown {_fmt_pct(dd_pct)} from {_fmt_money(hwm)} peak)" if dd_pct is not None else ""),
+                "value": f"{dd_snap.label}{self._format_dual_drawdown_detail(dd_snap)}",
                 "inline": False,
             },
             {
@@ -1030,7 +1135,7 @@ class ReportBuilder:
             and ret_eq is not None
             else (day_pnl(marks, ret_eq, session_date, flows) if ret_eq is not None else (None, None))
         )
-        dd_pct, hwm, _, dd_desc = self._persisted_or_computed_drawdown(marks, ret_eq)
+        dd_snap = self._drawdown_snapshot(marks, ret_eq)
         twr_pct = twr(marks, flows)
         dep = net_deposits(flows, session_date)
         total_ret_pct = (
@@ -1117,7 +1222,7 @@ class ReportBuilder:
             },
             {
                 "name": "Drawdown & Safety Tier",
-                "value": f"{dd_desc}" + (f" (Current {_fmt_pct(dd_pct)}, Peak {_fmt_money(hwm)})" if dd_pct is not None else ""),
+                "value": f"{dd_snap.label}{self._format_dual_drawdown_detail(dd_snap)}",
                 "inline": False,
             },
             {"name": "Borrowing & Leverage", "value": self._margin_lines(snap, bm, interest, session_date),
@@ -1333,7 +1438,13 @@ class ReportBuilder:
         )
 
         # Persisted drawdown state/latch first; fallback to marks
-        dd_now, hwm, dd_tier, dd_label = self._persisted_or_computed_drawdown(marks, ret_live_eq)
+        dd_snap = self._drawdown_snapshot(marks, ret_live_eq)
+        dd_now, hwm, dd_tier, dd_label = (
+            dd_snap.all_time_dd_pct,
+            dd_snap.all_time_hwm,
+            dd_snap.tier,
+            dd_snap.label,
+        )
         hwm_date: str | None = None
         max_dd_pct: Decimal | None = None
         max_dd_date: str | None = None
@@ -1405,7 +1516,15 @@ class ReportBuilder:
                 "benchmark_stale": bm.any_stale,
                 "hwm": float(hwm) if hwm is not None else None,
                 "hwm_date": hwm_date,
+                "rolling_hwm": float(dd_snap.rolling_hwm) if dd_snap.rolling_hwm is not None else None,
                 "drawdown_pct": float(dd_now) if dd_now is not None else None,
+                "all_time_drawdown_pct": float(dd_now) if dd_now is not None else None,
+                "decision_drawdown_pct": (
+                    float(dd_snap.decision_dd_pct) if dd_snap.decision_dd_pct is not None else None
+                ),
+                "drawdown_rolling_sessions": dd_snap.rolling_window_sessions,
+                "drawdown_paused": dd_snap.paused,
+                "pause_sessions_remaining": dd_snap.pause_sessions_remaining,
                 "max_drawdown_pct": float(max_dd_pct) if max_dd_pct is not None else None,
                 "max_drawdown_date": max_dd_date,
                 "drawdown_tier": dd_tier,
@@ -1948,7 +2067,10 @@ class ReportBuilder:
                     "name": "Drawdown & Risk Controls",
                     "value": (
                         f"{dd_label}\n"
-                        f"Current: {_fmt_pct(acc['drawdown_pct'])} | Worst Close Drawdown: {_fmt_pct(acc['max_drawdown_pct'])}"
+                        f"Rolling {acc.get('drawdown_rolling_sessions', 252)}-Session Decision Drawdown: "
+                        f"{_fmt_pct(acc.get('decision_drawdown_pct'))} | "
+                        f"All-Time Fall from Peak: {_fmt_pct(acc['drawdown_pct'])} | "
+                        f"Worst Close Drawdown: {_fmt_pct(acc['max_drawdown_pct'])}"
                         + (f" on {acc['max_drawdown_date']}" if acc["max_drawdown_date"] else "")
                         + f" | Breaches: {acc['breach_count']} | Invalid Marks: {acc['invalid_mark_count']}"
                     ),
@@ -2155,16 +2277,19 @@ class ReportBuilder:
             except Exception:
                 pass
 
-        st_dd = _read_persisted_drawdown(self.ledger, config=self.config)
-        if st_dd is not None:
-            pause_thr = Decimal(str(getattr(self.config, "DRAWDOWN_PAUSE_PCT", "0.20")))
-            rec_target = int(getattr(self.config, "DRAWDOWN_RECOVERY_SESSIONS", 5))
-            if st_dd.paused or st_dd.drawdown >= pause_thr:
-                _add(
-                    "drawdown_pause",
-                    "20% drawdown safety stop",
-                    f"drawdown stays above -15% for {rec_target} consecutive closes ({st_dd.recovery_closes}/{rec_target} recorded)",
-                )
+        st_dd, dd_corrupt = _read_persisted_drawdown_checked(self.ledger, config=self.config)
+        if dd_corrupt:
+            _add(
+                "risk_state_unavailable",
+                "invalid persisted drawdown record",
+                "the risk state is readable and valid and the broker reconciles cleanly",
+            )
+        elif st_dd is not None and st_dd.paused:
+            _add(
+                "drawdown_pause",
+                "20% drawdown safety stop",
+                _format_pause_lift_condition(st_dd, config=self.config),
+            )
 
         if snap is not None:
             flags = getattr(snap, "account_flags", None) or {}

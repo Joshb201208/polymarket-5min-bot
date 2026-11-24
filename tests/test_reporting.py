@@ -921,3 +921,157 @@ def test_entry_funnel_and_locks_in_daily_and_weekly_reports(
     asyncio.run(_run())
 
 
+def test_rolling_and_all_time_drawdown_pause_cap_reporting(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, update_drawdown
+
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path / "pause_cap_reporting"
+        cfg.DRAWDOWN_ROLLING_SESSIONS = 30
+        ledger = make_ledger(tmp_path / "pause_cap_reporting", world)
+
+        def _session_label(idx: int) -> str:
+            return (date(2026, 6, 1) + timedelta(days=idx)).isoformat()
+
+        # Build valid v3 states strictly via update_drawdown so every window/episode invariant holds.
+        st0 = update_drawdown(DrawdownState(), _session_label(0), Decimal("100000"), config=cfg)
+        for idx in range(1, 6):
+            st0 = update_drawdown(st0, _session_label(idx), Decimal("85000"), config=cfg)
+        for idx in range(6, 31):
+            st0 = update_drawdown(st0, _session_label(idx), Decimal("90000"), config=cfg)
+        # Day 30 rolled $100k out of the 30-session window: all-time HWM=$100k, rolling HWM=$90k.
+        latched0 = update_drawdown(st0, _session_label(31), Decimal("70200"), config=cfg)
+        assert latched0.paused is True
+
+        # 1) Active pause: 4 closes at $70,200 + 2 recovery closes at $77,400 ->
+        # governed=6 (15 remaining of 21), recovery_closes=2, rolling=-14.00%, all-time=-22.60%.
+        active_pause = latched0
+        for idx in range(32, 36):
+            active_pause = update_drawdown(active_pause, _session_label(idx), Decimal("70200"), config=cfg)
+        for idx in range(36, 38):
+            active_pause = update_drawdown(active_pause, _session_label(idx), Decimal("77400"), config=cfg)
+        assert active_pause.paused is True
+        assert active_pause.pause_sessions_remaining(cfg) == 15
+        assert active_pause.recovery_closes == 2
+
+        snap_date = date.fromisoformat(active_pause.last_session or "2026-07-08")
+        snap = BookSnapshot(
+            as_of=datetime(snap_date.year, snap_date.month, snap_date.day, 21, 5, tzinfo=timezone.utc),
+            run_id="r-pause-cap",
+            equity=Decimal("77400"),
+            cash=Decimal("27400"),
+            long_mv=Decimal("50000"),
+            short_mv=Decimal("0"),
+            options_mv=Decimal("0"),
+            last_equity=None,
+            buying_power=Decimal("104800"),
+            holdings=(),
+            legs=(),
+            open_orders=(),
+            diffs=(),
+        )
+        ledger.record_equity_mark(snap_date, "close", snap)
+        rb = ReportBuilder(
+            cfg,
+            ledger=ledger,
+            clock=lambda: datetime(snap_date.year, snap_date.month, snap_date.day, 21, 10, tzinfo=timezone.utc),
+        )
+
+        ledger.risk_state_set(DRAWDOWN_STATE_KEY, active_pause.to_record())
+
+        tier, label = describe_drawdown_tier(None, ledger, config=cfg)
+        assert tier == "halt_20pct"
+        assert "15 more trusted session closes are recorded" in label
+        assert "rolling drawdown stays below 15% for 5 consecutive closes (2/5 recovery closes recorded)" in label
+
+        morning_txt = str(await rb.build_morning_brief(snapshot=snap))
+        daily_txt = str(await rb.build_daily_summary(snapshot=snap))
+        wk_embeds, sc = await rb.build_weekly_scorecard(snapshot=snap)
+        wk_txt = str(wk_embeds)
+
+        for rendered in (morning_txt, daily_txt):
+            assert "Rolling 30-session decision drawdown -14.00%" in rendered
+            assert "All-time fall from peak -22.60%" in rendered
+            assert "15 more trusted session closes are recorded" in rendered
+        assert "Entries locked: 20% drawdown safety stop — clears when 15 more trusted session closes are recorded" in daily_txt
+        assert sc["account"]["drawdown_tier"] == "halt_20pct"
+        assert sc["account"]["decision_drawdown_pct"] == -14.0
+        assert sc["account"]["all_time_drawdown_pct"] == -22.6
+        assert sc["account"]["drawdown_pct"] == -22.6
+        assert sc["account"]["drawdown_paused"] is True
+        assert sc["account"]["pause_sessions_remaining"] == 15
+        assert sc["entry_locks"]["locked"] is True
+        assert "Rolling 30-Session Decision Drawdown: -14.00%" in wk_txt
+        assert "All-Time Fall from Peak: -22.60%" in wk_txt
+
+        # 2) Expired 21-session pause cap with rolling drawdown still > 20% (-22.00% rolling, -29.80% all-time):
+        # MUST NOT report halt_20pct or lock entries; reports throttle_15pct + dual drawdowns.
+        expired_cap = latched0
+        for idx in range(32, 53):
+            expired_cap = update_drawdown(expired_cap, _session_label(idx), Decimal("70200"), config=cfg)
+        assert expired_cap.paused is False
+        assert expired_cap.decision_drawdown == Decimal("0.22")
+
+        ledger.risk_state_set(DRAWDOWN_STATE_KEY, expired_cap.to_record())
+
+        tier_exp, label_exp = describe_drawdown_tier(None, ledger, config=cfg)
+        assert tier_exp == "throttle_15pct"
+        assert "21-session pause cap elapsed" in label_exp
+        assert "no new margin borrowing" in label_exp
+
+        daily_exp_txt = str(await rb.build_daily_summary(snapshot=snap))
+        _, sc_exp = await rb.build_weekly_scorecard(snapshot=snap)
+        assert "20% drawdown safety stop" not in daily_exp_txt
+        assert "Rolling 30-session decision drawdown -22.00%" in daily_exp_txt
+        assert "All-time fall from peak -29.80%" in daily_exp_txt
+        assert sc_exp["account"]["drawdown_tier"] == "throttle_15pct"
+        assert sc_exp["account"]["drawdown_paused"] is False
+        assert sc_exp["account"]["pause_sessions_remaining"] == 0
+        assert sc_exp["account"]["decision_drawdown_pct"] == -22.0
+        assert sc_exp["account"]["all_time_drawdown_pct"] == -29.8
+        assert sc_exp["entry_locks"]["locked"] is False
+
+        # 3) Rolled-off historical peak: rolling decision drawdown is -4.00% (normal),
+        # while all-time fall from peak (-23.20%) is still reported honestly.
+        rolled_off = update_drawdown(expired_cap, _session_label(53), Decimal("80000"), config=cfg)
+        for idx in range(54, 83):
+            rolled_off = update_drawdown(rolled_off, _session_label(idx), Decimal("76800"), config=cfg)
+        assert rolled_off.paused is False
+        assert rolled_off.decision_drawdown == Decimal("0.04")
+
+        ledger.risk_state_set(DRAWDOWN_STATE_KEY, rolled_off.to_record())
+        tier_norm, _ = describe_drawdown_tier(None, ledger, config=cfg)
+        assert tier_norm == "normal"
+        daily_norm_txt = str(await rb.build_daily_summary(snapshot=snap))
+        assert "Normal — all safety rules clear" in daily_norm_txt
+        assert "Rolling 30-session decision drawdown -4.00%" in daily_norm_txt
+        assert "All-time fall from peak -23.20%" in daily_norm_txt
+
+        # 4) Exact -20.00% rolling drawdown without prior crossing is throttled, NOT cap-elapsed.
+        exact_20 = update_drawdown(
+            update_drawdown(DrawdownState(), "2026-01-02", Decimal("100000"), config=cfg),
+            "2026-01-05",
+            Decimal("80000"),
+            config=cfg,
+        )
+        tier_20, label_20 = describe_drawdown_tier(None, persisted=exact_20, config=cfg)
+        assert tier_20 == "throttle_15pct"
+        assert "pause cap elapsed" not in label_20
+
+        # 5) Corrupt persisted drawdown record fails closed in entry-lock status.
+        ledger.risk_state_set(DRAWDOWN_STATE_KEY, {"hwm": "50000"})
+        _, sc_corrupt = await rb.build_weekly_scorecard(snapshot=snap)
+        assert sc_corrupt["entry_locks"]["locked"] is True
+        assert any(
+            item["code"] == "risk_state_unavailable"
+            for item in sc_corrupt["entry_locks"]["locks"]
+        )
+
+        ledger.store.close()
+
+    asyncio.run(_run())
+
+
+
