@@ -74,6 +74,11 @@ DRAWDOWN_CLOSE_CAUSES = {
     "close_option_underlying_unpriced": "A reliable underlying price was unavailable for an unpriced option",
     "close_option_mark_inconsistent": "The broker reported a value for an option whose price could not be verified",
     "close_option_near_money": "A missing short-option price was too close to its strike to value safely",
+    "close_option_pairing_ambiguous": "An unpriced option leg could not be paired with a single spread partner",
+    "close_option_credit_vertical": "An unpriced or crossed leg belongs to a credit spread, which cannot be bounded safely",
+    "close_option_mark_missing": "The broker did not report a value for an option leg whose liability is needed",
+    "close_option_unparseable": "An option position symbol could not be parsed",
+    "close_option_adjusted_contract": "An unpriced short option is an adjusted contract with a non-standard multiplier",
     "close_haircut_nonpositive": "Account equity was not positive after the conservative option adjustment",
     "close_snapshot_indicative": "The snapshot was indicative without a verified option-only cause",
     "close_mark_not_recorded": "The account equity mark did not persist",
@@ -866,15 +871,16 @@ class StockAgentScheduler:
         if mark is None:
             # Close path only: a copy at conservative equity; raw snapshot quality is unchanged elsewhere.
             trust = close_trust.assess_close(snapshot, await self._underlying_session_closes(snapshot, session.date))
-            trust_detail = trust.detail()
             if not trust.trusted:
-                return JobOutcome(JobStatus.FAILED, detail=trust_detail)
+                return JobOutcome(JobStatus.FAILED, detail=trust.detail())
+            # A fully live close keeps today's outcome and mark; only a conservative close carries detail.
+            trust_detail = trust.detail() if trust.conservative else {}
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
         if mark is None:
             self._last_close_report = await close_session(
-                self.ledger, trust.close_snapshot(snapshot), session.date, mark_extra=trust_detail)
+                self.ledger, trust.close_snapshot(snapshot), session.date, mark_extra=trust_detail or None)
             mark = next((item for item in self.ledger.equity_marks("close", since=session.date)
                          if item.session_date == session.date), None)
             if mark is None:

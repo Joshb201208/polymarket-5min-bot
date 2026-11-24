@@ -198,13 +198,14 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
                       if not h.price_ok or h.price is None or _d(h.price) <= 0]
     if unpriced_stock:
         return untrusted(CLOSE_UNPRICED_STOCK, unpriced_stock)
+    unparseable = _has_unparseable_option(snapshot)
+    if unparseable:
+        # Reconcile drops such a row from legs, so it could otherwise be silently ignored.
+        return untrusted(CLOSE_OPTION_UNPARSEABLE, unparseable)
     if not invalid:
         if snapshot.quality != "live":
             return untrusted(CLOSE_SNAPSHOT_INDICATIVE)
         return CloseTrust(True, None, broker, equity=broker)
-    unparseable = _has_unparseable_option(snapshot)
-    if unparseable:
-        return untrusted(CLOSE_OPTION_UNPARSEABLE, unparseable)
     rows: list[dict[str, Any]] = []
     haircut = ZERO
     try:
