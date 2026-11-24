@@ -268,12 +268,11 @@ class StockAgentScheduler:
                     f"ledger trading block: {block}",
                     "a clean broker reconcile or rebuild clears the ledger block",
                 )
-            if self._drawdown_state().paused:
-                pct = getattr(self.config, "DRAWDOWN_THROTTLE_PCT", .15)
-                closes = getattr(self.config, "DRAWDOWN_RECOVERY_SESSIONS", 5)
+            drawdown = self._drawdown_state()
+            if drawdown.paused:
                 locks["drawdown_pause"] = (
-                    "drawdown halt",
-                    f"drawdown is below {pct:.0%} for {closes} consecutive trusted closes",
+                    "rolling drawdown halt",
+                    self._drawdown_release_condition(drawdown),
                 )
         except (ValueError, StateUnavailable, OptionsError, sqlite3.Error):
             locks["risk_state_unavailable"] = (
@@ -452,6 +451,16 @@ class StockAgentScheduler:
 
     def _drawdown_state(self) -> DrawdownState:
         return DrawdownState.from_record(self.ledger.risk_state_get(DRAWDOWN_STATE_KEY), config=self.config)
+
+    def _drawdown_release_condition(self, state: DrawdownState) -> str:
+        remaining = state.pause_sessions_remaining(self.config)
+        label = "close is" if remaining == 1 else "closes are"
+        pct = self.config.DRAWDOWN_THROTTLE_PCT
+        recovery = self.config.DRAWDOWN_RECOVERY_SESSIONS
+        return (
+            f"{remaining} more trusted session {label} recorded, or rolling drawdown stays below "
+            f"{pct:.0%} for {recovery} consecutive trusted closes; a fresh breach at expiry can start a new pause"
+        )
 
     def _manually_paused(self) -> bool:
         if self.pause_file.exists() or getattr(self.config, "STOCK_TRADING_PAUSED", False):
@@ -856,11 +865,28 @@ class StockAgentScheduler:
         self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
         before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
         alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
-        if before != (alert, throttled, updated.paused):
+        new_episode = updated.paused and updated.pause_start_session != state.pause_start_session
+        if before != (alert, throttled, updated.paused) or new_episode:
+            message = (
+                f"Rolling decision drawdown: {updated.decision_drawdown:.1%}; "
+                f"all-time drawdown: {updated.drawdown:.1%}. "
+            )
+            if new_episode:
+                message += "A new drawdown pause started. "
+            elif state.paused and not updated.paused:
+                expired = updated.pause_sessions_governed >= self.config.DRAWDOWN_PAUSE_MAX_SESSIONS
+                why = "its session cap was reached" if expired else "the trusted-close recovery streak was met"
+                message += f"The drawdown pause lifted because {why}; other entry checks still apply. "
+            if updated.paused:
+                message += f"The pause can lift when {self._drawdown_release_condition(updated)}. "
+            if throttled:
+                message += "Throttled: half-size stock entries when allowed, no new borrowing or options."
+            else:
+                message += "Drawdown throttle inactive."
             await self._alert(
-                "critical" if updated.paused else "warning" if alert else "info",
+                "critical" if updated.paused else "warning" if alert or throttled else "info",
                 "Drawdown controls changed",
-                f"Drawdown: {updated.drawdown:.1%}; throttled: {throttled}; paused: {updated.paused}.",
+                message,
                 key=f"drawdown:{session.date}",
             )
         return risk_result
