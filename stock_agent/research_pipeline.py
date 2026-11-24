@@ -27,7 +27,7 @@ _INPUT_BLOCKERS = {"broker_book_blocked", "broker_book_unavailable", "quote_stal
                    "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
 _FRESH_SET = "research:fresh_scheduled_set"
 _SCHEDULED = {"prescan", "weekly", "midweek"}
-_HANDOFF_TRANSIENT = {"broker_book_blocked", "broker_book_unavailable",
+_HANDOFF_TRANSIENT = {"broker_book_unavailable",
                       "quote_stale_or_unavailable", "news_stale_or_unavailable", "llm_unavailable"}
 
 
@@ -379,10 +379,12 @@ class ResearchPipeline:
                 async with asyncio.timeout(min(remaining, 8 if intent.reference_price is not None else 55)):
                     code = await self._validate_handoff(key, intent, funnel)
             except (TimeoutError, SourceUnavailable, StaleBook) as exc:
-                reason = {
-                    TimeoutError: "handoff_input_timeout", SourceUnavailable: "handoff_input_unavailable",
-                    StaleBook: "broker_book_unavailable",
-                }[type(exc)]
+                if isinstance(exc, TimeoutError):
+                    reason = "handoff_input_timeout"
+                elif isinstance(exc, StaleBook):
+                    reason = "broker_book_unavailable"
+                else:
+                    reason = "handoff_input_unavailable"
                 code = self._retry_handoff(key, intent, reason)
             outcomes[code] += 1
             if code == "handoff_promoted":
@@ -443,7 +445,8 @@ class ResearchPipeline:
         now = self.clock()
         session = self.calendar.session_on(intent.session_date)
         if session is None or now >= session.closes_at - timedelta(minutes=10):
-            return self._retry_handoff(key, intent, "handoff_execution_window_closed")
+            self.store.finish_pending_buy(key, "waiting", retry_at=intent.expires_at)
+            return "handoff_execution_window_closed"
         refresh = getattr(self.sources, "refresh_entry_inputs", None)
         if refresh is not None:
             await refresh(symbol, now)
@@ -455,7 +458,7 @@ class ResearchPipeline:
             if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
                 return self._retry_handoff(key, intent, gate.reasons[0])
             return refuse("handoff_gate_refused", *gate.reasons)
-        if (gate.thesis_id != intent.thesis_ids[0] or gate.direction is not Direction.BUY
+        if (gate.thesis_id != intent.thesis_ids[0] or gate.direction != Direction.BUY
                 or type(gate.effective_conviction) is not int
                 or gate.effective_conviction < intent.meta["minimum_conviction"]):
             return refuse("handoff_gate_refused", "buy_thesis_or_conviction_changed")
@@ -467,6 +470,8 @@ class ResearchPipeline:
             return self._retry_handoff(key, intent, "quote_stale_or_unavailable")
         stories = await self.sources.background((symbol,))
         security = replace(security, evidence=(*stories.get(symbol, ()), *security.evidence))
+        if not _fresh_quote(security, self.clock(), max_age=timedelta(seconds=90)):
+            return self._retry_handoff(key, intent, "quote_stale_or_unavailable")
         code, holding = check_identity()
         if code:
             return refuse(code)
@@ -705,7 +710,7 @@ class ResearchPipeline:
                     rejected.append("active_thesis_changed")
                 elif not gate.ok and not gate.reasons:
                     rejected.append("research_gate_refused")
-                elif gate.direction is not direction:
+                elif gate.direction != direction:
                     rejected.append("research_direction_changed")
         qualifies = not rejected
         defer = scheduled and set(rejected) == {"quote_stale_or_unavailable"}

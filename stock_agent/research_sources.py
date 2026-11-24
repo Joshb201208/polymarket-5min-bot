@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -143,7 +143,7 @@ class ResearchSources:
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
 
-    async def completed_close(self, symbol: str, session_date) -> Decimal | None:
+    async def completed_close(self, symbol: str, session_date: date) -> Decimal | None:
         """An analysis anchor only, for the exact expected previous session."""
         getter = getattr(self.prices, "get_daily_bars", None)
         if getter is None:
