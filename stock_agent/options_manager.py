@@ -129,6 +129,20 @@ async def _maybe(x: Any) -> Any:
     return await x if inspect.isawaitable(x) else x
 
 
+def _drawdown_halts_options(controls: Any, config: Any = None) -> bool:
+    """New option risk is refused whenever the drawdown throttle applies (paused or the
+    rolling decision drawdown at/above the throttle), judged with the running config."""
+    dd = getattr(controls, "drawdown", None)
+    if dd is None:
+        return False
+    check = getattr(dd, "is_throttled", None)
+    if callable(check):
+        if config is None:
+            from stock_agent.config import Config as config  # noqa: N813
+        return bool(check(config))
+    return bool(getattr(dd, "throttled", False))
+
+
 def _f(x: Any) -> float | None:
     try:
         return None if x is None else float(x)
@@ -588,7 +602,7 @@ class OptionsManager:
             await self._alert("critical", "Options entries refused: risk state unreadable", str(e),
                               key="opt-risk-state")
             return ScanOutcome(sym, None, f"risk state unavailable: {e}", final=False)
-        halted = bool(getattr(getattr(controls, "drawdown", None), "throttled", False))
+        halted = _drawdown_halts_options(controls, self._config)
         ladder = self._open_ladder(prop)
         if not ladder:
             return ScanOutcome(sym, None, "no limit price meets the reward/risk floor")

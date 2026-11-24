@@ -21,7 +21,7 @@ from stock_agent.market_calendar import ET, GateDecision, MarketSource, MarketSt
 from stock_agent.news_service import NewsService
 from stock_agent.research_pipeline import JobOutcome, OptionIdea
 from stock_agent.research_schemas import Direction
-from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, TradeIntent, TradeKind
+from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState, TradeIntent, TradeKind, update_drawdown
 from stock_agent.state_store import StateStore
 from tests.exec_helpers import FakePrices, enqueue
 
@@ -656,6 +656,53 @@ def test_close_performance_and_drawdown_share_trusted_mark_persisted_once(tmp_pa
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == state.to_record()
         assert sched.ledger.equity_marks("close")[0].equity == Decimal(790)
         await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_drawdown_timeout_close_alert_reports_remaining_throttle_and_does_not_repeat(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 13, 5, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        monkeypatch.setattr(sched.config, "DRAWDOWN_PAUSE_MAX_SESSIONS", 5)
+        state = update_drawdown(DrawdownState(), "2026-11-18", Decimal(1000), config=sched.config)
+        for day in ("19", "20", "23", "24", "25"):
+            state = update_drawdown(state, f"2026-11-{day}", Decimal(790), config=sched.config)
+        sched.ledger.risk_state_set(DRAWDOWN_STATE_KEY, state.to_record())
+        assert "1 more trusted session close is recorded" in sched._entry_safety_locks()["drawdown_pause"][1]
+        sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, sched.calendar.state.session)
+        snapshot = BookSnapshot(
+            as_of=now, run_id="timeout-close-fixture", equity=Decimal(790), cash=Decimal(790),
+            long_mv=Decimal(0), short_mv=Decimal(0), options_mv=Decimal(0),
+            last_equity=Decimal(790), buying_power=Decimal(790),
+            holdings=(), legs=(), open_orders=(), diffs=(), quality="live",
+        )
+
+        async def refresh(reason):
+            return snapshot
+
+        sent = []
+
+        async def alert(severity, title, body, *, key=None):
+            sent.append((severity, body, key))
+
+        monkeypatch.setattr(sched.ledger, "refresh", refresh)
+        monkeypatch.setattr(sched, "_alert", alert)
+        try:
+            await sched._close_drawdown()
+            assert "drawdown_pause" not in sched._entry_safety_locks()
+            assert sched._risk_controls().drawdown.is_throttled(sched.config)
+            assert len(sent) == 1
+            severity, body, key = sent[0]
+            assert severity == "warning" and key == "drawdown:2026-11-27"
+            assert "Rolling decision drawdown: 21.0%; all-time drawdown: 21.0%" in body
+            assert "pause lifted because its session cap was reached" in body
+            assert "half-size stock entries when allowed, no new borrowing or options" in body
+            await sched._close_drawdown()
+            assert len(sent) == 1
+        finally:
+            await sched._cleanup()
 
     asyncio.run(check())
 
