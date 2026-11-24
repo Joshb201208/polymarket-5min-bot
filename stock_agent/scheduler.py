@@ -188,7 +188,8 @@ class StockAgentScheduler:
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
             bars=self._stop_bars, controls=self._risk_controls, margin_controls=self._margin_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
-            capital_lock=self.capital_lock, research_gate=self.research_gate, notifier=self.alerts,
+            capital_lock=self.capital_lock, research_gate=self.research_gate,
+            research_refresh=getattr(self.research_sources, "refresh_entry_inputs", None), notifier=self.alerts,
         ))
         self.options_store = service("options_store", lambda: KvOptionsStore(self.store))
         self.options = service("options", lambda: OptionsManager(

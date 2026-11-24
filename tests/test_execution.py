@@ -1028,7 +1028,8 @@ def test_research_gate_outage_degrades_to_ledger_thesis(world, tmp_path, monkeyp
 
     from dataclasses import replace
     it = replace(it, origin="weekly", thesis_ids=("th-1",))
-    monkeypatch.setattr(eng.ledger, "current_thesis", lambda s: SimpleNamespace(thesis_id="th-1"))
+    monkeypatch.setattr(eng.ledger, "current_thesis", lambda s: SimpleNamespace(
+        thesis_id="th-1", actionable=True, payload={"draft": {"direction": "BUY"}}))
     assert run(eng._research_recheck(it, None)) is None
     monkeypatch.setattr(eng.ledger, "current_thesis", lambda s: SimpleNamespace(thesis_id="th-2"))
     assert "newer thesis" in run(eng._research_recheck(it, None))

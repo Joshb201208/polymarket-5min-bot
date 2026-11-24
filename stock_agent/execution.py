@@ -148,6 +148,7 @@ class ExecutionEngine:
         market_gate: Callable[..., Awaitable[Any]] | None = None,
         capital_lock: Any = None,
         research_gate: Any = None,
+        research_refresh: Callable[[str, datetime], Any] | None = None,
         notifier: Any = None,
         margin_controls: Callable[[Any], Any] | None = None,
         config: Any = Config,
@@ -165,6 +166,7 @@ class ExecutionEngine:
         self._market_gate = market_gate
         self._capital_lock = capital_lock
         self._research_gate = research_gate
+        self._research_refresh = research_refresh  # ResearchSources.refresh_entry_inputs(symbol, now)
         self._margin_controls = margin_controls  # scheduler: snapshot -> RiskControls (held convictions)
         self._notifier = notifier  # AlertService-like: send_normalise_plan / send_normalise_result
         self.config = config
@@ -542,7 +544,7 @@ class ExecutionEngine:
         "symbol_blocked", "short_open", "research_stale", "position_changed", "risk_size_zero",
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
         "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
-        "nothing_to_sell", "exit_cap", "other"})
+        "nothing_to_sell", "exit_cap", "research_inputs_pending", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
         """Journal event `execution.buy_funnel` for the daily entry funnel (A14d). Never raises."""
@@ -555,6 +557,18 @@ class ExecutionEngine:
                                        session_date=self.session_date().isoformat(), **extra)
         except Exception:
             logger.exception("buy funnel journal failed")
+        if stage == "skipped":
+            self._alert_blocked_buy(it, code, reason)
+
+    def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str) -> None:
+        """Part 5: one #risk line per blocked buy (AlertService filters/dedupes). Never raises."""
+        fn = getattr(self._notifier, "alert_blocked_buy", None) if self._notifier is not None else None
+        if fn is None:
+            return
+        try:
+            fn(it.symbol, code, reason, session_date=self.session_date())
+        except Exception:
+            logger.exception("blocked-buy alert failed")
 
     @staticmethod
     def _code_meta(code: str, reason: str, **extra: Any) -> dict:
@@ -676,6 +690,9 @@ class ExecutionEngine:
             return self._skip(intent, f"price {ask:.2f} ran more than {self.s.max_price_drift_pct:.0%} above "
                                       f"the analysed {ref:.2f}", "price_ran_away")
         limit = round_price(ask * (1 + self.s.buy_limit_offset_pct))
+        # Network refresh of an old quote/news proof happens here, outside the capital lock;
+        # the binding recheck inside the lock is network-free.
+        await self._refresh_research_proof(intent)
         try:
             async with (self._capital_lock or contextlib.nullcontext()):
                 # Held only from the fresh risk snapshot through submit/confirm, so the
@@ -709,9 +726,10 @@ class ExecutionEngine:
             not add or h.meta is None or h.meta.position_id != intent.position_id
         ):
             return self._skip(intent, "top-up no longer matches the live position", "position_changed")
-        why = await self._research_recheck(intent, h)
+        why, code = await self._research_verdict(intent, h)
         if why:
-            code = "position_changed" if why.startswith("top-up") else "research_stale"
+            if code == "research_inputs_pending":
+                return await self._hold(intent, why, code=code)
             return self._skip(intent, why, code)
         thesis = None
         last_filled_conviction = None
@@ -794,21 +812,75 @@ class ExecutionEngine:
             raise
         return claimed, order, released
 
-    RESEARCH_ORIGINS = frozenset({"weekly", "midweek", "prescan", "earnings", "news"})
+    RESEARCH_ORIGINS = frozenset({"weekly", "midweek", "prescan", "earnings", "news", "market_move"})
+
+    # Gate reasons (research_gate.py / research_health.py) that only say a proof is old or a
+    # provider blipped. They are refreshed before submit and, if still present, the buy is held
+    # and retried (it expires at the session close) instead of being skipped.
+    RESEARCH_REFRESHABLE = frozenset({"quote_stale_or_unavailable", "news_stale_or_unavailable"})
+    RESEARCH_TRANSIENT = RESEARCH_REFRESHABLE | frozenset({
+        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable"})
+    RESEARCH_REFRESH_TIMEOUT_S = 10.0
+    # Aggregate cap so N due buys can't stall monitor_tick by N x 10s: at most this many seconds
+    # of proof refresh per rolling minute; past it, stale proofs take the transient hold path.
+    RESEARCH_REFRESH_BUDGET_S = 15.0
+
+    async def _eligibility(self, symbol: str) -> Any:
+        g = self._research_gate.is_entry_eligible(symbol, self.now())
+        if hasattr(g, "__await__"):
+            g = await g
+        return g
+
+    def _blocking_reasons(self, g: Any) -> tuple[str, ...]:
+        if getattr(g, "ok", None) is True:
+            return ()
+        return tuple(getattr(g, "reasons", ()) or ()) or ("research_gate_refused",)
+
+    async def _refresh_research_proof(self, intent: OrderIntent) -> None:
+        """Refresh an old quote/news proof before the binding recheck. Never raises."""
+        if (self._research_gate is None or self._research_refresh is None
+                or intent.origin not in self.RESEARCH_ORIGINS):
+            return
+        try:
+            g = await self._eligibility(intent.symbol)
+            if not set(self._blocking_reasons(g)) & self.RESEARCH_REFRESHABLE:
+                return
+            loop = asyncio.get_running_loop()  # same clock as asyncio.timeout
+            clock = loop.time()
+            start, spent = getattr(self, "_refresh_window", (clock, 0.0))
+            if clock - start >= 60.0:
+                start, spent = clock, 0.0
+            budget = min(self.RESEARCH_REFRESH_TIMEOUT_S, self.RESEARCH_REFRESH_BUDGET_S - spent)
+            if budget <= 0:
+                logger.info("research proof refresh budget used up; %s waits for the next try", intent.symbol)
+                return
+            try:
+                async with asyncio.timeout(budget):
+                    r = self._research_refresh(intent.symbol, self.now())
+                    if hasattr(r, "__await__"):
+                        await r
+            finally:
+                self._refresh_window = (start, spent + loop.time() - clock)
+        except (Exception, TimeoutError) as e:  # the recheck below decides; a refresh failure only means "still old"
+            logger.warning("research proof refresh for %s failed: %s", intent.symbol, e)
 
     async def _research_recheck(self, intent: OrderIntent, holding: Any) -> str | None:
-        """At submission, not just at proposal: the research gate must still say BUY
-        for this intent's thesis, and a top-up must target the position it was proven for."""
-        if holding is not None and holding.qty > 0 and intent.position_id:
-            meta = self.ledger.open_position_meta(intent.symbol)
+        return (await self._research_verdict(intent, holding))[0]
+
+    async def _research_verdict(self, intent: OrderIntent, holding: Any) -> tuple[str | None, str]:
+        """At submission, not just at proposal: the research gate must still pass (``ok``)
+        with a BUY for this intent's thesis, and the intent must still match the position
+        it was proven for. Returns (reason, code); reason None means go."""
+        held = holding is not None and holding.qty > 0
+        if intent.position_id:
+            meta = self.ledger.open_position_meta(intent.symbol) if held else None
             if meta is None or meta.position_id != intent.position_id:
-                return "top-up was approved for a position that has since closed or reopened"
+                return ("top-up was approved for a position that has since closed or reopened",
+                        "position_changed")
         if self._research_gate is None or intent.origin not in self.RESEARCH_ORIGINS:
-            return None
+            return None, ""
         try:
-            g = self._research_gate.is_entry_eligible(intent.symbol, self.now())
-            if hasattr(g, "__await__"):
-                g = await g
+            g = await self._eligibility(intent.symbol)
         except Exception as e:
             # A14a: a broken recheck must not block every buy. Degrade to the ledger's
             # current thesis: the intent still has to come from the newest thesis.
@@ -816,15 +888,26 @@ class ExecutionEngine:
             try:
                 cur = self.ledger.current_thesis(intent.symbol)
             except Exception as le:
-                return f"research gate and ledger thesis both unavailable: {e}; {le}"
+                return f"research gate and ledger thesis both unavailable: {e}; {le}", "research_stale"
             if cur is None or cur.thesis_id not in set(intent.thesis_ids or ()):
-                return "research gate unavailable and the ledger has a newer thesis"
-            return None
-        if not g or getattr(g, "direction", None) != "BUY":
-            return "research gate no longer has a BUY for this symbol"
+                return "research gate unavailable and the ledger has a newer thesis", "research_stale"
+            draft = (getattr(cur, "payload", None) or {}).get("draft") or {}
+            if not getattr(cur, "actionable", False) or str(draft.get("direction", "")).upper() != "BUY":
+                return "research gate unavailable and the ledger thesis is not an actionable BUY", "research_stale"
+            if any(i.side == "sell" and not i.terminal for i in self.ledger.list_intents(symbol=intent.symbol)):
+                return "research gate unavailable and an exit is pending for this symbol", "research_stale"
+            return None, ""
+        if g is None or getattr(g, "direction", None) != "BUY":
+            return "research gate no longer has a BUY for this symbol", "research_stale"
         if getattr(g, "thesis_id", None) not in set(intent.thesis_ids or ()):
-            return "research gate's current thesis is not the one this intent was made from"
-        return None
+            return "research gate's current thesis is not the one this intent was made from", "research_stale"
+        blocking = self._blocking_reasons(g)
+        if not blocking:
+            return None, ""
+        text = "research gate refused at submit: " + ", ".join(blocking)
+        if set(blocking) <= self.RESEARCH_TRANSIENT:
+            return text + " (retrying)", "research_inputs_pending"
+        return text, "research_stale"
 
     async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None,
                     code: str = "other") -> ExecResult:
