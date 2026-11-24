@@ -55,7 +55,8 @@ class BrokerReader(Protocol):
 # Activity types ingested into broker_activities (OPXRC is the documented
 # spelling of exercise; OPEXC is what the live account returns).
 ACTIVITY_TYPES = ("FILL", "DIV", "FEE", "OPEXP", "OPASN", "OPEXC", "OPXRC", "OPTRD", "NC", "SC",
-                  "SSP", "SPLIT", "SSO", "MA", "REORG", "JNLC", "JNLS", "JNL", "CSD", "CSW", "INT")
+                  "SSP", "SPLIT", "SSO", "MA", "REORG", "JNLC", "JNLS", "JNL", "CSD", "CSW", "INT",
+                  "INTNRA", "INTTW")
 CASH_FLOW_TYPES = ("JNLC", "CSD", "CSW", "JNL")
 # Stock splits: "SPLIT" (current; a remove entry with negative qty and an add entry
 # with the new qty, same group_id) and "SSP" (former code). Per
@@ -186,8 +187,6 @@ async def _read_broker(broker: Any, after: datetime | None) -> tuple[Any, list, 
         raise ReconcileError(f"broker read failed: {type(e).__name__}: {e}") from e
     if account is None or positions is None or orders is None or acts is None:
         raise ReconcileError("broker read returned nothing")
-    if _dec(_g(account, "equity")) is None or _dec(_g(account, "cash")) is None:
-        raise ReconcileError("account reply has no equity/cash")
     return account, list(positions), list(orders), list(acts)
 
 
@@ -469,9 +468,19 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
     after = (cursor - timedelta(days=3)) if cursor else None
     try:
         account, positions, orders, acts = await _read_broker(broker, after)
+    except ReconcileError as e:
+        journal.append("reconcile", ok=False, reason=reason, error=str(e))
+        raise
+    try:
         _validate_read(account, positions)
     except ReconcileError as e:
         journal.append("reconcile", ok=False, reason=reason, error=str(e))
+        # A14c: name the exact cause; the read is retried on every reconcile and the lock
+        # clears by itself on the first usable read (key dedupe is the alert sink's job).
+        ledger._raise_alert(Severity.CRITICAL, "Broker read unusable; entries locked",
+                            f"Cause: {e}. Clears automatically on the next reconcile whose broker read is "
+                            "complete (numeric equity/cash, one row per symbol, numeric qty).",
+                            key="state:read_unusable")
         raise
 
     open_meta = {m.symbol: m for m in ledger.all_open_meta()}
@@ -695,7 +704,14 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         open_orders=tuple(_order(o) for o in orders), diffs=tuple(diffs), quality=quality,
         blocked_symbols=frozenset(blocked),
         account_flags={k: _g(account, k) for k in ("shorting_enabled", "trading_blocked", "account_blocked",
-                                                  "multiplier", "options_trading_level", "status")},
+                                                  "multiplier", "options_trading_level", "status", "sma",
+                                                  "last_maintenance_margin")},
+        regt_buying_power=_dec(_g(account, "regt_buying_power")),
+        maintenance_margin=_dec(_g(account, "maintenance_margin")),
+        initial_margin=_dec(_g(account, "initial_margin")),
+        options_buying_power=_dec(_g(account, "options_buying_power")),
+        non_marginable_buying_power=_dec(_g(account, "non_marginable_buying_power")),
+        margin_call=(bool(_g(account, "margin_call")) if _g(account, "margin_call") is not None else None),
     )
     # B1: resume only after a CLEAN reconcile. Shorts are blocked per symbol, not globally.
     blocking = [d for d in diffs if d.severity == Severity.CRITICAL and d.kind != DiffKind.SHORT_STOCK]
@@ -724,7 +740,10 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
                    equity=str(equity), cash=str(cash), n_holdings=len(holdings), n_legs=len(legs))
     if store.trading_block() and blocking:
         ledger._raise_alert(Severity.CRITICAL, "Books not clean; trading stays blocked",
-                            "; ".join(f"{d.kind.value} {d.symbol or ''}".strip() for d in blocking[:10]),
+                            "Cause: " + "; ".join(f"{d.kind.value} {d.symbol or ''}".strip() for d in blocking[:10])
+                            + f". Block: {store.trading_block()}. These positions are now closed in the ledger, so"
+                            " the next reconcile is clean and clears the block unless the broker book changes"
+                            " again without activity.",
                             key="state:still_blocked")
     elif store.trading_block():
         old = store.trading_block()
