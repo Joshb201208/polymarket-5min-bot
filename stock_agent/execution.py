@@ -917,7 +917,14 @@ class ExecutionEngine:
                     code: str = "other") -> ExecResult:
         nxt = until or (self.now() + timedelta(minutes=5))
         if intent.expires_at is not None and nxt >= intent.expires_at:
-            return self._skip(intent, reason + " (intent would expire)", "intent_expired", held_by=code)
+            # Holds never alert; this one skip is the single blocked-buy message, so it names
+            # what kept the buy waiting earlier (e.g. a research outage) as well as the last hold.
+            cur = self.ledger.get_intent(intent.intent_id)
+            prior = getattr(cur, "last_error", None) or ""
+            why = reason + " (intent would expire)"
+            if prior and prior != reason:
+                why += f"; earlier held: {prior}"
+            return self._skip(intent, why, "intent_expired", held_by=code)
         self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=reason, next_attempt_at=nxt,
                                meta=self._code_meta(code, reason))
         self._funnel(intent, "held", code, reason)

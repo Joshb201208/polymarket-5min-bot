@@ -359,3 +359,38 @@ def test_risk_refusal_alert_carries_structured_risk_reasons(world, tmp_path, mon
     it = enqueue(eng, "AAA", "buy", ref=50)
     eng._skip(it, "risk refused: sector cap", "risk_refused", risk_reasons=["sector_cap"])
     assert calls == [("AAA", "risk_refused", ("sector_cap",))]
+
+
+def test_all_day_model_outage_gives_one_blocked_buy_alert_at_expiry(world, tmp_path, monkeypatch):
+    """Holds never alert; the hold that would cross the close skips once as intent_expired."""
+    world.clock.set_et(2026, 11, 30, 15, 40)
+    world.price("AAA", 50, spread=0.02)
+    eng, gate = wired(world, tmp_path, monkeypatch, news_at=world.clock.now(), extra=("llm_unavailable",))
+    calls = []
+
+    class Notifier:
+        def alert_blocked_buy(self, symbol, code, reason="", **kw):
+            calls.append((symbol, code, reason))
+            return True
+
+    eng._notifier = Notifier()
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    close = datetime(2026, 11, 30, 16, 0, tzinfo=ZoneInfo("America/New_York"))
+    ids = eng.ledger.enqueue_intents([NewIntent(
+        symbol="AAA", side="buy", dedupe_key="prescan:AAA:exp", reference_price=Decimal("50"), origin="prescan",
+        thesis_ids=(eng.thesis_id,), sleeve="core", expires_at=close,
+        meta={"effective_conviction": 8, "raw_conviction": 8, "sector": "Technology"})])
+    statuses = []
+    for minute in (40, 45, 50, 56):
+        world.clock.set_et(2026, 11, 30, 15, minute)
+        world.price("AAA", 50, spread=0.02)
+        gate.news_at = world.clock.now()
+        res = run(eng.execute_intent(eng.ledger.get_intent(ids[0])))
+        statuses.append(res.code)
+        if res.status != IntentStatus.QUEUED:
+            break
+    assert statuses[:-1] and all(c == "research_inputs_pending" for c in statuses[:-1])
+    assert statuses[-1] == "intent_expired"
+    assert len(calls) == 1 and calls[0][1] == "intent_expired" and "llm_unavailable" in calls[0][2]
+    world.assert_no_orders()
