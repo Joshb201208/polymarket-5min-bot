@@ -62,6 +62,34 @@ MAX_JOB_ATTEMPTS = 3
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
 
+DRAWDOWN_CLOSE_CAUSES = {
+    "close_clock_unverified": "The broker clock did not confirm the scheduled session had closed",
+    "close_equity_unverified": "The broker account equity could not be verified",
+    "close_snapshot_nonpositive": "The broker account equity was not positive",
+    "close_snapshot_preclose": "The account snapshot was taken before the scheduled close",
+    "close_snapshot_stale": "The account snapshot was not fresh enough",
+    "close_trading_block": "A ledger trading block was still in force",
+    "close_unpriced_stock": "One or more stock prices could not be verified",
+    "close_option_marks_crossed": "The broker reported inconsistent prices for the legs of an option spread",
+    "close_option_underlying_unpriced": "A reliable underlying price was unavailable for an unpriced option",
+    "close_option_mark_inconsistent": "The broker reported a value for an option whose price could not be verified",
+    "close_option_near_money": "A missing short-option price was too close to its strike to value safely",
+    "close_haircut_nonpositive": "Account equity was not positive after the conservative option adjustment",
+    "close_snapshot_indicative": "The snapshot was indicative without a verified option-only cause",
+    "close_mark_not_recorded": "The account equity mark did not persist",
+    "previous_session_unverified": "The previous trading session could not be confirmed",
+    "drawdown_record_invalid": "The saved drawdown record could not be read or validated",
+    "drawdown_close_invalid": "The close or its external cash flows could not be used to update drawdown",
+    "close_risk_input_unverified": "A separate closing risk check did not have usable inputs",
+}
+
+DRAWDOWN_CLOSE_ERRORS = {
+    "TimeoutError": "The closing check timed out",
+    "ReconcileError": "The broker account could not be reconciled",
+    "StateUnavailable": "The required local risk state could not be read",
+    "OperationalError": "The local database was unavailable during the closing check",
+}
+
 
 def _now_et() -> datetime:
     return datetime.now(ET)
@@ -175,6 +203,7 @@ class StockAgentScheduler:
         self._options_task: asyncio.Task | None = None
         self._telemetry_task: asyncio.Task | None = None
         self._last_issue: dict[str, datetime] = {}
+        self._missed_close_notices: set[str] = set()
         self._pending_ledger_alerts: set[asyncio.Task] = set()
         self.macro = service("macro", lambda: MacroMonitor(
             self.config, prices=self.prices, store=self.store, defer_load=True,
@@ -212,6 +241,8 @@ class StockAgentScheduler:
                 routing = {"channel_key": "announcements"} if (
                     key == "normalise-plan" and isinstance(self.alerts, AlertService)
                 ) else {}
+                if isinstance(self.alerts, AlertService) and key and key.startswith("trusted-close-missed:"):
+                    routing["dedupe_window_sec"] = 48 * 3600
                 result = self.alerts.alert(severity, title, body, key=key, **routing)
                 if inspect.isawaitable(result):
                     async with asyncio.timeout(2):
@@ -1069,6 +1100,13 @@ class StockAgentScheduler:
             return
         row = self.ledger.job_status(name, window_key)
         if row is not None:
+            if (name == "drawdown_close" and row.status is JobStatus.FAILED
+                    and row.attempts >= MAX_JOB_ATTEMPTS and row.detail.get("missed_close_streak")
+                    and window_key not in self._missed_close_notices):
+                # The terminal outcome is durable before alert dispatch. If a process
+                # stopped between them, recover the notice, not the close or any orders.
+                self._job_tasks[name] = asyncio.create_task(self._warn_missed_close(window_key, row.detail))
+                return
             if row.status in {JobStatus.DONE, JobStatus.SKIPPED} or row.attempts >= MAX_JOB_ATTEMPTS:
                 return
             if row.status is JobStatus.STARTED and not replay:
@@ -1085,6 +1123,82 @@ class StockAgentScheduler:
             name=f"stock-agent:{name}",
         )
 
+    def _terminal_close_failure(self, window_key, detail):
+        day = date.fromisoformat(window_key)
+        try:
+            last_applied = self._drawdown_state().last_session
+        except (ValueError, StateUnavailable, sqlite3.Error):
+            last_applied = None
+        if last_applied == window_key:
+            # The close-limit check can fail even after the drawdown record advances.
+            return detail
+        try:
+            mark_present = any(m.session_date == day for m in self.ledger.equity_marks("close", since=day))
+        except (ValueError, StateUnavailable, sqlite3.Error):
+            mark_present = None
+        streak = 1
+        prior = self.calendar.previous_session(day)
+        lower_bound = prior is None
+        while prior is not None and prior.date < day:
+            key = prior.date.isoformat()
+            if last_applied is not None and key <= last_applied:
+                break
+            try:
+                row = self.ledger.job_status("drawdown_close", key)
+            except (ValueError, StateUnavailable, sqlite3.Error):
+                lower_bound = True
+                break
+            if row is None or row.status is not JobStatus.FAILED or row.attempts < MAX_JOB_ATTEMPTS:
+                break
+            saved_streak = row.detail.get("missed_close_streak")
+            if type(saved_streak) is int and saved_streak > 0:
+                # A prior terminal job already counted earlier sessions, including
+                # those now outside the broker calendar cache's lookback window.
+                streak += saved_streak
+                lower_bound = bool(row.detail.get("missed_close_streak_lower_bound"))
+                break
+            if row.detail.get("reason") == "close_risk_input_unverified":
+                break
+            streak += 1
+            day = prior.date
+            prior = self.calendar.previous_session(day)
+            lower_bound = prior is None
+        return {**detail, "missed_close_streak": streak, "missed_close_streak_lower_bound": lower_bound,
+                "close_mark_present": mark_present}
+
+    async def _warn_missed_close(self, window_key, detail):
+        if window_key in self._missed_close_notices:
+            return
+        self._missed_close_notices.add(window_key)
+        if detail.get("close_mark_present") is True:
+            headline = "An equity mark exists, but the fall-from-peak brakes did not update."
+            title = "Drawdown did not update from the close"
+        elif detail.get("close_mark_present") is False:
+            headline = "No trusted close was recorded today, so the fall-from-peak brakes did not update."
+            title = "Trusted close not recorded"
+        else:
+            headline = "The bot could not confirm a trusted close or an update to the fall-from-peak brakes."
+            title = "Trusted close not verified"
+        cause = DRAWDOWN_CLOSE_CAUSES.get(detail.get("reason"))
+        if cause is None:
+            cause = DRAWDOWN_CLOSE_ERRORS.get(detail.get("error"), "The closing check could not complete")
+        values = detail.get("symbols") or detail.get("unpriced_option_legs")
+        names = list(dict.fromkeys(
+            value for value in values if isinstance(value, str) and value.isascii()
+            and 0 < len(value) <= 32 and value.replace("-", "").replace(".", "").isalnum()
+        )) if isinstance(values, (list, tuple)) else []
+        if names:
+            cause += f" ({', '.join(names[:10])}{', plus others' if len(names) > 10 else ''})"
+        count = str(detail["missed_close_streak"])
+        if detail.get("missed_close_streak_lower_bound"):
+            count = f"at least {count} (earlier sessions could not be verified)"
+        await self._alert(
+            "critical", title,
+            f"{window_key}: {headline} Cause: {cause}. "
+            f"Consecutive trading days with a missed drawdown update: {count}.",
+            key=f"trusted-close-missed:{window_key}",
+        )
+
     async def _run_scheduled_job(self, name, window_key, callback, timeout, attempt):
         try:
             async with asyncio.timeout(timeout):
@@ -1094,18 +1208,29 @@ class StockAgentScheduler:
             detail = getattr(outcome, "detail", {})
             if not isinstance(detail, Mapping):
                 detail = {"reason": str(detail)[:160]}
+            if name == "drawdown_close" and status is JobStatus.FAILED and attempt >= MAX_JOB_ATTEMPTS:
+                detail = self._terminal_close_failure(window_key, detail)
             retry = _now_utc() + timedelta(minutes=5 * attempt) if status is JobStatus.FAILED else None
             self.ledger.finish_job(name, window_key, status, intents=intents, detail=detail, eligible_retry_at=retry)
             if status is JobStatus.SKIPPED and isinstance(self.alerts, AlertService):
                 self.alerts.alert_skipped_cycle(name, str(detail.get("reason") or "schedule gate declined"))
             elif status is JobStatus.FAILED:
-                await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
-                                  key=f"job-result:{name}")
+                if name == "drawdown_close" and detail.get("missed_close_streak"):
+                    await self._warn_missed_close(window_key, detail)
+                else:
+                    await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
+                                      key=f"job-result:{name}")
         except Exception as exc:
+            detail = {"error": type(exc).__name__}
+            if name == "drawdown_close" and attempt >= MAX_JOB_ATTEMPTS:
+                detail = self._terminal_close_failure(window_key, detail)
             self.ledger.finish_job(name, window_key, JobStatus.FAILED,
-                                   detail={"error": type(exc).__name__},
+                                   detail=detail,
                                    eligible_retry_at=_now_utc() + timedelta(minutes=5 * attempt))
-            await self._report_exception(name, exc)
+            if name == "drawdown_close" and detail.get("missed_close_streak"):
+                await self._warn_missed_close(window_key, detail)
+            else:
+                await self._report_exception(name, exc)
 
     async def _collect_finished_jobs(self):
         for name, task in tuple(self._job_tasks.items()):
