@@ -113,6 +113,13 @@ class BrokerError(Exception):
     def retryable(self) -> bool:
         return self.kind in ("rate_limited", "server", "timeout", "network")
 
+    @property
+    def insufficient_buying_power(self) -> bool:
+        """Alpaca's 403 40310000 'insufficient buying power' (code 40310000 is shared
+        with other 403s, so the message is checked too)."""
+        return (self.status == 403 and str(self.code) == "40310000"
+                and "buying power" in str(self.message).lower())
+
 
 # --------------------------------------------------------------------- models
 
@@ -134,6 +141,14 @@ def _num(v: Any) -> Any:
     return v
 
 
+def _dec_or_none(v: Any) -> Decimal | None:
+    """Empty -> None; otherwise an exact Decimal (finite only)."""
+    v = _num(v)
+    if v is None:
+        return None
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
 class Account(_Model):
     id: str = ""
     status: str = ""
@@ -143,16 +158,21 @@ class Account(_Model):
     last_equity: float | None = None
     long_market_value: float = 0.0
     short_market_value: float = 0.0
-    options_buying_power: float | None = None
-    multiplier: float | None = None
-    # margin figures (trading-api.json Account schema); None when the reply omits them
-    regt_buying_power: float | None = None
-    maintenance_margin: float | None = None
-    last_maintenance_margin: float | None = None
-    initial_margin: float | None = None
-    non_marginable_buying_power: float | None = None
-    sma: float | None = None
-    margin_call: bool | None = None   # not in the documented Account schema; kept if a reply carries it
+    options_buying_power: Decimal | None = None
+    multiplier: Decimal | None = None
+    # A13 margin fields (Alpaca sends them as strings). All optional: a missing
+    # figure stays None and is never read as 0. Field meanings:
+    # https://docs.alpaca.markets/us/docs/account-plans
+    regt_buying_power: Decimal | None = None
+    daytrading_buying_power: Decimal | None = None
+    non_marginable_buying_power: Decimal | None = None
+    initial_margin: Decimal | None = None
+    maintenance_margin: Decimal | None = None
+    last_maintenance_margin: Decimal | None = None
+    sma: Decimal | None = None
+    # Not a documented Alpaca account field (unverified); parsed if a broker or the
+    # fake ever sends it. Risk also derives a call from equity < maintenance_margin.
+    margin_call: bool | None = None
     shorting_enabled: bool | None = None
     trading_blocked: bool = False
     account_blocked: bool = False
@@ -163,10 +183,35 @@ class Account(_Model):
 
     _n = field_validator(
         "equity", "cash", "buying_power", "last_equity", "long_market_value",
-        "short_market_value", "options_buying_power", "multiplier", "regt_buying_power",
-        "maintenance_margin", "last_maintenance_margin", "initial_margin", "non_marginable_buying_power",
-        "sma", mode="before",
+        "short_market_value", mode="before",
     )(_num)
+    _d = field_validator(
+        "options_buying_power", "multiplier", "regt_buying_power", "daytrading_buying_power",
+        "non_marginable_buying_power", "initial_margin", "maintenance_margin",
+        "last_maintenance_margin", "sma", mode="before",
+    )(_dec_or_none)
+
+    @property
+    def margin_enabled_at_broker(self) -> bool:
+        return self.multiplier is not None and self.multiplier > 1
+
+    @property
+    def overnight_buying_power(self) -> Decimal | None:
+        """Buying power a position can be HELD overnight with (A13b).
+
+        Multiplier 1 (cash): cash-backed `buying_power`. Margin accounts: Reg T
+        overnight figure only; never the 4x intraday `buying_power` or
+        `daytrading_buying_power`. None when the broker did not send it."""
+        if self.multiplier is not None and self.multiplier <= 1:
+            return Decimal(str(self.buying_power))
+        return self.regt_buying_power
+
+    @property
+    def margin_excess(self) -> Decimal | None:
+        """equity - maintenance_margin, or None if the broker figure is missing."""
+        if self.maintenance_margin is None:
+            return None
+        return Decimal(str(self.equity)) - self.maintenance_margin
 
     @property
     def can_trade(self) -> bool:

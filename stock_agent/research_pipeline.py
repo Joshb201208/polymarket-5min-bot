@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import math
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -22,6 +23,9 @@ from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
 _RETRYABLE = {"auth", "quota", "model_unavailable", "rate_limit", "budget", "transport", "upstream"}
+_INPUT_BLOCKERS = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
+                   "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
+_FRESH_SET = "research:fresh_scheduled_set"
 
 
 class SourceUnavailable(RuntimeError):
@@ -81,6 +85,7 @@ class OptionIdea:
     effective_conviction: int
     generated_at: datetime
     evidence_ids: tuple[str, ...]
+    source: str = "news"
 
     @classmethod
     def from_payload(cls, payload: dict):
@@ -88,6 +93,7 @@ class OptionIdea:
             payload["symbol"], Direction(payload["direction"]), payload["story_id"], payload["thesis_id"],
             payload["raw_conviction"], payload["effective_conviction"],
             datetime.fromisoformat(payload["generated_at"]), tuple(payload["evidence_ids"]),
+            payload.get("source", "news"),
         )
 
 
@@ -97,6 +103,24 @@ class JobOutcome:
     intents: tuple[NewIntent, ...] = ()
     detail: dict[str, Any] = field(default_factory=dict)
     option_candidates: tuple[OptionIdea, ...] = ()
+
+
+@dataclass
+class _EntryFunnel:
+    screened: int = 0
+    thesis_written: int = 0
+    healthy_unheld_theses: int = 0  # Internal readiness signal, not a reported counter.
+    passed_conviction: int = 0
+    buy_candidates: int = 0
+    option_ideas: int = 0
+    rejected_by_reason: Counter[str] = field(default_factory=Counter)
+
+    def payload(self) -> dict:
+        return {
+            "screened": self.screened, "thesis_written": self.thesis_written,
+            "passed_conviction": self.passed_conviction, "buy_candidates": self.buy_candidates,
+            "option_ideas": self.option_ideas, "rejected_by_reason": dict(self.rejected_by_reason),
+        }
 
 
 def _safe_previous(thesis) -> dict | None:
@@ -141,21 +165,33 @@ class ResearchPipeline:
         self.alerts = alerts
         self._analysis_lock = asyncio.Lock()
 
-    async def run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
+    def has_fresh_thesis_set(self, now: datetime) -> bool:
+        stamp = utc_datetime(self.store.store.kv_get(_FRESH_SET))
+        return stamp is not None and timedelta() <= now - stamp <= timedelta(
+            hours=self.config.RESEARCH_THESIS_MAX_AGE_H,
+        )
+
+    async def run(self, kind: str, snapshot: BookSnapshot | None = None, *, work_scope: str | None = None) -> JobOutcome:
         # Avoid overlapping scheduled/news windows superseding a thesis
         # during its independent review. Broker protection has its own lane.
         async with self._analysis_lock:
+            funnel = _EntryFunnel()
+            session = self._session(self.clock())
+            if session is None:
+                return JobOutcome(JobStatus.SKIPPED, detail={"reason": "no_execution_session"})
             try:
-                return await self._run(kind, snapshot)
+                outcome = await self._run(kind, snapshot, session, funnel, work_scope)
             except SourceUnavailable:
                 intents, ideas = self._recover()
-                return JobOutcome(JobStatus.FAILED, intents, {"reason": "required_source_unavailable"}, ideas)
+                funnel.rejected_by_reason["required_source_unavailable"] += 1
+                outcome = JobOutcome(JobStatus.FAILED, intents, {"reason": "required_source_unavailable"}, ideas)
+            info = funnel.payload()
+            self.ledger.journal.append("research.entry_funnel", job=kind,
+                                       session_date=session.date.isoformat(), **info)
+            return replace(outcome, detail={**outcome.detail, "entry_funnel": info})
 
-    async def _run(self, kind: str, snapshot: BookSnapshot | None = None) -> JobOutcome:
+    async def _run(self, kind, snapshot, session, funnel, work_scope) -> JobOutcome:
         now = self.clock()
-        session = self._session(now)
-        if session is None:
-            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "no_execution_session"})
         held = {row.symbol: row for row in (snapshot or self.ledger.snapshot()).holdings if row.qty > 0}
         for pending in self.store.due_confirmations(now):
             await self._confirm(pending["work_key"], held.get(pending["symbol"]))
@@ -195,7 +231,18 @@ class ResearchPipeline:
                 Candidate(row.symbol, row.name, row.sector, row.tradable, row.metrics, row.symbol in focus)
                 for row in securities.values()
             ])
-            chosen = tuple(dict.fromkeys((*held, *focus, *(r["symbol"] for r in ranked[:8]))))
+            funnel.screened = len(ranked)
+            if not ranked:
+                funnel.rejected_by_reason["no_tradable_universe"] += 1
+            ranked_symbols = [row["symbol"] for row in ranked]
+            screen_at = self.clock()
+            if session.opens_at <= screen_at < session.closes_at:
+                # Keep factor order within each group, but don't crowd out
+                # usable candidates with names that have no execution quote.
+                ranked_symbols.sort(key=lambda symbol: not _fresh_quote(
+                    securities[symbol], screen_at, max_age=timedelta(seconds=90),
+                ))
+            chosen = tuple(dict.fromkeys((*held, *focus, *ranked_symbols[:8])))
             background = getattr(self.sources, "background", None)
             if background is not None:
                 stories = await background(chosen)
@@ -203,7 +250,7 @@ class ResearchPipeline:
                     if symbol in securities:
                         row = securities[symbol]
                         securities[symbol] = replace(row, evidence=(*stories.get(symbol, ()), *row.evidence))
-            work = [(sym, f"{kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
+            work = [(sym, f"{work_scope or kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
         failed = attempted = deferred = 0
         for symbol, key, story in work:
@@ -216,9 +263,11 @@ class ResearchPipeline:
                 continue
             attempted += 1
             try:
-                await self._review(kind, key, item, held.get(symbol), story, session, as_of)
+                await self._review(kind, key, item, held.get(symbol), story, session, as_of, funnel)
             except ProviderUnavailable as exc:
                 failed += 1
+                failures = {error.kind for error in exc.attempts}
+                funnel.rejected_by_reason.update(f"llm_{reason}" for reason in failures or {"no_available_route"})
                 state = self.store.work_state(key)
                 can_retry = state["attempts"] < 3 and _can_retry(exc)
                 if can_retry:
@@ -234,6 +283,11 @@ class ResearchPipeline:
         collected, ideas = self._recover()
         incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
         status = JobStatus.FAILED if incomplete else JobStatus.DONE
+        if kind not in {"news", "earnings"} and funnel.screened and funnel.healthy_unheld_theses and (
+            not failed and not deferred and not
+            ((_INPUT_BLOCKERS | {"target_session_closed"}) & funnel.rejected_by_reason.keys())
+        ):
+            self.store.store.kv_set(_FRESH_SET, now.isoformat())
         return JobOutcome(status, collected, {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
 
     def _recover(self) -> tuple[tuple[NewIntent, ...], tuple[OptionIdea, ...]]:
@@ -282,7 +336,7 @@ class ResearchPipeline:
     @staticmethod
     def _fresh_story(event: NewsEvent, now: datetime) -> bool:
         stamp = event.evidence.published_at
-        return stamp is not None and now - timedelta(hours=24) <= stamp <= now
+        return stamp is not None and now - timedelta(hours=24) <= stamp <= now and event.evidence.retrieved_at <= now
 
     def _session(self, now: datetime):
         day = now.astimezone(NY).date()
@@ -291,13 +345,16 @@ class ResearchPipeline:
             return today
         return self.calendar.next_session(day)
 
-    async def _review(self, kind, key, security, holding, story, session, now) -> None:
+    async def _review(self, kind, key, security, holding, story, session, now, funnel) -> None:
         symbol = security.symbol
         position_id = holding.meta.position_id if holding and holding.meta else None
         entry = self.ledger.entry_thesis(position_id) if position_id else None
         baseline = self.ledger.last_filled_thesis(position_id) if position_id else None
         current = self.ledger.current_thesis(symbol)
-        evidence = {item.evidence_id: item for item in security.evidence}
+        evidence = {
+            item.evidence_id: item for item in security.evidence
+            if item.retrieved_at <= now and (item.published_at is None or item.published_at <= now)
+        }
         if story:
             evidence = {story.evidence.evidence_id: story.evidence, **evidence}
         context = self.context()
@@ -326,9 +383,32 @@ class ResearchPipeline:
             if holding else None, context,
         )
         task = ResearchTask.NEWS if story else ResearchTask.REVIEW if holding else ResearchTask.THESIS
-        result = await self.analyst.evaluate(data, task=task)
+        # Dated feed evidence can ground this evaluation directly; external
+        # web search is useful when it fills a gap, not a second mandatory feed.
+        needs_search = not any(item.published_at is not None and item.published_at <= now for item in data.evidence)
+        result = await self.analyst.evaluate(data, task=task, grounded=needs_search)
         record = result.record
         direction = record.draft.direction
+        entry_direction = direction in {Direction.BUY, Direction.BEARISH}
+        if not holding or entry_direction:
+            funnel.thesis_written += 1
+        # An all-HOLD set can be valid, but not when nobody had a usable
+        # quote and the analyst may simply have stood aside for that reason.
+        news_ok = getattr(self.sources, "news_ok", None)
+        if (not holding and security.tradable and _fresh_quote(security, now, max_age=timedelta(seconds=90))
+                and (news_ok is None or news_ok(symbol, now))):
+            funnel.healthy_unheld_theses += 1
+        floor = 8 if story or direction is Direction.BEARISH or (
+            str(context.get("regime", "")).lower() in {"cautious", "risk_off", "bear"}
+        ) else 7
+        conviction_ok = entry_direction and record.raw_conviction >= 7 and record.effective_conviction >= floor
+        if conviction_ok:
+            funnel.passed_conviction += 1
+            refresh = getattr(self.sources, "refresh_entry_inputs", None)
+            current_time = self.clock()
+            if (refresh is not None and fresh_quote and security.tradable
+                    and session.opens_at <= current_time < session.closes_at):
+                await refresh(symbol, current_time)
         role = ThesisRole.HELD_REVIEW if holding else ThesisRole.ENTRY_CANDIDATE
         payload = record.model_dump(mode="json") | {
             "inputs": result.inputs, "job": kind, "fallbacks": [
@@ -346,10 +426,14 @@ class ResearchPipeline:
                 activate=not exit_pending,
             )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
-                entry_blockers = self._record_entry(
+                rejected = self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
-                    thesis_id, record, fresh_quote, price, evidence_ids, context,
+                    thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel,
                 )
+                if entry_direction or not holding:
+                    funnel.rejected_by_reason.update(rejected)
+                if conviction_ok and session.opens_at <= self.clock() < session.closes_at:
+                    entry_blockers = tuple(reason for reason in rejected if reason in _INPUT_BLOCKERS)
                 if story:
                     self.ledger.journal.append(
                         "news_reaction", story_id=story.story_id, symbol=symbol, thesis_id=thesis_id,
@@ -444,14 +528,29 @@ class ResearchPipeline:
             )
 
     def _record_entry(self, key, symbol, kind, security, holding, position_id, baseline, story, session,
-                      thesis_id, record, fresh_quote, price, evidence_ids, context):
+                      thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel):
         direction = record.draft.direction
-        gate = self.gate.is_entry_eligible(symbol, self.clock()) if fresh_quote else None
-        floor = 8 if story or str(context.get("regime", "")).lower() in {"cautious", "risk_off", "bear"} else 7
-        qualifies = (
-            gate is not None and gate.ok and gate.thesis_id == thesis_id and security.tradable
-            and record.raw_conviction >= 7 and record.effective_conviction >= floor
-        )
+        rejected = []
+        now = self.clock()
+        if direction not in {Direction.BUY, Direction.BEARISH}:
+            rejected.append("non_entry_direction")
+        elif not conviction_ok:
+            rejected.append("conviction_below_floor")
+        else:
+            if now >= session.closes_at:
+                rejected.append("target_session_closed")
+            if not security.tradable:
+                rejected.append("not_tradable")
+            if not fresh_quote:
+                rejected.append("quote_stale_or_unavailable")
+            if not rejected:
+                gate = self.gate.is_entry_eligible(symbol, now)
+                rejected.extend(gate.reasons)
+                if gate.thesis_id != thesis_id:
+                    rejected.append("active_thesis_changed")
+                elif not gate.ok and not gate.reasons:
+                    rejected.append("research_gate_refused")
+        qualifies = not rejected
         baseline_grade = baseline.payload.get("effective_conviction") if baseline else None
         strengthened = (
             position_id is not None and baseline is not None and type(baseline_grade) is int
@@ -467,20 +566,19 @@ class ResearchPipeline:
                                    "signal_at": record.generated_at.isoformat(),
                                    "baseline_thesis_id": baseline.thesis_id if baseline else None})
             self.store.record_proposal(key, thesis_id, intent)
+            funnel.buy_candidates += 1
         else:
             self.store.finish_work(key, "no_action", thesis_id=thesis_id)
-        if qualifies and story and direction in {Direction.BEARISH, Direction.BUY}:
-            idea = OptionIdea(symbol, direction, story.story_id, thesis_id, record.raw_conviction,
-                              record.effective_conviction, record.generated_at, evidence_ids)
-            self.store.record_option_idea(story.story_id, idea, session.closes_at)
-        if not qualifies and direction in {Direction.BUY, Direction.BEARISH} and record.effective_conviction >= floor:
-            health_reasons = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
-                              "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
-            if not fresh_quote:
-                return ("quote_stale_or_unavailable",) if session.opens_at <= self.clock() < session.closes_at else ()
-            if gate is not None:
-                return tuple(reason for reason in gate.reasons if reason in health_reasons)
-        return ()
+            if qualifies and direction is Direction.BUY:
+                rejected.append("add_thesis_not_strengthened")
+        if qualifies and (story or direction is Direction.BEARISH):
+            idea_id = story.story_id if story else f"research:{key}"
+            idea = OptionIdea(symbol, direction, idea_id, thesis_id, record.raw_conviction,
+                              record.effective_conviction, record.generated_at, evidence_ids,
+                              "news" if story else "research")
+            self.store.record_option_idea(idea_id, idea, session.closes_at)
+            funnel.option_ideas += 1
+        return tuple(dict.fromkeys(rejected))
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):
