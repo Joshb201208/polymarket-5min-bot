@@ -34,6 +34,7 @@ Provider facts (checked 2026-11-23):
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import math
 import re
@@ -401,24 +402,46 @@ class FundamentalsService:
             return set()
         return {s for s, q in batch.quotes.items() if (_finite(q.price) or 0.0) >= _MIN_SCREENER_PRICE}
 
-    async def list_universe(self) -> tuple[str, ...]:
+    async def list_universe_with_baseline(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         focus = self.focus()
-        catalogue = tuple(s for names in UNIVERSE_CATALOGUE.values() for s in names)
+        catalogue_fixed = tuple(s for names in UNIVERSE_CATALOGUE.values() for s in names)
         screened = await self.screener_symbols()
         ready = self._registry_ready()
-        picked: list[str] = []
+        picked_rr: list[str] = []
+        picked_fixed: list[str] = []
         if ready:
-            picked.extend(t for t in (self._tradable(s) for s in catalogue) if t)
-            extra = tuple(t for t in (self._tradable(s) for s in screened) if t and t not in picked)
+            sector_queues = [
+                [t for s in names if (t := self._tradable(s))]
+                for names in UNIVERSE_CATALOGUE.values()
+            ]
+            picked_rr.extend(
+                t for row in itertools.zip_longest(*sector_queues) for t in row if t is not None
+            )
+            picked_fixed.extend(t for s in catalogue_fixed if (t := self._tradable(s)))
+            seen_cat = set(picked_fixed)
+            extra = tuple(t for t in (self._tradable(s) for s in screened) if t and t not in seen_cat)
             ok = await self._price_ok(extra)
-            picked.extend(s for s in extra if s in ok)
+            tail = [s for s in extra if s in ok]
+            picked_rr.extend(tail)
+            picked_fixed.extend(tail)
         else:
-            # Registry not loaded yet: keep the catalogue so research continues;
-            # AssetRegistry still decides tradability before any order.
-            picked.extend(catalogue)
+            # Registry not loaded yet: keep the catalogue in sector round-robin order so research
+            # continues; AssetRegistry still decides tradability before any order.
+            picked_rr.extend(
+                s for row in itertools.zip_longest(*UNIVERSE_CATALOGUE.values()) for s in row if s is not None
+            )
+            picked_fixed.extend(catalogue_fixed)
             logger.warning("asset registry empty: universe catalogue %s not validated", UNIVERSE_CATALOGUE_VERSION)
-        rest = [s for s in dict.fromkeys(picked) if s not in focus][: max(0, self.universe_size)]
-        return tuple(dict.fromkeys((*focus, *rest)))
+        cap = max(0, self.universe_size)
+        rest_rr = [s for s in dict.fromkeys(picked_rr) if s not in focus][:cap]
+        rest_fixed = [s for s in dict.fromkeys(picked_fixed) if s not in focus][:cap]
+        return (
+            tuple(dict.fromkeys((*focus, *rest_rr))),
+            tuple(dict.fromkeys((*focus, *rest_fixed))),
+        )
+
+    async def list_universe(self) -> tuple[str, ...]:
+        return (await self.list_universe_with_baseline())[0]
 
     # ------------------------------------------------------------ company
     async def _finnhub_metrics(self, symbol: str, now: datetime) -> tuple[dict, Evidence | None]:
