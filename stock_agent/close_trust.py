@@ -139,6 +139,11 @@ def _has_unparseable_option(snapshot) -> list[str]:
                   if getattr(d, "explanation", "") == "option symbol not parseable")
 
 
+def _candidates(leg, same) -> list:
+    return [o for o in same if o is not leg and _d(o.qty) * _d(leg.qty) < 0
+            and abs(_d(o.qty)) == abs(_d(leg.qty))]
+
+
 def _groups(snapshot) -> list[tuple]:
     """Invalid legs grouped as ("pair", long, short), ("long", leg) or ("short", leg).
 
@@ -151,12 +156,16 @@ def _groups(snapshot) -> list[tuple]:
         same = [o for o in snapshot.legs if _key(o) == _key(leg)]
         if _crossed(leg) and len(same) >= 3:
             raise _Untrusted(CLOSE_OPTION_MARKS_CROSSED, [o.occ_symbol for o in same])
-        partners = [o for o in same if o is not leg and _d(o.qty) * _d(leg.qty) < 0
-                    and abs(_d(o.qty)) == abs(_d(leg.qty))]
+        partners = _candidates(leg, same)
         if len(partners) > 1:
             raise _Untrusted(CLOSE_OPTION_PAIRING_AMBIGUOUS, [leg.occ_symbol, *(o.occ_symbol for o in partners)])
         if partners:
             other = partners[0]
+            back = _candidates(other, same)
+            if len(back) != 1 or other.occ_symbol in done:
+                # The pairing must be mutual and unique, or the result would depend on traversal order.
+                raise _Untrusted(CLOSE_OPTION_PAIRING_AMBIGUOUS,
+                                 [leg.occ_symbol, other.occ_symbol, *(o.occ_symbol for o in back)])
             long_leg, short_leg = (leg, other) if _d(leg.qty) > 0 else (other, leg)
             done.update({leg.occ_symbol, other.occ_symbol})
             out.append(("pair", long_leg, short_leg))

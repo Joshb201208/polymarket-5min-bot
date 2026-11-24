@@ -123,6 +123,18 @@ def test_ambiguous_pairing_untrusted():
     assert not trust.trusted and trust.reason == ct.CLOSE_OPTION_PAIRING_AMBIGUOUS
 
 
+@pytest.mark.parametrize("order", [0, 1])
+def test_shared_partner_is_ambiguous_in_any_order(order):
+    # two invalid equal longs and one valid short: each long alone sees one partner, the short sees two
+    longs = [leg("AAA", 100, 1), leg("AAA", 105, 1)]
+    if order:
+        longs.reverse()
+    book = snap(legs=[*longs, leg("AAA", 110, -1, price=D(2), mv=-200)])
+    trust = ct.assess_close(book)
+    assert not trust.trusted and trust.reason == ct.CLOSE_OPTION_PAIRING_AMBIGUOUS
+    assert len(trust.symbols) == 3
+
+
 def test_crossed_group_of_three_untrusted():
     book = snap(legs=[leg("AAA", 100, 2, price=D(1), ok=False, mv=200),
                       leg("AAA", 110, -1, price=D(3), ok=False, mv=-300),
