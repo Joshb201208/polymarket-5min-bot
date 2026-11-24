@@ -26,7 +26,8 @@ def margin_book(tmp_path):
     b = StubBroker(cash=-36000.0)
     b.pos("AAA", 100, 1000.0)            # long 100k on 64k equity: borrowed 36k
     b.account_extra = {"regt_buying_power": "28000", "maintenance_margin": "30000",
-                       "options_buying_power": "0", "non_marginable_buying_power": "0"}
+                       "options_buying_power": "0", "non_marginable_buying_power": "0",
+                       "trade_suspended_by_user": False}
     return b, make_ledger(tmp_path, broker=b)
 
 
@@ -39,6 +40,7 @@ def test_debit_balance_snapshot_fields(tmp_path):
     assert snap.maintenance_margin == D(30000) and snap.regt_buying_power == D(28000)
     assert snap.margin_excess == D(34000) and snap.margin_excess_pct == D("0.53125")
     assert not [d for d in snap.diffs if d.severity.value == "critical"]
+    assert snap.account_flags["trade_suspended_by_user"] is False
 
 
 def test_close_session_with_debit_balance_keeps_broker_equity(tmp_path):

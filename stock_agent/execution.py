@@ -884,7 +884,7 @@ class ExecutionEngine:
             return "fresh risk plan sells nothing"
         return qty
 
-    MARGIN_EPISODE_KEY = "a13.margin_trim_episode"  # owned by the scheduler: {"opened_at": iso} or {}
+    MARGIN_EPISODE_KEY = "a13.margin_trim_episode"  # ledger risk_state, written by the scheduler
 
     async def _replan_margin_trim(self, intent: OrderIntent) -> float | str:
         """A13e: a queued margin-buffer trim is re-planned on a fresh book right before it
@@ -897,7 +897,10 @@ class ExecutionEngine:
             return "risk has no margin trim planner"
         want_ep = (intent.meta or {}).get("margin_episode")
         if want_ep is not None:
-            cur_ep = (self._kv_get(self.MARGIN_EPISODE_KEY, {}) or {}).get("opened_at")
+            try:  # the scheduler persists the episode in the ledger's risk_state table
+                cur_ep = (self.ledger.risk_state_get(self.MARGIN_EPISODE_KEY, {}) or {}).get("opened_at")
+            except Exception as e:
+                return f"margin episode unreadable: {e}"
             if cur_ep != want_ep:
                 return "margin trim belongs to an earlier margin episode"
         snap = await self._snapshot(f"margin trim replan {intent.symbol}")
