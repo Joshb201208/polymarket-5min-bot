@@ -560,12 +560,27 @@ class ExecutionEngine:
         if stage == "skipped":
             self._alert_blocked_buy(it, code, reason, extra.get("risk_reasons") or ())
 
+    _LIVE_BUY = frozenset({IntentStatus.QUEUED, IntentStatus.SUBMITTING, IntentStatus.SUBMITTED,
+                           IntentStatus.AMBIGUOUS, IntentStatus.PARTIALLY_FILLED, IntentStatus.FILLED})
+
+    def _superseded_by_live_buy(self, it: OrderIntent) -> bool:
+        cur = self.ledger.current_thesis(it.symbol)
+        if cur is None or cur.thesis_id in set(it.thesis_ids or ()):
+            return False
+        return any(
+            o.intent_id != it.intent_id and o.side == "buy" and o.kind != "cover" and o.status in self._LIVE_BUY
+            and cur.thesis_id in set(o.thesis_ids or ())
+            for o in self.ledger.list_intents(symbol=it.symbol)
+        )
+
     def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str, risk_reasons: Any = ()) -> None:
         """Part 5: one #risk line per blocked buy (AlertService filters/dedupes). Never raises."""
         fn = getattr(self._notifier, "alert_blocked_buy", None) if self._notifier is not None else None
         if fn is None:
             return
         try:
+            if code == "research_stale" and self._superseded_by_live_buy(it):
+                return  # a newer thesis's buy for this symbol is live: not a blocked buy
             fn(it.symbol, code, reason, session_date=self.session_date(), risk_reasons=tuple(risk_reasons))
         except Exception:
             logger.exception("blocked-buy alert failed")

@@ -394,3 +394,31 @@ def test_all_day_model_outage_gives_one_blocked_buy_alert_at_expiry(world, tmp_p
     assert statuses[-1] == "intent_expired"
     assert len(calls) == 1 and calls[0][1] == "intent_expired" and "llm_unavailable" in calls[0][2]
     world.assert_no_orders()
+
+
+def test_superseded_buy_does_not_page_when_the_newer_thesis_buy_is_live(world, tmp_path, monkeypatch):
+    world.clock.set_et(2026, 11, 30, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng, gate = wired(world, tmp_path, monkeypatch, news_at=world.clock.now())
+    calls = []
+
+    class Notifier:
+        def alert_blocked_buy(self, symbol, code, reason="", **kw):
+            calls.append(code)
+            return True
+
+    eng._notifier = Notifier()
+    old = research_buy(eng, key="old")
+    t2 = eng.ledger.record_thesis("AAA", {"conviction": 9, "draft": {"symbol": "AAA", "direction": "BUY"}},
+                                  ThesisRole.ENTRY_CANDIDATE, source="test", activate=True)
+    gate.thesis_id = t2
+    research_buy(eng, key="new", thesis=t2)  # live newer buy
+    res = run(eng.execute_intent(old))
+    assert res.code in {"research_stale", "duplicate"} and calls == []
+    # without a live replacement, the superseded buy still alerts
+    eng2_old = research_buy(eng, key="old2", thesis=eng.thesis_id)
+    for o in eng.ledger.list_intents(symbol="AAA"):
+        if o.dedupe_key == "new":
+            eng.ledger.ack_intent(o.intent_id, IntentStatus.SKIPPED, error="test")
+    eng._skip(eng2_old, "research gate's current thesis is not the one", "research_stale")
+    assert calls == ["research_stale"]
