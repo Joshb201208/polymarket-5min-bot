@@ -704,7 +704,7 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
         open_orders=tuple(_order(o) for o in orders), diffs=tuple(diffs), quality=quality,
         blocked_symbols=frozenset(blocked),
         account_flags={k: _g(account, k) for k in ("shorting_enabled", "trading_blocked", "account_blocked",
-                                                  "multiplier", "options_trading_level", "status", "sma",
+                                                  "multiplier", "options_trading_level", "status", "sma", "trade_suspended_by_user",
                                                   "last_maintenance_margin")},
         regt_buying_power=_dec(_g(account, "regt_buying_power")),
         maintenance_margin=_dec(_g(account, "maintenance_margin")),
