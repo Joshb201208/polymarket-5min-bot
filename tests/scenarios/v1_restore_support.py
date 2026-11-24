@@ -49,7 +49,14 @@ class Harness:
         text = body.get("input") or body["messages"][0]["content"]
         data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
         self.calls.append((self.world.clock.now_et(), self.reply.direction, data.get("reference_price")))
-        evidence = next(item for item in data["evidence"] if item["published_at"])
+        evidence = next((item for item in data["evidence"] if item["published_at"]), None)
+        if evidence is None:  # nothing dated to cite: an honest no-claims HOLD (the pipeline won't act on it)
+            return {
+                "symbol": self.symbol, "direction": "HOLD", "conviction": 1, "summary": "No new evidence.",
+                "bull_case": "None.", "bear_case": "None.", "claims": [], "catalysts": [], "risks": [],
+                "thesis_break": "Not applicable.", "target_price": None, "thesis_change": "unchanged",
+                "horizon_days": 15,
+            }
         return {
             "symbol": self.symbol, "direction": self.reply.direction, "conviction": self.reply.conviction,
             "summary": "The issuer updated its outlook.", "bull_case": "Improving demand.",
