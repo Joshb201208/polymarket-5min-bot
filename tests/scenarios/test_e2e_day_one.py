@@ -50,13 +50,13 @@ def _cautious_macro(world):
         world.price(sym, 100.0, spread=0.02)
 
 
-def _providers(world):
+def _providers(world, conviction=None, symbols=_RESEARCH):
     world.perplexity.fail("/v1/agent", "status", status=401, body={"error": {"code": "insufficient_credits"}},
                           times=None)
     world.fmp.fail("/stable/profile", "status", status=402, times=None)
     world.finnhub.on("GET", "/api/v1/stock/metric",
                      {"metric": {"peTTM": 20, "grossMarginTTM": 50, "revenueGrowthTTMYoy": 10}})
-    for sym in _RESEARCH:
+    for sym in symbols:
         world.news([sym], f"{sym} raises quarterly guidance", summary="The issuer publishes new guidance.",
                    at=_START - timedelta(hours=2))
 
@@ -66,7 +66,7 @@ def _providers(world):
         sym = data["symbol"]
         story = next((e for e in data.get("evidence", []) if e.get("published_at")), None)
         return {
-            "symbol": sym, "direction": "BUY", "conviction": 9 if sym == "AAPL" else 7,
+            "symbol": sym, "direction": "BUY", "conviction": conviction(sym) if conviction else (9 if sym == "AAPL" else 7),
             "summary": "The issuer raised its outlook.", "bull_case": "Improving demand.",
             "bear_case": "Demand may weaken.",
             "claims": [{"text": "The issuer raised guidance.", "evidence_ids": [story["evidence_id"]]}] if story else [],
