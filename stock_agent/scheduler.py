@@ -1616,50 +1616,34 @@ class StockAgentScheduler:
         flush_fn = getattr(alerts_obj, "flush_blocked_buy_overflow", None)
         if not callable(flush_fn):
             return
-        alert_blocked_fn = getattr(alerts_obj, "alert_blocked_buy", None)
-        ledger_obj = getattr(self, "ledger", None)
-        day_key = now_et.date().isoformat()
 
-        def _sweep_ledger_expired(*, target_day: str | None = None, before_day: str | None = None) -> None:
-            if not callable(alert_blocked_fn) or ledger_obj is None:
-                return
-            expire_fn = getattr(ledger_obj, "expire_intents", None)
-            list_fn = getattr(ledger_obj, "list_intents", None)
-            if not callable(list_fn):
-                return
-            try:
-                if callable(expire_fn):
-                    expire_fn(_now_utc())
-                for it in list_fn(["expired"]):
-                    side = str(getattr(it.side, "value", it.side) or "").lower()
-                    if side != "buy" or getattr(it, "job", None) == "open_handoff":
-                        continue
-                    it_day = str(it.session_date)[:10] if getattr(it, "session_date", None) else ""
-                    if not it_day:
-                        continue
-                    if target_day is not None and it_day != target_day:
-                        continue
-                    if before_day is not None and it_day >= before_day:
-                        continue
-                    alert_blocked_fn(
-                        it.symbol,
-                        "intent_expired",
-                        str(getattr(it, "last_error", "") or ""),
-                        session_date=it_day,
-                    )
-            except Exception as exc:
-                logger.debug("Expired buy alert sweep skipped (%s)", type(exc).__name__)
-
-        _sweep_ledger_expired(before_day=day_key)
-        try:
-            flush_fn(before_session=day_key)
-        except Exception as exc:
-            logger.debug("Prior-session blocked-buy overflow flush skipped (%s)", type(exc).__name__)
-
+        today = now_et.date()
         cal = getattr(self, "calendar", None)
-        session = cal.session_on(now_et.date()) if cal is not None else None
-        if session is None or now_et < session.closes_at:
+        session = cal.session_on(today) if cal is not None else None
+        if session is not None and now_et >= session.closes_at:
+            closed_cutoff = today.isoformat()
+        else:
+            closed_cutoff = (today - timedelta(days=1)).isoformat()
+
+        store_obj = getattr(self, "store", None)
+        last_swept = getattr(self, "_blocked_buy_swept_through", None)
+        if last_swept is None:
+            kv_get = getattr(store_obj, "kv_get", None)
+            raw_swept = kv_get("alerts.blocked_buy_swept_through") if callable(kv_get) else ""
+            last_swept = str(raw_swept or "")[:10]
+            self._blocked_buy_swept_through = last_swept
+
+        blocked_map = getattr(alerts_obj, "blocked_buys", None) or {}
+        needs_overflow_flush = any(
+            int(st.get("overflow_count", 0) or 0) > 0 and not bool(st.get("overflow_emitted", False))
+            for day_k, st in blocked_map.items()
+            if isinstance(st, dict) and str(day_k)[:10] <= closed_cutoff
+        )
+        needs_ledger_sweep = bool(closed_cutoff > last_swept)
+        if not needs_ledger_sweep and not needs_overflow_flush:
             return
+
+        # Defer both current-close and prior-rollover flushes until any running or due entry_handoff finishes.
         job_tasks = getattr(self, "_job_tasks", None) or {}
         if "entry_handoff" in job_tasks:
             return
@@ -1672,11 +1656,88 @@ class StockAgentScheduler:
             except Exception:
                 return
 
-        _sweep_ledger_expired(target_day=day_key)
+        if needs_ledger_sweep and StockAgentScheduler._sweep_closed_expired_buys(
+            self,
+            today=today,
+            last_swept=last_swept,
+            closed_cutoff=closed_cutoff,
+        ):
+            self._blocked_buy_swept_through = closed_cutoff
+            kv_set = getattr(store_obj, "kv_set", None)
+            if callable(kv_set):
+                try:
+                    kv_set("alerts.blocked_buy_swept_through", closed_cutoff)
+                except Exception as exc:
+                    logger.debug("Could not persist blocked-buy sweep marker (%s)", type(exc).__name__)
+
         try:
-            flush_fn(session_date=day_key)
+            next_after_closed = (date.fromisoformat(closed_cutoff) + timedelta(days=1)).isoformat()
+            flush_fn(before_session=next_after_closed)
         except Exception as exc:
             logger.debug("Session blocked-buy overflow flush skipped (%s)", type(exc).__name__)
+
+    def _sweep_closed_expired_buys(self, *, today: date, last_swept: str, closed_cutoff: str) -> bool:
+        alerts_obj = getattr(self, "alerts", None)
+        alert_blocked_fn = getattr(alerts_obj, "alert_blocked_buy", None)
+        ledger_obj = getattr(self, "ledger", None)
+        if not callable(alert_blocked_fn) or ledger_obj is None:
+            return True
+
+        retention_floor = (today - timedelta(days=14)).isoformat()
+        if last_swept and len(last_swept) == 10:
+            try:
+                after_last = (date.fromisoformat(last_swept) + timedelta(days=1)).isoformat()
+                min_day = max(retention_floor, after_last)
+            except ValueError:
+                min_day = retention_floor
+        else:
+            min_day = retention_floor
+        if min_day > closed_cutoff:
+            return True
+
+        try:
+            expire_fn = getattr(ledger_obj, "expire_intents", None)
+            if callable(expire_fn):
+                expire_fn(_now_utc())
+
+            ledger_store = getattr(ledger_obj, "store", None)
+            query_fn = getattr(ledger_store, "query", None)
+            if callable(query_fn):
+                rows = query_fn(
+                    "SELECT symbol, session_date, last_error FROM order_intents "
+                    "WHERE status='expired' AND side='buy' AND kind != 'cover' "
+                    "AND COALESCE(job, '') != 'open_handoff' "
+                    "AND session_date >= ? AND session_date <= ? "
+                    "ORDER BY created_at",
+                    (min_day, closed_cutoff),
+                )
+                for r in rows:
+                    alert_blocked_fn(
+                        str(r["symbol"]),
+                        "intent_expired",
+                        str(r["last_error"] or ""),
+                        session_date=str(r["session_date"])[:10],
+                    )
+                return True
+
+            list_fn = getattr(ledger_obj, "list_intents", None)
+            if callable(list_fn):
+                for it in list_fn(["expired"]):
+                    side = str(getattr(it.side, "value", it.side) or "").lower()
+                    if side != "buy" or getattr(it, "job", None) == "open_handoff":
+                        continue
+                    it_day = str(it.session_date)[:10] if getattr(it, "session_date", None) else ""
+                    if min_day <= it_day <= closed_cutoff:
+                        alert_blocked_fn(
+                            it.symbol,
+                            "intent_expired",
+                            str(getattr(it, "last_error", "") or ""),
+                            session_date=it_day,
+                        )
+            return True
+        except Exception as exc:
+            logger.debug("Expired buy alert sweep skipped (%s)", type(exc).__name__)
+            return False
 
     async def _send_daily_summary(self):
         """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""

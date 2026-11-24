@@ -1,4 +1,4 @@
-"""Tests for V1-restore Part 5 blocked-buy alerts and plain-English handoff/rescan text."""
+"""Tests for V1-restore Part 5 blocked-buy #risk alerts, dedupe/cap, and bounded close/rollover flush."""
 
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ from stock_agent.alerts import (
     AlertEvent,
     AlertService,
     OutboxItem,
-    format_handoff_outcome_text,
-    format_market_rescan_text,
 )
 from stock_agent.config import Config
 
@@ -243,64 +241,127 @@ def test_blocked_buy_session_dedupe_cap_10_overflow_restart_and_rollover(
     asyncio.run(_run())
 
 
-def test_handoff_outcome_and_rescan_announcement_helpers(world: Any, tmp_path: Path) -> None:
+def test_rollover_waits_for_overdue_prior_handoff_and_never_flushes_inside_alert_blocked_buy(
+    world: Any, tmp_path: Path
+) -> None:
+    from stock_agent.scheduler import StockAgentScheduler
+
     cfg = _make_cfg(tmp_path)
-    world.clock.set_et(2026, 11, 24, 9, 36)
+    world.clock.set_et(2026, 11, 23, 15, 45)
+    svc = AlertService(cfg, clock=world.clock.now)
+    for i in range(1, 13):
+        svc.alert_blocked_buy(f"MON{i:02d}", "risk_refused", "risk: position_count", session_date="2026-11-23")
+    assert len(svc.outbox) == 10
+
+    # Roll into Tuesday morning while an overdue Monday entry_handoff sweep is still due/running.
+    world.clock.set_et(2026, 11, 24, 9, 35)
+    handoff_due = {"flag": True}
+    tue_session = SimpleNamespace(date=date(2026, 11, 24), closes_at=datetime(2026, 11, 24, 16, 0, tzinfo=ET))
+    sched = SimpleNamespace(
+        alerts=svc,
+        calendar=SimpleNamespace(session_on=lambda d: tue_session if str(d) == "2026-11-24" else None),
+        _job_tasks={"entry_handoff": object()},
+        research=SimpleNamespace(entry_handoff_due=lambda _now: handoff_due["flag"]),
+        ledger=None,
+        store=None,
+    )
+
+    # New Tuesday blocked buy must NOT flush Monday's overflow early while Monday's handoff is unresolved.
+    assert svc.alert_blocked_buy("TUE01", "risk_refused", "risk: position_count", session_date="2026-11-24") is True
+    assert not any("Blocked buys — and" in it.event.title for it in svc.outbox)
+
+    # Scheduler rollover check also defers while entry_handoff is running or due.
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 9, 35, tzinfo=ET))
+    assert not any("Blocked buys — and" in it.event.title for it in svc.outbox)
+    sched._job_tasks.clear()
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 9, 36, tzinfo=ET))
+    assert not any("Blocked buys — and" in it.event.title for it in svc.outbox)
+
+    # Overdue Monday handoff completes and adds MON13 (handoff_expired) to 2026-11-23 -> overflow = 3.
+    svc.alert_blocked_buy("MON13", "handoff_expired", "", session_date="2026-11-23")
+    handoff_due["flag"] = False
+
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 9, 37, tzinfo=ET))
+    overflow_titles = [it.event.title for it in svc.outbox if "Blocked buys — and" in it.event.title]
+    assert overflow_titles == ["Blocked buys — and 3 more"]
+
+
+def test_tick_overflow_bounds_sql_and_skips_repeated_30s_scans(
+    world: Any, tmp_path: Path
+) -> None:
+    from stock_agent.scheduler import StockAgentScheduler
+
+    cfg = _make_cfg(tmp_path)
+    world.clock.set_et(2026, 11, 24, 9, 35)
     svc = AlertService(cfg, clock=world.clock.now)
 
-    staged_title, staged_body = format_handoff_outcome_text(
-        stage="staged",
-        session_date="2026-11-24",
-        symbols=("AAPL", "NVDA"),
-        source_job="prescan",
-    )
-    assert "AAPL" in staged_body and "NVDA" in staged_body
-    assert "open" in staged_body.lower()
+    kv_data: dict[str, Any] = {}
+    sql_calls: list[tuple[str, tuple[Any, ...]]] = []
+    expire_calls = {"n": 0}
 
-    resolved_title, resolved_body = format_handoff_outcome_text(
-        stage="resolved",
-        session_date="2026-11-24",
-        outcomes={"handoff_promoted": 2, "handoff_reanchored": 1, "handoff_gate_refused": 1},
-    )
-    assert "promoted" in resolved_body.lower() or "queued" in resolved_body.lower()
-    assert "handoff_promoted" not in resolved_body
-    assert "handoff_gate_refused" not in resolved_body
+    def _fake_query(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        sql_calls.append((sql, params))
+        # Ancient historical expired intent outside [min_day, closed_cutoff] is excluded by SQL bounds.
+        all_rows = [
+            {"symbol": "OLD01", "session_date": "2026-09-01", "last_error": "expired before submission"},
+            {"symbol": "CUR01", "session_date": "2026-11-24", "last_error": "expired before submission"},
+        ]
+        lo, hi = str(params[0]), str(params[1])
+        return [r for r in all_rows if lo <= r["session_date"] <= hi]
 
-    assert svc.send_handoff_outcome(
-        stage="staged",
-        session_date="2026-11-24",
-        symbols=("AAPL", "NVDA"),
-        source_job="prescan",
-    ) is True
-    # Deduped for the same session/job
-    assert svc.send_handoff_outcome(
-        stage="staged",
-        session_date="2026-11-24",
-        symbols=("AAPL", "NVDA"),
-        source_job="prescan",
-    ) is False
-
-    rescan_with_vix = format_market_rescan_text(
-        triggers=("S&P 500 +1.6% vs prior close", "VIX +3.2 pts over 30m"),
-        sp500_source="SPY live quote",
-        vix_source="CBOE cash VIX",
-        vix_unavailable=False,
-        rescan_number=1,
-        max_rescans=3,
+    tue_session = SimpleNamespace(date=date(2026, 11, 24), closes_at=datetime(2026, 11, 24, 16, 0, tzinfo=ET))
+    sched = SimpleNamespace(
+        alerts=svc,
+        calendar=SimpleNamespace(session_on=lambda d: tue_session if str(d) == "2026-11-24" else None),
+        _job_tasks={},
+        research=SimpleNamespace(entry_handoff_due=lambda _now: False),
+        store=SimpleNamespace(
+            kv_get=lambda k: kv_data.get(k),
+            kv_set=lambda k, v: kv_data.__setitem__(k, v),
+        ),
+        ledger=SimpleNamespace(
+            expire_intents=lambda _now: expire_calls.__setitem__("n", expire_calls["n"] + 1) or 0,
+            store=SimpleNamespace(query=_fake_query),
+        ),
     )
-    assert "SPY live quote" in rescan_with_vix
-    assert "CBOE cash VIX" in rescan_with_vix
-    assert "1 of 3" in rescan_with_vix
 
-    rescan_no_vix = format_market_rescan_text(
-        triggers=("S&P 500 -1.7% vs prior close",),
-        sp500_source="SPY live quote",
-        vix_unavailable=True,
-        rescan_number=2,
-        max_rescans=3,
+    # First intraday tick sweeps bounded recent prior window [2026-11-10, 2026-11-23] once (ignores 2026-09-01).
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 9, 35, tzinfo=ET))
+    assert len(sql_calls) == 1
+    assert sql_calls[0][1] == ("2026-11-10", "2026-11-23")
+    assert expire_calls["n"] == 1
+    assert kv_data["alerts.blocked_buy_swept_through"] == "2026-11-23"
+    assert len(svc.outbox) == 0
+
+    # Subsequent 30s intraday ticks perform ZERO SQL queries and ZERO expire_intents calls.
+    for minute in range(36, 56):
+        StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 9, minute, tzinfo=ET))
+    assert len(sql_calls) == 1
+    assert expire_calls["n"] == 1
+
+    # First post-close tick sweeps ONLY ["2026-11-24", "2026-11-24"] once and alerts CUR01.
+    world.clock.set_et(2026, 11, 24, 16, 5)
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 5, tzinfo=ET))
+    assert len(sql_calls) == 2
+    assert sql_calls[1][1] == ("2026-11-24", "2026-11-24")
+    assert expire_calls["n"] == 2
+    assert kv_data["alerts.blocked_buy_swept_through"] == "2026-11-24"
+    assert [it.event.title for it in svc.outbox] == ["Buy blocked — CUR01"]
+
+    # Repeated post-close ticks and a fresh restarted scheduler instance perform ZERO SQL queries.
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 6, tzinfo=ET))
+    restarted_sched = SimpleNamespace(
+        alerts=AlertService(cfg, clock=world.clock.now),
+        calendar=sched.calendar,
+        _job_tasks={},
+        research=sched.research,
+        store=sched.store,
+        ledger=sched.ledger,
     )
-    assert "S&P-only" in rescan_no_vix
-    assert "2 of 3" in rescan_no_vix
+    StockAgentScheduler._flush_blocked_buy_overflow(restarted_sched, datetime(2026, 11, 24, 16, 10, tzinfo=ET))
+    StockAgentScheduler._flush_blocked_buy_overflow(restarted_sched, datetime(2026, 11, 25, 9, 35, tzinfo=ET))
+    assert len(sql_calls) == 2
+    assert expire_calls["n"] == 2
 
 
 def test_scheduler_flushes_blocked_buy_overflow_only_after_close_and_handoff_completion(

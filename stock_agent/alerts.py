@@ -1452,9 +1452,6 @@ class AlertService:
         bucket, body = classified
         day_str = _session_day_str(session_date, self._clock)
 
-        # If a prior session closed with un-flushed overflow and we rolled into a new day, flush it once.
-        self.flush_blocked_buy_overflow(before_session=day_str)
-
         state = self.blocked_buys.setdefault(
             day_str,
             {"seen": [], "sent_count": 0, "overflow_count": 0, "overflow_emitted": False},
@@ -1536,39 +1533,6 @@ class AlertService:
             self._save()
             return False
         return queued
-
-    def send_handoff_outcome(
-        self,
-        *,
-        stage: str,
-        session_date: date | str | Any = None,
-        symbols: Sequence[str] = (),
-        source_job: str = "",
-        outcomes: Mapping[str, int] | None = None,
-        key_suffix: str = "",
-    ) -> bool:
-        """Send a plain-English #announcements update for staged or resolved open handoffs."""
-        day_str = _session_day_str(session_date, self._clock)
-        title, body = format_handoff_outcome_text(
-            stage=stage,
-            session_date=day_str,
-            symbols=symbols,
-            source_job=source_job,
-            outcomes=outcomes,
-        )
-        if not body:
-            return False
-        suffix = re.sub(r"[^a-z0-9_-]", "", str(key_suffix or source_job or stage).strip().lower())[:32]
-        return self.alert(
-            Severity.INFO,
-            title,
-            body,
-            key=f"handoff:{day_str}:{stage}:{suffix or 'update'}",
-            dedupe_window_sec=86400,
-            category=AlertCategory.LIFECYCLE,
-            channel_key="announcements",
-            mirror_telegram=False,
-        )
 
 
 BLOCKED_BUY_SESSION_CAP = 10
@@ -1966,109 +1930,6 @@ def _classify_blocked_buy(
     return None
 
 
-_SOURCE_JOB_LABELS: dict[str, str] = {
-    "weekly": "the weekend scan",
-    "prescan": "the pre-market scan",
-    "midweek": "the midweek scan",
-}
-
-
-def format_handoff_outcome_text(
-    *,
-    stage: str,
-    session_date: date | str | Any = "",
-    symbols: Sequence[str] = (),
-    source_job: str = "",
-    outcomes: Mapping[str, int] | None = None,
-) -> tuple[str, str]:
-    """Build plain-English title and body for pre-open handoff staging or open resolution."""
-    day_txt = str(session_date.isoformat())[:10] if hasattr(session_date, "isoformat") else str(session_date or "")[:10]
-    norm_stage = str(stage or "").strip().lower()
-    clean_syms = [
-        re.sub(r"[^A-Z0-9./-]", "", str(s or "").strip().upper())[:16]
-        for s in (symbols or ())
-        if str(s or "").strip()
-    ]
-
-    if norm_stage == "staged":
-        if not clean_syms:
-            return ("Open handoff staged", "")
-        shown = ", ".join(clean_syms[:8])
-        more = f" and {len(clean_syms) - 8} more" if len(clean_syms) > 8 else ""
-        src_txt = _SOURCE_JOB_LABELS.get(str(source_job or "").strip().lower(), "closed-market research")
-        when_txt = f" for the {day_txt} open" if day_txt else " for the next market open"
-        return (
-            "Buy candidates staged for market open",
-            f"Staged {len(clean_syms)} buy candidate(s) from {src_txt}{when_txt} ({shown}{more}). "
-            "Each setup will run a live quote and news check five minutes after the opening bell before placing an order.",
-        )
-
-    counts = {str(k): int(v) for k, v in (outcomes or {}).items() if int(v or 0) > 0}
-    if not counts:
-        return ("Market-open handoff summary", "")
-
-    queued_n = counts.get("handoff_promoted", 0) + counts.get("handoff_reanchored", 0)
-    reanchored_n = counts.get("handoff_reanchored", 0)
-    already_queued_n = counts.get("handoff_buy_pending", 0)
-    superseded_n = counts.get("handoff_superseded", 0)
-    refused_n = sum(
-        counts.get(k, 0)
-        for k in (
-            "handoff_gate_refused",
-            "handoff_thesis_changed",
-            "handoff_position_changed",
-            "handoff_exit_pending",
-            "handoff_reanchor_unavailable",
-        )
-    )
-    expired_n = counts.get("handoff_expired", 0)
-
-    parts: list[str] = []
-    if queued_n:
-        reanchor_note = f" ({reanchored_n} re-checked after overnight news)" if reanchored_n else ""
-        parts.append(f"{queued_n} queued for execution{reanchor_note}")
-    if refused_n:
-        parts.append(f"{refused_n} held back by the open recheck")
-    if already_queued_n:
-        parts.append(f"{already_queued_n} skipped because another buy order already holds that stock's queue slot")
-    if superseded_n:
-        parts.append(f"{superseded_n} replaced by a fresher pre-market scan")
-    if expired_n:
-        parts.append(f"{expired_n} expired at session close")
-
-    if not parts:
-        return ("Market-open handoff summary", "")
-    session_prefix = f"For the {day_txt} session: " if day_txt else ""
-    return (
-        "Market-open handoff summary",
-        session_prefix + "; ".join(parts) + ".",
-    )
-
-
-def format_market_rescan_text(
-    *,
-    triggers: Sequence[str],
-    sp500_source: str = "SPY live quote",
-    vix_source: str = "",
-    vix_unavailable: bool = False,
-    rescan_number: int = 1,
-    max_rescans: int = 3,
-) -> str:
-    """Build plain-English announcement text for an intraday market-move rescan."""
-    clean_triggers = [redact_secrets_in_text(str(t).strip()) for t in (triggers or ()) if str(t).strip()]
-    trigger_txt = "; ".join(clean_triggers) if clean_triggers else "a sharp intraday market move"
-    if vix_unavailable or not vix_source:
-        source_txt = f"Sources: {sp500_source} (VIX quote unavailable — running in S&P-only mode)."
-    else:
-        source_txt = f"Sources: {sp500_source} and {vix_source}."
-    return (
-        f"Trigger: {trigger_txt}. "
-        f"{source_txt} "
-        f"Intraday market-move rescan {max(1, int(rescan_number))} of {max(1, int(max_rescans))} today "
-        "for stock and options setups."
-    )
-
-
 def format_entry_lock_line(item: Any) -> str:
     """Format any lock dict/object/string into the canonical A14c line."""
     if isinstance(item, str):
@@ -2129,8 +1990,6 @@ __all__ = [
     "alert",
     "coerce_severity",
     "format_entry_lock_line",
-    "format_handoff_outcome_text",
-    "format_market_rescan_text",
     "get_default_alert_service",
     "redact_secrets_in_text",
     "set_default_alert_service",
