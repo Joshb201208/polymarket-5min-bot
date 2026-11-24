@@ -414,6 +414,10 @@ class ResearchPipeline:
                 )
                 (intent_id,) = self.ledger.enqueue_intents((queued,), job="entry_handoff")
             self.store.finish_pending_buy(key, code, intent_id=intent_id)
+        if code not in {"handoff_promoted", "handoff_reanchored"}:
+            alert = getattr(self.alerts, "alert_blocked_buy", None)
+            if alert is not None:
+                alert(intent.symbol, code, session_date=intent.session_date, risk_reasons=reasons)
         return code
 
     def _retry_handoff(self, key, intent, reason):
