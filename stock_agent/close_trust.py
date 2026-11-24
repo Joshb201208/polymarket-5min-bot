@@ -5,7 +5,10 @@ The reconcile snapshot is "indicative" whenever any holding or option leg lacks 
 usable mark. Close equity is the broker's account equity, which already carries
 each leg at its broker market value. For the drawdown close only, a snapshot whose
 sole invalid marks are option legs is accepted at ``broker equity - haircut``,
-where the haircut can only lower equity (the safe direction for every brake):
+where the haircut is never negative, so the recorded close never overstates
+today's equity relative to broker equity. An understated close can slightly lower
+a later high-water mark and so slightly reduce a later measured fall; that is
+accepted (lead ruling) and the mark is labelled a conservative estimate:
 
 * every stock holding (long or short) must be validly priced, else untrusted;
 * each invalid leg (unpriced, or crossed by reconcile) is paired with the unique
@@ -17,8 +20,9 @@ where the haircut can only lower equity (the safe direction for every brake):
 * lone long: unpriced needs market value 0 (missing is consistent), haircut 0;
   crossed gives haircut max(0, mv);
 * lone short: needs today's valid underlying price (held stock mark, else the
-  official session close) at least 10% from the strike, and a standard contract;
-  haircut = max(0, intrinsic x 100 x |qty| + mv);
+  official session close) more than 10% from the strike (exactly 10% is near the
+  money), and a standard contract; haircut = max(0, intrinsic x 100 x |qty| + mv),
+  the part of intrinsic not already carried as a liability in broker equity;
 * a short leg or paired leg with no reported market value is untrusted;
 * the resulting equity must stay positive.
 
@@ -44,6 +48,7 @@ CLOSE_UNPRICED_STOCK = "close_unpriced_stock"
 CLOSE_OPTION_MARKS_CROSSED = "close_option_marks_crossed"
 CLOSE_OPTION_UNDERLYING_UNPRICED = "close_option_underlying_unpriced"
 CLOSE_SNAPSHOT_INDICATIVE = "close_snapshot_indicative"
+CLOSE_SNAPSHOT_QUALITY_UNKNOWN = "close_snapshot_quality_unknown"
 CLOSE_HAIRCUT_NONPOSITIVE = "close_haircut_nonpositive"
 CLOSE_OPTION_MARK_INCONSISTENT = "close_option_mark_inconsistent"
 CLOSE_OPTION_NEAR_MONEY = "close_option_near_money"
@@ -56,6 +61,17 @@ CLOSE_OPTION_ADJUSTED_CONTRACT = "close_option_adjusted_contract"
 
 NEAR_MONEY_FRACTION = Decimal("0.10")
 STANDARD_MULTIPLIER = 100
+KNOWN_QUALITIES = frozenset({"live", "indicative"})
+# Detail keys persisted in equity_marks.extra_json for a conservative close (restored on replay).
+PERSISTED_KEYS = ("close_basis", "conservative", "summary", "broker_equity", "haircut", "close_equity",
+                  "unpriced_option_legs", "legs")
+
+
+def persisted_detail(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The conservative-close fields of a recorded mark's extra (empty for an ordinary close)."""
+    if not extra or extra.get("conservative") is not True:
+        return {}
+    return {key: extra[key] for key in PERSISTED_KEYS if key in extra}
 
 
 @dataclass(frozen=True)
@@ -175,6 +191,16 @@ def _groups(snapshot) -> list[tuple]:
     return out
 
 
+BOOK_TOLERANCE = Decimal("0.05")
+
+
+def _book_adds_up(snapshot) -> bool:
+    """Broker equity equals cash plus every carried market value (within rounding)."""
+    total = _d(snapshot.cash) + sum((_d(h.market_value) for h in snapshot.holdings), ZERO) \
+        + sum((_d(o.market_value) for o in snapshot.legs), ZERO)
+    return abs(total - _d(snapshot.equity)) <= BOOK_TOLERANCE
+
+
 def _standard_root(symbol: str) -> bool:
     # Reconcile hardcodes multiplier 100; adjusted contracts carry a non-alpha root (e.g. "XYZ1").
     return bool(symbol) and symbol.replace(".", "").isalpha()
@@ -203,6 +229,8 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
         return CloseTrust(False, reason, broker, haircut=haircut, symbols=tuple(sorted(set(symbols))),
                           unpriced_option_legs=invalid, legs=tuple(rows))
 
+    if snapshot.quality not in KNOWN_QUALITIES:
+        return untrusted(CLOSE_SNAPSHOT_QUALITY_UNKNOWN)
     unpriced_stock = [h.symbol for h in snapshot.holdings
                       if not h.price_ok or h.price is None or _d(h.price) <= 0]
     if unpriced_stock:
@@ -245,6 +273,9 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
                     cut = max(ZERO, _d(leg.market_value))
                 elif _d(leg.market_value) != 0:
                     raise _Untrusted(CLOSE_OPTION_MARK_INCONSISTENT, [leg.occ_symbol])
+                elif not leg.market_value_reported and not _book_adds_up(snapshot):
+                    # A missing value is "consistent" only if broker equity carries nothing for it.
+                    raise _Untrusted(CLOSE_OPTION_MARK_INCONSISTENT, [leg.occ_symbol])
                 else:
                     cut = ZERO
                 haircut += cut
@@ -259,7 +290,7 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
                 if price is None:
                     raise _Untrusted(CLOSE_OPTION_UNDERLYING_UNPRICED, [leg.occ_symbol, leg.underlying])
                 strike = _d(leg.strike)
-                if abs(strike - price) < NEAR_MONEY_FRACTION * price:
+                if abs(strike - price) <= NEAR_MONEY_FRACTION * price:
                     raise _Untrusted(CLOSE_OPTION_NEAR_MONEY, [leg.occ_symbol])
                 intrinsic = _intrinsic(leg.right, strike, price) * STANDARD_MULTIPLIER * abs(_d(leg.qty))
                 cut = max(ZERO, intrinsic + _d(leg.market_value))

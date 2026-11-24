@@ -80,6 +80,7 @@ DRAWDOWN_CLOSE_CAUSES = {
     "close_option_unparseable": "An option position symbol could not be parsed",
     "close_option_adjusted_contract": "An unpriced short option may have a non-standard contract multiplier",
     "close_haircut_nonpositive": "Account equity was not positive after the conservative option adjustment",
+    "close_snapshot_quality_unknown": "The account snapshot had an unrecognised quality label",
     "close_snapshot_indicative": "The snapshot was indicative without a verified option-only cause",
     "close_mark_not_recorded": "The account equity mark did not persist",
     "previous_session_unverified": "The previous trading session could not be confirmed",
@@ -867,7 +868,8 @@ class StockAgentScheduler:
             return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_TRADING_BLOCK})
         marks = self.ledger.equity_marks("close", since=session.date)
         mark = next((item for item in marks if item.session_date == session.date), None)
-        trust_detail: dict = {}
+        # On replay, report the persisted conservative fields of the recorded mark, never a refreshed value.
+        trust_detail: dict = close_trust.persisted_detail(mark.extra) if mark is not None else {}
         if mark is None:
             # Close path only: a copy at conservative equity; raw snapshot quality is unchanged elsewhere.
             trust = close_trust.assess_close(snapshot, await self._underlying_session_closes(snapshot, session.date))
@@ -912,6 +914,36 @@ class StockAgentScheduler:
                               "The existing high-water record was retained.",
                               key=f"invalid-drawdown-close:{session.date}")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_close_invalid"})
+        # Commit the drawdown record before the ancillary close-limit check, so a failure there
+        # cannot keep the brakes stale (drawdown state does not affect trims or portfolio checks).
+        if updated != state:
+            self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
+            before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
+            alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
+            new_episode = updated.paused and updated.pause_start_session != state.pause_start_session
+            if before != (alert, throttled, updated.paused) or new_episode:
+                message = (
+                    f"Rolling decision drawdown: {updated.decision_drawdown:.1%}; "
+                    f"all-time drawdown: {updated.drawdown:.1%}. "
+                )
+                if new_episode:
+                    message += "A new drawdown pause started. "
+                elif state.paused and not updated.paused:
+                    expired = updated.pause_sessions_governed >= self.config.DRAWDOWN_PAUSE_MAX_SESSIONS
+                    why = "its session cap was reached" if expired else "the trusted-close recovery streak was met"
+                    message += f"The drawdown pause lifted because {why}; other entry checks still apply. "
+                if updated.paused:
+                    message += f"The pause can lift when {self._drawdown_release_condition(updated)}. "
+                if throttled:
+                    message += "Throttled: half-size stock entries when allowed, no new borrowing or options."
+                else:
+                    message += "Drawdown throttle inactive."
+                await self._alert(
+                    "critical" if updated.paused else "warning" if alert or throttled else "info",
+                    "Drawdown controls changed",
+                    message,
+                    key=f"drawdown:{session.date}",
+                )
         risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
         if trust_detail:
             if risk_result is None:
@@ -920,35 +952,6 @@ class StockAgentScheduler:
                 risk_result = JobOutcome(risk_result.status, risk_result.intents,
                                          {**trust_detail, **dict(risk_result.detail or {})},
                                          risk_result.option_candidates)
-        if updated == state:
-            return risk_result
-        self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
-        before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
-        alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
-        new_episode = updated.paused and updated.pause_start_session != state.pause_start_session
-        if before != (alert, throttled, updated.paused) or new_episode:
-            message = (
-                f"Rolling decision drawdown: {updated.decision_drawdown:.1%}; "
-                f"all-time drawdown: {updated.drawdown:.1%}. "
-            )
-            if new_episode:
-                message += "A new drawdown pause started. "
-            elif state.paused and not updated.paused:
-                expired = updated.pause_sessions_governed >= self.config.DRAWDOWN_PAUSE_MAX_SESSIONS
-                why = "its session cap was reached" if expired else "the trusted-close recovery streak was met"
-                message += f"The drawdown pause lifted because {why}; other entry checks still apply. "
-            if updated.paused:
-                message += f"The pause can lift when {self._drawdown_release_condition(updated)}. "
-            if throttled:
-                message += "Throttled: half-size stock entries when allowed, no new borrowing or options."
-            else:
-                message += "Drawdown throttle inactive."
-            await self._alert(
-                "critical" if updated.paused else "warning" if alert or throttled else "info",
-                "Drawdown controls changed",
-                message,
-                key=f"drawdown:{session.date}",
-            )
         return risk_result
 
     async def _underlying_session_closes(self, snapshot, session_date: date) -> dict[str, Decimal]:

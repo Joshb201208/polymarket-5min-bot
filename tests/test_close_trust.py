@@ -8,6 +8,8 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+from dataclasses import replace
+
 import pytest
 
 from stock_agent import close_trust as ct
@@ -135,6 +137,24 @@ def test_shared_partner_is_ambiguous_in_any_order(order):
     assert len(trust.symbols) == 3
 
 
+@pytest.mark.parametrize("legs", [
+    # plan_coverage_reviewer: one long reused by two shorts would hide a 20,000 liability at U=300
+    [("SPY", 510, -1, "put", None), ("SPY", 520, -1, "put", None), ("SPY", 530, 1, "put", None)],
+    [("SPY", 100, 1, "call", D(3)), ("SPY", 110, -1, "call", None), ("SPY", 120, -1, "call", None)],
+])
+def test_partner_reuse_is_ambiguous(legs):
+    built = [leg(u, k, q, right=r, price=p, mv=(D(300) if p else 0)) for u, k, q, r, p in legs]
+    trust = ct.assess_close(snap(holdings=[stock("SPY", 10, price=D(300))], legs=built))
+    assert not trust.trusted and trust.reason == ct.CLOSE_OPTION_PAIRING_AMBIGUOUS
+
+
+def test_lone_unpriced_long_missing_mv_needs_book_to_add_up():
+    # equity carries 5,000 that no reported value explains: the missing leg value may be nonzero
+    book = snap(legs=[leg("AAA", 100, 1, mv=0, reported=False)], equity=D(105_000))
+    book = replace(book, cash=D(100_000))
+    assert ct.assess_close(book).reason == ct.CLOSE_OPTION_MARK_INCONSISTENT
+
+
 def test_crossed_group_of_three_untrusted():
     book = snap(legs=[leg("AAA", 100, 2, price=D(1), ok=False, mv=200),
                       leg("AAA", 110, -1, price=D(3), ok=False, mv=-300),
@@ -203,10 +223,35 @@ def test_lone_short_no_underlying_untrusted():
     assert trust.reason == ct.CLOSE_OPTION_UNDERLYING_UNPRICED
 
 
-@pytest.mark.parametrize("u", [D(95), D(105), D("109.9")])
+@pytest.mark.parametrize("u", [D(95), D(105), D("109.9"), D(110)])
 def test_lone_short_near_money_untrusted(u):
     book = snap(holdings=[stock("AAA", 100, price=u)], legs=[leg("AAA", 100, -1, mv=0)])
     assert ct.assess_close(book).reason == ct.CLOSE_OPTION_NEAR_MONEY
+
+
+def test_near_money_guard_is_inclusive_at_exactly_ten_percent():
+    # |K - U| / U == 0.10 exactly (K 110, U 100): near the money, untrusted
+    book = snap(holdings=[stock("AAA", 100, price=D(100))], legs=[leg("AAA", 110, -1, mv=0)])
+    assert ct.assess_close(book).reason == ct.CLOSE_OPTION_NEAR_MONEY
+    # just beyond 10% is admitted (K 110, U 99.9 -> 10.11%)
+    book = snap(holdings=[stock("AAA", 100, price=D("99.9"))], legs=[leg("AAA", 110, -1, mv=0)])
+    assert ct.assess_close(book).trusted
+
+
+def test_unknown_snapshot_quality_untrusted():
+    from dataclasses import replace
+
+    book = replace(snap(holdings=[stock("AAA", 10)]), quality="something_new")
+    assert ct.assess_close(book).reason == ct.CLOSE_SNAPSHOT_QUALITY_UNKNOWN
+
+
+def test_persisted_detail_only_for_conservative_marks():
+    trust = ct.assess_close(snap(legs=debit_pair()))
+    extra = {"maintenance_margin": "1", **trust.detail()}
+    restored = ct.persisted_detail(extra)
+    assert restored["conservative"] is True and "maintenance_margin" not in restored
+    assert restored["unpriced_option_legs"] == list(trust.unpriced_option_legs)
+    assert ct.persisted_detail({"maintenance_margin": "1"}) == {}
 
 
 def test_lone_short_missing_mv_untrusted():
