@@ -303,12 +303,14 @@ class ResearchStore:
         ))
 
     def finish_pending_buy(self, key: str, status: str, *, intent_id: str | None = None,
-                           retry_at: datetime | None = None) -> bool:
+                           retry_at: datetime | None = None, hold_reason: str | None = None) -> bool:
         with self.store.transaction() as conn:
             return bool(conn.execute(
-                """UPDATE research_pending_buys SET status=?,intent_id=?,due_at_s=COALESCE(?,due_at_s)
+                """UPDATE research_pending_buys SET status=?,intent_id=?,due_at_s=COALESCE(?,due_at_s),
+                   details_json=CASE WHEN ? IS NULL THEN details_json ELSE json_set(details_json,'$.last_hold',?) END
                    WHERE work_key=? AND status='waiting'""",
-                (status, intent_id, int(retry_at.timestamp()) if retry_at is not None else None, key),
+                (status, intent_id, int(retry_at.timestamp()) if retry_at is not None else None,
+                 hold_reason, hold_reason, key),
             ).rowcount)
 
     def record_option_idea(self, story_id: str, idea, expires_at: datetime) -> None:

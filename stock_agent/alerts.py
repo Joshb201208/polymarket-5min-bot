@@ -1867,10 +1867,15 @@ def _classify_blocked_buy(
                 "recheck_failed",
                 f"Skipped buying {sym} because our latest research recheck no longer rates {sym} an actionable buy.",
             )
-        if raw_ctx & {"llm_unavailable", "llm_budget", "budget"}:
+        if raw_ctx & {"llm_budget", "budget"}:
             return (
                 "recheck_failed",
-                f"Skipped buying {sym} because the market-open recheck could not run while AI review routes or weekly AI budget were unavailable.",
+                f"Skipped buying {sym} because the weekly AI research budget was exhausted before the market-open recheck could run.",
+            )
+        if "llm_unavailable" in raw_ctx:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because no AI review route was available for the market-open recheck.",
             )
         if raw_ctx & {"auth", "plan_blocked"}:
             return (
@@ -1882,11 +1887,15 @@ def _classify_blocked_buy(
                 "recheck_failed",
                 f"Skipped buying {sym} because fresh material news arrived after the market-open recheck.",
             )
+        if "targeted_review_already_attempted" in raw_ctx:
+            return (
+                "recheck_failed",
+                f"Skipped buying {sym} because its one market-open recheck was already attempted without a usable result.",
+            )
         if raw_ctx & {
             "buy_thesis_or_conviction_changed",
             "top_up_baseline_changed",
             "targeted_review_did_not_qualify",
-            "targeted_review_already_attempted",
         }:
             return (
                 "recheck_failed",
@@ -1902,6 +1911,12 @@ def _classify_blocked_buy(
         raw_ctx = {str(r or "").partition(":")[0].strip().lower() for r in (risk_reasons or ())}
         reason_lc = str(reason or "").lower()
         if norm_code == "handoff_expired":
+            if "llm_unavailable" in raw_ctx:
+                return (
+                    "handoff_expired",
+                    f"Skipped buying {sym} because the open handoff expired at the session close; "
+                    "the last recheck was waiting for an AI review route to become available.",
+                )
             if raw_ctx & {
                 "quote_stale_or_unavailable",
                 "news_stale_or_unavailable",

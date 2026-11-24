@@ -187,3 +187,67 @@ def test_handoff_rechecks_new_material_news_only(world, monkeypatch, headline, n
         assert not h.buys()  # Existing gap rule still uses the original close.
 
     _run(world, monkeypatch, body, anchored=True)
+
+
+@pytest.mark.parametrize("material", [False, True], ids=["missing-anchor", "material-news"])
+@pytest.mark.parametrize("recovers", [False, True], ids=["expires", "recovers"])
+def test_handoff_waits_for_review_route_before_spending_its_attempt(world, monkeypatch, material, recovers):
+    async def body(h):
+        before = len(h.calls)
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        headline = ("AAPL cuts revenue guidance after revised quarterly results" if material
+                    else "Why AAPL stock moved today")
+        world.news(["AAPL"], headline, at=world.clock.now() - timedelta(minutes=5))
+        model = h.scheduler.research.gate.health.llm
+        healthy = model.is_healthy
+        monkeypatch.setattr(model, "is_healthy", lambda: False)
+        (row,) = h.scheduler.research.store.pending_buys(world.clock.now())
+        review_key = f"{row['work_key']}:reanchor"
+
+        assert (await _sweep(h)).detail["handoff_outcomes"] == {"llm_unavailable": 1}
+        assert h.scheduler.research.store.work_state(review_key) is None
+        assert len(h.calls) == before and not h.intents() and not h.buys()
+        await h.scheduler.alerts.flush()
+        assert not [line for line in world.discord.texts() if "Buy blocked" in line]
+
+        if recovers:
+            monkeypatch.setattr(model, "is_healthy", healthy)
+            await h.advance(17, 9, 36)
+            h.fresh_quote()
+            assert (await _sweep(h)).detail["handoff_outcomes"] == {"handoff_reanchored": 1}
+            assert (await _sweep(h)).detail["handoff_outcomes"] == {"handoff_promoted": 1}
+            await h.scheduler._run_execution_cycle()
+            assert len(h.calls) == before + 1 and len(h.buys()) == 1
+        else:
+            await h.restart()
+            await h.advance(17, 16)
+            assert (await _sweep(h)).detail["handoff_outcomes"] == {"handoff_expired": 1}
+            assert not (await _sweep(h)).detail["handoff_outcomes"]
+            assert len(h.calls) == before and not h.buys()
+            assert h.intents()[0].meta["handoff_reasons"] == ["llm_unavailable"]
+            await h.scheduler.alerts.flush()
+            (line,) = [line for line in world.discord.texts() if "Buy blocked" in line]
+            assert "AAPL" in line and "session close" in line and "AI review" in line
+
+    _run(world, monkeypatch, body, anchored=material)
+
+
+def test_handoff_research_budget_refusal_is_terminal_without_a_paid_call(world, monkeypatch):
+    async def body(h):
+        before = len(h.calls)
+        await h.advance(17, 9, 35)
+        h.fresh_quote()
+        world.news(["AAPL"], "AAPL cuts revenue guidance after revised quarterly results",
+                   at=world.clock.now() - timedelta(minutes=5))
+        monkeypatch.setattr(h.scheduler.research.store.config, "RESEARCH_WEEKLY_BUDGET_USD", 0.0)
+        assert (await _sweep(h)).detail["handoff_outcomes"] == {"handoff_reanchor_unavailable": 1}
+        assert not (await _sweep(h)).detail["handoff_outcomes"]
+        (intent,) = h.intents()
+        assert intent.status == IntentStatus.SKIPPED and intent.meta["handoff_reasons"] == ["budget"]
+        assert len(h.calls) == before and not h.buys()
+        await h.scheduler.alerts.flush()
+        (line,) = [line for line in world.discord.texts() if "Buy blocked" in line]
+        assert "weekly AI research budget was exhausted" in line
+
+    _run(world, monkeypatch, body, anchored=True)

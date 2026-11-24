@@ -397,11 +397,12 @@ class ResearchPipeline:
             remaining = deadline - elapsed()
             if remaining <= 0:
                 break
-            intent = _reconstitute(json.loads(row["details_json"])["intent"])
+            details = json.loads(row["details_json"])
+            intent = _reconstitute(details["intent"])
             key = row["work_key"]
             try:
                 async with asyncio.timeout(min(remaining, 55)):
-                    code = await self._validate_handoff(key, intent, funnel)
+                    code = await self._validate_handoff(key, intent, funnel, last_hold=details.get("last_hold"))
             except (TimeoutError, SourceUnavailable, StaleBook) as exc:
                 if isinstance(exc, TimeoutError):
                     reason = "handoff_input_timeout"
@@ -441,14 +442,16 @@ class ResearchPipeline:
         if now >= intent.expires_at:
             return self._finish_handoff(key, intent, "handoff_expired", reasons=(reason,))
         self.store.finish_pending_buy(key, "waiting",
-                                      retry_at=min(now + timedelta(minutes=1), intent.expires_at))
+                                      retry_at=min(now + timedelta(minutes=1), intent.expires_at), hold_reason=reason)
         return reason
 
-    async def _validate_handoff(self, key, intent, funnel):
+    async def _validate_handoff(self, key, intent, funnel, *, last_hold=None):
         symbol = intent.symbol
         reanchor_key = f"{key}:reanchor"
 
         def refuse(code, *reasons):
+            if code == "handoff_expired" and not reasons and last_hold:
+                reasons = (last_hold,)
             return self._finish_handoff(key, intent, code, reasons=reasons)
 
         def check_identity():
@@ -470,14 +473,9 @@ class ResearchPipeline:
                 return "handoff_position_changed", None
             return None, holding
 
-        def gate_rejection(*, check_material_news=False, needs_review=False):
+        def gate_rejection():
             gate = self.gate.is_entry_eligible(symbol, self.clock())
             if not gate.ok:
-                if gate.reasons == ("llm_unavailable",):
-                    if check_material_news:
-                        return None  # First determine whether this handoff even needs a model.
-                    if needs_review:
-                        return refuse("handoff_reanchor_unavailable", "llm_unavailable")
                 if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
                     return self._retry_handoff(key, intent, gate.reasons[0])
                 return refuse("handoff_gate_refused", *gate.reasons)
@@ -496,6 +494,8 @@ class ResearchPipeline:
         code, holding = check_identity()
         if code:
             return refuse(code)
+        if self.store.work_state(reanchor_key) is not None:
+            return refuse("handoff_reanchor_unavailable", "targeted_review_already_attempted")
         now = self.clock()
         session = self.calendar.session_on(intent.session_date)
         if session is None or now >= session.closes_at - timedelta(minutes=10):
@@ -507,7 +507,7 @@ class ResearchPipeline:
         code, holding = check_identity()
         if code:
             return refuse(code)
-        if rejection := gate_rejection(check_material_news=True):
+        if rejection := gate_rejection():
             return rejection
         material_since = getattr(self.sources, "handoff_material_news", None)
         current = self.ledger.current_thesis(symbol)
@@ -519,7 +519,7 @@ class ResearchPipeline:
         if self.clock() >= session.closes_at - timedelta(minutes=10):
             self.store.finish_pending_buy(key, "waiting", retry_at=intent.expires_at)
             return "handoff_execution_window_closed"
-        if rejection := gate_rejection(needs_review=bool(material) or intent.reference_price is None):
+        if rejection := gate_rejection():
             return rejection
         if material and intent.meta.get("handoff_reviewed"):
             return refuse("handoff_reanchor_unavailable", "new_material_news_after_single_review")
@@ -536,6 +536,8 @@ class ResearchPipeline:
         code, holding = check_identity()
         if code:
             return refuse(code)
+        if rejection := gate_rejection():
+            return rejection
         if not self.store.claim_work(reanchor_key, symbol, self.clock()):
             return refuse("handoff_reanchor_unavailable", "targeted_review_already_attempted")
         try:
