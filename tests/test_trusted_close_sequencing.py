@@ -7,7 +7,9 @@ from datetime import date
 
 import pytest
 
+from stock_agent.broker import BrokerError
 from stock_agent.ledger import JobStatus
+from stock_agent.reconcile import ReconcileError
 from tests.test_trusted_close_gap import GS_CALL, JPM_CALL, _run, close_mark, drawdown_session, seed_23nov
 
 DAY = date(2026, 11, 23)
@@ -52,5 +54,52 @@ def test_replay_reports_the_persisted_conservative_detail(world):
         for key in ("broker_equity", "close_equity", "haircut", "unpriced_option_legs", "summary"):
             assert again.detail[key] == first.detail[key]
         assert close_mark(sched, DAY) == mark
+
+    _run(world, body)
+
+
+@pytest.mark.parametrize("raw", ["NaN", "garbage", "inf"])
+def test_malformed_market_value_on_unpriced_long_stays_untrusted(world, monkeypatch, raw):
+    seed_23nov(world)
+    original = world.alpaca.position_json
+
+    def position_json(p):
+        out = original(p)
+        if p.symbol == JPM_CALL:
+            out["market_value"] = raw  # not absent: malformed, so it cannot count as "missing and consistent"
+        return out
+
+    monkeypatch.setattr(world.alpaca, "position_json", position_json)
+
+    async def body(sched):
+        world.clock.set_et(2026, 11, 23, 16, 5)
+        # The broker client already refuses a non-finite or unreadable value, so the close fails closed.
+        with pytest.raises((BrokerError, ReconcileError)):
+            await sched._close_drawdown()
+        assert close_mark(sched, DAY) is None and drawdown_session(sched) is None
+
+    _run(world, body)
+
+
+def test_absent_market_value_on_unpriced_long_is_consistent(world, monkeypatch):
+    seed_23nov(world)
+    original = world.alpaca.position_json
+
+    def position_json(p):
+        out = original(p)
+        if p.symbol == JPM_CALL:
+            out.pop("market_value", None)
+        return out
+
+    monkeypatch.setattr(world.alpaca, "position_json", position_json)
+
+    async def body(sched):
+        world.clock.set_et(2026, 11, 23, 16, 5)
+        snap = await sched.ledger.refresh("fixture")
+        jpm = next(item for item in snap.legs if item.occ_symbol == JPM_CALL)
+        assert not jpm.market_value_reported and not jpm.market_value_malformed
+        # JPM_CALL pairs with JPM_SHORT, so a missing value on a paired leg is untrusted (section 7)
+        outcome = await sched._close_drawdown()
+        assert outcome.detail["reason"] == "close_option_mark_missing"
 
     _run(world, body)

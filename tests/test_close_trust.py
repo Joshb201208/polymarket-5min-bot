@@ -148,6 +148,12 @@ def test_partner_reuse_is_ambiguous(legs):
     assert not trust.trusted and trust.reason == ct.CLOSE_OPTION_PAIRING_AMBIGUOUS
 
 
+def test_malformed_market_value_is_not_missing():
+    bad = replace(leg("AAA", 100, 1, mv=0, reported=False), market_value_malformed=True)
+    trust = ct.assess_close(snap(legs=[bad]))
+    assert trust.reason == ct.CLOSE_OPTION_MARK_INCONSISTENT and trust.symbols == (bad.occ_symbol,)
+
+
 def test_lone_unpriced_long_missing_mv_needs_book_to_add_up():
     # equity carries 5,000 that no reported value explains: the missing leg value may be nonzero
     book = snap(legs=[leg("AAA", 100, 1, mv=0, reported=False)], equity=D(105_000))

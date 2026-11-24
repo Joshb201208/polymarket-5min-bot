@@ -243,6 +243,10 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
         if snapshot.quality != "live":
             return untrusted(CLOSE_SNAPSHOT_INDICATIVE)
         return CloseTrust(True, None, broker, equity=broker)
+    malformed = [o.occ_symbol for o in snapshot.legs if getattr(o, "market_value_malformed", False)]
+    if malformed:
+        # A malformed value is not "missing": it may hide a carried value we cannot read.
+        return untrusted(CLOSE_OPTION_MARK_INCONSISTENT, malformed)
     rows: list[dict[str, Any]] = []
     haircut = ZERO
     try:
