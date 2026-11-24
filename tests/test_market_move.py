@@ -3,11 +3,16 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
+
 from stock_agent import scheduler as scheduler_module
+from stock_agent.analyst import Analyst
 from stock_agent.ledger import JobStatus
+from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import ET
 from stock_agent.market_move import Reading, observe, valid_reading
-from stock_agent.research_pipeline import JobOutcome
+from stock_agent.research_pipeline import JobOutcome, ResearchPipeline, SecurityInputs
+from tests.test_review_research import openai_only
 from tests.test_scheduler_lifecycle import EngineStub, build
 
 OPEN = datetime(2026, 11, 27, 14, 30, tzinfo=UTC)
@@ -190,6 +195,50 @@ def test_rescan_does_not_consume_research_marker_and_requests_options_after_rese
             assert outcome.status is JobStatus.DONE
             assert outcome.detail["triggers"] == hits
             assert events == [("research", "market_move", f"market_move:{key}"), ("options", key)]
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
+def test_rescan_uses_the_normal_budget_and_skips_llm_transport_when_exhausted(tmp_path, monkeypatch):
+    async def check():
+        now = OPEN.astimezone(ET) + timedelta(minutes=31)
+        sched, _ = build(tmp_path, monkeypatch, now)
+        sched.store.open()
+        monkeypatch.setattr(sched.ledger, "snapshot", lambda: SimpleNamespace(holdings=()))
+        calls = []
+
+        class Sources:
+            async def universe(self, timestamp):
+                return ("TEST",)
+
+            async def securities(self, symbols, timestamp):
+                return {"TEST": SecurityInputs("TEST", "Synthetic", "Technology", Decimal(100), timestamp, True)}
+
+        def endpoint(request):
+            calls.append(request.method)
+            return httpx.Response(503)
+
+        cfg = openai_only()
+        sched.research_store.config = cfg
+        budget = cfg.RESEARCH_WEEKLY_BUDGET_USD * 1_000_000
+        try:
+            assert sched.research_store.reserve("fixture-full-budget", now, budget, exit_work=True)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+                llm = LLMClient(cfg, client=http, spend=sched.research_store, now=lambda: now)
+                sched.research = ResearchPipeline(cfg, sched.ledger, sched.calendar, Analyst(llm),
+                                                  sched.research_store, Sources(), sched.research_gate,
+                                                  clock=lambda: now, focus=lambda **_: ())
+                key = f"{now.date()}:1"
+                outcome = await sched._run_market_move_rescan(
+                    key, [{"signal": "spy_up_close", "text": "SPY +1.50% from the prior regular close"}],
+                )
+                assert outcome.status is JobStatus.FAILED
+                assert outcome.detail["unavailable"] == 1
+                assert outcome.intents == ()
+                assert calls == []
+                assert sched.research_store.available_budget(now)["billed_or_reserved_microusd"] == budget
         finally:
             await sched._cleanup()
 
