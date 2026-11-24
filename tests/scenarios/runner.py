@@ -266,10 +266,13 @@ class ScenarioRunner:
                         self._watchers.remove(item)
             # Next step boundary after the tick's start; a tick that slept past it
             # (simulated asyncio.sleep) resumes at the next boundary, like run().
+            now = self.clock.now_et()
+            if now >= end:  # the tick (or work it launched) slept past the end of the run
+                break
             nxt = tick_at + timedelta(seconds=self.step_seconds)
-            while nxt <= self.clock.now_et():
+            while nxt <= now:
                 nxt += timedelta(seconds=self.step_seconds)
-            self.clock.set(min(nxt, end) if nxt > end else nxt)
+            self.clock.set(min(nxt, end))
 
     # ── reporting ────────────────────────────────────────────────────
     def summary(self) -> str:
