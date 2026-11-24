@@ -204,6 +204,7 @@ def test_rescan_does_not_consume_research_marker_and_requests_options_after_rese
 
         def options(window):
             events.append(("options", window))
+            return "outside_options_window"
 
         sched, _ = build(tmp_path, monkeypatch, now, research=SimpleNamespace(
             run=run, has_fresh_thesis_set=lambda _: True,
@@ -216,6 +217,10 @@ def test_rescan_does_not_consume_research_marker_and_requests_options_after_rese
             outcome = await sched._run_market_move_rescan(key, hits)
             assert outcome.status is JobStatus.DONE
             assert outcome.detail["triggers"] == hits
+            assert outcome.detail["entry_funnel"]["rejected_by_reason"] == {"outside_options_window": 1}
+            events_in_funnel = list(sched.journal.read(kinds={"research.entry_funnel"}))
+            assert len(events_in_funnel) == 1
+            assert events_in_funnel[0]["rejected_by_reason"] == {"outside_options_window": 1}
             assert events == [("research", "market_move", f"market_move:{key}"), ("options", key)]
         finally:
             await sched._cleanup()

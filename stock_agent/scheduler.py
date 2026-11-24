@@ -1863,6 +1863,15 @@ class StockAgentScheduler:
                 options_status = "request unavailable"
                 logger.warning("Market-move options request failed (%s)", type(exc).__name__)
         detail = {**result.detail, "triggers": hits, "options_rescan": options_status}
+        if options_status == "outside_options_window":
+            # The normal research run has already journalled its stock stages.
+            # Append just this additional skip so it cannot duplicate stock counts.
+            outside = {"outside_options_window": 1}
+            self.journal.append("research.entry_funnel", job="market_move_options",
+                                session_date=window.split(":", 1)[0], rejected_by_reason=outside)
+            funnel = dict(detail.get("entry_funnel") or {})
+            rejected = {**(funnel.get("rejected_by_reason") or {}), **outside}
+            detail["entry_funnel"] = {**funnel, "rejected_by_reason": rejected}
         return JobOutcome(result.status, result.intents, detail, result.option_candidates)
 
     # ── Morning Brief ────────────────────────────────────────────────
