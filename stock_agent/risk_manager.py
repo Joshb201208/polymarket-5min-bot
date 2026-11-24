@@ -269,14 +269,27 @@ class DrawdownState:
         if (abs(rolling - (peak - last_close) / peak) > tolerance or peak > high * (1 + tolerance)
                 or abs(loss - (high - last_close) / high) > tolerance or rolling > loss + tolerance):
             raise fail("drawdowns disagree with closes")
+        # Only a v1 migration (synthetic peak + one real close, never advanced) lacks raw equity;
+        # any other null would silently re-anchor returns across earlier external flows.
+        if last_equity is None and (len(window) != 2 or window[0][0] is not None):
+            raise fail("missing last raw equity")
         if start is None:
             # Without any episode anchor a close above the pause line always latches.
             if paused or governed or rolling > _decimal(config.DRAWDOWN_PAUSE_PCT) + Decimal("1e-10"):
                 raise fail("episode without anchor")
         else:
+            # update_drawdown adds one per applied trusted close after the latch, capped; the
+            # window labels are exactly the applied closes, so the clock is recomputable.
+            cap = config.DRAWDOWN_PAUSE_MAX_SESSIONS
             after = sum(1 for name in labels if name > start)
-            if (start > session or (start == session) != (governed == 0)
-                    or (start in labels and governed > after)):
+            if start > session or governed > cap or (paused and governed >= cap):
+                raise fail("episode clock")
+            if start in labels:
+                if governed != min(after, cap):
+                    raise fail("episode clock")
+            elif start > labels[0] or not min(after, cap) <= governed:
+                # An anchor between retained closes is missing; one before the window has
+                # at least every retained close counted (exact count unknowable if short).
                 raise fail("episode clock")
         return cls(high, loss, paused, closes, session, last_equity, tuple(window), rolling, start, governed)
 

@@ -330,3 +330,96 @@ def test_old_code_rejects_v3_and_accepts_the_conservative_projection(closes):
 def test_projection_of_empty_state_is_the_old_empty_record():
     old = _old_risk_manager()
     assert old.DrawdownState.from_record(DrawdownState().to_legacy_record(CFG), config=Config) == old.DrawdownState()
+
+
+# ---------------------------------------------------------------- strict episode clock (lead ruling)
+
+def _walk(closes, *, skip=(), config=CFG, start="2026-01-05", reload_each=True):
+    """Calendar walk: closes in ``skip`` are never applied (outage); the scheduler still passes
+    the calendar's previous session, so the recovery streak resets and the gap is visible."""
+    days = sessions(start, len(closes))
+    state, out = DrawdownState(), []
+    for i, (day, equity) in enumerate(zip(days, closes)):
+        if i in skip:
+            continue
+        state = update_drawdown(state, day, D(str(equity)), previous_session=days[i - 1] if i else None,
+                                config=config)
+        if reload_each:
+            state = persisted(state, config)
+        out.append(state)
+    return out
+
+
+@pytest.mark.parametrize(("closes", "skip"), [
+    (TRAP, ()),
+    (TRAP, (5, 6, 12)),                       # skipped trusted closes mid-episode
+    (EARLY_THEN_DROP, ()),                    # early release then re-drop inside the cooldown
+    (EARLY_THEN_DROP, (4,)),                  # gap inside the recovery streak
+    ([100, 79] + [79] * 25 + [100, 79, 79], (20,)),  # expiry, recovery, fresh second episode
+], ids=["trap", "trap_skips", "cooldown", "cooldown_gap", "second_episode"])
+def test_legitimate_histories_always_reload_with_exact_clock(closes, skip):
+    states = _walk(closes, skip=skip)
+    assert states == _walk(closes, skip=skip, reload_each=False)
+    for state in states:
+        if state.pause_start_session is not None:
+            after = sum(1 for label, _ in state.rolling_closes if label and label > state.pause_start_session)
+            assert state.pause_sessions_governed == min(after, CFG.DRAWDOWN_PAUSE_MAX_SESSIONS)
+
+
+def test_holiday_gap_and_replay_mid_episode_reload():
+    # Thanksgiving 2026-11-26 is not a session: the calendar passes 11-25 as the previous close.
+    plan = [("2026-11-23", 100, None), ("2026-11-24", 79, "2026-11-23"), ("2026-11-25", 79, "2026-11-24"),
+            ("2026-11-27", 79, "2026-11-25"), ("2026-11-30", 79, "2026-11-27")]
+    state = DrawdownState()
+    for day, equity, prev in plan:
+        state = persisted(update_drawdown(state, day, D(equity), previous_session=prev, config=CFG))
+        assert persisted(update_drawdown(state, day, D(1), previous_session=prev, config=CFG)) == state
+    assert state.paused and state.pause_sessions_governed == 3
+
+
+def test_one_ulp_residuals_reload():
+    state = run([D(100), D(100) / 3, D(100) / 7])[-1]
+    record = state.to_record()
+    record["rolling_drawdown"] = str(D(record["rolling_drawdown"]).next_plus())
+    record["drawdown"] = str(D(record["drawdown"]).next_minus())
+    loaded = DrawdownState.from_record(record, config=CFG)
+    assert loaded.paused == state.paused
+
+
+def _episode(**kw):
+    record = run(TRAP[:8])[-1].to_record()   # paused, start retained, governed 6
+    assert record["paused"] and record["pause_sessions_governed"] == 6
+    record.update(kw)
+    return record
+
+
+@pytest.mark.parametrize("record", [
+    _episode(pause_sessions_governed=5),                      # under-count
+    _episode(pause_sessions_governed=7),                      # over-count
+    _episode(pause_sessions_governed=21),                     # paused at the cap is impossible
+    _episode(pause_sessions_governed=22),
+    _episode(pause_start_session="2026-01-10"),               # interior anchor with no close (a Saturday)
+    _episode(last_equity=None),                               # raw equity lost on an advanced history
+    {**run(TRAP)[-1].to_record(), "pause_sessions_governed": 22},    # above the cap after expiry
+    {**run(TRAP)[-1].to_record(), "paused": True},            # expired clock cannot be active
+], ids=["under", "over", "paused_at_cap", "over_cap", "interior_anchor", "null_raw", "expired_over_cap",
+        "expired_active"])
+def test_inconsistent_episode_clock_fails_closed(record):
+    with pytest.raises(ValueError):
+        DrawdownState.from_record(record, config=CFG)
+
+
+def test_anchor_before_short_window_counts_at_least_retained_closes():
+    short = cfg(DRAWDOWN_ROLLING_SESSIONS=5)
+    state = run(TRAP[:12], reload_each=True, config=short)[-1]   # paused, governed 10, anchor slid out
+    record = state.to_record()
+    assert record["pause_start_session"] < record["rolling_closes"][0][0]
+    assert DrawdownState.from_record(record, config=short) == state
+    with pytest.raises(ValueError):
+        DrawdownState.from_record({**record, "pause_sessions_governed": 4}, config=short)  # < 5 retained
+    assert DrawdownState.from_record({**record, "pause_sessions_governed": 5}, config=short)
+
+
+def test_v1_migration_is_the_only_null_raw_equity():
+    migrated = DrawdownState.from_record(legacy(1), config=CFG)
+    assert persisted(migrated) == migrated and migrated.last_equity is None
