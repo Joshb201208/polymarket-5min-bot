@@ -146,6 +146,11 @@ class OptionLeg:
     price: Decimal | None
     price_ok: bool
     market_value: Decimal
+    # False when the broker omitted market_value (reconcile then carries 0). Read only by the
+    # drawdown close trust check: a missing short-leg liability must not be read as 0.
+    market_value_reported: bool = True
+    # True when the broker sent a market_value that is not a finite number (not merely absent).
+    market_value_malformed: bool = False
 
     @property
     def side(self) -> str:

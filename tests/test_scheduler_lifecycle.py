@@ -642,7 +642,7 @@ def test_close_performance_and_drawdown_share_trusted_mark_persisted_once(tmp_pa
         assert (await sched._close_drawdown()).detail == {"reason": "close_clock_unverified"}
         sess = sched.calendar.state.session
         sched.calendar.state = MarketState(MarketStatus.CLOSED, MarketSource.LIVE, sess)
-        assert (await sched._close_drawdown()).detail == {"reason": "close_equity_unverified"}
+        assert (await sched._close_drawdown()).detail["reason"] == "close_snapshot_indicative"
         assert sched.ledger.risk_state_get(DRAWDOWN_STATE_KEY) == old.to_record()
         assert not sched.ledger.equity_marks("close")
         snapshot = replace(snapshot, quality="live")

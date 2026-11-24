@@ -106,6 +106,77 @@ def _safe_report_reason(exc: BaseException, config: Any | None = None) -> str:
     return label[:180]
 
 
+_CLOSE_FAILURE_CAUSES: dict[str, str] = {
+    "close_clock_unverified": "the broker clock did not confirm the scheduled session had closed",
+    "close_equity_unverified": "the broker account equity could not be verified",
+    "close_snapshot_nonpositive": "the broker account equity was not positive",
+    "close_snapshot_preclose": "the account snapshot was taken before the scheduled close",
+    "close_snapshot_stale": "the account snapshot was not fresh enough",
+    "close_trading_block": "a ledger trading block was in force",
+    "close_unpriced_stock": "one or more stock prices could not be verified",
+    "close_option_marks_crossed": "the broker reported inconsistent prices for option spread legs",
+    "close_option_underlying_unpriced": "a reliable underlying price was unavailable for an unpriced option",
+    "close_option_mark_inconsistent": "the broker reported a value for an option whose price could not be verified",
+    "close_option_near_money": "a missing short-option price was too close to its strike to value safely",
+    "close_option_pairing_ambiguous": "an unpriced option leg could not be paired uniquely",
+    "close_option_credit_vertical": "an option credit spread had an unverified price",
+    "close_option_mark_missing": "an option position was missing its broker market value",
+    "close_option_unparseable": "an option contract symbol could not be parsed",
+    "close_option_adjusted_contract": "a non-standard adjusted option contract could not be valued safely",
+    "close_haircut_nonpositive": "account equity was not positive after the conservative option adjustment",
+    "close_snapshot_indicative": "the broker snapshot was indicative without a verified option-only cause",
+    "close_snapshot_quality_unknown": "the account snapshot had an unrecognised quality label",
+    "close_mark_not_recorded": "the closing equity mark did not save",
+    "previous_session_unverified": "the previous trading session could not be confirmed",
+    "drawdown_record_invalid": "the saved drawdown record could not be read or validated",
+    "drawdown_close_invalid": "the close or external cash flows could not be applied to drawdown",
+    "close_risk_input_unverified": "a separate closing risk check lacked usable inputs",
+}
+
+_CLOSE_FAILURE_ERRORS: dict[str, str] = {
+    "TimeoutError": "the closing check timed out",
+    "ReconcileError": "the broker account could not be reconciled",
+    "StateUnavailable": "the required local risk state could not be read",
+    "OperationalError": "the local database was unavailable during the closing check",
+}
+
+
+def _clean_close_symbols(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    out: list[str] = []
+    for val in values:
+        if (
+            isinstance(val, str)
+            and val.isascii()
+            and 0 < len(val) <= 32
+            and val.replace("-", "").replace(".", "").isalnum()
+            and val not in out
+        ):
+            out.append(val)
+    return out
+
+
+def _fmt_close_symbol_suffix(symbols: Sequence[str]) -> str:
+    if not symbols:
+        return ""
+    shown = ", ".join(symbols[:10])
+    return f" ({shown}{', plus others' if len(symbols) > 10 else ''})"
+
+
+def _format_close_job_cause(detail: Any) -> str:
+    d = detail if isinstance(detail, Mapping) else {}
+    reason = d.get("reason")
+    cause = _CLOSE_FAILURE_CAUSES.get(str(reason)) if isinstance(reason, str) else None
+    if cause is None:
+        err = d.get("error")
+        cause = _CLOSE_FAILURE_ERRORS.get(str(err)) if isinstance(err, str) else None
+    if cause is None:
+        cause = "the closing check could not verify a trusted close"
+    syms = _clean_close_symbols(d.get("symbols") or d.get("unpriced_option_legs"))
+    return f"{cause}{_fmt_close_symbol_suffix(syms)}"
+
+
 @dataclass(frozen=True)
 class _DrawdownReportSnapshot:
     decision_dd_pct: Decimal | None
@@ -1075,6 +1146,9 @@ class ReportBuilder:
         marks = self.ledger.equity_marks("close") if self.ledger else []
         flows = self.ledger.cash_flows() if self.ledger else []
         today_mark: EquityMark | None = next((m for m in marks if m.session_date == session_date), None)
+        missed_close_why, dd_brake_missed_why, close_job_failed = self._inspect_close_recording(
+            session_date, today_mark, snap
+        )
 
         if today_mark is None and snap is None:
             locks_empty = self._compile_entry_locks(None, entry_locks)
@@ -1092,7 +1166,10 @@ class ReportBuilder:
             return [
                 {
                     "title": f"📊 Daily Summary — {date_label}",
-                    "description": "Could not produce end-of-day summary because no verified broker snapshot was available.",
+                    "description": (
+                        f"Trusted close was not recorded today ({missed_close_why}), and could not produce "
+                        "end-of-day summary because no verified broker snapshot was available."
+                    ),
                     "color": 0xEF4444,
                     "fields": empty_fields,
                 }
@@ -1119,7 +1196,7 @@ class ReportBuilder:
             if (today_mark is not None and today_mark.options_mv is not None)
             else (snap.options_mv if snap is not None else None)
         )
-        mark_quality = "trusted close" if today_mark is not None else f"{snap.quality} snapshot (close mark pending)"  # type: ignore[union-attr]
+        mark_quality = self._format_close_mark_quality(today_mark, snap)
 
         # equity used for any return/drawdown: today's trusted close, else a LIVE snapshot only
         ret_eq = (
@@ -1185,15 +1262,43 @@ class ReportBuilder:
         exp_str = f"{exp_pct:.1f}%" if exp_pct is not None else "N/A"
         net_ret_val = total_ret_pct if total_ret_pct is not None else bm.portfolio_since_launch_pct
 
+        if sess_pnl is not None:
+            today_change_val = f"{_fmt_money(sess_pnl, signed=True, decimals=2)} ({_fmt_pct(sess_pct)})"
+            if today_mark is None and close_job_failed:
+                today_change_val += f" (close not recorded — {missed_close_why})"
+        elif today_mark is not None:
+            today_change_val = (
+                "First close baseline recorded"
+                if previous_close(marks, session_date) is None
+                else "Unavailable (previous close baseline was not positive)"
+            )
+        else:
+            today_change_val = f"Close not recorded — {missed_close_why}"
+
+        dd_brake_note = (
+            f"\n⚠️ Closing mark saved, but fall-from-peak brakes did not update today ({dd_brake_missed_why})."
+            if dd_brake_missed_why
+            else ""
+        )
+
+        if today_mark is None:
+            summary_description = (
+                f"Trusted close was not recorded today ({missed_close_why}). "
+                f"Showing latest {snap.quality} broker snapshot; fall-from-peak drawdown brakes did not update."  # type: ignore[union-attr]
+            )
+        elif dd_brake_missed_why:
+            summary_description = (
+                f"Closing account value was recorded, but the fall-from-peak drawdown brakes did not update today "
+                f"({dd_brake_missed_why})."
+            )
+        else:
+            summary_description = "End-of-day results based on reconciled broker holdings and verified close marks."
+
         summary_fields = [
             {"name": "Closing Account Value", "value": f"**{_fmt_money(equity, decimals=2)}** ({mark_quality})", "inline": True},
             {
                 "name": "Today's Change",
-                "value": f"{_fmt_money(sess_pnl, signed=True, decimals=2)} ({_fmt_pct(sess_pct)})" if sess_pnl is not None else (
-                    "Unavailable until a trusted close mark (snapshot is indicative)"
-                    if previous_close(marks, session_date) is not None
-                    else "First close baseline recorded"
-                ),
+                "value": today_change_val,
                 "inline": True,
             },
             {
@@ -1222,7 +1327,7 @@ class ReportBuilder:
             },
             {
                 "name": "Drawdown & Safety Tier",
-                "value": f"{dd_snap.label}{self._format_dual_drawdown_detail(dd_snap)}",
+                "value": f"{dd_snap.label}{self._format_dual_drawdown_detail(dd_snap)}{dd_brake_note}",
                 "inline": False,
             },
             {"name": "Borrowing & Leverage", "value": self._margin_lines(snap, bm, interest, session_date),
@@ -1270,11 +1375,89 @@ class ReportBuilder:
         return [
             {
                 "title": f"📊 Daily Close Summary — {date_label}",
-                "description": "End-of-day results based on reconciled broker holdings and verified close marks.",
+                "description": summary_description,
                 "color": color,
                 "fields": summary_fields,
             }
         ]
+
+    @staticmethod
+    def _format_close_mark_quality(today_mark: EquityMark | None, snap: BookSnapshot | None) -> str:
+        if today_mark is not None:
+            extra = today_mark.extra if isinstance(today_mark.extra, Mapping) else {}
+            if extra.get("conservative") is True:
+                legs = _clean_close_symbols(extra.get("unpriced_option_legs"))
+                haircut = _safe_dec(extra.get("haircut"))
+                haircut_txt = _fmt_money(haircut if haircut is not None else ZERO, decimals=2)
+                if legs:
+                    leg_word = "leg" if len(legs) == 1 else "legs"
+                    return (
+                        f"trusted close — conservative estimate: {len(legs)} option {leg_word} unpriced, "
+                        f"haircut {haircut_txt}"
+                    )
+                return f"trusted close — conservative estimate, haircut {haircut_txt}"
+            return "trusted close"
+        qual = getattr(snap, "quality", "indicative") if snap is not None else "indicative"
+        return f"{qual} snapshot — close not recorded"
+
+    def _inspect_close_recording(
+        self,
+        session_date: date,
+        today_mark: EquityMark | None,
+        snap: BookSnapshot | None,
+    ) -> tuple[str, str | None, bool]:
+        """Return ``(missed_close_reason, dd_brake_missed_reason, close_job_failed)``.
+
+        Watchpoint: ``drawdown_close`` can finish ``FAILED`` inside ``_evaluate_close_limits``
+        after both today's trusted close mark and today's ``DrawdownState.last_session``
+        have already persisted; never treat that as a missed trusted close or missed
+        drawdown brake update.
+        """
+        day_key = session_date.isoformat()
+        close_job = None
+        if self.ledger is not None and hasattr(self.ledger, "job_status"):
+            try:
+                close_job = self.ledger.job_status("drawdown_close", day_key)
+            except Exception:
+                close_job = None
+
+        status_raw = getattr(close_job, "status", None) if close_job is not None else None
+        status_val = getattr(status_raw, "value", status_raw)
+        close_job_failed = status_val == "failed"
+
+        if today_mark is not None:
+            if not close_job_failed:
+                return "", None, False
+            persisted_dd, corrupt_dd = _read_persisted_drawdown_checked(self.ledger, config=self.config)
+            if not corrupt_dd and persisted_dd is not None and persisted_dd.last_session == day_key:
+                return "", None, True
+            return "", _format_close_job_cause(getattr(close_job, "detail", None)), True
+
+        if close_job_failed:
+            return _format_close_job_cause(getattr(close_job, "detail", None)), None, True
+
+        if self.ledger is not None and hasattr(self.ledger, "trading_block"):
+            try:
+                if self.ledger.trading_block():
+                    return "a ledger trading block was in force", None, False
+            except Exception:
+                pass
+        if snap is None:
+            return "no verified broker snapshot was available", None, False
+        bad_stocks = _clean_close_symbols(
+            [h.symbol for h in snap.holdings if not h.price_ok or h.price is None or h.price <= ZERO]
+        )
+        if bad_stocks:
+            return f"one or more stock prices could not be verified{_fmt_close_symbol_suffix(bad_stocks)}", None, False
+        bad_legs = _clean_close_symbols([leg.occ_symbol for leg in snap.legs if not leg.price_ok])
+        if bad_legs:
+            return f"one or more option prices could not be verified{_fmt_close_symbol_suffix(bad_legs)}", None, False
+        if snap.quality != "live":
+            return "the broker snapshot was indicative", None, False
+        close_at = self._session_close(session_date)
+        if close_at is not None and snap.as_of < close_at:
+            return "the account snapshot was taken before the scheduled close", None, False
+        return "no closing equity mark was saved for this session", None, False
 
     def _daily_decisions_summary(
         self, session_date: date, closed_opt_structs: Sequence[Any]

@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from stock_agent import close_trust
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -60,6 +61,40 @@ NEWS_SECONDS = 180
 MAX_JOB_ATTEMPTS = 3
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
+
+DRAWDOWN_CLOSE_CAUSES = {
+    "close_clock_unverified": "The broker clock did not confirm the scheduled session had closed",
+    "close_equity_unverified": "The broker account equity could not be verified",
+    "close_snapshot_nonpositive": "The broker account equity was not positive",
+    "close_snapshot_preclose": "The account snapshot was taken before the scheduled close",
+    "close_snapshot_stale": "The account snapshot was not fresh enough",
+    "close_trading_block": "A ledger trading block was still in force",
+    "close_unpriced_stock": "One or more stock prices could not be verified",
+    "close_option_marks_crossed": "The broker reported inconsistent prices for the legs of an option spread",
+    "close_option_underlying_unpriced": "A reliable underlying price was unavailable for an unpriced option",
+    "close_option_mark_inconsistent": "The broker reported a value for an option whose price could not be verified",
+    "close_option_near_money": "A missing short-option price was too close to its strike to value safely",
+    "close_option_pairing_ambiguous": "An unpriced option leg could not be paired with a single spread partner",
+    "close_option_credit_vertical": "An unpriced or crossed leg belongs to a credit spread, which cannot be bounded safely",
+    "close_option_mark_missing": "The broker did not report a market value needed to value an option position",
+    "close_option_unparseable": "An option position symbol could not be parsed",
+    "close_option_adjusted_contract": "An unpriced short option may have a non-standard contract multiplier",
+    "close_haircut_nonpositive": "Account equity was not positive after the conservative option adjustment",
+    "close_snapshot_quality_unknown": "The account snapshot had an unrecognised quality label",
+    "close_snapshot_indicative": "The snapshot was indicative without a verified option-only cause",
+    "close_mark_not_recorded": "The account equity mark did not persist",
+    "previous_session_unverified": "The previous trading session could not be confirmed",
+    "drawdown_record_invalid": "The saved drawdown record could not be read or validated",
+    "drawdown_close_invalid": "The close or its external cash flows could not be used to update drawdown",
+    "close_risk_input_unverified": "A separate closing risk check did not have usable inputs",
+}
+
+DRAWDOWN_CLOSE_ERRORS = {
+    "TimeoutError": "The closing check timed out",
+    "ReconcileError": "The broker account could not be reconciled",
+    "StateUnavailable": "The required local risk state could not be read",
+    "OperationalError": "The local database was unavailable during the closing check",
+}
 
 
 def _now_et() -> datetime:
@@ -174,6 +209,7 @@ class StockAgentScheduler:
         self._options_task: asyncio.Task | None = None
         self._telemetry_task: asyncio.Task | None = None
         self._last_issue: dict[str, datetime] = {}
+        self._missed_close_notices: set[str] = set()
         self._pending_ledger_alerts: set[asyncio.Task] = set()
         self.macro = service("macro", lambda: MacroMonitor(
             self.config, prices=self.prices, store=self.store, defer_load=True,
@@ -211,6 +247,8 @@ class StockAgentScheduler:
                 routing = {"channel_key": "announcements"} if (
                     key == "normalise-plan" and isinstance(self.alerts, AlertService)
                 ) else {}
+                if isinstance(self.alerts, AlertService) and key and key.startswith("trusted-close-missed:"):
+                    routing["dedupe_window_sec"] = 48 * 3600
                 result = self.alerts.alert(severity, title, body, key=key, **routing)
                 if inspect.isawaitable(result):
                     async with asyncio.timeout(2):
@@ -817,21 +855,38 @@ class StockAgentScheduler:
         session = self.calendar.session_on(now.date())
         if (market.source is not MarketSource.LIVE or market.status is not MarketStatus.CLOSED
                 or session is None or now < session.closes_at):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_clock_unverified"})
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_CLOCK_UNVERIFIED})
         snapshot = await self.ledger.refresh("drawdown close")
-        if (snapshot.equity <= 0 or snapshot.as_of < session.closes_at
-                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        if snapshot.equity <= 0:
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_NONPOSITIVE})
+        if snapshot.as_of < session.closes_at:
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_PRECLOSE})
+        if abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_STALE})
         await self._evaluate_margin_guard(snapshot, now, at_close=True)
-        if snapshot.quality != "live" or self.ledger.trading_block():
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        if self.ledger.trading_block():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_TRADING_BLOCK})
+        marks = self.ledger.equity_marks("close", since=session.date)
+        mark = next((item for item in marks if item.session_date == session.date), None)
+        # On replay, report the persisted conservative fields of the recorded mark, never a refreshed value.
+        trust_detail: dict = close_trust.persisted_detail(mark.extra) if mark is not None else {}
+        if mark is None:
+            # Close path only: a copy at conservative equity; raw snapshot quality is unchanged elsewhere.
+            trust = close_trust.assess_close(snapshot, await self._underlying_session_closes(snapshot, session.date))
+            if not trust.trusted:
+                return JobOutcome(JobStatus.FAILED, detail=trust.detail())
+            # A fully live close keeps today's outcome and mark; only a conservative close carries detail.
+            trust_detail = trust.detail() if trust.conservative else {}
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
-        marks = self.ledger.equity_marks("close", since=session.date)
-        mark = next((item for item in marks if item.session_date == session.date), None)
         if mark is None:
-            self._last_close_report = await close_session(self.ledger, snapshot, session.date)
+            self._last_close_report = await close_session(
+                self.ledger, trust.close_snapshot(snapshot), session.date, mark_extra=trust_detail or None)
+            mark = next((item for item in self.ledger.equity_marks("close", since=session.date)
+                         if item.session_date == session.date), None)
+            if mark is None:
+                return JobOutcome(JobStatus.FAILED, detail={**trust_detail, "reason": "close_mark_not_recorded"})
         try:
             state = self._drawdown_state()
         except ValueError:
@@ -850,7 +905,7 @@ class StockAgentScheduler:
                     Decimal(0),
                 )
             updated = update_drawdown(
-                state, day, mark.equity if mark else snapshot.equity,
+                state, day, mark.equity,
                 previous_session=previous.date.isoformat(), net_external_flow=net_flow, config=self.config,
             )
         except (ValueError, InvalidOperation):
@@ -859,37 +914,59 @@ class StockAgentScheduler:
                               "The existing high-water record was retained.",
                               key=f"invalid-drawdown-close:{session.date}")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_close_invalid"})
+        # Commit the drawdown record before the ancillary close-limit check, so a failure there
+        # cannot keep the brakes stale (drawdown state does not affect trims or portfolio checks).
+        if updated != state:
+            self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
+            before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
+            alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
+            new_episode = updated.paused and updated.pause_start_session != state.pause_start_session
+            if before != (alert, throttled, updated.paused) or new_episode:
+                message = (
+                    f"Rolling decision drawdown: {updated.decision_drawdown:.1%}; "
+                    f"all-time drawdown: {updated.drawdown:.1%}. "
+                )
+                if new_episode:
+                    message += "A new drawdown pause started. "
+                elif state.paused and not updated.paused:
+                    expired = updated.pause_sessions_governed >= self.config.DRAWDOWN_PAUSE_MAX_SESSIONS
+                    why = "its session cap was reached" if expired else "the trusted-close recovery streak was met"
+                    message += f"The drawdown pause lifted because {why}; other entry checks still apply. "
+                if updated.paused:
+                    message += f"The pause can lift when {self._drawdown_release_condition(updated)}. "
+                if throttled:
+                    message += "Throttled: half-size stock entries when allowed, no new borrowing or options."
+                else:
+                    message += "Drawdown throttle inactive."
+                await self._alert(
+                    "critical" if updated.paused else "warning" if alert or throttled else "info",
+                    "Drawdown controls changed",
+                    message,
+                    key=f"drawdown:{session.date}",
+                )
         risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
-        if updated == state:
-            return risk_result
-        self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
-        before = (state.should_alert(self.config), state.is_throttled(self.config), state.paused)
-        alert, throttled = updated.should_alert(self.config), updated.is_throttled(self.config)
-        new_episode = updated.paused and updated.pause_start_session != state.pause_start_session
-        if before != (alert, throttled, updated.paused) or new_episode:
-            message = (
-                f"Rolling decision drawdown: {updated.decision_drawdown:.1%}; "
-                f"all-time drawdown: {updated.drawdown:.1%}. "
-            )
-            if new_episode:
-                message += "A new drawdown pause started. "
-            elif state.paused and not updated.paused:
-                expired = updated.pause_sessions_governed >= self.config.DRAWDOWN_PAUSE_MAX_SESSIONS
-                why = "its session cap was reached" if expired else "the trusted-close recovery streak was met"
-                message += f"The drawdown pause lifted because {why}; other entry checks still apply. "
-            if updated.paused:
-                message += f"The pause can lift when {self._drawdown_release_condition(updated)}. "
-            if throttled:
-                message += "Throttled: half-size stock entries when allowed, no new borrowing or options."
+        if trust_detail:
+            if risk_result is None:
+                risk_result = JobOutcome(JobStatus.DONE, detail=dict(trust_detail))
             else:
-                message += "Drawdown throttle inactive."
-            await self._alert(
-                "critical" if updated.paused else "warning" if alert or throttled else "info",
-                "Drawdown controls changed",
-                message,
-                key=f"drawdown:{session.date}",
-            )
+                risk_result = JobOutcome(risk_result.status, risk_result.intents,
+                                         {**trust_detail, **dict(risk_result.detail or {})},
+                                         risk_result.option_candidates)
         return risk_result
+
+    async def _underlying_session_closes(self, snapshot, session_date: date) -> dict[str, Decimal]:
+        """Official session closes for unpriced short legs' underlyings that are not held."""
+        needed = close_trust.short_leg_underlyings(snapshot)
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if not needed or getter is None:
+            return {}
+        try:
+            bars = await getter(list(needed), start_date=session_date, end_date=session_date)
+        except Exception:
+            logger.warning("Session closes for option underlyings unavailable", exc_info=True)
+            return {}
+        return {symbol: bar.close for symbol, rows in bars.items() for bar in rows
+                if bar.session_date == session_date}
 
     async def _evaluate_close_limits(self, snapshot, session_date: date, previous_session: date):
         controls = self._risk_controls()
@@ -1032,6 +1109,13 @@ class StockAgentScheduler:
             return
         row = self.ledger.job_status(name, window_key)
         if row is not None:
+            if (name == "drawdown_close" and row.status is JobStatus.FAILED
+                    and row.attempts >= MAX_JOB_ATTEMPTS and row.detail.get("missed_close_streak")
+                    and window_key not in self._missed_close_notices):
+                # The terminal outcome is durable before alert dispatch. If a process
+                # stopped between them, recover the notice, not the close or any orders.
+                self._job_tasks[name] = asyncio.create_task(self._warn_missed_close(window_key, row.detail))
+                return
             if row.status in {JobStatus.DONE, JobStatus.SKIPPED} or row.attempts >= MAX_JOB_ATTEMPTS:
                 return
             if row.status is JobStatus.STARTED and not replay:
@@ -1048,6 +1132,87 @@ class StockAgentScheduler:
             name=f"stock-agent:{name}",
         )
 
+    def _terminal_close_failure(self, window_key, detail):
+        day = date.fromisoformat(window_key)
+        try:
+            last_applied = self._drawdown_state().last_session
+        except (ValueError, StateUnavailable, sqlite3.Error):
+            last_applied = None
+        if last_applied == window_key:
+            # The close-limit check can fail even after the drawdown record advances.
+            return detail
+        try:
+            mark_present = any(m.session_date == day for m in self.ledger.equity_marks("close", since=day))
+        except (ValueError, StateUnavailable, sqlite3.Error):
+            mark_present = None
+        streak = 1
+        prior = self.calendar.previous_session(day)
+        lower_bound = prior is None
+        while prior is not None and prior.date < day:
+            key = prior.date.isoformat()
+            if last_applied is not None and key <= last_applied:
+                break
+            if last_applied is None:
+                # Without a verifiable baseline, count only observed terminal
+                # misses. A missing job row does not establish an earlier miss.
+                try:
+                    row = self.ledger.job_status("drawdown_close", key)
+                except (ValueError, StateUnavailable, sqlite3.Error):
+                    lower_bound = True
+                    break
+                if row is None or row.status is not JobStatus.FAILED or row.attempts < MAX_JOB_ATTEMPTS:
+                    lower_bound = True
+                    break
+                saved_streak = row.detail.get("missed_close_streak")
+                if type(saved_streak) is int and saved_streak > 0:
+                    streak += saved_streak
+                    lower_bound = bool(row.detail.get("missed_close_streak_lower_bound"))
+                    break
+                if row.detail.get("reason") == "close_risk_input_unverified":
+                    lower_bound = True
+                    break
+            # When the state is readable and has a date, every later trading
+            # session missed the update, including days the process did not run.
+            streak += 1
+            day = prior.date
+            prior = self.calendar.previous_session(day)
+            lower_bound = prior is None
+        return {**detail, "missed_close_streak": streak, "missed_close_streak_lower_bound": lower_bound,
+                "close_mark_present": mark_present}
+
+    async def _warn_missed_close(self, window_key, detail):
+        if window_key in self._missed_close_notices:
+            return
+        self._missed_close_notices.add(window_key)
+        if detail.get("close_mark_present") is True:
+            headline = "An equity mark exists, but the fall-from-peak brakes did not update."
+            title = "Drawdown did not update from the close"
+        elif detail.get("close_mark_present") is False:
+            headline = "No trusted close was recorded today, so the fall-from-peak brakes did not update."
+            title = "Trusted close not recorded"
+        else:
+            headline = "The bot could not confirm a trusted close or an update to the fall-from-peak brakes."
+            title = "Trusted close not verified"
+        cause = DRAWDOWN_CLOSE_CAUSES.get(detail.get("reason"))
+        if cause is None:
+            cause = DRAWDOWN_CLOSE_ERRORS.get(detail.get("error"), "The closing check could not complete")
+        values = detail.get("symbols") or detail.get("unpriced_option_legs")
+        names = list(dict.fromkeys(
+            value for value in values if isinstance(value, str) and value.isascii()
+            and 0 < len(value) <= 32 and value.replace("-", "").replace(".", "").isalnum()
+        )) if isinstance(values, (list, tuple)) else []
+        if names:
+            cause += f" ({', '.join(names[:10])}{', plus others' if len(names) > 10 else ''})"
+        count = str(detail["missed_close_streak"])
+        if detail.get("missed_close_streak_lower_bound"):
+            count = f"at least {count} (earlier sessions could not be verified)"
+        await self._alert(
+            "critical", title,
+            f"{window_key}: {headline} Cause: {cause}. "
+            f"Consecutive trading days with a missed drawdown update: {count}.",
+            key=f"trusted-close-missed:{window_key}",
+        )
+
     async def _run_scheduled_job(self, name, window_key, callback, timeout, attempt):
         try:
             async with asyncio.timeout(timeout):
@@ -1057,18 +1222,29 @@ class StockAgentScheduler:
             detail = getattr(outcome, "detail", {})
             if not isinstance(detail, Mapping):
                 detail = {"reason": str(detail)[:160]}
+            if name == "drawdown_close" and status is JobStatus.FAILED and attempt >= MAX_JOB_ATTEMPTS:
+                detail = self._terminal_close_failure(window_key, detail)
             retry = _now_utc() + timedelta(minutes=5 * attempt) if status is JobStatus.FAILED else None
             self.ledger.finish_job(name, window_key, status, intents=intents, detail=detail, eligible_retry_at=retry)
             if status is JobStatus.SKIPPED and isinstance(self.alerts, AlertService):
                 self.alerts.alert_skipped_cycle(name, str(detail.get("reason") or "schedule gate declined"))
             elif status is JobStatus.FAILED:
-                await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
-                                  key=f"job-result:{name}")
+                if name == "drawdown_close" and detail.get("missed_close_streak"):
+                    await self._warn_missed_close(window_key, detail)
+                else:
+                    await self._alert("warning", f"{name} {status.value}", "See the job journal for details.",
+                                      key=f"job-result:{name}")
         except Exception as exc:
+            detail = {"error": type(exc).__name__}
+            if name == "drawdown_close" and attempt >= MAX_JOB_ATTEMPTS:
+                detail = self._terminal_close_failure(window_key, detail)
             self.ledger.finish_job(name, window_key, JobStatus.FAILED,
-                                   detail={"error": type(exc).__name__},
+                                   detail=detail,
                                    eligible_retry_at=_now_utc() + timedelta(minutes=5 * attempt))
-            await self._report_exception(name, exc)
+            if name == "drawdown_close" and detail.get("missed_close_streak"):
+                await self._warn_missed_close(window_key, detail)
+            else:
+                await self._report_exception(name, exc)
 
     async def _collect_finished_jobs(self):
         for name, task in tuple(self._job_tasks.items()):

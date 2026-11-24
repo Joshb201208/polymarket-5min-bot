@@ -635,7 +635,10 @@ async def reconcile(ledger: Ledger, *, reason: str, rebuild: bool = False) -> Bo
                                       action="mark not used"))
                 legs.append(OptionLeg(occ_symbol=sym, underlying=und, right=right, strike=strike, expiry=exp,
                                       qty=qty, multiplier=100, avg_cost=avg, price=price, price_ok=ok,
-                                      market_value=mv))
+                                      market_value=mv,
+                                      market_value_reported=_dec(_g(p, "market_value")) is not None,
+                                      market_value_malformed=(_g(p, "market_value") not in (None, "")
+                                                              and _dec(_g(p, "market_value")) is None)))
                 continue
             if qty < 0:
                 blocked.add(sym)
