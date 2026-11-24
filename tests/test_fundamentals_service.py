@@ -117,6 +117,85 @@ def test_universe_size_caps_non_focus_only(world):
     assert uni[:2] == ("F1", "F2") and len(uni) == 7
 
 
+def test_universe_catalogue_round_robin_covers_every_tradable_sector_in_first_50_deterministically(world):
+    screener(world)
+    symbol_to_sector = {
+        sym: sector
+        for sector, names in UNIVERSE_CATALOGUE.items()
+        for sym in names
+    }
+    all_metas = [Meta(s, canonical_sector=sec) for s, sec in symbol_to_sector.items()]
+    assets_all = Assets(all_metas)
+
+    first_50_a = run_svc(lambda s: s.list_universe(), assets=assets_all, universe_size=50, focus=())
+    first_50_b = run_svc(lambda s: s.list_universe(), assets=assets_all, universe_size=50, focus=())
+    rr_50, baseline_50 = run_svc(
+        lambda s: s.list_universe_with_baseline(), assets=assets_all, universe_size=50, focus=()
+    )
+    assert len(first_50_a) == 50
+    assert first_50_a == first_50_b == rr_50
+
+    # Baseline second tuple preserves exact 185f9c6 fixed-sector catalogue order for direct options parity
+    expected_fixed_50 = tuple(
+        dict.fromkeys(s for names in UNIVERSE_CATALOGUE.values() for s in names)
+    )[:50]
+    assert baseline_50 == expected_fixed_50
+
+    # First pass must take the first leader from each of the 11 GICS sectors in stable order
+    expected_round_one = tuple(names[0] for names in UNIVERSE_CATALOGUE.values())
+    assert first_50_a[: len(expected_round_one)] == expected_round_one
+    expected_round_two = tuple(names[1] for names in UNIVERSE_CATALOGUE.values())
+    assert first_50_a[len(expected_round_one) : 2 * len(expected_round_one)] == expected_round_two
+
+    represented_sectors = {symbol_to_sector[sym] for sym in first_50_a}
+    assert represented_sectors == set(UNIVERSE_CATALOGUE.keys())
+
+    # Even if Utilities only has its final ticker tradable, it still appears in round 1 (first 50)
+    utilities = list(UNIVERSE_CATALOGUE[CanonicalSector.UTILITIES])
+    sparse_metas = [
+        Meta(
+            s,
+            tradable=(s == utilities[-1]) if sec == CanonicalSector.UTILITIES else True,
+            canonical_sector=sec,
+        )
+        for s, sec in symbol_to_sector.items()
+    ]
+    sparse_50 = run_svc(lambda s: s.list_universe(), assets=Assets(sparse_metas), universe_size=50, focus=())
+    sparse_sectors = {symbol_to_sector[sym] for sym in sparse_50}
+    assert CanonicalSector.UTILITIES in sparse_sectors
+    assert utilities[-1] in sparse_50[: len(UNIVERSE_CATALOGUE)]
+    assert sparse_sectors == set(UNIVERSE_CATALOGUE.keys())
+
+    # End-to-end scheduler check: equity research gets round-robin catalogue while direct
+    # options scan (_option_universe) keeps exact 185f9c6 fixed-sector catalogue parity
+    for sym in (*Config().PRIORITY_SYMBOLS, *symbol_to_sector):
+        world.alpaca.add_asset(sym)
+    world.fmp.fail("/stable/company-screener", "status", status=402, times=None)
+
+    async def _check_sched_options_baseline() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            eq_uni = await sched.research.sources.universe(world.clock.now())
+            opt_uni = tuple(sched._option_universe())
+            focus = tuple(sched.config.PRIORITY_SYMBOLS)
+            rest_fixed_non_focus = [
+                s for names in UNIVERSE_CATALOGUE.values() for s in names if s not in focus
+            ][: sched.config.UNIVERSE_SIZE]
+            expected_opt = tuple(dict.fromkeys((*focus, *rest_fixed_non_focus)))[: sched.config.UNIVERSE_SIZE]
+            rest_rr_non_focus = [s for s in first_50_a if s not in focus]
+            assert eq_uni[: len(focus)] == focus
+            assert eq_uni[len(focus) : len(focus) + len(rest_rr_non_focus)] == tuple(
+                rest_rr_non_focus[: sched.config.UNIVERSE_SIZE - len(focus)]
+            )
+            assert opt_uni == expected_opt
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_check_sched_options_baseline())
+
+
 # ------------------------------------------------------------------ SEC TTM
 def _f(start, end, val, filed="2026-11-01"):
     return {"start": start, "end": end, "val": val, "filed": filed}

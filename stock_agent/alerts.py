@@ -972,7 +972,7 @@ class AlertService:
     ) -> bool:
         st = str(state).strip().lower()
         key = f"input:{provider}:{capability}"
-        if st == "healthy":
+        if st in ("healthy", "ok"):
             return self.alert(
                 Severity.INFO,
                 f"{provider} ({capability}) is working again",
@@ -982,7 +982,7 @@ class AlertService:
                 channel_key="risk",
                 resolved=True,
             )
-        if st == "disabled":
+        if st in ("disabled", "absent", "unknown"):
             return False
 
         sev = Severity.CRITICAL if (required_for_trading and st == "unhealthy") else Severity.WARNING

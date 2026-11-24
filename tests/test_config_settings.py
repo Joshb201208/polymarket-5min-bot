@@ -119,16 +119,14 @@ def test_no_secret_defaults_exist_in_code_or_repr() -> None:
         "ANTHROPIC_API_KEY",
         "FMP_API_KEY",
         "FINNHUB_API_KEY",
-        "TIPRANKS_API_KEY",
-        "TIPRANKS_API_TOKEN",
-        "TIPRANKS_EMAIL",
-        "TIPRANKS_PASSWORD",
         "DISCORD_BOT_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_CHAT_ID",
     ]
     for field_name in secret_fields:
         assert getattr(defaults, field_name) == "", f"{field_name} has a non-empty default"
+    for removed_tipranks in ("TIPRANKS_API_KEY", "TIPRANKS_API_TOKEN", "TIPRANKS_EMAIL", "TIPRANKS_PASSWORD"):
+        assert not hasattr(defaults, removed_tipranks)
 
     populated = load_settings(SERVER_ENV_SUMMARY_SYNTHETIC)
     secret_vals = populated.secret_values()

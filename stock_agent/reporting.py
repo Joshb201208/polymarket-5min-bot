@@ -325,8 +325,12 @@ def format_input_health_table(health_registry: Any | None) -> tuple[str, list[di
 
     icon_map = {
         "healthy": "✅",
+        "ok": "✅",
         "degraded": "⚠️",
+        "stale": "⚠️",
         "unhealthy": "🚨",
+        "dead": "🚨",
+        "absent": "•",
         "disabled": "⏸️",
     }
     lines: list[str] = []
@@ -340,7 +344,7 @@ def format_input_health_table(health_registry: Any | None) -> tuple[str, list[di
             continue
         icon = icon_map.get(state, "•")
         req_tag = " (required)" if req else " (backup)"
-        note = f" — {err[:90]}" if err and state in ("degraded", "unhealthy") else ""
+        note = f" — {err[:90]}" if err and state in ("degraded", "unhealthy", "ok", "stale", "dead", "absent") else ""
         lines.append(f"{icon} **{prov} {cap}**{req_tag}: {state}{note}")
 
     if not lines:

@@ -37,8 +37,12 @@ UNHEALTHY_FAILURE_THRESHOLD = 3
 
 class HealthState(StrEnum):
     HEALTHY = "healthy"
+    OK = "ok"
     DEGRADED = "degraded"
+    STALE = "stale"
     UNHEALTHY = "unhealthy"
+    DEAD = "dead"
+    ABSENT = "absent"
     PLAN_BLOCKED = "plan_blocked"
     DISABLED = "disabled"
     UNKNOWN = "unknown"
@@ -56,13 +60,15 @@ class InputHealthStatus:
     last_status_code: int | None = None
     last_error_summary: str | None = None
     blocked_until: datetime | None = None
+    row_count: int | None = None
+    age_days: float | None = None
 
     @property
     def key(self) -> str:
         return f"{self.provider}:{self.capability}"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "provider": self.provider,
             "capability": self.capability,
             "state": self.state.value,
@@ -74,6 +80,11 @@ class InputHealthStatus:
             "last_error_summary": self.last_error_summary,
             "blocked_until": self.blocked_until.isoformat() if self.blocked_until else None,
         }
+        if self.row_count is not None:
+            payload["row_count"] = self.row_count
+        if self.age_days is not None:
+            payload["age_days"] = round(float(self.age_days), 3)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -150,12 +161,7 @@ class ProviderHealthRegistry:
         )
         finnhub_configured = bool(getattr(self.config, "FINNHUB_API_KEY", ""))
         fmp_configured = bool(getattr(self.config, "FMP_API_KEY", ""))
-        tipranks_configured = any(
-            bool(getattr(self.config, attr, ""))
-            for attr in ("TIPRANKS_API_KEY", "TIPRANKS_API_TOKEN")
-        ) or bool(
-            getattr(self.config, "TIPRANKS_EMAIL", "") and getattr(self.config, "TIPRANKS_PASSWORD", "")
-        )
+        tipranks_enabled = bool(getattr(self.config, "TIPRANKS_ENABLED", True))
         llm_configured = any(
             bool(getattr(self.config, attr, ""))
             for attr in ("PERPLEXITY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
@@ -176,10 +182,13 @@ class ProviderHealthRegistry:
             ("fmp", "fundamentals", False, fmp_configured),
             ("fmp", "screener", False, fmp_configured),
             ("sec", "edgar", False, True),
-            ("tipranks", "screener", False, tipranks_configured),
+            ("tipranks", "screener", False, tipranks_enabled),
         ]
         for provider, capability, required, enabled in defaults:
-            state = HealthState.UNKNOWN if enabled else HealthState.DISABLED
+            if (provider, capability) == ("tipranks", "screener"):
+                state = HealthState.ABSENT if enabled else HealthState.DISABLED
+            else:
+                state = HealthState.UNKNOWN if enabled else HealthState.DISABLED
             self._statuses[(provider, capability)] = InputHealthStatus(
                 provider=provider,
                 capability=capability,
@@ -240,6 +249,8 @@ class ProviderHealthRegistry:
                 last_status_code=item.get("last_status_code"),
                 last_error_summary=item.get("last_error_summary"),
                 blocked_until=blocked_until,
+                row_count=int(item["row_count"]) if item.get("row_count") is not None else None,
+                age_days=float(item["age_days"]) if item.get("age_days") is not None else None,
             )
 
         sym_blocks = raw.get("symbol_blocks", {})
@@ -376,6 +387,45 @@ class ProviderHealthRegistry:
         )
         self._statuses[key] = updated
         if prev_state is HealthState.PLAN_BLOCKED or (prev and prev.consecutive_failures > 0):
+            self._persist()
+        self._emit_if_changed(prev_state, updated)
+        return updated
+
+    def record_tipranks(
+        self,
+        state: HealthState | str,
+        *,
+        row_count: int = 0,
+        age_days: float | None = None,
+        summary: str = "",
+        at: datetime | None = None,
+    ) -> InputHealthStatus:
+        """Record local TipRanks screener CSV status (ok / stale / dead / absent / disabled)."""
+        self._ensure_loaded()
+        ts = utc_datetime(at or self._now())
+        key = ("tipranks", "screener")
+        prev = self._statuses.get(key)
+        prev_state = prev.state if prev else HealthState.ABSENT
+        resolved_state = state if isinstance(state, HealthState) else HealthState(str(state))
+        clean_summary = scrub_secrets(summary)[:240] if summary else None
+        is_usable = resolved_state in (HealthState.OK, HealthState.STALE)
+        is_problem = resolved_state in (HealthState.STALE, HealthState.DEAD)
+        updated = InputHealthStatus(
+            provider="tipranks",
+            capability="screener",
+            state=resolved_state,
+            required_for_trading=False,
+            last_ok_at=ts if is_usable else (prev.last_ok_at if prev else None),
+            last_error_at=ts if is_problem else (prev.last_error_at if prev else None),
+            consecutive_failures=(prev.consecutive_failures + 1 if prev else 1) if is_problem else 0,
+            last_status_code=None,
+            last_error_summary=clean_summary,
+            blocked_until=None,
+            row_count=int(row_count),
+            age_days=round(float(age_days), 3) if age_days is not None else None,
+        )
+        self._statuses[key] = updated
+        if prev_state != resolved_state:
             self._persist()
         self._emit_if_changed(prev_state, updated)
         return updated
@@ -676,6 +726,8 @@ class ProviderHealthRegistry:
         self._ensure_loaded()
         now_utc = utc_datetime(self._now())
         return self._expire_if_due((provider, capability), now_utc)
+
+    get_status = status
 
     def get_input_health(self) -> dict[str, InputHealthStatus]:
         """Return snapshot keyed by 'provider:capability' for alerts_reporting."""
