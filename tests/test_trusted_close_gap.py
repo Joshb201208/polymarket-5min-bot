@@ -27,6 +27,7 @@ from stock_agent.scheduler import MAX_JOB_ATTEMPTS
 GS_CALL = "GS261127C00920000"
 JPM_CALL = "JPM261127C00345000"
 ALERT_TITLE = "Trusted close not recorded"
+STREAK = "Consecutive trading days with a missed drawdown update: {}."
 
 
 # --------------------------------------------------------------------------- accessors for the fix's contract
@@ -48,7 +49,8 @@ def detail_text(row) -> str:
 
 
 def missed_alerts(world) -> list[str]:
-    return [t for t in world.alert_texts() if ALERT_TITLE in t]
+    """One entry per alert: Discord only (Telegram mirrors every alert)."""
+    return [t for t in world.discord.texts() if ALERT_TITLE in t]
 
 
 # --------------------------------------------------------------------------- book and job helpers
@@ -93,6 +95,8 @@ async def run_attempts(sched, world, day: int, attempts: int = 1, *, hour: int =
         if task := sched._job_tasks.get("drawdown_close"):
             await task
             await sched._collect_finished_jobs()
+        if hasattr(sched.alerts, "flush"):
+            await sched.alerts.flush()  # alerts are queued; the fake Discord/Telegram see them after a flush
         world.clock.advance(minutes=16)
     return sched.ledger.job_status("drawdown_close", key)
 
@@ -161,7 +165,7 @@ def test_23nov_replay_and_restart_keep_one_mark(world):
         fresh = world.scheduler()
         fresh.store.open()
         try:
-            row = await run_attempts(fresh, world, 23)
+            row = await run_attempts(fresh, world, 23, minute=50)  # the sim clock never runs backwards
             assert row.status is JobStatus.DONE and row.attempts == 1  # DONE is not re-run after restart
         finally:
             await fresh._cleanup()
@@ -222,7 +226,8 @@ def test_short_leg_far_from_strike_applies_intrinsic_haircut(world, right, und_p
 
     async def body(sched):
         equity = broker_equity(world)
-        row = await run_attempts(sched, world, 23)
+        # an unheld underlying is priced from today's official daily bar, served from close + 16 min
+        row = await run_attempts(sched, world, 23, minute=5 if held else 20)
         assert row.status is JobStatus.DONE, row
         mark = close_mark(sched, date(2026, 11, 23))
         haircut = Decimal(intrinsic * 100 * 2)
@@ -278,14 +283,14 @@ def test_unpriced_stock_stays_untrusted(world, symbol):
     _run(world, body)
 
 
-def test_trading_block_stays_untrusted(world):
+def test_trading_block_stays_untrusted(world, monkeypatch):
     seed_23nov(world)
 
     async def body(sched):
         world.clock.set_et(2026, 11, 23, 16, 5)
         await sched.ledger.refresh("fixture")
-        sched.store.set_trading_block("test: operator block")
-        assert sched.ledger.trading_block()
+        # a clean reconcile clears a store block, so hold it in force the way a live block would be
+        monkeypatch.setattr(sched.ledger, "trading_block", lambda: "test: operator block")
         row = await run_attempts(sched, world, 23)
         assert row.status is JobStatus.FAILED
         assert close_mark(sched, date(2026, 11, 23)) is None and drawdown_session(sched) is None
@@ -336,7 +341,7 @@ def test_final_attempt_alert_fires_once_with_cause_and_streak(world):
         assert row.attempts == MAX_JOB_ATTEMPTS and row.status is JobStatus.FAILED
         assert row.detail.get("reason") not in (None, "close_equity_unverified")  # a distinct cause code
         (msg,) = missed_alerts(world)
-        assert "PDD" in msg and "1" in msg.replace("2026", "")
+        assert "PDD" in msg and STREAK.format(1) in msg
         await run_attempts(sched, world, 23, attempts=2, minute=59)  # attempts exhausted: no rerun, no repeat
         assert len(missed_alerts(world)) == 1
 
@@ -344,18 +349,18 @@ def test_final_attempt_alert_fires_once_with_cause_and_streak(world):
         world.alpaca.set_price("PDD", 0.0)
         await run_attempts(sched, world, 24, attempts=MAX_JOB_ATTEMPTS)
         msgs = missed_alerts(world)
-        assert len(msgs) == 2 and "2" in msgs[-1].replace("2026", "")  # second trading day in a row
+        assert len(msgs) == 2 and STREAK.format(2) in msgs[-1]  # second trading day in a row
 
     _run(world, body)
 
 
-def test_final_attempt_alert_names_the_trading_block(world):
+def test_final_attempt_alert_names_the_trading_block(world, monkeypatch):
     seed_23nov(world)
 
     async def body(sched):
         world.clock.set_et(2026, 11, 23, 16, 5)
         await sched.ledger.refresh("fixture")
-        sched.store.set_trading_block("test: operator block")
+        monkeypatch.setattr(sched.ledger, "trading_block", lambda: "test: operator block")
         row = await run_attempts(sched, world, 23, attempts=MAX_JOB_ATTEMPTS)
         (msg,) = missed_alerts(world)
         assert "block" in msg.lower()
@@ -379,7 +384,7 @@ def test_streak_resets_after_a_recorded_close(world):
         await run_attempts(sched, world, 25, attempts=MAX_JOB_ATTEMPTS)
         msgs = missed_alerts(world)
         assert len(msgs) == 2
-        assert not any(f"{n} trading days" in msgs[-1] or f"{n} consecutive" in msgs[-1] for n in (2, 3))
+        assert STREAK.format(1) in msgs[-1]  # the recorded close on 24 Nov reset the streak
 
     _run(world, body)
 
