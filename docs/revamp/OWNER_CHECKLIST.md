@@ -32,7 +32,7 @@ Rotate or revoke each item below in its provider dashboard:
 ## 2. Check Provider Billing and Quotas (Browser Only)
 
 - **`PERPLEXITY_API_KEY`**: Check your Perplexity API credit balance and auto-top-up settings (earlier runs hit HTTP 401 insufficient-credit responses).
-- **`OPENAI_API_KEY` and `ANTHROPIC_API_KEY`**: Verify active credit balances and monthly spend caps in OpenAI and Anthropic billing settings. The revamped research pipeline reads all three keys (`RESEARCH_PROVIDER_ORDER=openai,perplexity,anthropic`) and enforces a built-in weekly spend cap (`RESEARCH_WEEKLY_BUDGET_USD=15.0`).
+- **`OPENAI_API_KEY` and `ANTHROPIC_API_KEY`**: Verify active credit balances and monthly spend caps in OpenAI and Anthropic billing settings. The revamped research pipeline reads all three keys (`RESEARCH_PROVIDER_ORDER=perplexity,openai,anthropic`) and enforces a built-in weekly spend cap (`RESEARCH_WEEKLY_BUDGET_USD=15.0`).
 - **`FMP_API_KEY` and `FINNHUB_API_KEY`**: Confirm your active subscription / rate-limit tier. Endpoints outside your current FMP plan are now automatically circuit-broken instead of retrying every cycle.
 
 ---
