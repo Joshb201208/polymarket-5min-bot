@@ -361,3 +361,36 @@ def test_heartbeat_callback_error_and_false_return_handled(world: FakeWorld) -> 
 
     asyncio.run(_run())
 
+
+def test_alert_entries_locked_daily_repeat_and_margin_trim(world: FakeWorld, tmp_path: Path) -> None:
+    async def _run() -> None:
+        cfg = Config()
+        cfg.DATA_DIR = tmp_path
+        cfg.DISCORD_BOT_TOKEN = "test-discord"
+        cfg.TELEGRAM_BOT_TOKEN = ""
+        svc = AlertService(cfg, clock=world.clock.now)
+
+        locks = [
+            {
+                "code": "cleanup_pending",
+                "lock": "first-run account clean-up pending",
+                "clears_when": "initial protective stops and legacy position repairs complete",
+            }
+        ]
+        # Fires once for 2026-11-23, dedupes within same session_date, repeats on 2026-11-24
+        assert svc.alert_entries_locked(locks, session_date="2026-11-23") is True
+        assert svc.alert_entries_locked(locks, session_date="2026-11-23") is False
+        assert svc.alert_entries_locked(locks, session_date="2026-11-24") is True
+
+        # Critical margin trim normalizes fractional excess (0.12 -> 12.0%) and target (0.25 -> 25.0%)
+        assert svc.alert_margin_trim(0.12, 0.25, ["AMD", "MU"], in_session=True) is True
+        await svc.flush()
+        texts = "\n".join(world.discord.texts())
+        assert "Entries locked: first-run account clean-up pending — clears when initial protective stops" in texts
+        assert "12.0%" in texts
+        assert "25.0%" in texts
+        assert "AMD, MU" in texts
+
+    asyncio.run(_run())
+
+
