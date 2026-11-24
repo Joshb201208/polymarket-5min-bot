@@ -28,6 +28,7 @@ class ResearchSources:
         fetch_releases: Callable[[tuple[str, ...], datetime], Awaitable[Sequence[Any]]] | None = None,
         asset_for: Callable[[str], Any] | None = None,
         health=None,
+        tipranks=None,
         fundamental_limit: int = 10,
     ):
         self.prices = prices
@@ -38,21 +39,40 @@ class ResearchSources:
         self.fetch_releases = fetch_releases
         self.asset_for = asset_for or (lambda _symbol: None)
         self.health = health
+        self.tipranks = tipranks
         self.fundamental_limit = max(0, fundamental_limit)
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
+        self._universe_tipranks_key: tuple[Any, ...] | None = None
+        self.last_universe_sources: dict[str, int] = {}
         self._news_at: dict[str, datetime] = {}
         self._quote_at: dict[str, datetime] = {}
         self._companies: dict[str, tuple[datetime, Any]] = {}
 
+    def record_universe_sources(self, counts: Mapping[str, int]) -> None:
+        self.last_universe_sources = {str(k): int(v) for k, v in counts.items()}
+
+    def _tipranks_universe_key(self, now: datetime) -> tuple[Any, ...]:
+        key_fn = getattr(self.tipranks, "universe_cache_key", None)
+        if key_fn is None:
+            return ()
+        return tuple(key_fn(now))
+
     async def universe(self, now: datetime) -> tuple[str, ...]:
-        if self._universe_at is None or now - self._universe_at >= timedelta(hours=12):
+        tr_key = self._tipranks_universe_key(now)
+        if (
+            self._universe_at is None
+            or now - self._universe_at >= timedelta(hours=12)
+            or tr_key != self._universe_tipranks_key
+        ):
             candidates = await self.list_universe()
             if candidates:
                 self._universe = tuple(dict.fromkeys(candidates))
                 self._universe_at = now
+                self._universe_tipranks_key = self._tipranks_universe_key(now)
             elif self._universe_at and now - self._universe_at > timedelta(days=2):
                 self._universe = ()
+                self._universe_tipranks_key = tr_key
         return self._universe
 
     def quote_ok(self, symbol: str, now: datetime) -> bool:
@@ -257,10 +277,13 @@ class ResearchSources:
             raw_metrics = getattr(snapshot, "metrics", {})
             metrics = _metrics(raw_metrics)
             quote = quotes.get(symbol)
+            ev_fn = getattr(self.tipranks, "evidence_for", None)
+            tr_evidence = tuple(ev_fn(symbol, now)) if ev_fn is not None else ()
+            snap_evidence = tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))
             out[symbol] = SecurityInputs(
                 symbol, str(display_name), str(sector), _price(quote.price) if quote else None,
                 utc_datetime(quote.as_of) if quote else None, tradable, metrics,
-                tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))[:12],
+                (*tr_evidence, *snap_evidence)[:12],
                 _provenance(raw_metrics),
             )
         return out

@@ -43,6 +43,7 @@ from stock_agent.state_store import StateUnavailable
 from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor
+from stock_agent.tipranks_ingest import TipRanksIngestor
 
 logger = logging.getLogger(__name__)
 
@@ -166,10 +167,12 @@ class StockAgentScheduler:
             health=self.health,
         ))
         self.analyst = service("analyst", lambda: Analyst(self.llm))
+        self.tipranks = service("tipranks", lambda: TipRanksIngestor(self.config, health=self.health))
         self.research_sources = service("research_sources", lambda: ResearchSources(
             self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
             cached_company=getattr(self.fundamentals, "cached_company", None),
             fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
+            tipranks=self.tipranks,
         ))
         self.research_health = service("research_health", lambda: ResearchInputHealth(
             self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
@@ -534,9 +537,10 @@ class StockAgentScheduler:
         current = self.ledger.last_snapshot()
         held = (position.symbol for position in current.holdings) if current else ()
         catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
+        tr_syms = tuple(self.tipranks.read(_now_utc()).rows) if self.tipranks is not None else ()
         return tuple(dict.fromkeys([
             *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
-            *self._universe_symbols, *catalogue,
+            *self._universe_symbols, *tr_syms, *catalogue,
         ]))
 
     def _resolve_symbols(self, symbols) -> tuple[str, ...]:
@@ -568,10 +572,48 @@ class StockAgentScheduler:
         return None
 
     async def _list_universe(self) -> tuple[str, ...]:
-        candidates = await self.fundamentals.list_universe()
-        self._universe_symbols = self._resolve_symbols((*self.config.PRIORITY_SYMBOLS, *candidates))[
-            :self.config.UNIVERSE_SIZE
-        ]
+        now = _now_utc()
+        cap = max(1, int(self.config.UNIVERSE_SIZE))
+        priority = self._resolve_symbols(self.config.PRIORITY_SYMBOLS)[:cap]
+        seen = set(priority)
+
+        raw_downstream = await self.fundamentals.list_universe()
+        focus_set = set(self._pollable_focus(now=now))
+        downstream = tuple(
+            sym for sym in self._resolve_symbols(raw_downstream)
+            if sym not in seen
+        )
+        non_focus_downstream = [sym for sym in downstream if sym not in focus_set]
+        tr_cap = (
+            int(self.config.TIPRANKS_UNIVERSE_SLICE)
+            if non_focus_downstream
+            else int(self.config.TIPRANKS_UNIVERSE_LIMIT)
+        )
+        remaining_after_priority = max(0, cap - len(priority))
+        tipranks_names: tuple[str, ...] = ()
+        if self.tipranks is not None and remaining_after_priority > 0 and tr_cap > 0:
+            tipranks_names = tuple(
+                self.tipranks.universe_candidates(
+                    now,
+                    assets=self.assets,
+                    exclude=seen | focus_set,
+                    max_names=min(remaining_after_priority, tr_cap),
+                )
+            )
+            seen.update(tipranks_names)
+
+        remaining_after_tr = max(0, cap - len(priority) - len(tipranks_names))
+        screener_names = tuple(sym for sym in downstream if sym not in seen)[:remaining_after_tr]
+
+        self._universe_symbols = (*priority, *tipranks_names, *screener_names)
+        source_counts = {
+            "priority": len(priority),
+            "tipranks": len(tipranks_names),
+            "screener": len(screener_names),
+        }
+        if hasattr(self.research_sources, "record_universe_sources"):
+            self.research_sources.record_universe_sources(source_counts)
+        logger.info("Universe funnel sources: %s (total=%d)", source_counts, len(self._universe_symbols))
         return self._universe_symbols
 
     async def _stop_bars(self, symbol: str):

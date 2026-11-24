@@ -196,9 +196,14 @@ class ResearchPipeline:
                 funnel.rejected_by_reason["required_source_unavailable"] += 1
                 outcome = JobOutcome(JobStatus.FAILED, intents, {"reason": "required_source_unavailable"}, ideas)
             info = funnel.payload()
+            universe_sources = getattr(self.sources, "last_universe_sources", None)
+            extra = {"universe_sources": dict(universe_sources)} if universe_sources else {}
             self.ledger.journal.append("research.entry_funnel", job=kind,
-                                       session_date=session.date.isoformat(), **info)
-            return replace(outcome, detail={**outcome.detail, "entry_funnel": info})
+                                       session_date=session.date.isoformat(), **info, **extra)
+            detail = {**outcome.detail, "entry_funnel": info}
+            if universe_sources:
+                detail["universe_sources"] = dict(universe_sources)
+            return replace(outcome, detail=detail)
 
     async def _run(self, kind, snapshot, session, funnel, work_scope) -> JobOutcome:
         now = self.clock()

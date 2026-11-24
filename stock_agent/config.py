@@ -244,13 +244,10 @@ class Settings(BaseModel):
     FMP_QUOTES_ENABLED: bool = True
     FINNHUB_API_KEY: str = ""
     SEC_USER_AGENT: str = ""
-    TIPRANKS_API_KEY: str = ""
-    TIPRANKS_API_TOKEN: str = ""
-    TIPRANKS_EMAIL: str = ""
-    TIPRANKS_PASSWORD: str = ""
     TIPRANKS_ENABLED: bool = True
     TIPRANKS_MIN_SMART_SCORE: int = Field(default=8, ge=1, le=10)
     TIPRANKS_UNIVERSE_LIMIT: int = Field(default=100, ge=1)
+    TIPRANKS_UNIVERSE_SLICE: int = Field(default=20, ge=0)
     PRIORITY_SYMBOLS: list[str] = Field(default_factory=lambda: list(_DEFAULT_PRIORITY_SYMBOLS))
     MIN_MARKET_CAP: int = Field(default=10_000_000_000, ge=0)
     UNIVERSE_SIZE: int = Field(default=50, ge=1)
@@ -526,7 +523,7 @@ class Settings(BaseModel):
                 "anthropic": bool(self.ANTHROPIC_API_KEY),
                 "fmp": bool(self.FMP_API_KEY),
                 "finnhub": bool(self.FINNHUB_API_KEY),
-                "tipranks": bool(self.TIPRANKS_API_KEY and self.TIPRANKS_API_TOKEN),
+                "tipranks": bool(self.TIPRANKS_ENABLED),
                 "discord": bool(self.DISCORD_BOT_TOKEN),
                 "telegram": bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID),
                 "heartbeat": bool(self.HEARTBEAT_PING_URL or self.HEARTBEAT_URL),
