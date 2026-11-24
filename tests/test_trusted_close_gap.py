@@ -256,6 +256,74 @@ def test_short_leg_near_the_money_stays_untrusted(world, und_px):
     _run(world, body)
 
 
+@pytest.mark.parametrize("strike, und_px, trusted", [
+    (900, 1000.0, False),  # exactly 10% from the strike: the guard is inclusive
+    (899, 1000.0, True),   # 10.1%: proceeds with intrinsic 101
+])
+def test_short_leg_ten_percent_guard_is_inclusive(world, strike, und_px, trusted):
+    sym = f"NVDA261127C{strike * 1000:08d}"
+    seed_23nov(world)
+    add_short_leg(world, sym, -1, "NVDA", und_px, held=True)
+
+    async def body(sched):
+        equity = broker_equity(world)
+        row = await run_attempts(sched, world, 23)
+        mark = close_mark(sched, date(2026, 11, 23))
+        if trusted:
+            assert row.status is JobStatus.DONE, row
+            assert mark.equity == equity - Decimal((int(und_px) - strike) * 100)
+        else:
+            assert row.status is JobStatus.FAILED and mark is None and drawdown_session(sched) is None
+
+    _run(world, body)
+
+
+@pytest.mark.parametrize("broker_mv, haircut", [
+    ("-5000.0", Decimal(31_000)),   # 36,000 intrinsic, 5,000 already carried as a liability by the broker
+    ("-40000.0", Decimal(0)),       # broker already carries more than intrinsic: max(0, ...)
+    (None, None),                   # raw market_value missing: untrusted
+])
+def test_short_leg_haircut_nets_the_broker_market_value(world, monkeypatch, broker_mv, haircut):
+    sym = "NVDA261127C00920000"
+    seed_23nov(world)
+    add_short_leg(world, sym, -2, "NVDA", 1100.0, held=True)  # intrinsic 180 x 100 x 2 = 36,000
+    original = world.alpaca.position_json
+    shift = {"v": Decimal(0)}
+
+    def position_json(p):
+        out = original(p)
+        if p.symbol == sym:
+            if broker_mv is None:
+                out.pop("market_value", None)
+            else:
+                out["market_value"] = broker_mv
+        return out
+
+    original_account = world.alpaca.account_json
+
+    def account_json():
+        out = original_account()
+        out["equity"] = str(Decimal(out["equity"]) + shift["v"])  # the broker's equity carries that liability
+        return out
+
+    if broker_mv is not None:
+        shift["v"] = Decimal(broker_mv)
+    monkeypatch.setattr(world.alpaca, "position_json", position_json)
+    monkeypatch.setattr(world.alpaca, "account_json", account_json)
+
+    async def body(sched):
+        equity = broker_equity(world)
+        row = await run_attempts(sched, world, 23)
+        mark = close_mark(sched, date(2026, 11, 23))
+        if haircut is None:
+            assert row.status is JobStatus.FAILED and mark is None
+        else:
+            assert row.status is JobStatus.DONE, row
+            assert mark.equity == equity - haircut <= equity
+
+    _run(world, body)
+
+
 def test_short_leg_with_unpriced_underlying_stays_untrusted(world):
     seed_23nov(world)
     add_short_leg(world, "XYZ261127C00050000", -1, "XYZ", None, held=False)  # no XYZ price anywhere
@@ -416,5 +484,31 @@ def test_other_snapshot_quality_consumers_unchanged(world, monkeypatch):
         await sched.calendar.refresh()
         await sched._queue_delivery_trims(world.clock.now_et())
         assert calls  # it refreshed and then declined on quality, exactly as before
+
+    _run(world, body)
+
+
+# --------------------------------------------------------------------------- 9. brakes before the closing risk check
+@pytest.mark.parametrize("failure", ["raise", "timeout"])
+def test_drawdown_record_is_written_before_the_closing_risk_check(world, monkeypatch, failure):
+    """Once a trusted mark exists, an exception or timeout in the separate closing risk check must not starve the
+    brakes: the drawdown record for the session is already written."""
+    seed_23nov(world)
+
+    async def body(sched):
+        async def broken(*a, **k):
+            if failure == "raise":
+                raise RuntimeError("closing risk check failed")
+            await asyncio.Event().wait()  # never finishes: the job timeout fires
+
+        monkeypatch.setattr(sched, "_evaluate_close_limits", broken)
+        world.clock.set_et(2026, 11, 23, 16, 5)
+        key = "2026-11-23"
+        sched._schedule_job("drawdown_close", key, sched._close_drawdown, timeout=0.2)
+        if task := sched._job_tasks.get("drawdown_close"):
+            await task
+            await sched._collect_finished_jobs()
+        assert close_mark(sched, date(2026, 11, 23)) is not None
+        assert drawdown_session(sched) == key
 
     _run(world, body)
