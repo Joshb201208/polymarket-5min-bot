@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from stock_agent import close_trust
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -817,21 +818,36 @@ class StockAgentScheduler:
         session = self.calendar.session_on(now.date())
         if (market.source is not MarketSource.LIVE or market.status is not MarketStatus.CLOSED
                 or session is None or now < session.closes_at):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_clock_unverified"})
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_CLOCK_UNVERIFIED})
         snapshot = await self.ledger.refresh("drawdown close")
-        if (snapshot.equity <= 0 or snapshot.as_of < session.closes_at
-                or abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60)):
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        if snapshot.equity <= 0:
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_NONPOSITIVE})
+        if snapshot.as_of < session.closes_at:
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_PRECLOSE})
+        if abs(_now_utc() - snapshot.as_of) > timedelta(seconds=60):
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_SNAPSHOT_STALE})
         await self._evaluate_margin_guard(snapshot, now, at_close=True)
-        if snapshot.quality != "live" or self.ledger.trading_block():
-            return JobOutcome(JobStatus.FAILED, detail={"reason": "close_equity_unverified"})
+        if self.ledger.trading_block():
+            return JobOutcome(JobStatus.FAILED, detail={"reason": close_trust.CLOSE_TRADING_BLOCK})
+        marks = self.ledger.equity_marks("close", since=session.date)
+        mark = next((item for item in marks if item.session_date == session.date), None)
+        trust_detail: dict = {}
+        if mark is None:
+            # Close path only: a copy at conservative equity; raw snapshot quality is unchanged elsewhere.
+            trust = close_trust.assess_close(snapshot, await self._underlying_session_closes(snapshot, session.date))
+            trust_detail = trust.detail()
+            if not trust.trusted:
+                return JobOutcome(JobStatus.FAILED, detail=trust_detail)
         previous = self.calendar.previous_session(session.date)
         if previous is None:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "previous_session_unverified"})
-        marks = self.ledger.equity_marks("close", since=session.date)
-        mark = next((item for item in marks if item.session_date == session.date), None)
         if mark is None:
-            self._last_close_report = await close_session(self.ledger, snapshot, session.date)
+            self._last_close_report = await close_session(
+                self.ledger, trust.close_snapshot(snapshot), session.date, mark_extra=trust_detail)
+            mark = next((item for item in self.ledger.equity_marks("close", since=session.date)
+                         if item.session_date == session.date), None)
+            if mark is None:
+                return JobOutcome(JobStatus.FAILED, detail={**trust_detail, "reason": "close_mark_not_recorded"})
         try:
             state = self._drawdown_state()
         except ValueError:
@@ -850,7 +866,7 @@ class StockAgentScheduler:
                     Decimal(0),
                 )
             updated = update_drawdown(
-                state, day, mark.equity if mark else snapshot.equity,
+                state, day, mark.equity,
                 previous_session=previous.date.isoformat(), net_external_flow=net_flow, config=self.config,
             )
         except (ValueError, InvalidOperation):
@@ -860,6 +876,13 @@ class StockAgentScheduler:
                               key=f"invalid-drawdown-close:{session.date}")
             return JobOutcome(JobStatus.FAILED, detail={"reason": "drawdown_close_invalid"})
         risk_result = await self._evaluate_close_limits(snapshot, session.date, previous.date)
+        if trust_detail:
+            if risk_result is None:
+                risk_result = JobOutcome(JobStatus.DONE, detail=dict(trust_detail))
+            else:
+                risk_result = JobOutcome(risk_result.status, risk_result.intents,
+                                         {**trust_detail, **dict(risk_result.detail or {})},
+                                         risk_result.option_candidates)
         if updated == state:
             return risk_result
         self.ledger.risk_state_set(DRAWDOWN_STATE_KEY, updated.to_record())
@@ -890,6 +913,20 @@ class StockAgentScheduler:
                 key=f"drawdown:{session.date}",
             )
         return risk_result
+
+    async def _underlying_session_closes(self, snapshot, session_date: date) -> dict[str, Decimal]:
+        """Official session closes for unpriced short legs' underlyings that are not held."""
+        needed = close_trust.short_leg_underlyings(snapshot)
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if not needed or getter is None:
+            return {}
+        try:
+            bars = await getter(list(needed), start_date=session_date, end_date=session_date)
+        except Exception:
+            logger.warning("Session closes for option underlyings unavailable", exc_info=True)
+            return {}
+        return {symbol: bar.close for symbol, rows in bars.items() for bar in rows
+                if bar.session_date == session_date}
 
     async def _evaluate_close_limits(self, snapshot, session_date: date, previous_session: date):
         controls = self._risk_controls()

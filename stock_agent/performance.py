@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -471,7 +471,8 @@ class CloseReport:
 
 
 async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: date, *,
-                        daily_bars: DailyBars | None = None, replace_mark: bool = False) -> CloseReport:
+                        daily_bars: DailyBars | None = None, replace_mark: bool = False,
+                        mark_extra: Mapping[str, Any] | None = None) -> CloseReport:
     """Daily close: record the trusted close mark, compute and journal performance.
 
     Idempotent: calling again for a session that already has a close mark keeps
@@ -490,7 +491,7 @@ async def close_session(ledger: Ledger, snapshot: BookSnapshot, session_date: da
         quality = "close" if snapshot.quality == "live" else "indicative"
         if quality != "close":
             warnings.append(f"snapshot quality {snapshot.quality}: mark stored as indicative")
-        ledger.record_equity_mark(session_date, quality, snapshot)
+        ledger.record_equity_mark(session_date, quality, snapshot, extra=mark_extra)
     flows = ledger.cash_flows()
     pnl, pnl_pct = day_pnl(marks_before, equity, session_date, flows)
     marks = ledger.equity_marks("close")
