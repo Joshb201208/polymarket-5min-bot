@@ -58,6 +58,19 @@ def _migrate_confirmation(conn) -> None:
     )""")
 
 
+def _migrate_handoff(conn) -> None:
+    # Research-only, additive; old versions do not read this table.
+    conn.execute("""CREATE TABLE research_pending_buys (
+        work_key TEXT PRIMARY KEY, symbol TEXT NOT NULL, session_date TEXT NOT NULL,
+        thesis_id TEXT NOT NULL, due_at_s INTEGER NOT NULL, expires_at_s INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting', details_json TEXT NOT NULL, intent_id TEXT
+    )""")
+    conn.execute("""CREATE INDEX research_pending_due
+        ON research_pending_buys(status,due_at_s,expires_at_s)""")
+    conn.execute("""CREATE UNIQUE INDEX research_pending_thesis
+        ON research_pending_buys(symbol,session_date,thesis_id)""")
+
+
 class ResearchStore:
     def __init__(self, store: StateStore, config):
         self.store = store
@@ -65,6 +78,7 @@ class ResearchStore:
         store.register_migration(1, "research", _migrate)
         store.register_migration(2, "research", _migrate_retry)
         store.register_migration(3, "research", _migrate_confirmation)
+        store.register_migration(4, "research", _migrate_handoff)
 
     def available_budget(self, now: datetime) -> dict:
         rows = self.store.query(
@@ -244,6 +258,46 @@ class ResearchStore:
 
     def record_proposal(self, work_key: str, thesis_id: str, intent) -> None:
         self.finish_work(work_key, "proposed", thesis_id=thesis_id, detail={"intent": asdict(intent)})
+
+    def stage_pending_buy(self, work_key: str, thesis_id: str, intent, anchor_kind: str) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO research_pending_buys
+                   (work_key,symbol,session_date,thesis_id,due_at_s,expires_at_s,details_json)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (work_key, intent.symbol, intent.session_date.isoformat(), thesis_id,
+                 int(intent.next_attempt_at.timestamp()), int(intent.expires_at.timestamp()),
+                 json.dumps({"intent": asdict(intent), "anchor_kind": anchor_kind}, default=str)),
+            )
+            self.finish_work(work_key, "no_action", thesis_id=thesis_id)
+
+    def pending_buys(self, now: datetime):
+        # Include expiry past close so outages/restarts are reported, not silently lost.
+        return self.store.query(
+            """SELECT * FROM research_pending_buys WHERE status='waiting'
+               AND due_at_s<=? ORDER BY due_at_s, work_key LIMIT 8""",
+            (int(now.timestamp()),),
+        )
+
+    def pending_buy(self, key: str):
+        rows = self.store.query("SELECT * FROM research_pending_buys WHERE work_key=?", (key,))
+        return rows[0] if rows else None
+
+    def protects_scheduled_buy(self, symbol: str, session_date: str) -> bool:
+        return bool(self.store.query(
+            """SELECT 1 FROM research_pending_buys WHERE symbol=? AND session_date=?
+               AND status IN ('waiting','handoff_promoted') LIMIT 1""",
+            (symbol, session_date),
+        ))
+
+    def finish_pending_buy(self, key: str, status: str, *, intent_id: str | None = None,
+                           retry_at: datetime | None = None) -> bool:
+        with self.store.transaction() as conn:
+            return bool(conn.execute(
+                """UPDATE research_pending_buys SET status=?,intent_id=?,due_at_s=COALESCE(?,due_at_s)
+                   WHERE work_key=? AND status='waiting'""",
+                (status, intent_id, int(retry_at.timestamp()) if retry_at is not None else None, key),
+            ).rowcount)
 
     def record_option_idea(self, story_id: str, idea, expires_at: datetime) -> None:
         with self.store.transaction() as conn:

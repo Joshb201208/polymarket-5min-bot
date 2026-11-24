@@ -143,6 +143,14 @@ class ResearchSources:
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
 
+    async def completed_close(self, symbol: str, session_date) -> Decimal | None:
+        """An analysis anchor only, for the exact expected previous session."""
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if getter is None:
+            return None
+        bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        return _price(bars[-1].close) if bars and bars[-1].session_date == session_date else None
+
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
         if self.fetch_releases is None:
             return ()

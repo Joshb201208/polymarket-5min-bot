@@ -799,6 +799,7 @@ class StockAgentScheduler:
                 await self._evaluate_margin_guard(snapshot, now_et, at_close=True)
         await self._drive_order_lane(now_et)
         try:
+            self._schedule_entry_handoff(now_et)
             self._schedule_research_catchup(now_et)
         except (ValueError, StateUnavailable, sqlite3.Error) as exc:
             await self._report_exception("Research catch-up", exc)
@@ -1395,6 +1396,13 @@ class StockAgentScheduler:
         next_session = self.calendar.next_session(anchor)
         return bool(next_session and next_session.date == now_et.date() and
                     self._in_preopen(now_et, start_minutes=180, end_minutes=30))
+
+    def _schedule_entry_handoff(self, now: datetime) -> None:
+        due = getattr(self.research, "entry_handoff_due", None)
+        if self._reconciled and due is not None and due(now):
+            slot = int(now.timestamp()) // 30
+            self._schedule_job("entry_handoff", f"{now.date()}:{slot}",
+                               self.research.run_entry_handoff, timeout=65)
 
     def _schedule_research_catchup(self, now: datetime) -> None:
         fresh = getattr(self.research, "has_fresh_thesis_set", None)
