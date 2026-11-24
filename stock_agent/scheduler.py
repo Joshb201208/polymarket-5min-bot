@@ -826,6 +826,8 @@ class StockAgentScheduler:
         # Re-read the clock after the protection lane and schedule by actual session.
         now_et = _now_et()
         day_key = now_et.date().isoformat()
+        if self._state_ready:
+            self._flush_blocked_buy_overflow(now_et)
         if self._state_ready and (self._is_market_open(now_et) or self._in_preopen(
             now_et, start_minutes=180, end_minutes=0,
         )):
@@ -1608,6 +1610,74 @@ class StockAgentScheduler:
 
     # ── Daily summary ────────────────────────────────────────────────
 
+    def _flush_blocked_buy_overflow(self, now_et: datetime) -> None:
+        """Emit session blocked-buy overflow once after close and handoff completion (or on rollover)."""
+        alerts_obj = getattr(self, "alerts", None)
+        flush_fn = getattr(alerts_obj, "flush_blocked_buy_overflow", None)
+        if not callable(flush_fn):
+            return
+        alert_blocked_fn = getattr(alerts_obj, "alert_blocked_buy", None)
+        ledger_obj = getattr(self, "ledger", None)
+        day_key = now_et.date().isoformat()
+
+        def _sweep_ledger_expired(*, target_day: str | None = None, before_day: str | None = None) -> None:
+            if not callable(alert_blocked_fn) or ledger_obj is None:
+                return
+            expire_fn = getattr(ledger_obj, "expire_intents", None)
+            list_fn = getattr(ledger_obj, "list_intents", None)
+            if not callable(list_fn):
+                return
+            try:
+                if callable(expire_fn):
+                    expire_fn(_now_utc())
+                for it in list_fn(["expired"]):
+                    side = str(getattr(it.side, "value", it.side) or "").lower()
+                    if side != "buy" or getattr(it, "job", None) == "open_handoff":
+                        continue
+                    it_day = str(it.session_date)[:10] if getattr(it, "session_date", None) else ""
+                    if not it_day:
+                        continue
+                    if target_day is not None and it_day != target_day:
+                        continue
+                    if before_day is not None and it_day >= before_day:
+                        continue
+                    alert_blocked_fn(
+                        it.symbol,
+                        "intent_expired",
+                        str(getattr(it, "last_error", "") or ""),
+                        session_date=it_day,
+                    )
+            except Exception as exc:
+                logger.debug("Expired buy alert sweep skipped (%s)", type(exc).__name__)
+
+        _sweep_ledger_expired(before_day=day_key)
+        try:
+            flush_fn(before_session=day_key)
+        except Exception as exc:
+            logger.debug("Prior-session blocked-buy overflow flush skipped (%s)", type(exc).__name__)
+
+        cal = getattr(self, "calendar", None)
+        session = cal.session_on(now_et.date()) if cal is not None else None
+        if session is None or now_et < session.closes_at:
+            return
+        job_tasks = getattr(self, "_job_tasks", None) or {}
+        if "entry_handoff" in job_tasks:
+            return
+        research_obj = getattr(self, "research", None)
+        due_fn = getattr(research_obj, "entry_handoff_due", None)
+        if callable(due_fn):
+            try:
+                if due_fn(_now_utc()):
+                    return
+            except Exception:
+                return
+
+        _sweep_ledger_expired(target_day=day_key)
+        try:
+            flush_fn(session_date=day_key)
+        except Exception as exc:
+            logger.debug("Session blocked-buy overflow flush skipped (%s)", type(exc).__name__)
+
     async def _send_daily_summary(self):
         """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""
         try:
@@ -1769,6 +1839,7 @@ class StockAgentScheduler:
 
             if self.alerts is not None:
                 try:
+                    self._flush_blocked_buy_overflow(now)
                     sent = await self.alerts.flush()
                     logger.info(
                         "Daily summary outcome=%s (outbox flushed=%s)",

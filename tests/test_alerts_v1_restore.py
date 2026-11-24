@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -301,3 +302,77 @@ def test_handoff_outcome_and_rescan_announcement_helpers(world: Any, tmp_path: P
     assert "S&P-only" in rescan_no_vix
     assert "2 of 3" in rescan_no_vix
 
+
+def test_scheduler_flushes_blocked_buy_overflow_only_after_close_and_handoff_completion(
+    world: Any, tmp_path: Path
+) -> None:
+    from stock_agent.scheduler import StockAgentScheduler
+
+    cfg = _make_cfg(tmp_path)
+    world.clock.set_et(2026, 11, 24, 15, 50)
+    svc = AlertService(cfg, clock=world.clock.now)
+    for i in range(1, 13):
+        svc.alert_blocked_buy(f"STK{i:02d}", "risk_refused", "risk: position_count", session_date="2026-11-24")
+
+    closes_at = datetime(2026, 11, 24, 16, 0, tzinfo=ET)
+    fake_session = SimpleNamespace(date=date(2026, 11, 24), closes_at=closes_at)
+    handoff_due = {"flag": True}
+    expired_intents = [
+        SimpleNamespace(
+            symbol="STK13",
+            side="buy",
+            job="prescan",
+            session_date=date(2026, 11, 24),
+            last_error="expired before submission",
+        ),
+        SimpleNamespace(
+            symbol="STK14",
+            side="buy",
+            job="prescan",
+            session_date=date(2026, 11, 24),
+            last_error="expired before submission",
+        ),
+    ]
+
+    sched = SimpleNamespace(
+        alerts=svc,
+        calendar=SimpleNamespace(session_on=lambda d: fake_session if str(d) == "2026-11-24" else None),
+        _job_tasks={"entry_handoff": object()},
+        research=SimpleNamespace(entry_handoff_due=lambda _now: handoff_due["flag"]),
+        ledger=SimpleNamespace(
+            expire_intents=lambda _now: len(expired_intents),
+            list_intents=lambda statuses: expired_intents if "expired" in statuses else [],
+        ),
+    )
+
+    # 1) Before 16:00 ET close: do not flush overflow
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 15, 50, tzinfo=ET))
+    assert len(svc.outbox) == 10
+
+    # 2) At 16:02 ET while entry_handoff is still in _job_tasks: defer so late handoff_expired counts in N
+    world.clock.set_et(2026, 11, 24, 16, 2)
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 2, tzinfo=ET))
+    assert len(svc.outbox) == 10
+
+    # 3) ExecutionEngine already emitted intent_expired after an all-day hold for STK13;
+    #    STK14 expired silently via ledger.expire_intents() -> total 14 unique blocks (overflow = 4)
+    svc.alert_blocked_buy(
+        "STK13",
+        "intent_expired",
+        "research inputs pending; earlier held: llm_unavailable (retrying)",
+        session_date=date(2026, 11, 24),
+    )
+    # Duplicate intent_expired with date/str/None on same session never adds a second count
+    assert svc.alert_blocked_buy("STK13", "handoff_expired", "", session_date="2026-11-24") is False
+    assert svc.alert_blocked_buy("STK13", "intent_expired", "expired", session_date=None) is False
+    sched._job_tasks.clear()
+    handoff_due["flag"] = False
+
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 5, tzinfo=ET))
+    assert len(svc.outbox) == 11
+    assert "and 4 more" in svc.outbox[-1].event.body
+
+    # 4) Subsequent close ticks and next-session rollover do not emit again
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 24, 16, 10, tzinfo=ET))
+    StockAgentScheduler._flush_blocked_buy_overflow(sched, datetime(2026, 11, 25, 9, 35, tzinfo=ET))
+    assert len(svc.outbox) == 11
