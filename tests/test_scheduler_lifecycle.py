@@ -665,7 +665,7 @@ def test_drawdown_timeout_close_alert_reports_remaining_throttle_and_does_not_re
         now = datetime(2026, 11, 27, 13, 5, tzinfo=ET)
         sched, _ = build(tmp_path, monkeypatch, now)
         sched.store.open()
-        monkeypatch.setattr(Config, "DRAWDOWN_PAUSE_MAX_SESSIONS", 5)
+        monkeypatch.setattr(sched.config, "DRAWDOWN_PAUSE_MAX_SESSIONS", 5)
         state = update_drawdown(DrawdownState(), "2026-11-18", Decimal(1000), config=sched.config)
         for day in ("19", "20", "23", "24", "25"):
             state = update_drawdown(state, f"2026-11-{day}", Decimal(790), config=sched.config)
