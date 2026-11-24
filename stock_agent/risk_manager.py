@@ -99,6 +99,18 @@ class DrawdownState:
     recovery_closes: int = 0
     last_session: str | None = None
     last_equity: Decimal | None = None
+    rolling_closes: tuple[tuple[str | None, Decimal], ...] = ()
+    rolling_drawdown: Decimal | None = None
+    pause_start_session: str | None = None
+    pause_sessions_governed: int = 0
+
+    @property
+    def decision_drawdown(self) -> Decimal:
+        return self.drawdown if self.rolling_drawdown is None else self.rolling_drawdown
+
+    @property
+    def rolling_high_water(self) -> Decimal:
+        return max((close for _, close in self.rolling_closes), default=self.high_water)
 
     @property
     def throttled(self) -> bool:
@@ -109,10 +121,15 @@ class DrawdownState:
         return self.should_alert()
 
     def is_throttled(self, config=Config) -> bool:
-        return self.paused or self.drawdown >= _decimal(config.DRAWDOWN_THROTTLE_PCT)
+        return self.paused or self.decision_drawdown >= _decimal(config.DRAWDOWN_THROTTLE_PCT)
 
     def should_alert(self, config=Config) -> bool:
-        return self.drawdown >= _decimal(config.DRAWDOWN_ALERT_PCT)
+        return self.decision_drawdown >= _decimal(config.DRAWDOWN_ALERT_PCT)
+
+    def pause_sessions_remaining(self, config=Config) -> int:
+        if not self.paused:
+            return 0
+        return max(0, config.DRAWDOWN_PAUSE_MAX_SESSIONS - self.pause_sessions_governed)
 
     def to_record(self) -> dict[str, str | bool | int | None]:
         record = {
@@ -504,23 +521,44 @@ def update_drawdown(
     if close_equity <= 0:
         raise ValueError("drawdown requires positive trusted equity")
     adjusted_close = close_equity
+    history = state.rolling_closes
     if state.last_session is not None:
-        prior_adjusted = state.high_water * (1 - state.drawdown)
+        prior_adjusted = history[-1][1] if history else state.high_water * (1 - state.drawdown)
         prior_raw = state.last_equity if state.last_equity is not None else prior_adjusted
         period_end = close_equity - _decimal(net_external_flow)
         if min(prior_adjusted, prior_raw, period_end) <= 0:
             raise ValueError("drawdown requires a positive flow-adjusted close interval")
         adjusted_close = prior_adjusted * period_end / prior_raw
-    high_water = max(adjusted_close, state.high_water)
-    drawdown = (high_water - adjusted_close) / high_water
-    paused = state.paused or drawdown >= _decimal(config.DRAWDOWN_PAUSE_PCT)
-    recovering = paused and drawdown < _decimal(config.DRAWDOWN_THROTTLE_PCT)
-    streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session
-              else 0)
+        if not history:  # Support callers constructing a legacy state directly.
+            history = ((None, state.high_water), (state.last_session, prior_adjusted))
+
+    window = (*history, (session, adjusted_close))[-config.DRAWDOWN_ROLLING_SESSIONS:]
+    rolling_high = max(close for _, close in window)
+    rolling_loss = (rolling_high - adjusted_close) / rolling_high
+    start = state.pause_start_session
+    # In-memory legacy state can lack an episode anchor before its first updated close.
+    if start is None and state.paused:
+        start = state.last_session or session
+    governed = state.pause_sessions_governed
+    if start is not None and start != session:
+        governed = min(config.DRAWDOWN_PAUSE_MAX_SESSIONS, governed + 1)
+    expired = governed >= config.DRAWDOWN_PAUSE_MAX_SESSIONS
+    paused = state.paused and not expired
+    # A fresh breach is strictly above the pause line, not equality (unlike
+    # the shipped latch). Use Addendum 2's tolerance for both crossing sides.
+    pause_line = _decimal(config.DRAWDOWN_PAUSE_PCT) + Decimal("1e-10")
+    if (start is None or expired) and state.decision_drawdown <= pause_line < rolling_loss:
+        start, governed, paused = session, 0, True
+    recovering = paused and rolling_loss < _decimal(config.DRAWDOWN_THROTTLE_PCT)
+    streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session else 0)
     closes = streak + 1 if recovering else 0
     if closes >= config.DRAWDOWN_RECOVERY_SESSIONS:
         paused, closes = False, 0
-    return DrawdownState(high_water, drawdown, paused, closes, session, close_equity)
+
+    high_water = max(adjusted_close, state.high_water)
+    drawdown = (high_water - adjusted_close) / high_water
+    return DrawdownState(high_water, drawdown, paused, closes, session, close_equity,
+                         window, rolling_loss, start, governed)
 
 
 def _session_id(day: str) -> str:

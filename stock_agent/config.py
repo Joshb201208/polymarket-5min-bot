@@ -295,6 +295,8 @@ class Settings(BaseModel):
     DRAWDOWN_PAUSE_PCT: float = Field(default=0.20, gt=0.0, lt=1.0)
     DRAWDOWN_THROTTLE_SCALE: float = Field(default=0.50, gt=0.0, le=1.0)
     DRAWDOWN_RECOVERY_SESSIONS: int = Field(default=5, ge=1)
+    DRAWDOWN_ROLLING_SESSIONS: int = Field(default=252, ge=2)
+    DRAWDOWN_PAUSE_MAX_SESSIONS: int = Field(default=21, ge=1)
     RISK_OPTION_MAX_LOSS_PCT: float = Field(default=0.03, gt=0.0, le=1.0)
     RISK_OPTION_TOTAL_LOSS_PCT: float = Field(default=0.10, gt=0.0, le=1.0)
     RISK_OPTION_MAX_STRUCTURES: int = Field(default=6, ge=1)
