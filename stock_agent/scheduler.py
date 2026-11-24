@@ -263,9 +263,9 @@ class StockAgentScheduler:
                 "every active pause-trading file is removed and any configured pause is turned off",
             )
         try:
-            if self.ledger.trading_block():
+            if block := self.ledger.trading_block():
                 locks["ledger_trading_block"] = (
-                    "ledger trading block",
+                    f"ledger trading block: {block}",
                     "a clean broker reconcile or rebuild clears the ledger block",
                 )
             if self._drawdown_state().paused:
@@ -411,7 +411,7 @@ class StockAgentScheduler:
         session = self.calendar.next_session(now.date()) if at_close else self.calendar.session_on(now.date())
         queued = False
         self.ledger.expire_intents(_now_utc())
-        existing = [row for row in self.ledger.list_intents() if row.origin == "margin_buffer"]
+        existing = self.ledger.list_intents(origin="margin_buffer")
         latest_execution = max(
             (row.updated_at or row.created_at for row in existing if row.broker_order_id),
             default=None,
