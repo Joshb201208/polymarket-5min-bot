@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
-from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, ThesisRole
+from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, StaleBook, ThesisRole
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_notes import load_notes, research_notes_payload
@@ -26,6 +26,9 @@ _RETRYABLE = {"auth", "quota", "model_unavailable", "rate_limit", "budget", "tra
 _INPUT_BLOCKERS = {"broker_book_blocked", "broker_book_unavailable", "quote_stale_or_unavailable",
                    "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
 _FRESH_SET = "research:fresh_scheduled_set"
+_SCHEDULED = {"prescan", "weekly", "midweek"}
+_HANDOFF_TRANSIENT = {"broker_book_unavailable",
+                      "quote_stale_or_unavailable", "news_stale_or_unavailable", "llm_unavailable"}
 
 
 class SourceUnavailable(RuntimeError):
@@ -113,14 +116,21 @@ class _EntryFunnel:
     passed_conviction: int = 0
     buy_candidates: int = 0
     option_ideas: int = 0
+    handoff_staged: int = 0
+    handoff_superseded: int = 0
     rejected_by_reason: Counter[str] = field(default_factory=Counter)
 
     def payload(self) -> dict:
-        return {
+        fields = {
             "screened": self.screened, "thesis_written": self.thesis_written,
             "passed_conviction": self.passed_conviction, "buy_candidates": self.buy_candidates,
             "option_ideas": self.option_ideas, "rejected_by_reason": dict(self.rejected_by_reason),
         }
+        if self.handoff_staged:
+            fields["handoff_staged"] = self.handoff_staged
+        if self.handoff_superseded:
+            fields["handoff_superseded"] = self.handoff_superseded
+        return fields
 
 
 def _safe_previous(thesis) -> dict | None:
@@ -254,6 +264,13 @@ class ResearchPipeline:
 
         failed = attempted = deferred = 0
         for symbol, key, story in work:
+            if (work_scope and work_scope.startswith("catchup-")
+                    and self._has_scheduled_entry(symbol, session.date)):
+                # A fallback retry for some other symbol must not redraw this
+                # symbol once its original handoff or queued BUY has resolved.
+                if self.store.claim_work(key, symbol, self.clock()):
+                    self.store.finish_work(key, "no_action", detail={"reason": "scheduled_entry_already_current"})
+                continue
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
             if not self.store.claim_work(key, symbol, as_of):
@@ -283,12 +300,22 @@ class ResearchPipeline:
         collected, ideas = self._recover()
         incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
         status = JobStatus.FAILED if incomplete else JobStatus.DONE
-        if kind not in {"news", "earnings"} and funnel.screened and funnel.healthy_unheld_theses and (
+        if kind in _SCHEDULED and funnel.screened and funnel.healthy_unheld_theses and not funnel.handoff_staged and (
             not failed and not deferred and not
             ((_INPUT_BLOCKERS | {"target_session_closed"}) & funnel.rejected_by_reason.keys())
         ):
             self.store.store.kv_set(_FRESH_SET, now.isoformat())
         return JobOutcome(status, collected, {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
+
+    def _has_scheduled_entry(self, symbol: str, session_date: date) -> bool:
+        if self.store.protects_scheduled_buy(symbol, session_date.isoformat()):
+            return True
+        current = self.ledger.current_thesis(symbol)
+        return current is not None and any(
+            i.side == "buy" and i.origin in _SCHEDULED and i.session_date == session_date
+            and current.thesis_id in i.thesis_ids
+            for i in self.ledger.list_intents((IntentStatus.QUEUED,), symbol=symbol)
+        )
 
     def _recover(self) -> tuple[tuple[NewIntent, ...], tuple[OptionIdea, ...]]:
         collected = []
@@ -345,7 +372,186 @@ class ResearchPipeline:
             return today
         return self.calendar.next_session(day)
 
-    async def _review(self, kind, key, security, holding, story, session, now, funnel) -> None:
+    def entry_handoff_due(self, now: datetime) -> bool:
+        return bool(self.store.pending_buys(now))
+
+    async def run_entry_handoff(self) -> JobOutcome:
+        funnel = _EntryFunnel()
+        outcomes = Counter()
+        if not self._analysis_lock.locked():
+            async with self._analysis_lock:
+                await self._sweep_handoffs(funnel, outcomes)
+        info = funnel.payload()
+        if outcomes:
+            # Handoff waits and refusals are observable but not independent
+            # research rejections. A terminal refusal has one skipped intent.
+            self.ledger.journal.append("research.entry_funnel", job="entry_handoff",
+                                       session_date=self.clock().astimezone(NY).date().isoformat(),
+                                       handoff_outcomes=dict(outcomes), **info)
+        return JobOutcome(JobStatus.DONE, detail={"entry_funnel": info, "handoff_outcomes": dict(outcomes)})
+
+    async def _sweep_handoffs(self, funnel, outcomes):
+        elapsed = asyncio.get_running_loop().time
+        deadline = elapsed() + 60
+        for row in self.store.pending_buys(self.clock()):
+            remaining = deadline - elapsed()
+            if remaining <= 0:
+                break
+            details = json.loads(row["details_json"])
+            intent = _reconstitute(details["intent"])
+            key = row["work_key"]
+            try:
+                async with asyncio.timeout(min(remaining, 55)):
+                    code = await self._validate_handoff(key, intent, funnel, last_hold=details.get("last_hold"))
+            except (TimeoutError, SourceUnavailable, StaleBook) as exc:
+                if isinstance(exc, TimeoutError):
+                    reason = "handoff_input_timeout"
+                elif isinstance(exc, StaleBook):
+                    reason = "broker_book_unavailable"
+                else:
+                    reason = "handoff_input_unavailable"
+                review = self.store.work_state(f"{key}:reanchor")
+                if review is not None and review["status"] == "started" and self.clock() < intent.expires_at:
+                    code = self._finish_handoff(key, intent, "handoff_reanchor_unavailable", reasons=(reason,))
+                else:
+                    code = self._retry_handoff(key, intent, reason)
+            outcomes[code] += 1
+            if code == "handoff_promoted":
+                funnel.buy_candidates += 1
+
+    def _finish_handoff(self, key, intent, code, *, reasons=()):
+        with self.store.store.transaction():
+            if self.store.pending_buy(key)["status"] != "waiting":
+                return "handoff_already_processed"
+            intent_id = None
+            if code != "handoff_reanchored":
+                queued = intent if code == "handoff_promoted" else replace(
+                    intent, status=IntentStatus.SKIPPED, last_error=code,
+                    meta={**intent.meta, "handoff_reasons": reasons, "skip_code": code},
+                )
+                (intent_id,) = self.ledger.enqueue_intents((queued,), job="entry_handoff")
+            self.store.finish_pending_buy(key, code, intent_id=intent_id)
+        if code not in {"handoff_promoted", "handoff_reanchored"}:
+            alert = getattr(self.alerts, "alert_blocked_buy", None)
+            if alert is not None:
+                alert(intent.symbol, code, session_date=intent.session_date, risk_reasons=reasons)
+        return code
+
+    def _retry_handoff(self, key, intent, reason):
+        now = self.clock()
+        if now >= intent.expires_at:
+            return self._finish_handoff(key, intent, "handoff_expired", reasons=(reason,))
+        self.store.finish_pending_buy(key, "waiting",
+                                      retry_at=min(now + timedelta(minutes=1), intent.expires_at), hold_reason=reason)
+        return reason
+
+    async def _validate_handoff(self, key, intent, funnel, *, last_hold=None):
+        symbol = intent.symbol
+        reanchor_key = f"{key}:reanchor"
+
+        def refuse(code, *reasons):
+            if code == "handoff_expired" and not reasons and last_hold:
+                reasons = (last_hold,)
+            return self._finish_handoff(key, intent, code, reasons=reasons)
+
+        def check_identity():
+            now = self.clock()
+            if now >= intent.expires_at:
+                return "handoff_expired", None
+            open_intents = [i for i in self.ledger.list_intents(symbol=symbol) if not i.terminal]
+            if (self.store.has_pending_confirmation(symbol, now) or self.store.has_unqueued_exit(symbol, now)
+                    or any(i.side == "sell" for i in open_intents)):
+                return "handoff_exit_pending", None
+            if any(i.side == "buy" and i.dedupe_key != intent.dedupe_key for i in open_intents):
+                return "handoff_buy_pending", None
+            current = self.ledger.current_thesis(symbol)
+            if current is None or current.thesis_id != intent.thesis_ids[0]:
+                return "handoff_thesis_changed", None
+            holding = next((h for h in self.ledger.snapshot().holdings if h.symbol == symbol and h.qty > 0), None)
+            position_id = holding.meta.position_id if holding and holding.meta else None
+            if position_id != intent.position_id or (holding is not None and position_id is None):
+                return "handoff_position_changed", None
+            return None, holding
+
+        def gate_rejection():
+            gate = self.gate.is_entry_eligible(symbol, self.clock())
+            if not gate.ok:
+                if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
+                    return self._retry_handoff(key, intent, gate.reasons[0])
+                return refuse("handoff_gate_refused", *gate.reasons)
+            if (gate.thesis_id != intent.thesis_ids[0] or gate.direction != Direction.BUY
+                    or type(gate.effective_conviction) is not int
+                    or gate.effective_conviction < intent.meta["minimum_conviction"]):
+                return refuse("handoff_gate_refused", "buy_thesis_or_conviction_changed")
+            if intent.position_id is not None:
+                grade, may_initialize = self.ledger.top_up_baseline(intent.position_id)
+                if not may_initialize and (grade is None or gate.effective_conviction < grade):
+                    return refuse("handoff_gate_refused", "top_up_baseline_changed")
+            return None
+
+        if self.store.pending_buy(reanchor_key) is not None:
+            return refuse("handoff_reanchored")
+        code, holding = check_identity()
+        if code:
+            return refuse(code)
+        if self.store.work_state(reanchor_key) is not None:
+            return refuse("handoff_reanchor_unavailable", "targeted_review_already_attempted")
+        now = self.clock()
+        session = self.calendar.session_on(intent.session_date)
+        if session is None or now >= session.closes_at - timedelta(minutes=10):
+            self.store.finish_pending_buy(key, "waiting", retry_at=intent.expires_at)
+            return "handoff_execution_window_closed"
+        refresh = getattr(self.sources, "refresh_entry_inputs", None)
+        if refresh is not None:
+            await refresh(symbol, now)
+        code, holding = check_identity()
+        if code:
+            return refuse(code)
+        if rejection := gate_rejection():
+            return rejection
+        material_since = getattr(self.sources, "handoff_material_news", None)
+        current = self.ledger.current_thesis(symbol)
+        inputs_as_of = utc_datetime(current.payload.get("inputs_as_of"))
+        material = await material_since(symbol, inputs_as_of, self.clock()) if material_since and inputs_as_of else ()
+        code, holding = check_identity()
+        if code:
+            return refuse(code)
+        if self.clock() >= session.closes_at - timedelta(minutes=10):
+            self.store.finish_pending_buy(key, "waiting", retry_at=intent.expires_at)
+            return "handoff_execution_window_closed"
+        if rejection := gate_rejection():
+            return rejection
+        if material and intent.meta.get("handoff_reviewed"):
+            return refuse("handoff_reanchor_unavailable", "new_material_news_after_single_review")
+        if intent.reference_price is not None and not material:
+            return refuse("handoff_promoted")
+        now = self.clock()
+        security = (await self.sources.securities((symbol,), now)).get(symbol)
+        if security is None or not _fresh_quote(security, self.clock(), max_age=timedelta(seconds=90)):
+            return self._retry_handoff(key, intent, "quote_stale_or_unavailable")
+        stories = await self.sources.background((symbol,))
+        security = replace(security, evidence=(*material, *stories.get(symbol, ()), *security.evidence))
+        if not _fresh_quote(security, self.clock(), max_age=timedelta(seconds=90)):
+            return self._retry_handoff(key, intent, "quote_stale_or_unavailable")
+        code, holding = check_identity()
+        if code:
+            return refuse(code)
+        if rejection := gate_rejection():
+            return rejection
+        if not self.store.claim_work(reanchor_key, symbol, self.clock()):
+            return refuse("handoff_reanchor_unavailable", "targeted_review_already_attempted")
+        try:
+            await self._review(intent.origin, reanchor_key, security, holding, None, session,
+                               self.clock(), funnel, reanchor=intent)
+        except ProviderUnavailable as exc:
+            reasons = tuple(sorted({error.kind for error in exc.attempts})) or ("no_available_route",)
+            self.store.finish_work(reanchor_key, "unavailable", detail={"reason": reasons})
+            return refuse("handoff_reanchor_unavailable", *reasons)
+        if self.store.pending_buy(reanchor_key) is not None:
+            return refuse("handoff_reanchored")
+        return refuse("handoff_reanchor_unavailable", "targeted_review_did_not_qualify")
+
+    async def _review(self, kind, key, security, holding, story, session, now, funnel, *, reanchor=None) -> None:
         symbol = security.symbol
         position_id = holding.meta.position_id if holding and holding.meta else None
         entry = self.ledger.entry_thesis(position_id) if position_id else None
@@ -370,12 +576,26 @@ class ResearchPipeline:
             context = {**context, "unverified_owner_notes": approved_notes}
         price = security.price
         quote_at = security.quote_at
-        fresh_quote = _fresh_quote(security, now)
+        # Catch-up uses the weekly prompt but is a fallback, not an original
+        # scheduled decision. Keep its preopen/regular recovery semantics.
+        scheduled = kind in _SCHEDULED and key.startswith(f"{kind}:") and story is None and now < session.opens_at
+        fresh_quote = _fresh_quote(security, now, max_age=timedelta(seconds=90) if scheduled else timedelta(minutes=20))
+        anchor_kind = "quote" if fresh_quote else None
+        if scheduled and not fresh_quote:
+            price = None
+            previous = self.calendar.previous_session(session.date)
+            completed = getattr(self.sources, "completed_close", None)
+            if previous is not None and completed is not None:
+                price = await completed(symbol, previous.date)
+                if price is not None:
+                    anchor_kind = "completed_split_adjusted_close"
         metrics = dict(security.metrics)
+        if anchor_kind:
+            metrics["reference_price_kind"] = anchor_kind
         if security.metric_provenance:
             metrics["point_in_time_provenance"] = security.metric_provenance
         data = ResearchInput(
-            symbol, now, security.name, security.sector, float(price) if fresh_quote else None,
+            symbol, now, security.name, security.sector, float(price) if anchor_kind else None,
             quote_at if fresh_quote else None, metrics, tuple(evidence.values())[:24],
             (story.evidence.evidence_id,) if story else (), _safe_previous(entry),
             _safe_previous(baseline or current), {"held": True, "opened_at": holding.meta.opened_at.isoformat()
@@ -401,6 +621,10 @@ class ResearchPipeline:
         floor = 8 if story or direction is Direction.BEARISH or (
             str(context.get("regime", "")).lower() in {"cautious", "risk_off", "bear"}
         ) else 7
+        if holding and direction is Direction.BUY:
+            floor = max(floor, 8)
+        if reanchor is not None:
+            floor = max(floor, reanchor.meta["minimum_conviction"])
         conviction_ok = entry_direction and record.raw_conviction >= 7 and record.effective_conviction >= floor
         if conviction_ok:
             funnel.passed_conviction += 1
@@ -429,6 +653,7 @@ class ResearchPipeline:
                 rejected = self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
                     thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel,
+                    scheduled=scheduled and not exit_pending, anchor_kind=anchor_kind, reanchor=reanchor,
                 )
                 if entry_direction or not holding:
                     funnel.rejected_by_reason.update(rejected)
@@ -442,7 +667,7 @@ class ResearchPipeline:
                     )
             elif kind == "news" and self.clock() >= session.closes_at:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "live_session_closed"})
-            elif not exit_pending:
+            elif not exit_pending and reanchor is None:
                 current = self.clock()
                 expiration = current + timedelta(minutes=30)
                 if story and story.evidence.published_at:
@@ -528,7 +753,8 @@ class ResearchPipeline:
             )
 
     def _record_entry(self, key, symbol, kind, security, holding, position_id, baseline, story, session,
-                      thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel):
+                      thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel, *,
+                      scheduled=False, anchor_kind=None, reanchor=None):
         direction = record.draft.direction
         rejected = []
         now = self.clock()
@@ -543,35 +769,59 @@ class ResearchPipeline:
                 rejected.append("not_tradable")
             if not fresh_quote:
                 rejected.append("quote_stale_or_unavailable")
-            if not rejected:
+            if not rejected or (scheduled and direction is Direction.BUY
+                                and rejected == ["quote_stale_or_unavailable"]):
                 gate = self.gate.is_entry_eligible(symbol, now)
                 rejected.extend(gate.reasons)
                 if gate.thesis_id != thesis_id:
                     rejected.append("active_thesis_changed")
                 elif not gate.ok and not gate.reasons:
                     rejected.append("research_gate_refused")
+                elif gate.direction != direction:
+                    rejected.append("research_direction_changed")
         qualifies = not rejected
-        baseline_grade = baseline.payload.get("effective_conviction") if baseline else None
-        strengthened = (
-            position_id is not None and baseline is not None and type(baseline_grade) is int
-            and record.effective_conviction >= baseline_grade and record.draft.thesis_change == "strengthened"
+        defer = scheduled and set(rejected) == {"quote_stale_or_unavailable"}
+        baseline_grade, may_initialize = self.ledger.top_up_baseline(position_id) if position_id else (None, False)
+        reaffirmed = (
+            position_id is not None and record.draft.thesis_change in {"strengthened", "unchanged"}
+            and record.effective_conviction >= 8
+            and (may_initialize or (baseline_grade is not None and record.effective_conviction >= baseline_grade))
         )
-        if qualifies and direction is Direction.BUY and (not holding or strengthened):
+        if (qualifies or defer) and direction is Direction.BUY and (not holding or reaffirmed):
+            if reanchor is None:
+                # A newer, qualified BUY replaces (rather than falsely "blocking")
+                # an older waiting BUY for the same session. HOLDs remain refusals.
+                funnel.handoff_superseded += self.store.supersede_pending_buys(symbol, session.date.isoformat())
             intent = self._intent(key, symbol, "buy", position_id, (thesis_id,), price, evidence_ids, kind, session,
                                   {"raw_conviction": record.raw_conviction,
                                    "effective_conviction": record.effective_conviction,
                                    "minimum_conviction": floor,
                                    "last_filled_conviction": baseline_grade,
+                                   "first_reaffirmation": may_initialize,
                                    "sector": security.sector, "thesis_change": record.draft.thesis_change,
                                    "signal_at": record.generated_at.isoformat(),
                                    "baseline_thesis_id": baseline.thesis_id if baseline else None})
-            self.store.record_proposal(key, thesis_id, intent)
-            funnel.buy_candidates += 1
+            if defer or reanchor is not None:
+                reviewed = {"handoff_reviewed": True} if reanchor is not None else {}
+                if reanchor is not None and reanchor.reference_price is not None:
+                    intent = replace(intent, reference_price=reanchor.reference_price)
+                    anchor_kind = reanchor.meta["reference_price_kind"]
+                intent = replace(intent, dedupe_key=f"handoff:{key}",
+                                 next_attempt_at=session.opens_at + timedelta(minutes=5),
+                                 meta={**intent.meta, **reviewed, "scheduled_handoff": True,
+                                       "reference_price_kind": anchor_kind})
+                self.store.stage_pending_buy(key, thesis_id, intent, anchor_kind or "none")
+                funnel.handoff_staged += 1
+                if defer:
+                    rejected.clear()  # A successfully deferred quote gap is not a rejection.
+            else:
+                self.store.record_proposal(key, thesis_id, intent)
+                funnel.buy_candidates += 1
         else:
             self.store.finish_work(key, "no_action", thesis_id=thesis_id)
-            if qualifies and direction is Direction.BUY:
-                rejected.append("add_thesis_not_strengthened")
-        if qualifies and (story or direction is Direction.BEARISH):
+            if (qualifies or defer) and direction is Direction.BUY:
+                rejected.append("add_thesis_not_reaffirmed")
+        if qualifies and reanchor is None and (story or direction is Direction.BEARISH):
             idea_id = story.story_id if story else f"research:{key}"
             idea = OptionIdea(symbol, direction, idea_id, thesis_id, record.raw_conviction,
                               record.effective_conviction, record.generated_at, evidence_ids,

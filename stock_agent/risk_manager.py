@@ -80,6 +80,8 @@ class TradeIntent:
     assignment_strike: Decimal = Decimal(0)
     structure_id: str | None = None
     reason: str | None = None
+    thesis_change: str | None = None
+    initial_reaffirmation: bool = False
 
 
 @dataclass(frozen=True)
@@ -730,7 +732,7 @@ class RiskManager:
             reasons = self._entry_reasons(snapshot, intent, kind, now, controls)
             if reasons:
                 return RiskVerdict(False, tuple(reasons))
-            projection = self._project_book(snapshot, controls)
+            projection = self._project_book(snapshot, controls, stock_mark_floor=self._add_mark_floor(intent, kind))
             if any(stock.qty < 0 for stock in projection.stocks.values()):
                 return RiskVerdict(False, ("unexpected_short",), projection.totals())
             if kind in {TradeKind.OPTION_OPEN, TradeKind.CASH_SECURED_PUT}:
@@ -747,11 +749,12 @@ class RiskManager:
                 return RiskVerdict(False, (condition,), projection.totals())
             if qty != qty.to_integral_value() or price <= 0:
                 return RiskVerdict(False, ("invalid_quantity_or_limit",))
-            if price * qty > target - held:
-                return RiskVerdict(False, ("sizing_limit",), projection.totals())
             mark = price if intent.mark_price is None else _decimal(intent.mark_price)
             if mark <= 0:
                 return RiskVerdict(False, ("invalid_mark",))
+            entry_value = qty * (max(price, mark) if kind == TradeKind.ADD else price)
+            if entry_value > target - held:
+                return RiskVerdict(False, ("sizing_limit",), projection.totals())
             before = self._breaches(projection)
             equity_before = projection.equity
             projection.add_buy(symbol, c, qty, price, mark)
@@ -768,7 +771,7 @@ class RiskManager:
             loss_budget = projection.equity * self._ratio("MAX_INITIAL_STOP_RISK_PCT")
             if controls.drawdown.is_throttled(self.config):
                 loss_budget *= self._ratio("DRAWDOWN_THROTTLE_SCALE")
-            if (held + qty * price) * stop_distance > loss_budget:
+            if (held + entry_value) * stop_distance > loss_budget:
                 return RiskVerdict(False, ("stop_risk_budget",), projection.totals())
             breaches = self._breaches(projection)
             unchanged = self._unchanged_breaches(before, breaches, equity_before, projection.equity)
@@ -791,11 +794,13 @@ class RiskManager:
                 return 0
             if self._entry_reasons(snapshot, intent, kind, now, controls):
                 return 0
-            projection = self._project_book(snapshot, controls)
+            projection = self._project_book(snapshot, controls, stock_mark_floor=self._add_mark_floor(intent, kind))
             target, held, condition = self._stock_target(projection, intent, kind, controls)
             price = _decimal(intent.price)
             if condition or price <= 0 or target <= held:
                 return 0
+            if kind == TradeKind.ADD and intent.mark_price is not None:
+                price = max(price, _decimal(intent.mark_price))
             low, high = 0, int((target - held) / price)
             while low < high:
                 qty = (low + high + 1) // 2
@@ -985,6 +990,7 @@ class RiskManager:
     def _project_book(
         self, snapshot: "BookSnapshot", controls: RiskControls, *,
         include_pending: bool = True, allow_unpriced: bool = False,
+        stock_mark_floor: tuple[str, Decimal] | None = None,
     ) -> _Projection:
         equity, cash = _decimal(snapshot.equity), _decimal(snapshot.cash)
         if equity <= 0:
@@ -1036,6 +1042,8 @@ class RiskManager:
                     conservative_value = max(_ZERO, _decimal(stock.market_value), qty * _decimal(stock.avg_cost))
                     book.maintenance += conservative_value  # Unknown mark: no discount to the fallback.
                 continue
+            if stock_mark_floor is not None and stock_mark_floor[0] == symbol:
+                mark = max(mark, stock_mark_floor[1])
             meta = self._metadata(snapshot, symbol)
             sector = getattr(meta, "sector", None) or getattr(stock, "sector", None)
             stop = getattr(meta, "stop_price", None)
@@ -1211,6 +1219,14 @@ class RiskManager:
                 reasons.append("price_drift")
         return reasons
 
+    @staticmethod
+    def _add_mark_floor(intent: TradeIntent, kind: TradeKind) -> tuple[str, Decimal] | None:
+        if kind == TradeKind.ADD and intent.mark_price is not None:
+            # A lower snapshot mark must not hide the live value of held or
+            # already working shares. Keep the higher mark for both.
+            return intent.symbol.strip().upper(), _decimal(intent.mark_price)
+        return None
+
     def _stock_target(
         self, book: _Projection, intent: TradeIntent, kind: TradeKind, controls: RiskControls,
     ) -> tuple[Decimal, Decimal, str | None]:
@@ -1234,12 +1250,19 @@ class RiskManager:
         if kind == TradeKind.ADD:
             if stock is None or stock.qty <= 0:
                 return target, held, "top_up_requires_holding"
-            if (type(intent.last_filled_conviction) is not int
-                    or intent.effective_conviction < intent.last_filled_conviction):
+            prior = intent.last_filled_conviction
+            if intent.effective_conviction < 8 or (
+                prior is None and not intent.initial_reaffirmation
+            ) or (
+                prior is not None
+                and (type(prior) is not int or not 1 <= prior <= 10 or intent.effective_conviction < prior)
+            ):
                 return target, held, "top_up_conviction"
-            if stock.stop is not None and mark <= stock.stop:
+            if intent.thesis_change not in ("strengthened", "unchanged"):
+                return target, held, "top_up_thesis_change"
+            if stock.stop is None or stock.stop <= 0 or mark <= stock.stop:
                 return target, held, "top_up_below_stop"
-            if held >= target * self._ratio("TOP_UP_TARGET_TOLERANCE"):
+            if held >= target * min(Decimal(".90"), self._ratio("TOP_UP_TARGET_TOLERANCE")):
                 return target, held, "near_target"
         elif stock is not None and stock.qty > 0:
             return target, held, "top_up_intent_required"

@@ -513,23 +513,24 @@ def test_owner_checklist_and_readme_cover_security_controls() -> None:
         assert deleted_module not in readme, f"README.md still references {deleted_module}"
 
 
-def test_branch_diff_contains_no_leaked_secret_patterns() -> None:
+def _scan_commit_range_for_secret_patterns(
+    repo_root: Path, base_ref: str = "origin/master"
+) -> list[str]:
     import re
     import subprocess
 
-    repo_root = Path(__file__).resolve().parent.parent
     base_check = subprocess.run(
-        ["git", "rev-parse", "--verify", "origin/master"],
+        ["git", "rev-parse", "--verify", base_ref],
         cwd=repo_root,
         capture_output=True,
         text=True,
         check=False,
     )
     if base_check.returncode != 0:
-        return
+        return []
 
-    diff_proc = subprocess.run(
-        ["git", "diff", "--unified=0", "origin/master...HEAD"],
+    log_proc = subprocess.run(
+        ["git", "log", "-p", "--unified=0", f"{base_ref}..HEAD"],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -552,22 +553,75 @@ def test_branch_diff_contains_no_leaked_secret_patterns() -> None:
     )
     hex_key_re = re.compile(r"\b0x([0-9a-fA-F]{64})\b")
 
-    current_file = ""
+    current_commit = "HEAD"
+    current_file = "<commit-message>"
     findings: list[str] = []
-    for raw_line in diff_proc.stdout.splitlines():
+    for raw_line in log_proc.stdout.splitlines():
+        if raw_line.startswith("commit "):
+            current_commit = raw_line.split()[1][:7]
+            current_file = "<commit-message>"
+            continue
         if raw_line.startswith("+++ b/"):
             current_file = raw_line[6:]
             continue
-        if not raw_line.startswith("+") or raw_line.startswith("+++"):
+        if raw_line.startswith(("Author:", "Date:", "diff --git ", "index ", "--- ", "@@ ")):
             continue
-        added = raw_line[1:]
+        if raw_line.startswith("    "):
+            candidate = raw_line[4:]
+        elif raw_line.startswith("+") and not raw_line.startswith("+++"):
+            candidate = raw_line[1:]
+        else:
+            continue
         for rule_name, pattern in token_patterns:
-            if pattern.search(added):
-                findings.append(f"{current_file}: matched {rule_name}")
-        for match in hex_key_re.finditer(added):
+            if pattern.search(candidate):
+                findings.append(f"{current_commit}:{current_file}: matched {rule_name}")
+        for match in hex_key_re.finditer(candidate):
             if len(set(match.group(1).lower())) >= 4:
-                findings.append(f"{current_file}: matched high-entropy 0x64 hex key")
+                findings.append(f"{current_commit}:{current_file}: matched high-entropy 0x64 hex key")
+    return findings
 
-    assert not findings, f"Secret pattern(s) detected in branch diff: {findings}"
+
+def test_commit_range_secret_scanner_catches_reverted_intermediate_commit(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    git_env = {
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, env=git_env, check=True, capture_output=True)
+
+    _git("init", "-b", "main")
+    target = tmp_path / "sample.py"
+    target.write_text("VALUE = 'clean'\n", encoding="utf-8")
+    _git("add", "sample.py")
+    _git("commit", "-m", "initial base")
+    _git("checkout", "-b", "feature")
+
+    # Intermediate commit introduces a synthetic token pattern, then a second commit reverts it.
+    synthetic_token = "pplx-" + ("a1b2" * 7)
+    target.write_text(f"VALUE = '{synthetic_token}'\n", encoding="utf-8")
+    _git("add", "sample.py")
+    _git("commit", "-m", "accidental token commit")
+
+    target.write_text("VALUE = 'clean'\n", encoding="utf-8")
+    _git("add", "sample.py")
+    _git("commit", "-m", "remove token from head tree")
+
+    findings = _scan_commit_range_for_secret_patterns(tmp_path, base_ref="main")
+    assert len(findings) == 1
+    assert "sample.py: matched perplexity_key" in findings[0]
+
+
+def test_branch_diff_contains_no_leaked_secret_patterns() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    findings = _scan_commit_range_for_secret_patterns(repo_root, base_ref="origin/master")
+    assert not findings, f"Secret pattern(s) detected in branch commits: {findings}"
 
 

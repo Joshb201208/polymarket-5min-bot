@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -142,6 +142,26 @@ class ResearchSources:
             await self._quotes((symbol,), purpose="order_sizing")
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
+
+    async def handoff_material_news(self, symbol: str, after: datetime, now: datetime) -> tuple[Evidence, ...]:
+        """Use the live-news materiality threshold on the opening symbol's newest stories."""
+        items = await self._poll((symbol,), scope="scheduled_research", include_market=False, lookback_hours=24)
+        evidence = []
+        for item in items:
+            score = _finite(item.materiality_score)
+            parsed = _news_evidence(item)
+            if (symbol in item.symbols and score is not None and score >= _NEWS_LIMIT and parsed is not None
+                    and parsed.published_at is not None and after < parsed.published_at <= now):
+                evidence.append(parsed)
+        return tuple(sorted(evidence, key=lambda row: row.published_at, reverse=True)[:6])
+
+    async def completed_close(self, symbol: str, session_date: date) -> Decimal | None:
+        """An analysis anchor only, for the exact expected previous session."""
+        getter = getattr(self.prices, "get_daily_bars", None)
+        if getter is None:
+            return None
+        bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        return _price(bars[-1].close) if bars and bars[-1].session_date == session_date else None
 
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
         if self.fetch_releases is None:

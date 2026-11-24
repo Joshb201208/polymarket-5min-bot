@@ -57,6 +57,10 @@ class LedgerError(Exception):
     """Misuse of the ledger API (bad role, unknown intent, illegal transition)."""
 
 
+class TopUpAlreadyToday(LedgerError):
+    """Another top-up for this position filled or is still unresolved this session."""
+
+
 # =========================================================================
 # Book snapshot (broker truth + local metadata)
 # =========================================================================
@@ -280,6 +284,21 @@ class ThesisRecord:
 
     def age(self, now: datetime) -> timedelta:
         return now - (self.generated_at or self.created_at)
+
+
+def filled_thesis_grade(thesis: ThesisRecord | None) -> int | None:
+    """Read a documented grade, including a verified v0 entry, never a placeholder."""
+    if thesis is None or not thesis.actionable:
+        return None
+    if thesis.source == "v0" or thesis.payload.get("legacy_v0") is True:
+        if thesis.source != "v0" or thesis.role != ThesisRole.ENTRY_CANDIDATE or (
+            thesis.payload.get("legacy_v0") is not True
+        ):
+            return None
+        grade = thesis.payload.get("conviction")
+    else:
+        grade = thesis.payload.get("effective_conviction")
+    return grade if type(grade) is int and 1 <= grade <= 10 else None
 
 
 # =========================================================================
@@ -655,7 +674,7 @@ class Ledger:
     def set_sector(self, position_id: str, sector: str) -> None:
         self._update_meta(position_id, sector=sector)
 
-    def set_entry_thesis(self, position_id: str, thesis_id: str) -> None:
+    def set_entry_thesis(self, position_id: str, thesis_id: str | None) -> None:
         self._update_meta(position_id, entry_thesis_id=thesis_id)
 
     def update_position_notes(self, position_id: str, **notes: Any) -> None:
@@ -731,16 +750,38 @@ class Ledger:
             return None
         return self.get_thesis(meta.entry_thesis_id)
 
+    def _last_filled_buy(self, position_id: str):
+        rows = self.store.query(
+            "SELECT thesis_ids_json FROM order_intents WHERE position_id=? AND kind='equity' AND side='buy'"
+            " AND status IN ('filled','partially_filled') ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (position_id,))
+        return rows[0] if rows else None
+
     def last_filled_thesis(self, position_id: str) -> ThesisRecord | None:
         """Thesis of the most recent filled buy intent for this position."""
-        rows = self.store.query(
-            "SELECT thesis_ids_json FROM order_intents WHERE position_id=? AND side='buy' AND status IN"
-            " ('filled','partially_filled') ORDER BY updated_at DESC LIMIT 1", (position_id,))
-        if rows:
-            ids = json.loads(rows[0][0] or "[]")
-            if ids:
-                return self.get_thesis(ids[0])
-        return self.entry_thesis(position_id)
+        fill = self._last_filled_buy(position_id)
+        if fill is None:
+            return self.entry_thesis(position_id)
+        ids = json.loads(fill[0] or "[]")
+        return self.get_thesis(ids[0]) if ids else None
+
+    def top_up_baseline(self, position_id: str) -> tuple[int | None, bool]:
+        """Return the actual fill grade and whether an adopted holding may initialize one."""
+        fill = self._last_filled_buy(position_id)
+        if fill is not None:
+            ids = json.loads(fill[0] or "[]")
+            return filled_thesis_grade(self.get_thesis(ids[0]) if ids else None), False
+        meta = self.position_meta(position_id)
+        entry = self.get_thesis(meta.entry_thesis_id) if meta and meta.entry_thesis_id else None
+        grade = filled_thesis_grade(entry)
+        may_initialize = (
+            grade is None and meta is not None and meta.entry_intent_id is None
+            # Reconcile may verify a migrated entry date from broker fills;
+            # that does not supply the legacy research conviction.
+            and meta.opened_source in {"v0", "v0_verified", "import", "assignment"}
+            and (entry is None or entry.source == "v0")
+        )
+        return grade, may_initialize
 
     def theses_for(self, symbol: str, limit: int = 20) -> list[ThesisRecord]:
         rows = self.store.query("SELECT * FROM theses WHERE symbol=? ORDER BY created_at DESC LIMIT ?",
@@ -872,7 +913,8 @@ class Ledger:
                             error=last_error, attempts=it.attempts)
         return it
 
-    def claim_intent(self, intent_id: str, *, check_thesis: bool = True) -> OrderIntent:
+    def claim_intent(self, intent_id: str, *, check_thesis: bool = True,
+                     top_up_session: date | None = None, top_up_baseline_grade: int | None = None) -> OrderIntent:
         """Mark SUBMITTING before the HTTP call. Raises ``LedgerError`` when the
         intent is not QUEUED, is expired, or (buys) its thesis was superseded."""
         it = self.get_intent(intent_id)
@@ -893,7 +935,39 @@ class Ledger:
             if not row or row[0][0] is not None:
                 self._transition(intent_id, IntentStatus.CANCELLED, last_error="position closed or replaced")
                 raise LedgerError(f"intent {intent_id}: position {it.position_id} is no longer open")
+        if top_up_session is not None:
+            return self._claim_top_up(it, top_up_session, top_up_baseline_grade)
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
+
+    def _claim_top_up(self, it: OrderIntent, session: date, baseline_grade: int | None) -> OrderIntent:
+        if not it.position_id or it.side != "buy" or it.kind != "equity":
+            raise LedgerError("only a buy matched to an open stock position can claim a top-up")
+        session_key = session.isoformat()
+        with self.store.transaction() as c:
+            rows = c.execute(
+                "SELECT intent_id, status, session_date, meta_json FROM order_intents"
+                " WHERE position_id=? AND kind='equity' AND side='buy' AND intent_id<>?",
+                (it.position_id, it.intent_id),
+            )
+            for row in rows:
+                meta = json.loads(row["meta_json"] or "{}")
+                status = IntentStatus(row["status"])
+                if status in (IntentStatus.SUBMITTING, IntentStatus.SUBMITTED, IntentStatus.AMBIGUOUS,
+                              IntentStatus.PARTIALLY_FILLED):
+                    # A working/uncertain buy may still fill. Do not place a
+                    # second order, even if the unresolved state crosses midnight.
+                    raise TopUpAlreadyToday("a previous top-up still has an unresolved order")
+                if meta.get("top_up_session", row["session_date"]) == session_key and (
+                    status == IntentStatus.FILLED or (_dec(meta.get("filled_qty")) or Decimal(0)) > 0
+                ):
+                    raise TopUpAlreadyToday("this position already had a top-up fill this session")
+            # The existing intent metadata is backward compatible. Claim and
+            # tag in one write, before contacting the broker or releasing the stop.
+            meta = {"top_up_session": session_key}
+            if baseline_grade is not None:
+                meta.update(top_up_baseline_provenance="first_fresh_reaffirmation",
+                            top_up_baseline_grade=baseline_grade)
+            return self._transition(it.intent_id, IntentStatus.SUBMITTING, bump_attempts=True, meta=meta)
 
     def ack_intent(self, intent_id: str, status: IntentStatus | str, *, broker_order_id: str | None = None,
                    error: str | None = None, next_attempt_at: datetime | None = None,
@@ -1027,5 +1101,5 @@ __all__ = [
     "BookSnapshot", "CashFlow", "Diff", "DiffKind", "EquityMark", "Holding", "IntentStatus", "JobRun",
     "JobStatus", "Ledger", "LedgerError", "NewIntent", "NON_ACTIONABLE_ROLES", "OpenOrder", "OptionLeg",
     "OrderIntent", "PositionMeta", "Severity", "StaleBook", "StateUnavailable", "TERMINAL_INTENT",
-    "ThesisRecord", "ThesisRole", "client_order_id_for", "new_id", "replace",
+    "ThesisRecord", "ThesisRole", "TopUpAlreadyToday", "client_order_id_for", "filled_thesis_grade", "new_id", "replace",
 ]

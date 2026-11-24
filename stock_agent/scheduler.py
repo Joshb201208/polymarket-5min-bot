@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from stock_agent import close_trust
+from stock_agent import close_trust, market_move
 from stock_agent.alerts import AlertService
 from stock_agent.analyst import Analyst
 from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
@@ -58,7 +58,14 @@ except KeyError:
 
 TICK_SECONDS = 30
 NEWS_SECONDS = 180
+MARKET_MOVE_SLOT_SECONDS = 30 * 60
+MARKET_MOVE_STATE_KEY = "scheduler.market_move"
 MAX_JOB_ATTEMPTS = 3
+OPTIONS_RESCAN_STATE_KEY = "options.rescan_requests"
+OPTIONS_RESCAN_QUEUED = "queued"
+OPTIONS_RESCAN_ALREADY_QUEUED = "already_queued"
+OPTIONS_RESCAN_OUTSIDE_WINDOW = "outside_options_window"
+OPTIONS_RESCAN_NO_MANAGER = "no_options_manager"
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
 
@@ -145,6 +152,7 @@ class StockAgentScheduler:
             assets=self.assets, report=self._provider_health, now=_now_utc,
         ))
         self.price_service = self.prices
+        self.market_move_vix = getattr(services, "market_move_vix", None)
         self.health_registry = self.health
         self._universe_symbols: tuple[str, ...] = ()
         self.fundamentals = service("fundamentals", lambda: FundamentalsService(
@@ -180,7 +188,8 @@ class StockAgentScheduler:
             self.broker, self.ledger, self.risk, self.calendar, self.prices, alert=self._alert,
             bars=self._stop_bars, controls=self._risk_controls, margin_controls=self._margin_controls,
             market_gate=self.market_gate, config=self.config, now=_now_utc,
-            capital_lock=self.capital_lock, research_gate=self.research_gate, notifier=self.alerts,
+            capital_lock=self.capital_lock, research_gate=self.research_gate,
+            research_refresh=getattr(self.research_sources, "refresh_entry_inputs", None), notifier=self.alerts,
         ))
         self.options_store = service("options_store", lambda: KvOptionsStore(self.store))
         self.options = service("options", lambda: OptionsManager(
@@ -224,12 +233,6 @@ class StockAgentScheduler:
         self._macro_check_done_today: str | None = None
         self._morning_brief_done_today: str | None = None
         self._options_scan_done_today: str | None = None
-        # Event-triggered scanning state
-        self._last_event_spx: float = 0.0
-        self._last_event_vix: float = 0.0
-        self._last_event_regime: str = ""
-        self._event_scan_cooldown: datetime | None = None  # Don’t fire twice in 30 min
-
     def shutdown(self):
         if not self._shutdown:
             logger.info("Shutdown requested")
@@ -245,7 +248,8 @@ class StockAgentScheduler:
         if self.alerts is not None:
             try:
                 routing = {"channel_key": "announcements"} if (
-                    key == "normalise-plan" and isinstance(self.alerts, AlertService)
+                    isinstance(self.alerts, AlertService) and key
+                    and (key == "normalise-plan" or key.startswith("market-move-rescan:"))
                 ) else {}
                 if isinstance(self.alerts, AlertService) and key and key.startswith("trusted-close-missed:"):
                     routing["dedupe_window_sec"] = 48 * 3600
@@ -799,12 +803,14 @@ class StockAgentScheduler:
                 await self._evaluate_margin_guard(snapshot, now_et, at_close=True)
         await self._drive_order_lane(now_et)
         try:
+            self._schedule_entry_handoff(now_et)
             self._schedule_research_catchup(now_et)
         except (ValueError, StateUnavailable, sqlite3.Error) as exc:
             await self._report_exception("Research catch-up", exc)
         if self._is_market_open(now_et):
             if self._shutdown:
                 return
+            self._schedule_market_move_sample(now_et)
             if self.research is not None and self._should_check_events():
                 self._last_news_at = now_et
                 slot = str(int(now_et.timestamp()) // NEWS_SECONDS)
@@ -813,12 +819,15 @@ class StockAgentScheduler:
                     self._schedule_job("market_regime", f"{day_key}:{slot}", self._check_for_market_event, timeout=90)
             if self._should_run_options_scan(now_et):
                 self._schedule_job("options", day_key, self._run_options_job, timeout=180)
+            self._drive_options_rescans(now_et)
             if self.options is not None:
                 await self._drive_options_monitor(now_et)
 
         # Re-read the clock after the protection lane and schedule by actual session.
         now_et = _now_et()
         day_key = now_et.date().isoformat()
+        if self._state_ready:
+            self._flush_blocked_buy_overflow(now_et)
         if self._state_ready and (self._is_market_open(now_et) or self._in_preopen(
             now_et, start_minutes=180, end_minutes=0,
         )):
@@ -1273,6 +1282,93 @@ class StockAgentScheduler:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "option_scan_temporarily_blocked"})
         return None
 
+    # ── Market-move options re-scan hook (V1 restore, Part 4) ───────────
+
+    def request_options_rescan(self, rescan_key: str, now_et: datetime | None = None) -> str:
+        """Ask for one extra options entry scan this session (market-move rescan).
+
+        Returns "queued", "already_queued", "outside_options_window" or "no_options_manager".
+        Only persists the request, so a restart keeps it and the caller never waits on the
+        options manager. The scan itself runs later as the ordinary "options" job in its own
+        window (see _drive_options_rescans), with the daily scan's 180 s timeout: one options
+        scan at a time, the options protection lane skipped while it runs, drained (not
+        cancelled) on shutdown, never in the stock stop/order lane. Every entry rule of the
+        daily scan still applies inside OptionsManager.scan: one structure per underlying,
+        open-structure and max-loss budgets, cool-downs, research gate, risk check, options
+        buying power, market gate. Requests never carry over to another session.
+        """
+        key = str(rescan_key).strip()
+        if not key:
+            raise ValueError("rescan_key required")
+        if self.options is None:
+            return OPTIONS_RESCAN_NO_MANAGER
+        now_et = (now_et or _now_et()).astimezone(ET)
+        if not self._options_window_open(now_et):
+            return OPTIONS_RESCAN_OUTSIDE_WINDOW  # refused at both ends, never carried over (lead ruling)
+        day = now_et.date().isoformat()
+        state = self.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {}) or {}
+        keys = list(state.get("keys", ())) if state.get("session") == day else []
+        if key in keys:
+            return OPTIONS_RESCAN_ALREADY_QUEUED
+        keys.append(key)
+        self.ledger.risk_state_set(OPTIONS_RESCAN_STATE_KEY, {"session": day, "keys": keys})
+        return OPTIONS_RESCAN_QUEUED
+
+    @staticmethod
+    def options_rescan_window(day: str, rescan_key: str) -> str:
+        return f"{day}:rescan:{rescan_key}"
+
+    def _options_window(self, now_et: datetime) -> tuple[datetime, datetime] | None:
+        """Today's options-entry window: open + 15 min until min(15:00 ET, close - 10 min)."""
+        session = self.calendar.session_on(now_et.date())
+        if session is None:
+            return None
+        until = min(datetime.combine(now_et.date(), time(15, 0), ET), session.closes_at - timedelta(minutes=10))
+        return session.opens_at + timedelta(minutes=15), until
+
+    def _options_window_open(self, now_et: datetime) -> bool:
+        window = self._options_window(now_et)
+        return bool(window and self._is_market_open(now_et) and window[0] <= now_et < window[1])
+
+    def _drive_options_rescans(self, now_et: datetime) -> None:
+        """Start the next pending options re-scan when the daily scan rules allow a scan now;
+        once the window has closed, journal every request that never ran as SKIPPED."""
+        if self.options is None or self._shutdown:
+            return
+        day = now_et.date().isoformat()
+        state = self.ledger.risk_state_get(OPTIONS_RESCAN_STATE_KEY, {}) or {}
+        if state.get("session") != day:
+            return
+        pending = []
+        for key in state.get("keys", ()):
+            window = self.options_rescan_window(day, key)
+            row = self.ledger.job_status("options", window)
+            if row is not None and (row.status in {JobStatus.DONE, JobStatus.SKIPPED}
+                                    or row.attempts >= MAX_JOB_ATTEMPTS):
+                continue
+            pending.append((window, row))
+        if not pending:
+            return
+        window_bounds = self._options_window(now_et)
+        if window_bounds is not None and now_et < window_bounds[0]:
+            return  # requests are only accepted inside the window; nothing can be pending yet
+        if window_bounds is None or now_et >= window_bounds[1]:
+            if "options" in self._job_tasks:
+                return  # never mark a re-scan while an options job is still running
+            for window, row in pending:  # the window has closed for today
+                if row is None:
+                    self.ledger.start_job("options", window)
+                self.ledger.finish_job("options", window, JobStatus.SKIPPED,
+                                       detail={"reason": OPTIONS_RESCAN_OUTSIDE_WINDOW})
+                logger.info("Options re-scan %s skipped: %s", window, OPTIONS_RESCAN_OUTSIDE_WINDOW)
+            return
+        if "options" in self._job_tasks or not self._should_run_options_scan(now_et):
+            return
+        window, row = pending[0]
+        if row is not None and row.eligible_retry_at and row.eligible_retry_at > _now_utc():
+            return  # keep order: a retrying re-scan is not overtaken by a later one
+        self._schedule_job("options", window, self._run_options_job, timeout=180)
+
     async def _drive_options_monitor(self, now: datetime):
         if self._options_task is not None:
             if not self._options_task.done():
@@ -1396,6 +1492,13 @@ class StockAgentScheduler:
         return bool(next_session and next_session.date == now_et.date() and
                     self._in_preopen(now_et, start_minutes=180, end_minutes=30))
 
+    def _schedule_entry_handoff(self, now: datetime) -> None:
+        due = getattr(self.research, "entry_handoff_due", None)
+        if self._reconciled and due is not None and due(now):
+            slot = int(now.timestamp()) // 30
+            self._schedule_job("entry_handoff", f"{now.date()}:{slot}",
+                               self.research.run_entry_handoff, timeout=65)
+
     def _schedule_research_catchup(self, now: datetime) -> None:
         fresh = getattr(self.research, "has_fresh_thesis_set", None)
         if (fresh is None or not self._reconciled
@@ -1506,6 +1609,144 @@ class StockAgentScheduler:
         )
 
     # ── Daily summary ────────────────────────────────────────────────
+
+    def _flush_blocked_buy_overflow(self, now_et: datetime) -> None:
+        """Emit session blocked-buy overflow once after close and handoff completion (or on rollover)."""
+        alerts_obj = getattr(self, "alerts", None)
+        flush_fn = getattr(alerts_obj, "flush_blocked_buy_overflow", None)
+        if not callable(flush_fn):
+            return
+
+        today = now_et.date()
+        cal = getattr(self, "calendar", None)
+        session = cal.session_on(today) if cal is not None else None
+        if session is not None and now_et >= session.closes_at:
+            closed_cutoff = today.isoformat()
+        else:
+            closed_cutoff = (today - timedelta(days=1)).isoformat()
+
+        store_obj = getattr(self, "store", None)
+        last_swept = getattr(self, "_blocked_buy_swept_through", None)
+        if last_swept is None:
+            kv_get = getattr(store_obj, "kv_get", None)
+            if callable(kv_get):
+                try:
+                    raw_swept = kv_get("alerts.blocked_buy_swept_through")
+                except Exception as exc:
+                    logger.debug("Could not read blocked-buy sweep marker (%s)", type(exc).__name__)
+                    return
+            else:
+                raw_swept = ""
+            last_swept = str(raw_swept or "")[:10]
+            self._blocked_buy_swept_through = last_swept
+
+        blocked_map = getattr(alerts_obj, "blocked_buys", None) or {}
+        needs_overflow_flush = any(
+            int(st.get("overflow_count", 0) or 0) > 0 and not bool(st.get("overflow_emitted", False))
+            for day_k, st in blocked_map.items()
+            if isinstance(st, dict) and str(day_k)[:10] <= closed_cutoff
+        )
+        needs_ledger_sweep = bool(closed_cutoff > last_swept)
+        if not needs_ledger_sweep and not needs_overflow_flush:
+            return
+
+        # Defer both current-close and prior-rollover flushes until any running or due entry_handoff finishes.
+        job_tasks = getattr(self, "_job_tasks", None) or {}
+        if "entry_handoff" in job_tasks:
+            return
+        research_obj = getattr(self, "research", None)
+        due_fn = getattr(research_obj, "entry_handoff_due", None)
+        if callable(due_fn):
+            try:
+                if due_fn(_now_utc()):
+                    return
+            except Exception:
+                return
+
+        if needs_ledger_sweep:
+            if not StockAgentScheduler._sweep_closed_expired_buys(
+                self,
+                today=today,
+                last_swept=last_swept,
+                closed_cutoff=closed_cutoff,
+            ):
+                return
+            self._blocked_buy_swept_through = closed_cutoff
+            kv_set = getattr(store_obj, "kv_set", None)
+            if callable(kv_set):
+                try:
+                    kv_set("alerts.blocked_buy_swept_through", closed_cutoff)
+                except Exception as exc:
+                    logger.debug("Could not persist blocked-buy sweep marker (%s)", type(exc).__name__)
+
+        try:
+            next_after_closed = (date.fromisoformat(closed_cutoff) + timedelta(days=1)).isoformat()
+            flush_fn(before_session=next_after_closed)
+        except Exception as exc:
+            logger.debug("Session blocked-buy overflow flush skipped (%s)", type(exc).__name__)
+
+    def _sweep_closed_expired_buys(self, *, today: date, last_swept: str, closed_cutoff: str) -> bool:
+        alerts_obj = getattr(self, "alerts", None)
+        alert_blocked_fn = getattr(alerts_obj, "alert_blocked_buy", None)
+        ledger_obj = getattr(self, "ledger", None)
+        if not callable(alert_blocked_fn) or ledger_obj is None:
+            return True
+
+        retention_floor = (today - timedelta(days=14)).isoformat()
+        if last_swept and len(last_swept) == 10:
+            try:
+                after_last = (date.fromisoformat(last_swept) + timedelta(days=1)).isoformat()
+                min_day = max(retention_floor, after_last)
+            except ValueError:
+                min_day = retention_floor
+        else:
+            min_day = retention_floor
+        if min_day > closed_cutoff:
+            return True
+
+        try:
+            expire_fn = getattr(ledger_obj, "expire_intents", None)
+            if callable(expire_fn):
+                expire_fn(_now_utc())
+
+            ledger_store = getattr(ledger_obj, "store", None)
+            query_fn = getattr(ledger_store, "query", None)
+            if callable(query_fn):
+                rows = query_fn(
+                    "SELECT symbol, session_date, last_error FROM order_intents "
+                    "WHERE status='expired' AND side='buy' AND kind != 'cover' "
+                    "AND COALESCE(job, '') != 'open_handoff' "
+                    "AND session_date >= ? AND session_date <= ? "
+                    "ORDER BY created_at",
+                    (min_day, closed_cutoff),
+                )
+                for r in rows:
+                    alert_blocked_fn(
+                        str(r["symbol"]),
+                        "intent_expired",
+                        str(r["last_error"] or ""),
+                        session_date=str(r["session_date"])[:10],
+                    )
+                return True
+
+            list_fn = getattr(ledger_obj, "list_intents", None)
+            if callable(list_fn):
+                for it in list_fn(["expired"]):
+                    side = str(getattr(it.side, "value", it.side) or "").lower()
+                    if side != "buy" or getattr(it, "job", None) == "open_handoff":
+                        continue
+                    it_day = str(it.session_date)[:10] if getattr(it, "session_date", None) else ""
+                    if min_day <= it_day <= closed_cutoff:
+                        alert_blocked_fn(
+                            it.symbol,
+                            "intent_expired",
+                            str(getattr(it, "last_error", "") or ""),
+                            session_date=it_day,
+                        )
+            return True
+        except Exception as exc:
+            logger.debug("Expired buy alert sweep skipped (%s)", type(exc).__name__)
+            return False
 
     async def _send_daily_summary(self):
         """End-of-day summary (plus weekly scorecard on the last exchange session of the week)."""
@@ -1668,6 +1909,7 @@ class StockAgentScheduler:
 
             if self.alerts is not None:
                 try:
+                    self._flush_blocked_buy_overflow(now)
                     sent = await self.alerts.flush()
                     logger.info(
                         "Daily summary outcome=%s (outbox flushed=%s)",
@@ -1720,6 +1962,152 @@ class StockAgentScheduler:
                 "warning", "Market regime changed", f"{before} to {after}; no trade triggered",
                 key=f"market_regime_{before}_{after}",
             )
+
+    def _schedule_market_move_sample(self, now: datetime) -> None:
+        if self.research is None:
+            return
+        session = self.calendar.session_on(now.date())
+        if session is None or not session.opens_at <= now < session.closes_at:
+            return
+        slot, offset = divmod(int((now - session.opens_at).total_seconds()), MARKET_MOVE_SLOT_SECONDS)
+        # Allow the opening print and normal scheduler jitter, but don't use
+        # a mid-slot restart as if it were a regularly spaced observation.
+        if not 30 <= offset < 300:
+            return
+        started_at = session.opens_at + timedelta(seconds=slot * MARKET_MOVE_SLOT_SECONDS)
+        latest = self.store.kv_get(MARKET_MOVE_STATE_KEY) or {}
+        eligible_at = market_move.cooldown_until(latest) if latest.get("session") == str(session.date) else None
+        deadline = started_at + timedelta(minutes=3)
+        if eligible_at is not None and eligible_at > started_at:
+            if now < eligible_at:
+                # The prior claim may have landed later within its 30-minute
+                # window. Wait, then read fresh inputs at this slot rather
+                # than consuming a crossing while still in the cooldown.
+                return
+            deadline = max(deadline, eligible_at + timedelta(seconds=2 * TICK_SECONDS))
+        if now >= deadline:
+            return
+        self._schedule_job("market_move_sample", f"{session.date}:{slot}",
+                           lambda: self._run_market_move_sample(session, slot), timeout=25, replay=False)
+
+    async def _market_move_input(self, label, callback):
+        try:
+            async with asyncio.timeout(10):
+                return await callback()
+        except Exception as exc:
+            logger.info("Market-move %s unavailable (%s)", label, type(exc).__name__)
+            return None
+
+    async def _run_market_move_sample(self, session, slot):
+        previous = self.calendar.previous_session(session.date)
+
+        async def spy_close():
+            if previous is None:
+                return None
+            rows = await self.prices.get_daily_bars(["SPY"], start_date=previous.date, end_date=previous.date)
+            return next((row.close for row in rows.get("SPY", ()) if row.session_date == previous.date), None)
+
+        async def vix():
+            if self.market_move_vix is None:
+                return None
+            # Inject only a real intraday cash VIX feed. Its verified close must
+            # be for previous.date; FRED daily data and VIXY are not substitutes.
+            return await self.market_move_vix(session, previous)
+
+        close, vix_data, current_macro = await asyncio.gather(
+            self._market_move_input("prior SPY close", spy_close),
+            self._market_move_input("VIX", vix),
+            self._market_move_input("macro", self.macro.check_conditions),
+        )
+        quotes = await self._market_move_input(
+            "SPY", lambda: self.prices.get_quotes(["SPY"], purpose="brief", max_age_s=90),
+        )
+        now = _now_utc()
+        if self._shutdown or not self._is_market_open(now) or not session.opens_at <= now < session.closes_at:
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "regular_session_unavailable"})
+        readings, closes = {}, {"spy": close}
+        quote = quotes.quotes.get("SPY") if quotes is not None else None
+        if quote is not None and quote.is_market_hours:
+            reading = market_move.valid_reading(quote.price, quote.as_of, now=now, opens_at=session.opens_at)
+            if reading is not None:
+                readings["spy"] = reading
+        if isinstance(vix_data, tuple) and len(vix_data) == 2 and isinstance(vix_data[0], market_move.Reading):
+            vix_reading, vix_close = vix_data
+            reading = market_move.valid_reading(vix_reading.value, vix_reading.as_of, now=now,
+                                                opens_at=session.opens_at)
+            if reading is not None:
+                readings["vix"] = reading
+                if previous is not None:
+                    closes["vix"] = vix_close
+
+        regime = None
+        if current_macro is not None and not current_macro.degraded:
+            try:
+                stamp = datetime.fromisoformat(current_macro.timestamp)
+            except (ValueError, TypeError):
+                stamp = None
+            if (stamp is not None and stamp.utcoffset() is not None
+                    and session.opens_at <= stamp <= now and now - stamp <= market_move.MAX_QUOTE_AGE):
+                regime = current_macro.regime
+        day = str(session.date)
+        name, window = "market_move_rescan", f"{day}:{slot}"
+        attempt = None
+        with self.store.transaction():
+            state = self.store.kv_get(MARKET_MOVE_STATE_KEY) or {}
+            if state.get("session") != day:
+                anchor = None
+                if previous is not None and state.get("session") == str(previous.date):
+                    prior_seconds = int((previous.closes_at - previous.opens_at).total_seconds())
+                    prior_final_slot = (prior_seconds - 1) // MARKET_MOVE_SLOT_SECONDS
+                    if state.get("slot") == prior_final_slot:
+                        anchor = state.get("regime")
+                state = {"regime_anchor": anchor}
+            state, hits = market_move.observe(
+                state, slot=slot, now=now, readings=readings, closes=closes, regime=regime,
+                can_claim=name not in self._job_tasks and self.ledger.job_status(name, window) is None,
+            )
+            self.store.kv_set(MARKET_MOVE_STATE_KEY, {"session": day, **state})
+            if hits:
+                attempt = self.ledger.start_job(name, window).attempts
+        if attempt is not None:
+            # Claim and cap are atomic with the job row. Intentional at-most-once
+            # semantics: an interrupted or failed rescan consumes its claim.
+            self._job_tasks[name] = asyncio.create_task(
+                self._run_scheduled_job(name, window, lambda: self._run_market_move_rescan(window, hits), 1500, attempt),
+                name=f"stock-agent:{name}",
+            )
+        return JobOutcome(JobStatus.DONE, detail={"inputs": sorted(readings), "triggered": bool(hits)})
+
+    async def _run_market_move_rescan(self, window, hits):
+        if not self._is_market_open(_now_et()):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "regular_session_unavailable", "triggers": hits})
+        why = "; ".join(hit["text"] for hit in hits)
+        await self._alert("info", "Market-move rescan",
+                          f"{why}. Reviewing held positions and looking for new ideas. "
+                          "The normal options scan will be requested; all research and risk limits still apply.",
+                          key=f"market-move-rescan:{window}")
+        result = await self.research.run("market_move", work_scope=f"market_move:{window}")
+        request_options = getattr(self, "request_options_rescan", None)
+        options_status = "not configured"
+        if request_options is not None:
+            try:
+                options_status = request_options(window) or "requested"
+            except Exception as exc:
+                # Do not lose valid stock intents because the separate options
+                # handoff was unavailable. This call only persists a request.
+                options_status = "request unavailable"
+                logger.warning("Market-move options request failed (%s)", type(exc).__name__)
+        detail = {**result.detail, "triggers": hits, "options_rescan": options_status}
+        if options_status == "outside_options_window":
+            # The normal research run has already journalled its stock stages.
+            # Append just this additional skip so it cannot duplicate stock counts.
+            outside = {"outside_options_window": 1}
+            self.journal.append("research.entry_funnel", job="market_move_options",
+                                session_date=window.split(":", 1)[0], rejected_by_reason=outside)
+            funnel = dict(detail.get("entry_funnel") or {})
+            rejected = {**(funnel.get("rejected_by_reason") or {}), **outside}
+            detail["entry_funnel"] = {**funnel, "rejected_by_reason": rejected}
+        return JobOutcome(result.status, result.intents, detail, result.option_candidates)
 
     # ── Morning Brief ────────────────────────────────────────────────
 

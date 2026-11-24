@@ -264,8 +264,9 @@ def test_limit_bound_and_marked_slippage_are_conservative(risk):
 
 def test_post_trade_sector_catches_aliases_for_new_buys_and_adds(risk):
     book = snapshot(stock("BANKA", 149, "Financials"), stock("BANKB", 149, "Financial Services"),
-                    stock("BANKC", 83, "Financials"), stock("ALFA", 10, "Financial Services"))
-    add = buy(kind=TradeKind.ADD, sector="Financials", last_filled_conviction=10)
+                    stock("BANKC", 83, "Financials"), stock("ALFA", 10, "Financial Services", stop="92"))
+    add = buy(kind=TradeKind.ADD, sector="Financials", last_filled_conviction=10,
+              thesis_change="strengthened")
     assert risk.evaluate_trade(book, add).reasons == ("sector_cap",)
     assert risk.propose_equity_qty(book, add) == 9
     new = replace(add, kind=TradeKind.BUY, symbol="BANKD")
@@ -318,21 +319,47 @@ def test_hard_cap_can_clip_a_new_buy_and_throttle_scales_sizes(risk, monkeypatch
 
 
 def test_top_up_can_use_equal_conviction_but_not_below_stop_or_near_target(risk):
-    trade = buy(kind=TradeKind.ADD, effective_conviction=7, raw_conviction=7, last_filled_conviction=7)
+    trade = buy(kind=TradeKind.ADD, effective_conviction=8, raw_conviction=8, last_filled_conviction=8,
+                thesis_change="unchanged")
     assert risk.evaluate_trade(snapshot(stock("ALFA", 20, "Industrials", stop="92")), trade).ok
     assert risk.evaluate_trade(snapshot(stock("ALFA", 20, "Industrials", stop="100")), trade).reasons == (
         "top_up_below_stop",
     )
-    assert risk.evaluate_trade(snapshot(stock("ALFA", 45, "Industrials")), trade).reasons == ("near_target",)
-    assert risk.evaluate_trade(snapshot(stock("ALFA", 20, "Industrials")),
-                               replace(trade, last_filled_conviction=8)).reasons == ("top_up_conviction",)
+    assert risk.evaluate_trade(snapshot(stock("ALFA", 63, "Industrials", stop="92")), trade).reasons == (
+        "near_target",
+    )
+    book = snapshot(stock("ALFA", 20, "Industrials", stop="92"))
+    for changes, reason in (
+        ({"last_filled_conviction": 9}, "top_up_conviction"),
+        ({"last_filled_conviction": None}, "top_up_conviction"),
+        ({"effective_conviction": 7, "raw_conviction": 7, "last_filled_conviction": 7}, "top_up_conviction"),
+        ({"thesis_change": "weakened"}, "top_up_thesis_change"),
+        ({"thesis_change": None}, "top_up_thesis_change"),
+    ):
+        candidate = replace(trade, **changes)
+        assert risk.propose_equity_qty(book, candidate) == 0
+        assert risk.evaluate_trade(book, candidate).reasons == (reason,)
+    assert risk.evaluate_trade(snapshot(stock("ALFA", 20, "Industrials")), trade).reasons == (
+        "top_up_below_stop",
+    )
+
+
+def test_top_up_cannot_overshoot_target_with_fresher_mark_or_working_shares(risk):
+    trade = buy(kind=TradeKind.ADD, effective_conviction=8, raw_conviction=8, last_filled_conviction=8,
+                thesis_change="unchanged", price=D("101"), mark_price=D("102"))
+    book = snapshot(stock("ALFA", 40, "Industrials", stop="92"),
+                    orders=(order("ALFA", qty="6", done="0", limit="101"),))
+    # Target $7,000, held + already pending $4,692, highest permissible new spend $2,244 (22 shares).
+    assert risk.propose_equity_qty(book, trade) == 22
+    assert risk.evaluate_trade(book, replace(trade, qty=D(22))).ok
+    assert risk.evaluate_trade(book, replace(trade, qty=D(23))).reasons == ("sizing_limit",)
 
 
 def test_position_count_blocks_new_names_but_not_top_up(risk):
-    book = snapshot(*(stock(f"STOCK{i}", 1, "Financials") for i in range(20)))
+    book = snapshot(*(stock(f"STOCK{i}", 1, "Financials", stop="92") for i in range(20)))
     assert risk.evaluate_trade(book, buy()).reasons == ("position_count",)
     assert risk.evaluate_trade(book, buy(symbol="STOCK1", sector="Financials", kind=TradeKind.ADD,
-                                         last_filled_conviction=10)).ok
+                                         last_filled_conviction=10, thesis_change="strengthened")).ok
 
 
 def test_missing_data_blocks_new_exposure_but_not_known_risk_reductions(risk):

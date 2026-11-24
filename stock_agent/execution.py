@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 from stock_agent.broker import AlpacaClient, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, round_price
 from stock_agent.config import Config
-from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent
+from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent, ThesisRecord, ThesisRole, TopUpAlreadyToday
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -148,6 +148,7 @@ class ExecutionEngine:
         market_gate: Callable[..., Awaitable[Any]] | None = None,
         capital_lock: Any = None,
         research_gate: Any = None,
+        research_refresh: Callable[[str, datetime], Any] | None = None,
         notifier: Any = None,
         margin_controls: Callable[[Any], Any] | None = None,
         config: Any = Config,
@@ -165,6 +166,7 @@ class ExecutionEngine:
         self._market_gate = market_gate
         self._capital_lock = capital_lock
         self._research_gate = research_gate
+        self._research_refresh = research_refresh  # ResearchSources.refresh_entry_inputs(symbol, now)
         self._margin_controls = margin_controls  # scheduler: snapshot -> RiskControls (held convictions)
         self._notifier = notifier  # AlertService-like: send_normalise_plan / send_normalise_result
         self.config = config
@@ -444,7 +446,10 @@ class ExecutionEngine:
             self._funnel(it, "ordered", order_id=order.id)
         self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id, meta=meta)
         if status == IntentStatus.FILLED:
-            self._funnel(it, "filled", qty=filled, avg_price=price, order_id=order.id)
+            provenance = {
+                key: it.meta[key] for key in ("top_up_baseline_provenance", "top_up_baseline_grade") if key in it.meta
+            }
+            self._funnel(it, "filled", qty=filled, avg_price=price, order_id=order.id, **provenance)
         elif code:
             self._funnel(it, "skipped", code, f"order ended {order.status}")
         if status == IntentStatus.REJECTED:
@@ -538,7 +543,8 @@ class ExecutionEngine:
         "cleanup_pending", "books_untrusted", "market_closed", "price_ran_away", "quote_unavailable",
         "symbol_blocked", "short_open", "research_stale", "position_changed", "risk_size_zero",
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
-        "intent_expired", "duplicate", "nothing_to_sell", "exit_cap", "other"})
+        "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
+        "nothing_to_sell", "exit_cap", "research_inputs_pending", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
         """Journal event `execution.buy_funnel` for the daily entry funnel (A14d). Never raises."""
@@ -551,6 +557,33 @@ class ExecutionEngine:
                                        session_date=self.session_date().isoformat(), **extra)
         except Exception:
             logger.exception("buy funnel journal failed")
+        if stage == "skipped":
+            self._alert_blocked_buy(it, code, reason, extra.get("risk_reasons") or ())
+
+    _LIVE_BUY = frozenset({IntentStatus.QUEUED, IntentStatus.SUBMITTING, IntentStatus.SUBMITTED,
+                           IntentStatus.AMBIGUOUS, IntentStatus.PARTIALLY_FILLED, IntentStatus.FILLED})
+
+    def _superseded_by_live_buy(self, it: OrderIntent) -> bool:
+        cur = self.ledger.current_thesis(it.symbol)
+        if cur is None or cur.thesis_id in set(it.thesis_ids or ()):
+            return False
+        return any(
+            o.intent_id != it.intent_id and o.side == "buy" and o.kind != "cover" and o.status in self._LIVE_BUY
+            and cur.thesis_id in set(o.thesis_ids or ())
+            for o in self.ledger.list_intents(symbol=it.symbol)
+        )
+
+    def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str, risk_reasons: Any = ()) -> None:
+        """Part 5: one #risk line per blocked buy (AlertService filters/dedupes). Never raises."""
+        fn = getattr(self._notifier, "alert_blocked_buy", None) if self._notifier is not None else None
+        if fn is None:
+            return
+        try:
+            if code == "research_stale" and self._superseded_by_live_buy(it):
+                return  # a newer thesis's buy for this symbol is live: not a blocked buy
+            fn(it.symbol, code, reason, session_date=self.session_date(), risk_reasons=tuple(risk_reasons))
+        except Exception:
+            logger.exception("blocked-buy alert failed")
 
     @staticmethod
     def _code_meta(code: str, reason: str, **extra: Any) -> dict:
@@ -573,7 +606,8 @@ class ExecutionEngine:
         elif cur is not None and cur.status == IntentStatus.SUBMITTING:
             self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=reason, meta=meta)
         logger.info("intent %s %s %s skipped [%s]: %s", intent.intent_id, intent.side, intent.symbol, code, reason)
-        self._funnel(intent, "skipped", code, reason)
+        risk = {"risk_reasons": list(extra["risk_reasons"])} if extra.get("risk_reasons") else {}
+        self._funnel(intent, "skipped", code, reason, **risk)
         return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=reason, code=code)
 
     async def _defer_or_skip(self, intent: OrderIntent, reason: str) -> ExecResult:
@@ -672,6 +706,9 @@ class ExecutionEngine:
             return self._skip(intent, f"price {ask:.2f} ran more than {self.s.max_price_drift_pct:.0%} above "
                                       f"the analysed {ref:.2f}", "price_ran_away")
         limit = round_price(ask * (1 + self.s.buy_limit_offset_pct))
+        # Network refresh of an old quote/news proof happens here, outside the capital lock;
+        # the binding recheck inside the lock is network-free.
+        await self._refresh_research_proof(intent)
         try:
             async with (self._capital_lock or contextlib.nullcontext()):
                 # Held only from the fresh risk snapshot through submit/confirm, so the
@@ -700,12 +737,35 @@ class ExecutionEngine:
         h = snap.holding(intent.symbol)
         if h is not None and h.qty < 0:
             return self._skip(intent, "account is short this symbol; cover first", "short_open")
-        why = await self._research_recheck(intent, h)
+        add = h is not None and h.qty > 0
+        if (add or intent.position_id) and (
+            not add or h.meta is None or h.meta.position_id != intent.position_id
+        ):
+            return self._skip(intent, "top-up no longer matches the live position", "position_changed")
+        why, code = await self._research_verdict(intent, h)
         if why:
-            code = "position_changed" if why.startswith("top-up") else "research_stale"
+            if code == "research_inputs_pending":
+                return await self._hold(intent, why, code=code)
             return self._skip(intent, why, code)
+        thesis = None
+        last_filled_conviction = None
+        initial_reaffirmation = False
+        if add:
+            thesis = self.ledger.get_thesis(intent.thesis_ids[0]) if len(intent.thesis_ids) == 1 else None
+            draft = thesis.payload.get("draft") if thesis is not None else None
+            if thesis is None or not thesis.actionable or thesis.symbol != intent.symbol or not isinstance(draft, dict) or (
+                draft.get("direction") != "BUY"
+            ):
+                return self._skip(intent, "top-up requires a linked BUY thesis", "top_up_thesis_direction")
+            last_filled_conviction, may_initialize = self.ledger.top_up_baseline(intent.position_id)
+            initial_reaffirmation = (
+                may_initialize and thesis.role == ThesisRole.HELD_REVIEW
+                and "/" in thesis.source and thesis.payload.get("legacy_v0") is not True
+            )
         dist = await self._stop_distance(intent.symbol, ask)
-        ti = self._trade_intent(intent, snap, limit, q, dist, add=h is not None and h.qty > 0)
+        ti = self._trade_intent(intent, limit, q, dist, add_thesis=thesis,
+                                last_filled_conviction=last_filled_conviction,
+                                initial_reaffirmation=initial_reaffirmation)
         controls = self._risk_controls()
         qty = int(self.risk.propose_equity_qty(snap, ti, now=self.now(), controls=controls))
         from dataclasses import replace
@@ -727,7 +787,12 @@ class ExecutionEngine:
             pass  # not QUEUED any more: claim below reports it
         self._funnel(intent, "passed_risk", qty=qty)
         try:
-            claimed = self.ledger.claim_intent(intent.intent_id)
+            claimed = self.ledger.claim_intent(
+                intent.intent_id, top_up_session=self.session_date() if add else None,
+                top_up_baseline_grade=ti.effective_conviction if initial_reaffirmation else None,
+            )
+        except TopUpAlreadyToday as e:
+            return self._skip(intent, str(e), "top_up_already_today")
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e), code="duplicate")
         # Sizing takes bar/quote/book round trips; the entry window can close meanwhile
@@ -763,43 +828,118 @@ class ExecutionEngine:
             raise
         return claimed, order, released
 
-    RESEARCH_ORIGINS = frozenset({"weekly", "midweek", "prescan", "earnings", "news"})
+    RESEARCH_ORIGINS = frozenset({"weekly", "midweek", "prescan", "earnings", "news", "market_move"})
+
+    # Gate reasons (research_gate.py / research_health.py) that only say a proof is old or a
+    # provider blipped. They are refreshed before submit and, if still present, the buy is held
+    # and retried (it expires at the session close) instead of being skipped.
+    RESEARCH_REFRESHABLE = frozenset({"quote_stale_or_unavailable", "news_stale_or_unavailable"})
+    RESEARCH_TRANSIENT = RESEARCH_REFRESHABLE | frozenset({
+        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable"})
+    RESEARCH_REFRESH_TIMEOUT_S = 10.0
+    # Aggregate cap so N due buys can't stall monitor_tick by N x 10s: at most this many seconds
+    # of proof refresh per rolling minute; past it, stale proofs take the transient hold path.
+    RESEARCH_REFRESH_BUDGET_S = 15.0
+
+    async def _eligibility(self, symbol: str) -> Any:
+        g = self._research_gate.is_entry_eligible(symbol, self.now())
+        if hasattr(g, "__await__"):
+            g = await g
+        return g
+
+    def _blocking_reasons(self, g: Any) -> tuple[str, ...]:
+        if getattr(g, "ok", None) is True:
+            return ()
+        return tuple(getattr(g, "reasons", ()) or ()) or ("research_gate_refused",)
+
+    async def _refresh_research_proof(self, intent: OrderIntent) -> None:
+        """Refresh an old quote/news proof before the binding recheck. Never raises."""
+        if (self._research_gate is None or self._research_refresh is None
+                or intent.origin not in self.RESEARCH_ORIGINS):
+            return
+        try:
+            g = await self._eligibility(intent.symbol)
+            if not set(self._blocking_reasons(g)) & self.RESEARCH_REFRESHABLE:
+                return
+            loop = asyncio.get_running_loop()  # same clock as asyncio.timeout
+            clock = loop.time()
+            start, spent = getattr(self, "_refresh_window", (clock, 0.0))
+            if clock - start >= 60.0:
+                start, spent = clock, 0.0
+            budget = min(self.RESEARCH_REFRESH_TIMEOUT_S, self.RESEARCH_REFRESH_BUDGET_S - spent)
+            if budget <= 0:
+                logger.info("research proof refresh budget used up; %s waits for the next try", intent.symbol)
+                return
+            try:
+                async with asyncio.timeout(budget):
+                    r = self._research_refresh(intent.symbol, self.now())
+                    if hasattr(r, "__await__"):
+                        await r
+            finally:
+                self._refresh_window = (start, spent + loop.time() - clock)
+        except (Exception, TimeoutError) as e:  # the recheck below decides; a refresh failure only means "still old"
+            logger.warning("research proof refresh for %s failed: %s", intent.symbol, e)
 
     async def _research_recheck(self, intent: OrderIntent, holding: Any) -> str | None:
-        """At submission, not just at proposal: the research gate must still say BUY
-        for this intent's thesis, and a top-up must target the position it was proven for."""
-        if holding is not None and holding.qty > 0 and intent.position_id:
-            meta = self.ledger.open_position_meta(intent.symbol)
+        return (await self._research_verdict(intent, holding))[0]
+
+    async def _research_verdict(self, intent: OrderIntent, holding: Any) -> tuple[str | None, str]:
+        """At submission, not just at proposal: the research gate must still pass (``ok``)
+        with a BUY for this intent's thesis, and the intent must still match the position
+        it was proven for. Returns (reason, code); reason None means go."""
+        held = holding is not None and holding.qty > 0
+        if intent.position_id:
+            meta = self.ledger.open_position_meta(intent.symbol) if held else None
             if meta is None or meta.position_id != intent.position_id:
-                return "top-up was approved for a position that has since closed or reopened"
+                return ("top-up was approved for a position that has since closed or reopened",
+                        "position_changed")
         if self._research_gate is None or intent.origin not in self.RESEARCH_ORIGINS:
-            return None
+            return None, ""
         try:
-            g = self._research_gate.is_entry_eligible(intent.symbol, self.now())
-            if hasattr(g, "__await__"):
-                g = await g
+            g = await self._eligibility(intent.symbol)
         except Exception as e:
+            if intent.origin == "market_move" or intent.meta.get("scheduled_handoff") is True:
+                logger.warning("research gate unavailable at submit for %s (%s)", intent.symbol, type(e).__name__)
+                return "research gate unavailable at submit (retrying)", "research_inputs_pending"
             # A14a: a broken recheck must not block every buy. Degrade to the ledger's
             # current thesis: the intent still has to come from the newest thesis.
             logger.warning("research gate unavailable at submit (%s); using the ledger thesis", e)
             try:
                 cur = self.ledger.current_thesis(intent.symbol)
             except Exception as le:
-                return f"research gate and ledger thesis both unavailable: {e}; {le}"
+                return f"research gate and ledger thesis both unavailable: {e}; {le}", "research_stale"
             if cur is None or cur.thesis_id not in set(intent.thesis_ids or ()):
-                return "research gate unavailable and the ledger has a newer thesis"
-            return None
-        if not g or getattr(g, "direction", None) != "BUY":
-            return "research gate no longer has a BUY for this symbol"
+                return "research gate unavailable and the ledger has a newer thesis", "research_stale"
+            draft = (getattr(cur, "payload", None) or {}).get("draft") or {}
+            if not getattr(cur, "actionable", False) or str(draft.get("direction", "")).upper() != "BUY":
+                return "research gate unavailable and the ledger thesis is not an actionable BUY", "research_stale"
+            if any(i.side == "sell" and not i.terminal for i in self.ledger.list_intents(symbol=intent.symbol)):
+                return "research gate unavailable and an exit is pending for this symbol", "research_stale"
+            return None, ""
+        if g is None or getattr(g, "direction", None) != "BUY":
+            return "research gate no longer has a BUY for this symbol", "research_stale"
         if getattr(g, "thesis_id", None) not in set(intent.thesis_ids or ()):
-            return "research gate's current thesis is not the one this intent was made from"
-        return None
+            return "research gate's current thesis is not the one this intent was made from", "research_stale"
+        blocking = self._blocking_reasons(g)
+        if not blocking:
+            return None, ""
+        text = "research gate refused at submit: " + ", ".join(blocking)
+        if set(blocking) <= self.RESEARCH_TRANSIENT:
+            return text + " (retrying)", "research_inputs_pending"
+        return text, "research_stale"
 
     async def _hold(self, intent: OrderIntent, reason: str, until: datetime | None = None,
                     code: str = "other") -> ExecResult:
         nxt = until or (self.now() + timedelta(minutes=5))
         if intent.expires_at is not None and nxt >= intent.expires_at:
-            return self._skip(intent, reason + " (intent would expire)", "intent_expired", held_by=code)
+            # Holds never alert; this one skip is the single blocked-buy message, so it names
+            # what kept the buy waiting earlier (e.g. a research outage) as well as the last hold.
+            cur = self.ledger.get_intent(intent.intent_id)
+            prior = getattr(cur, "last_error", None) or ""
+            why = reason + " (intent would expire)"
+            if prior and prior != reason:
+                why += f"; earlier held: {prior}"
+            return self._skip(intent, why, "intent_expired", held_by=code)
         self.ledger.ack_intent(intent.intent_id, IntentStatus.QUEUED, error=reason, next_attempt_at=nxt,
                                meta=self._code_meta(code, reason))
         self._funnel(intent, "held", code, reason)
@@ -818,10 +958,19 @@ class ExecutionEngine:
                 pass
         return intent.created_at
 
-    def _trade_intent(self, intent: OrderIntent, snap: Any, limit: float, q: Any, dist: Any, *, add: bool):
+    def _trade_intent(self, intent: OrderIntent, limit: float, q: Any, dist: Any, *,
+                      add_thesis: ThesisRecord | None = None, last_filled_conviction: int | None = None,
+                      initial_reaffirmation: bool = False):
         from stock_agent.risk_manager import TradeIntent, TradeKind
 
         m = dict(intent.meta or {})
+        add = add_thesis is not None
+        if add:
+            # The thesis/grade used for approval comes from the ledger, not
+            # a stale or optimistic copy in a queued order's metadata.
+            m.update(raw_conviction=add_thesis.payload.get("raw_conviction"),
+                     effective_conviction=add_thesis.payload.get("effective_conviction"),
+                     thesis_change=add_thesis.payload["draft"].get("thesis_change"))
         kw: dict[str, Any] = dict(
             kind=TradeKind.ADD if add else TradeKind.BUY,
             symbol=intent.symbol,
@@ -830,10 +979,12 @@ class ExecutionEngine:
             sector=m.get("sector"),
             raw_conviction=m.get("raw_conviction"),
             effective_conviction=m.get("effective_conviction", m.get("conviction")),
-            last_filled_conviction=m.get("last_filled_conviction"),
+            last_filled_conviction=last_filled_conviction,
+            thesis_change=m.get("thesis_change") if add else None,
+            initial_reaffirmation=initial_reaffirmation,
             stop_distance=dist.fraction,
             analysis_price=intent.reference_price,
-            signal_at=self._signal_at(intent),
+            signal_at=add_thesis.generated_at if add else self._signal_at(intent),
             quote_at=getattr(q, "as_of", None),
         )
         if m.get("minimum_conviction") is not None:
