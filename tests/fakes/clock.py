@@ -274,6 +274,9 @@ class SimClock:
         - `asyncio.sleep(n)` advances the clock by n seconds and yields once,
           so `await asyncio.sleep(3)` in the executor costs no real time and
           lets the fake broker's fill engine run.
+        - modules that did `import time` (any alias) see `time.monotonic()` /
+          `time.time()` on the simulated clock, so rate limiters waiting with
+          asyncio.sleep make progress (otherwise they spin in simulated time).
         """
         import importlib
 
@@ -282,11 +285,15 @@ class SimClock:
         monkeypatch.setattr(sched, "_now_utc", lambda: self.now())
 
         sim_dt = self.datetime_class()
+        sim_time = _SimTime(self)
         for name, mod in list(sys.modules.items()):
             if not (name == modules_prefix or name.startswith(modules_prefix + ".")):
                 continue
             if getattr(mod, "datetime", None) is datetime:
                 monkeypatch.setattr(mod, "datetime", sim_dt)
+            for attr, val in list(vars(mod).items()):
+                if val is _time_mod:     # `import time` / `import time as _time`
+                    monkeypatch.setattr(mod, attr, sim_time)
 
         if patch_sleep:
             real_sleep = asyncio.sleep
@@ -300,3 +307,22 @@ class SimClock:
                 return result
 
             monkeypatch.setattr(asyncio, "sleep", sim_sleep)
+
+
+_time_mod = __import__("time")
+
+
+class _SimTime:
+    """Stand-in for the `time` module: monotonic/time/perf_counter follow the
+    simulated clock; everything else is the real module."""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def time(self) -> float:
+        return self._clock.now().timestamp()
+
+    monotonic = perf_counter = time
+
+    def __getattr__(self, name):
+        return getattr(_time_mod, name)
