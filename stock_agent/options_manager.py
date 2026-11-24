@@ -76,8 +76,18 @@ ET = ZoneInfo("America/New_York")
 # estimated counts are trusted only this many sessions past the exit threshold
 _FALLBACK_MARGIN = 5
 _EXPIRY_DRIVEN = frozenset({ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND})
+# Parsed locally, never sent as a server-side filter: Alpaca documents OPXRC
+# but the live API rejects it ("422 invalid activity type: OPXRC"), and the
+# live account reports exercise as OPEXC. Both spellings are kept for parsing.
 OPTION_ACTIVITY_TYPES = ("FILL", "OPEXC", "OPXRC", "OPASN", "OPEXP", "OPTRD")
 _FILLED = "filled"
+
+
+def _activity_type(a: Any) -> str:
+    t = a.get("activity_type") if isinstance(a, dict) else getattr(a, "activity_type", None)
+    return str(t or "").upper()
+
+
 _DEAD = {"canceled", "expired", "rejected", "done_for_day", "replaced", "suspended", "stopped"}
 
 
@@ -871,7 +881,9 @@ class OptionsManager:
         live_dates = [st.opened_at for st in self.live() if st.opened_at]
         since = min(live_dates) if live_dates else None
         after = (_parse_ts(since) - timedelta(days=1)) if since else now - timedelta(days=10)
-        activities = await self.broker.get_activities(OPTION_ACTIVITY_TYPES, after=after)
+        # unfiltered read + local filter, as reconcile.py does
+        raw = await self.broker.get_activities(None, after=after)
+        activities = [a for a in raw or [] if _activity_type(a) in OPTION_ACTIVITY_TYPES]
 
         rep = ReconcileReport()
         # 1. orders in flight
