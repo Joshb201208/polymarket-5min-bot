@@ -1125,3 +1125,20 @@ def test_stale_margin_trim_from_an_earlier_episode_is_skipped(world, tmp_path, m
     assert a.position("AAA").qty == 10
     res = run(eng.exit(_margin_intent(eng, margin_episode="2026-11-23T15:00:00+00:00")))
     assert res.status == IntentStatus.FILLED and a.position("AAA").qty == 7
+
+
+def test_margin_trim_skips_when_its_symbol_is_no_longer_first(world, tmp_path, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from stock_agent.risk_manager import TradeKind
+
+    a = world.alpaca
+    eng = _margin_setup(world, tmp_path, monkeypatch)
+    run(eng.ledger.refresh("t"))
+    monkeypatch.setattr(eng.risk, "plan_margin_trim", lambda snap, *, controls=None, force=False: (
+        SimpleNamespace(kind=TradeKind.SELL, symbol="ZZZ", qty=Decimal(5)),
+        SimpleNamespace(kind=TradeKind.SELL, symbol="AAA", qty=Decimal(3))), raising=False)
+    res = run(eng.exit(_margin_intent(eng)))
+    assert res.status == IntentStatus.SKIPPED and "ZZZ first" in res.reason
+    assert a.position("AAA").qty == 10
