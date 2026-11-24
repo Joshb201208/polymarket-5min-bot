@@ -83,9 +83,18 @@ def observe(state, *, slot, now, readings, closes, regime, can_claim=True):
         if hit and hit["signal"] not in crossed:
             crossed.add(hit["signal"])
             hits.append(hit)
-    previous_regime = state.get("regime")
-    if regime and previous_regime and regime != previous_regime:
-        hits.append({"signal": "regime_change", "text": f"Macro regime: {previous_regime} to {regime}"})
+    previous_regime = state.get("regime") if last_slot == slot - 1 else None
+    anchor_regime = state.get("regime_anchor")
+    if regime:
+        change = previous_regime is not None and regime != previous_regime
+        anchor_key = f"macro_close:{anchor_regime}:{regime}"
+        first_from_anchor = bool(anchor_regime and regime != anchor_regime and anchor_key not in crossed)
+        if first_from_anchor:
+            crossed.add(anchor_key)
+        if change or first_from_anchor:
+            before = previous_regime if change else anchor_regime
+            suffix = "" if change else " since the last regular window of the prior trading day"
+            hits.append({"signal": "regime_change", "text": f"Macro regime: {before} to {regime}{suffix}"})
     claims = dict(state.get("claims", {}))
     last_claim = _stamp(state.get("last_claim"))
     admitted = bool(can_claim and hits and len(claims) < MAX_CLAIMS
@@ -96,7 +105,8 @@ def observe(state, *, slot, now, readings, closes, regime, can_claim=True):
         "slot": slot,
         "readings": {key: {"value": str(r.value), "as_of": r.as_of.isoformat()} for key, r in readings.items()},
         "crossed": sorted(crossed),
-        "regime": regime or previous_regime,
+        "regime": regime,
+        "regime_anchor": anchor_regime,
         "claims": claims,
         "last_claim": now.isoformat() if admitted else state.get("last_claim"),
     }, hits if admitted else ()

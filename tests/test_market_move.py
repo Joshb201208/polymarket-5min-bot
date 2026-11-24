@@ -50,6 +50,19 @@ def test_unavailable_vix_does_not_disable_spy_or_compare_across_missing_slot():
     assert len(state["claims"]) == 1
 
 
+def test_macro_requires_adjacent_valid_sample_or_previous_sessions_final_window():
+    state, _ = step({}, 0, regime="normal")
+    state, _ = step(state, 1)
+    state, hits = step(state, 2, regime="cautious")
+    assert not hits
+    state, hits = step(state, 3, regime="normal")
+    assert [h["signal"] for h in hits] == ["regime_change"]
+    state, hits = step({"regime_anchor": "normal"}, 0, regime="cautious")
+    assert [h["signal"] for h in hits] == ["regime_change"]
+    state, hits = step(state, 1, regime="cautious")
+    assert not hits
+
+
 def test_cooldown_daily_cap_and_repeated_window():
     state, hits = step({}, 0, spy=102, previous_spy=100)
     assert hits

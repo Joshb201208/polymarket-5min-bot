@@ -1752,7 +1752,6 @@ class StockAgentScheduler:
 
     async def _run_market_move_sample(self, session, slot):
         previous = self.calendar.previous_session(session.date)
-        prior_macro = self.macro.get_last_snapshot()
 
         async def spy_close():
             if previous is None:
@@ -1793,28 +1792,28 @@ class StockAgentScheduler:
                 if previous is not None:
                     closes["vix"] = vix_close
 
-        def usable_regime(snapshot, allowed_dates, *, max_age=None):
-            if snapshot is None or snapshot.degraded or not snapshot.regime:
-                return None
+        regime = None
+        if current_macro is not None and not current_macro.degraded:
             try:
-                seen = datetime.fromisoformat(snapshot.timestamp)
+                stamp = datetime.fromisoformat(current_macro.timestamp)
             except (ValueError, TypeError):
-                return None
-            if (seen.utcoffset() is None or seen > now or seen.astimezone(ET).date() not in allowed_dates
-                    or max_age is not None and now - seen > max_age):
-                return None
-            return snapshot.regime
-
-        regime = usable_regime(current_macro, {session.date}, max_age=market_move.MAX_QUOTE_AGE)
-        prior_dates = {session.date, previous.date} if previous else {session.date}
+                stamp = None
+            if (stamp is not None and stamp.utcoffset() is not None
+                    and session.opens_at <= stamp <= now and now - stamp <= market_move.MAX_QUOTE_AGE):
+                regime = current_macro.regime
         day = str(session.date)
         name, window = "market_move_rescan", f"{day}:{slot}"
         attempt = None
         with self.store.transaction():
             state = self.store.kv_get(MARKET_MOVE_STATE_KEY) or {}
             if state.get("session") != day:
-                yesterday = state.get("regime") if previous and state.get("session") == str(previous.date) else None
-                state = {"regime": yesterday or usable_regime(prior_macro, prior_dates)}
+                anchor = None
+                if previous is not None and state.get("session") == str(previous.date):
+                    prior_seconds = int((previous.closes_at - previous.opens_at).total_seconds())
+                    prior_final_slot = (prior_seconds - 1) // MARKET_MOVE_SLOT_SECONDS
+                    if state.get("slot") == prior_final_slot:
+                        anchor = state.get("regime")
+                state = {"regime_anchor": anchor}
             state, hits = market_move.observe(
                 state, slot=slot, now=now, readings=readings, closes=closes, regime=regime,
                 can_claim=name not in self._job_tasks and self.ledger.job_status(name, window) is None,
