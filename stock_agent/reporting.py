@@ -1424,9 +1424,9 @@ class ReportBuilder:
             "orders_and_stops": orders_stats,
             "news_and_inputs": news_inputs,
             "what_we_learned": learned,
-            "margin": self._margin_dict(snap, bm, interest, session_date),
             "entry_locks": self._compile_entry_locks(snap, entry_locks) or {"locked": False, "locks": [], "lines": []},
             "entry_funnel": self._compile_entry_funnel(session_date, week=True, explicit_funnel=entry_funnel),
+            "margin": self._margin_dict(snap, bm, interest, session_date),
         }
 
         embeds = self._format_weekly_embeds(scorecard, bm, dd_label, now_et)

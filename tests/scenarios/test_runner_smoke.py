@@ -102,3 +102,15 @@ def test_restart_after_lost_order_rebuilds_agent(world):
     runner.run_until(et(2026, 11, 23, 10, 10))
     assert runner.builds == 2
     assert world.alpaca.position("AAA").qty == 5  # broker filled although the client saw a timeout
+
+
+def test_runner_stops_when_a_tick_sleeps_past_the_end(world):
+    import asyncio
+
+    async def step(agent, now):
+        await asyncio.sleep(30 * 60)  # simulated: a long job pushes the clock past the end
+
+    runner = ScenarioRunner(world, build=lambda w: object(), startup=None, shutdown=None, step=step)
+    start = world.clock.now_et()
+    runner.run_until(start.replace(minute=10))
+    assert runner.steps == 1 and world.clock.now_et() >= start.replace(minute=10)

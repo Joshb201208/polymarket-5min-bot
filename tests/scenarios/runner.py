@@ -71,7 +71,13 @@ async def _default_startup(agent) -> None:
 
 
 async def _default_step(agent, now_et: datetime) -> None:
+    """One pass of StockAgentScheduler.run()'s loop body: the tick, then the
+    runtime file and the notification lane (alert delivery, heartbeat)."""
     await agent._tick(now_et)
+    for name in ("_publish_runtime", "_schedule_notifications"):
+        fn = getattr(agent, name, None)
+        if fn is not None:
+            fn()
 
 
 async def _default_shutdown(agent) -> None:
@@ -266,10 +272,13 @@ class ScenarioRunner:
                         self._watchers.remove(item)
             # Next step boundary after the tick's start; a tick that slept past it
             # (simulated asyncio.sleep) resumes at the next boundary, like run().
+            now = self.clock.now_et()
+            if now >= end:  # the tick (or work it launched) slept past the end of the run
+                break
             nxt = tick_at + timedelta(seconds=self.step_seconds)
-            while nxt <= self.clock.now_et():
+            while nxt <= now:
                 nxt += timedelta(seconds=self.step_seconds)
-            self.clock.set(min(nxt, end) if nxt > end else nxt)
+            self.clock.set(min(nxt, end))
 
     # ── reporting ────────────────────────────────────────────────────
     def summary(self) -> str:

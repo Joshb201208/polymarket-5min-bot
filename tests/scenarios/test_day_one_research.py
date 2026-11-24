@@ -10,7 +10,8 @@ import httpx
 import pytest
 
 from stock_agent.config import Config
-from stock_agent.ledger import JobStatus
+from stock_agent.ledger import IntentStatus, JobStatus
+from stock_agent.research_pipeline import OptionIdea
 from stock_agent.research_schemas import Direction
 from tests.fakes import ET
 
@@ -19,11 +20,12 @@ _SYMBOLS = ("AAPL", "MSFT", "JPM")
 
 
 @pytest.mark.world_start(_START)
-@pytest.mark.parametrize(("openai_rate_limited", "stale_preopen"), [
-    (False, None), (True, None), (False, "entry"), (False, "hold"),
+@pytest.mark.parametrize(("openai_rate_limited", "stale_preopen", "scheduled_submit"), [
+    (False, None, False), (True, None, False), (False, "entry", False), (False, "hold", False),
+    (True, None, True),
 ])
 def test_day_one_cautious_research_produces_equity_and_bearish_options(
-    world, monkeypatch, openai_rate_limited, stale_preopen,
+    world, monkeypatch, openai_rate_limited, stale_preopen, scheduled_submit,
 ):
     monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", _SYMBOLS)
     monkeypatch.setattr(Config, "ANTHROPIC_API_KEY", "test-anthropic")
@@ -96,20 +98,33 @@ def test_day_one_cautious_research_produces_equity_and_bearish_options(
                 world.price(symbol, 100.0 if symbol in _SYMBOLS else 95.0, spread=0.02)
             await scheduler._run_execution_cycle()
             assert scheduler.engine.normalised and scheduler._reconciled
-            await research.observe_regime()
             assert not research.has_fresh_thesis_set(world.clock.now())
-            outcome = await research.run("weekly", work_scope="catchup-regular")
-            assert outcome.status is JobStatus.DONE
-            assert [(intent.symbol, intent.side) for intent in outcome.intents] == [("AAPL", "buy")]
-            assert outcome.intents[0].meta["minimum_conviction"] == 8
-            assert outcome.intents[0].reference_price == 100
+            if scheduled_submit:
+                await scheduler.calendar.refresh()
+                scheduler._schedule_research_catchup(world.clock.now_et())
+                await scheduler._job_tasks["catchup"]
+                await scheduler._collect_finished_jobs()
+                job = scheduler.ledger.job_status("catchup", f"{_START.date()}:regular")
+                assert job.status is JobStatus.DONE
+                info = job.detail["entry_funnel"]
+                intents = scheduler.ledger.due_intents(world.clock.now())
+                ideas = [OptionIdea.from_payload(row) for row in
+                         scheduler.research_store.pending_option_ideas(world.clock.now())]
+            else:
+                await research.observe_regime()
+                outcome = await research.run("weekly", work_scope="catchup-regular")
+                assert outcome.status is JobStatus.DONE
+                intents, ideas = outcome.intents, outcome.option_candidates
+                info = outcome.detail["entry_funnel"]
+            assert [(intent.symbol, intent.side) for intent in intents] == [("AAPL", "buy")]
+            assert intents[0].meta["minimum_conviction"] == 8
+            assert intents[0].reference_price == 100
             assert scheduler.prices.last_quote("AAPL").as_of >= world.clock.now() - timedelta(seconds=90)
-            assert [(idea.symbol, idea.direction, idea.source) for idea in outcome.option_candidates] == [
+            assert [(idea.symbol, idea.direction, idea.source) for idea in ideas] == [
                 ("MSFT", Direction.BEARISH, "research"),
             ]
             assert research.has_fresh_thesis_set(world.clock.now())
             assert not research.has_fresh_thesis_set(world.clock.now() + timedelta(hours=97))
-            info = outcome.detail["entry_funnel"]
             assert info == {"screened": 3, "thesis_written": 3, "passed_conviction": 2,
                             "buy_candidates": 1, "option_ideas": 1, "rejected_by_reason": {"conviction_below_floor": 1}}
             *_, event = scheduler.journal.read(kinds={"research.entry_funnel"})
@@ -120,6 +135,15 @@ def test_day_one_cautious_research_produces_equity_and_bearish_options(
             spend = scheduler.research_store.available_budget(world.clock.now())
             assert 0 < spend["entry_microusd"] == spend["billed_or_reserved_microusd"] < 12_000_000
             assert scheduler.research_store.get_cooldown(research.analyst.llm._routes()[0]) > world.clock.now()
+            if scheduled_submit:
+                await scheduler._run_execution_cycle()
+                filled = scheduler.ledger.get_intent(intents[0].intent_id)
+                assert filled.status is IntentStatus.FILLED, filled.last_error
+                assert world.alpaca.positions["AAPL"].qty > 0
+                await scheduler._run_execution_cycle()
+                orders = [row for row in world.orders_sent() if row.method == "POST"
+                          and row.json.get("symbol") == "AAPL" and row.json.get("side") == "buy"]
+                assert len(orders) == 1
         finally:
             await scheduler._cleanup()
 
@@ -129,4 +153,5 @@ def test_day_one_cautious_research_produces_equity_and_bearish_options(
     assert world.net.requests(service="fmp", path="/stable/profile")
     assert world.net.requests(service="finnhub", path="/api/v1/stock/metric")
     assert world.net.requests(service="finnhub", path="/api/v1/company-news")
-    world.assert_no_orders()
+    if not scheduled_submit:
+        world.assert_no_orders()

@@ -79,6 +79,7 @@ def test_scheduling_and_order_skip_opening_auction_and_invalid_clock(tmp_path):
     assert not asyncio.run(market.market_gate("entry")).allowed
     assert not asyncio.run(market.market_gate("exit")).allowed
     assert asyncio.run(market.market_gate("exit", rule="cover_short")).allowed
+    assert asyncio.run(market.market_gate("exit", rule="margin_buffer")).allowed
     broker.now += timedelta(minutes=5)
     assert asyncio.run(market.market_gate("entry")).allowed
     broker.clock_skew = timedelta(minutes=-3)
