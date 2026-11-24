@@ -315,3 +315,21 @@ def test_refresh_budget_is_shared_across_due_buys(world, tmp_path, monkeypatch):
         run(eng._refresh_research_proof(it))
     assert time.monotonic() - t0 < 1.0
     assert len(calls) == 2  # 0.2s + 0.1s, then the budget is spent
+
+
+def test_risk_refusal_alert_carries_structured_risk_reasons(world, tmp_path, monkeypatch):
+    world.clock.set_et(2026, 11, 30, 10, 0)
+    world.price("AAA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    calls = []
+
+    class Notifier:
+        def alert_blocked_buy(self, symbol, code, reason="", **kw):
+            calls.append((symbol, code, kw.get("risk_reasons")))
+            return True
+
+    eng._notifier = Notifier()
+    from tests.exec_helpers import enqueue
+    it = enqueue(eng, "AAA", "buy", ref=50)
+    eng._skip(it, "risk refused: sector cap", "risk_refused", risk_reasons=["sector_cap"])
+    assert calls == [("AAA", "risk_refused", ("sector_cap",))]

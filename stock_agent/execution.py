@@ -558,15 +558,15 @@ class ExecutionEngine:
         except Exception:
             logger.exception("buy funnel journal failed")
         if stage == "skipped":
-            self._alert_blocked_buy(it, code, reason)
+            self._alert_blocked_buy(it, code, reason, extra.get("risk_reasons") or ())
 
-    def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str) -> None:
+    def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str, risk_reasons: Any = ()) -> None:
         """Part 5: one #risk line per blocked buy (AlertService filters/dedupes). Never raises."""
         fn = getattr(self._notifier, "alert_blocked_buy", None) if self._notifier is not None else None
         if fn is None:
             return
         try:
-            fn(it.symbol, code, reason, session_date=self.session_date())
+            fn(it.symbol, code, reason, session_date=self.session_date(), risk_reasons=tuple(risk_reasons))
         except Exception:
             logger.exception("blocked-buy alert failed")
 
@@ -591,7 +591,8 @@ class ExecutionEngine:
         elif cur is not None and cur.status == IntentStatus.SUBMITTING:
             self.ledger.ack_intent(intent.intent_id, IntentStatus.REJECTED, error=reason, meta=meta)
         logger.info("intent %s %s %s skipped [%s]: %s", intent.intent_id, intent.side, intent.symbol, code, reason)
-        self._funnel(intent, "skipped", code, reason)
+        risk = {"risk_reasons": list(extra["risk_reasons"])} if extra.get("risk_reasons") else {}
+        self._funnel(intent, "skipped", code, reason, **risk)
         return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=reason, code=code)
 
     async def _defer_or_skip(self, intent: OrderIntent, reason: str) -> ExecResult:
