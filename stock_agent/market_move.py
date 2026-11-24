@@ -41,6 +41,11 @@ def _stamp(raw) -> datetime | None:
     return stamp if stamp.utcoffset() is not None else None
 
 
+def cooldown_until(state) -> datetime | None:
+    stamp = _stamp(state.get("last_claim"))
+    return stamp + COOLDOWN if stamp is not None else None
+
+
 def _signal(kind, reading, base, anchor):
     if base is None:
         return None
@@ -96,9 +101,9 @@ def observe(state, *, slot, now, readings, closes, regime, can_claim=True):
             suffix = "" if change else " since the last regular window of the prior trading day"
             hits.append({"signal": "regime_change", "text": f"Macro regime: {before} to {regime}{suffix}"})
     claims = dict(state.get("claims", {}))
-    last_claim = _stamp(state.get("last_claim"))
+    eligible_at = cooldown_until(state)
     admitted = bool(can_claim and hits and len(claims) < MAX_CLAIMS
-                    and (last_claim is None or now - last_claim >= COOLDOWN))
+                    and (eligible_at is None or now >= eligible_at))
     if admitted:
         claims[str(slot)] = hits
     return {

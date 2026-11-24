@@ -97,6 +97,28 @@ def test_invalid_quotes_never_enter_the_detector():
     assert valid_reading(100, OPEN - timedelta(seconds=1), now=OPEN, opens_at=OPEN) is None
 
 
+def test_adjacent_slot_waits_out_normal_tick_jitter_without_losing_the_sample(tmp_path, monkeypatch):
+    async def check():
+        opens = OPEN.astimezone(ET)
+        sched, _ = build(tmp_path, monkeypatch, opens)
+        sched.store.open()
+        scheduled = []
+        monkeypatch.setattr(sched, "_schedule_job", lambda name, window, *args, **kwargs: scheduled.append((name, window)))
+        try:
+            last_claim = opens + timedelta(seconds=90)
+            sched.store.kv_set(scheduler_module.MARKET_MOVE_STATE_KEY, {
+                "session": str(opens.date()), "last_claim": last_claim.isoformat(),
+            })
+            sched._schedule_market_move_sample(opens + timedelta(minutes=30, seconds=35))
+            assert scheduled == []
+            sched._schedule_market_move_sample(last_claim + timedelta(minutes=30))
+            assert scheduled == [("market_move_sample", f"{opens.date()}:1")]
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
 def test_rescan_claim_precedes_work_protection_continues_and_restart_does_not_repeat(tmp_path, monkeypatch):
     async def check():
         now = OPEN.astimezone(ET) + timedelta(minutes=1)

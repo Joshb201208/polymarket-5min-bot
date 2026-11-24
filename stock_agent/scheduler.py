@@ -1737,7 +1737,20 @@ class StockAgentScheduler:
         slot, offset = divmod(int((now - session.opens_at).total_seconds()), MARKET_MOVE_SLOT_SECONDS)
         # Allow the opening print and normal scheduler jitter, but don't use
         # a mid-slot restart as if it were a regularly spaced observation.
-        if not 30 <= offset < 180:
+        if not 30 <= offset < 300:
+            return
+        started_at = session.opens_at + timedelta(seconds=slot * MARKET_MOVE_SLOT_SECONDS)
+        latest = self.store.kv_get(MARKET_MOVE_STATE_KEY) or {}
+        eligible_at = market_move.cooldown_until(latest) if latest.get("session") == str(session.date) else None
+        deadline = started_at + timedelta(minutes=3)
+        if eligible_at is not None and eligible_at > started_at:
+            if now < eligible_at:
+                # The prior claim may have landed later within its 30-minute
+                # window. Wait, then read fresh inputs at this slot rather
+                # than consuming a crossing while still in the cooldown.
+                return
+            deadline = max(deadline, eligible_at + timedelta(seconds=2 * TICK_SECONDS))
+        if now >= deadline:
             return
         self._schedule_job("market_move_sample", f"{session.date}:{slot}",
                            lambda: self._run_market_move_sample(session, slot), timeout=25, replay=False)
