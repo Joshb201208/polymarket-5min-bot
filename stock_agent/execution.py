@@ -218,7 +218,7 @@ class ExecutionEngine:
         if key is None or from_record is None:
             return rm.RiskControls()
         try:
-            dd = from_record(self.ledger.risk_state_get(key))
+            dd = from_record(self.ledger.risk_state_get(key), config=self.config)
         except ValueError as e:
             raise ExecutionError(f"drawdown state unreadable: {e}") from e
         return rm.RiskControls(drawdown=dd)
