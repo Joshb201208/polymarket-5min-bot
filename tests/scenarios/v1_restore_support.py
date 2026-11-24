@@ -29,19 +29,21 @@ class Harness:
     world: object
     monkeypatch: object
     symbol: str = SYMBOL
+    others: tuple = ()  # extra focus symbols (same scripted reply, same synthetic price)
     reply: Reply = field(default_factory=Reply)
     calls: list = field(default_factory=list)  # (et_time, direction, reference_price) per LLM draft
     scheduler: object = None
 
     def install(self, *, price: float = 100.0) -> Harness:
         w = self.world
-        self.monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", (self.symbol,))
+        self.monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", (self.symbol, *self.others))
         self.monkeypatch.setattr(Config, "UNIVERSE_SIZE", 1)
         # Out-of-hours quotes are stale at every provider except the broker.
         w.finnhub.fail("/api/v1/quote", "status", status=503, times=None)
         w.fmp.fail("/stable/quote", "status", status=503, times=None)
         w.perplexity.fail("/v1/agent", "status", status=401, times=None)
-        w.price(self.symbol, price, spread=0.02)
+        for symbol in (self.symbol, *self.others):
+            w.price(symbol, price, spread=0.02)
         w.openai.respond_with(self._draft)
         return self
 
@@ -52,13 +54,13 @@ class Harness:
         evidence = next((item for item in data["evidence"] if item["published_at"]), None)
         if evidence is None:  # nothing dated to cite: an honest no-claims HOLD (the pipeline won't act on it)
             return {
-                "symbol": self.symbol, "direction": "HOLD", "conviction": 1, "summary": "No new evidence.",
+                "symbol": data.get("symbol") or self.symbol, "direction": "HOLD", "conviction": 1, "summary": "No new evidence.",
                 "bull_case": "None.", "bear_case": "None.", "claims": [], "catalysts": [], "risks": [],
                 "thesis_break": "Not applicable.", "target_price": None, "thesis_change": "unchanged",
                 "horizon_days": 15,
             }
         return {
-            "symbol": self.symbol, "direction": self.reply.direction, "conviction": self.reply.conviction,
+            "symbol": data.get("symbol") or self.symbol, "direction": self.reply.direction, "conviction": self.reply.conviction,
             "summary": "The issuer updated its outlook.", "bull_case": "Improving demand.",
             "bear_case": "Demand may weaken.", "claims": [
                 {"text": "The issuer issued updated guidance.", "evidence_ids": [evidence["evidence_id"]]},
@@ -97,7 +99,7 @@ class Harness:
 
     def story(self, minutes_ago: int = 5):
         now = self.world.clock.now()
-        self.world.news([self.symbol], f"Issuer updates outlook {now.isoformat()}",
+        self.world.news([self.symbol, *self.others], f"Issuer updates outlook {now.isoformat()}",
                         summary="The issuer publishes new guidance.", at=now - timedelta(minutes=minutes_ago))
 
     def quotes_go_stale(self):
@@ -105,7 +107,8 @@ class Harness:
         self.world.alpaca.behaviour.quotes_stay_fresh_in_session = False
 
     def fresh_quote(self, price: float = 100.0):
-        self.world.price(self.symbol, price, spread=0.02)
+        for symbol in (self.symbol, *self.others):
+            self.world.price(symbol, price, spread=0.02)
 
     async def run_research(self, kind: str):
         """Run one scheduled research job (prescan | midweek | weekly) now and return its job row."""
