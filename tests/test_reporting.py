@@ -1072,6 +1072,3 @@ def test_rolling_and_all_time_drawdown_pause_cap_reporting(
         ledger.store.close()
 
     asyncio.run(_run())
-
-
-

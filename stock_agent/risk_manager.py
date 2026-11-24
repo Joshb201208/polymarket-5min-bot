@@ -121,6 +121,8 @@ class DrawdownState:
         return self.should_alert()
 
     def is_throttled(self, config=Config) -> bool:
+        # Preserve the shipped exact Decimal boundary at 15%; the research
+        # float reference uses a 1e-10 guard against binary rounding.
         return self.paused or self.decision_drawdown >= _decimal(config.DRAWDOWN_THROTTLE_PCT)
 
     def should_alert(self, config=Config) -> bool:
@@ -664,6 +666,7 @@ def update_drawdown(
     pause_line = _decimal(config.DRAWDOWN_PAUSE_PCT) + Decimal("1e-10")
     if (start is None or expired) and state.decision_drawdown <= pause_line < rolling_loss:
         start, governed, paused = session, 0, True
+    # Same exact Decimal boundary as the shipped throttle, strictly below for recovery.
     recovering = paused and rolling_loss < _decimal(config.DRAWDOWN_THROTTLE_PCT)
     streak = (state.recovery_closes if previous_session is None or previous_session == state.last_session else 0)
     closes = streak + 1 if recovering else 0

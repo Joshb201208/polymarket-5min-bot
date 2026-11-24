@@ -173,6 +173,18 @@ def test_exactly_15pct_is_throttled_inclusive_and_just_below_is_not():
     assert not p.close("85.01").is_throttled(CFG)
 
 
+def test_decimal_15pct_boundary_does_not_adopt_the_research_float_epsilon():
+    # A 5e-11 gap is inside the float engine's 1e-10 guard, but live
+    # Decimal throttle/recovery use the existing exact comparison.
+    almost = "85.000000005"
+    p = Path()
+    p.close(100)
+    s = p.close(almost)
+    assert s.decision_drawdown == D("0.14999999995") and not s.is_throttled(CFG)
+    p = latched()
+    assert [x.paused for x in p.closes(almost, 5)] == [True, True, True, True, False]
+
+
 def test_early_recovery_on_fifth_close_strictly_below_15pct():
     p = latched(100, 79)
     rec = p.closes("85.01", 5)
