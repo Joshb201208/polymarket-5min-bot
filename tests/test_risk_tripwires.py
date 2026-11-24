@@ -176,12 +176,13 @@ def test_drawdown_uses_returns_not_deposits_or_withdrawals_across_restarts():
 
 
 def test_legacy_drawdown_record_uses_implied_raw_equity_for_first_adjusted_interval():
-    old = DrawdownState(Decimal(100), Decimal("0.10"), last_session="2026-11-23")
-    assert old.to_record()["version"] == 1
-    restored = DrawdownState.from_record(old.to_record())
+    old = {"version": 1, "high_water": "100", "drawdown": "0.10", "paused": False,
+           "recovery_closes": 0, "last_session": "2026-11-23"}
+    restored = DrawdownState.from_record(old)
+    assert restored.last_equity is None and restored.to_record()["version"] == 3
     next_close = update_drawdown(restored, "2026-11-24", Decimal(60), net_external_flow=Decimal(-30))
     assert next_close.high_water == 100 and next_close.drawdown == Decimal("0.10")
-    assert next_close.to_record()["version"] == 2 and next_close.last_equity == 60
+    assert next_close.to_record()["version"] == 3 and next_close.last_equity == 60
 
 
 def test_missing_expected_close_breaks_drawdown_recovery_streak():
@@ -193,7 +194,10 @@ def test_missing_expected_close_breaks_drawdown_recovery_streak():
 def test_drawdown_state_roundtrip_never_resets_a_corrupt_latch_as_cutover():
     assert DrawdownState.from_record(None) == DrawdownState()
     state = DrawdownState(Decimal(100), Decimal(".14"), True, 3, "2026-10-14")
-    assert DrawdownState.from_record(state.to_record()) == state
+    # A legacy-shaped state persists as its v3 migration and keeps the latch and streak.
+    restored = DrawdownState.from_record(state.to_record())
+    assert restored.paused and restored.recovery_closes == 3 and restored.pause_start_session == "2026-10-14"
+    assert DrawdownState.from_record(restored.to_record()) == restored
     with pytest.raises(ValueError):
         DrawdownState.from_record({**state.to_record(), "paused": "false"})
     with pytest.raises(ValueError):

@@ -131,13 +131,45 @@ class DrawdownState:
             return 0
         return max(0, config.DRAWDOWN_PAUSE_MAX_SESSIONS - self.pause_sessions_governed)
 
-    def to_record(self) -> dict[str, str | bool | int | None]:
-        record = {
-            "version": 2 if self.last_equity is not None else 1,
+    def to_record(self) -> dict[str, object]:
+        """Serialize as the v3 record; all decimals are exact strings.
+
+        A state built directly with only the legacy fields is written as its
+        Addendum 2 migration (synthetic peak + last close; a latch starts an episode).
+        """
+        if self.last_session is not None and not self.rolling_closes:
+            return self._seeded().to_record()
+        return {
+            "version": 3,
             "high_water": str(self.high_water),
             "drawdown": str(self.drawdown),
             "paused": self.paused,
             "recovery_closes": self.recovery_closes,
+            "last_session": self.last_session,
+            "last_equity": None if self.last_equity is None else str(self.last_equity),
+            "rolling_closes": [[label, str(close)] for label, close in self.rolling_closes],
+            "rolling_drawdown": None if self.rolling_drawdown is None else str(self.rolling_drawdown),
+            "pause_start_session": self.pause_start_session,
+            "pause_sessions_governed": self.pause_sessions_governed,
+        }
+
+    def to_legacy_record(self, config=Config) -> dict[str, str | bool | int | None]:
+        """Conservative v2 projection for a rollback to pre-v3 code (never looser).
+
+        Keeps the all-time high-water/drawdown, last session and raw equity so the
+        old code chains the next close correctly. The old code cannot represent a
+        capped episode, so it pauses whenever v3 is paused or the all-time drawdown
+        is at/above the pause line (the old latch), and the recovery streak restarts.
+        """
+        if self.last_session is None:
+            return {"version": 1, "high_water": "0", "drawdown": "0", "paused": False,
+                    "recovery_closes": 0, "last_session": None}
+        record = {
+            "version": 2 if self.last_equity is not None else 1,
+            "high_water": str(self.high_water),
+            "drawdown": str(self.drawdown),
+            "paused": self.paused or self.drawdown >= _decimal(config.DRAWDOWN_PAUSE_PCT),
+            "recovery_closes": 0,
             "last_session": self.last_session,
         }
         if self.last_equity is not None:
@@ -146,10 +178,30 @@ class DrawdownState:
 
     @classmethod
     def from_record(cls, record: Mapping | None, *, config=Config) -> "DrawdownState":
+        """Parse v1/v2/v3; any inconsistency raises ValueError (callers fail closed)."""
         if record is None:
             return cls()
-        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] not in (1, 2):
+        if not isinstance(record, Mapping) or type(record.get("version")) is not int or record["version"] not in (1, 2, 3):
             raise ValueError("unrecognized drawdown record")
+        if record["version"] == 3:
+            return cls._from_v3(record, config)
+        legacy = cls._from_legacy(record, config)
+        return cls() if legacy.last_session is None else legacy._seeded()
+
+    def _seeded(self) -> "DrawdownState":
+        # Addendum 2 migration: the old high-water is one synthetic prior close, so
+        # day-one decisions equal the old ones; an old latch starts a capped episode.
+        last_close = self.high_water * (1 - self.drawdown)
+        return replace(
+            self,
+            rolling_closes=((None, self.high_water), (self.last_session, last_close)),
+            rolling_drawdown=self.drawdown,
+            pause_start_session=self.last_session if self.paused else None,
+            pause_sessions_governed=0,
+        )
+
+    @classmethod
+    def _from_legacy(cls, record: Mapping, config) -> "DrawdownState":
         high, loss = _decimal(record.get("high_water")), _decimal(record.get("drawdown"))
         paused, closes = record.get("paused"), record.get("recovery_closes")
         session = record.get("last_session")
@@ -162,6 +214,69 @@ class DrawdownState:
                 or (last_equity is not None and (session is None or last_equity <= 0))):
             raise ValueError("invalid drawdown record")
         return cls(high, loss, paused, closes, session, last_equity)
+
+    @classmethod
+    def _from_v3(cls, record: Mapping, config) -> "DrawdownState":
+        def fail(why: str) -> ValueError:
+            return ValueError(f"invalid drawdown record: {why}")
+
+        def label(value: object) -> str:
+            if not isinstance(value, str) or _session_id(value) != value:
+                raise fail("session label")
+            return value
+
+        def optional(value: object) -> Decimal | None:
+            return None if value is None else _decimal(value)
+
+        expected = {"version", "high_water", "drawdown", "paused", "recovery_closes", "last_session",
+                    "last_equity", "rolling_closes", "rolling_drawdown", "pause_start_session",
+                    "pause_sessions_governed"}
+        if set(record) != expected:
+            raise fail("fields")
+        paused, closes = record["paused"], record["recovery_closes"]
+        governed, raw_window = record["pause_sessions_governed"], record["rolling_closes"]
+        if (type(paused) is not bool or type(closes) is not int or type(governed) is not int
+                or not isinstance(raw_window, list)):
+            raise fail("types")
+        high, loss = _decimal(record["high_water"]), _decimal(record["drawdown"])
+        rolling, last_equity = optional(record["rolling_drawdown"]), optional(record["last_equity"])
+        session = None if record["last_session"] is None else label(record["last_session"])
+        start = None if record["pause_start_session"] is None else label(record["pause_start_session"])
+        window: list[tuple[str | None, Decimal]] = []
+        for i, item in enumerate(raw_window):
+            if not isinstance(item, list) or len(item) != 2:
+                raise fail("rolling close")
+            name = None if item[0] is None and i == 0 else label(item[0])
+            window.append((name, _decimal(item[1])))
+        if not 0 <= closes < config.DRAWDOWN_RECOVERY_SESSIONS or governed < 0 or (closes and not paused):
+            raise fail("recovery or episode counters")
+        if session is None:
+            if (high or loss or paused or closes or window or rolling is not None or last_equity is not None
+                    or start is not None or governed):
+                raise fail("empty record carries state")
+            return cls()
+        labels = [name for name, _ in window if name is not None]
+        tolerance = Decimal("1e-12")
+        if (not labels or labels[-1] != session or any(a >= b for a, b in zip(labels, labels[1:]))
+                or len(window) > config.DRAWDOWN_ROLLING_SESSIONS or any(v <= 0 for _, v in window)):
+            raise fail("rolling window")
+        if high <= 0 or not 0 <= loss < 1 or rolling is None or not 0 <= rolling < 1 or (
+                last_equity is not None and last_equity <= 0):
+            raise fail("values")
+        last_close, peak = window[-1][1], max(v for _, v in window)
+        if (abs(rolling - (peak - last_close) / peak) > tolerance or peak > high * (1 + tolerance)
+                or abs(loss - (high - last_close) / high) > tolerance or rolling > loss + tolerance):
+            raise fail("drawdowns disagree with closes")
+        if start is None:
+            # Without any episode anchor a close above the pause line always latches.
+            if paused or governed or rolling > _decimal(config.DRAWDOWN_PAUSE_PCT) + Decimal("1e-10"):
+                raise fail("episode without anchor")
+        else:
+            after = sum(1 for name in labels if name > start)
+            if (start > session or (start == session) != (governed == 0)
+                    or (start in labels and governed > after)):
+                raise fail("episode clock")
+        return cls(high, loss, paused, closes, session, last_equity, tuple(window), rolling, start, governed)
 
 
 @dataclass(frozen=True)
