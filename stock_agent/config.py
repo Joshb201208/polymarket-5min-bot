@@ -33,7 +33,7 @@ _LOCAL_DATA_DIR = _REPO_ROOT / "data" / "stock_agent"
 _VPS_DATA_DIR = Path("/root/polymarket-bot/data/stock_agent")
 
 _SECRET_SUFFIXES = ("_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
-_SECRET_EXTRA_NAMES = frozenset({"TIPRANKS_EMAIL", "HEARTBEAT_PING_URL", "HEARTBEAT_URL"})
+_SECRET_EXTRA_NAMES = frozenset({"HEARTBEAT_PING_URL", "HEARTBEAT_URL"})
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
 _VALID_RESEARCH_PROVIDERS = frozenset({"perplexity", "openai", "anthropic"})
@@ -246,8 +246,8 @@ class Settings(BaseModel):
     SEC_USER_AGENT: str = ""
     TIPRANKS_ENABLED: bool = True
     TIPRANKS_MIN_SMART_SCORE: int = Field(default=8, ge=1, le=10)
-    TIPRANKS_UNIVERSE_LIMIT: int = Field(default=100, ge=1)
-    TIPRANKS_UNIVERSE_SLICE: int = Field(default=20, ge=0)
+    TIPRANKS_UNIVERSE_LIMIT: int = Field(default=100, ge=1, le=10_000)
+    TIPRANKS_UNIVERSE_SLICE: int = Field(default=20, ge=0, le=10_000)
     PRIORITY_SYMBOLS: list[str] = Field(default_factory=lambda: list(_DEFAULT_PRIORITY_SYMBOLS))
     MIN_MARKET_CAP: int = Field(default=10_000_000_000, ge=0)
     UNIVERSE_SIZE: int = Field(default=50, ge=1)
@@ -403,12 +403,15 @@ class Settings(BaseModel):
         "DRAWDOWN_ROLLING_SESSIONS",
         "DRAWDOWN_PAUSE_MAX_SESSIONS",
         "DRAWDOWN_RECOVERY_SESSIONS",
+        "TIPRANKS_MIN_SMART_SCORE",
+        "TIPRANKS_UNIVERSE_LIMIT",
+        "TIPRANKS_UNIVERSE_SLICE",
         mode="before",
     )
     @classmethod
     def _parse_strict_session_count(cls, value: Any) -> int:
         if isinstance(value, bool):
-            raise ValueError("must be an integer session count, not a boolean")
+            raise ValueError("must be a whole integer, not a boolean")
         if isinstance(value, int):
             return value
         if isinstance(value, str):
@@ -418,7 +421,7 @@ class Settings(BaseModel):
                 or (cleaned[0] in "+-" and len(cleaned) > 1 and cleaned[1:].isdigit())
             ):
                 return int(cleaned)
-        raise ValueError("must be a whole integer number of trading sessions")
+        raise ValueError("must be a whole integer")
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> Settings:

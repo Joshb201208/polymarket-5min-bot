@@ -569,3 +569,101 @@ def test_option_b_universe_order_slice_cap_fallback_cache_invalidation_and_funne
             await sched._cleanup()
 
     asyncio.run(_run())
+
+
+def test_tipranks_security_no_credential_refs_and_strict_dir_fd_confinement(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    from stock_agent.config import Settings, SettingsError
+
+    repo_root = Path(__file__).resolve().parent.parent
+    removed_names = (
+        "TIPRANKS_EMAIL",
+        "TIPRANKS_PASSWORD",
+        "TIPRANKS_API_KEY",
+        "TIPRANKS_API_TOKEN",
+    )
+
+    # 1. Zero references to retired TipRanks credential names anywhere in stock_agent/*.py or .env.example
+    for py_file in sorted((repo_root / "stock_agent").rglob("*.py")):
+        src = py_file.read_text(encoding="utf-8")
+        for cred_name in removed_names:
+            assert cred_name not in src, f"{py_file.name} still mentions {cred_name}"
+
+    env_example = (repo_root / ".env.example").read_text(encoding="utf-8")
+    assert "TIPRANKS_ENABLED=true" in env_example
+    for cred_name in removed_names:
+        assert cred_name not in env_example
+
+    # 2. Strict integer validation & upper bounds on TipRanks integer settings
+    for int_field in ("TIPRANKS_MIN_SMART_SCORE", "TIPRANKS_UNIVERSE_LIMIT", "TIPRANKS_UNIVERSE_SLICE"):
+        with pytest.raises(ValidationError):
+            Settings(**{int_field: True})
+        with pytest.raises(SettingsError):
+            load_settings({int_field: "8.5"})
+    with pytest.raises(SettingsError):
+        load_settings({"TIPRANKS_UNIVERSE_LIMIT": "100000"})
+    with pytest.raises(SettingsError):
+        load_settings({"TIPRANKS_UNIVERSE_SLICE": "100000"})
+
+    # 3. Strict path confinement inside DATA_DIR (including dangling-symlink DATA_DIR,
+    #    live-symlink DATA_DIR, slash/dot variants, symlinked sidecar, and secret-file leak prevention)
+    now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    _write_csv(outside_dir, [_row("AAPL", smart_score="10")], mtime=now - timedelta(hours=1))
+    outside_sidecar = outside_dir / "secret_sidecar.json"
+    outside_sidecar.write_text('{"exported_at": "2026-01-01T00:00:00Z"}', encoding="utf-8")
+
+    # 3a. Live symlink DATA_DIR -> refused as DEAD, never reads outside CSV
+    live_sym_dir = tmp_path / "sym_live"
+    live_sym_dir.symlink_to(outside_dir)
+    sym_live_snap = TipRanksIngestor(Config(DATA_DIR=live_sym_dir)).read(now)
+    assert sym_live_snap.state == HealthState.DEAD
+    assert not sym_live_snap.usable
+
+    # 3b. Dangling symlink DATA_DIR -> refused as DEAD ("DATA_DIR must not be a symlink"), NOT ABSENT
+    dangling_sym_dir = tmp_path / "sym_dangling"
+    dangling_sym_dir.symlink_to(tmp_path / "does_not_exist")
+    sym_dangling_snap = TipRanksIngestor(Config(DATA_DIR=dangling_sym_dir)).read(now)
+    assert sym_dangling_snap.state == HealthState.DEAD
+    assert "symlink" in sym_dangling_snap.reason.lower()
+
+    # 3c. Bare-basename enforcement on filename (no './', '/', '\\', '..', '.')
+    real_dir = tmp_path / "real_data"
+    _write_csv(real_dir, [_row("AAPL", smart_score="10")], mtime=now - timedelta(hours=1))
+    cfg = Config(DATA_DIR=real_dir)
+    for bad_name in (
+        "/etc/passwd",
+        "../outside/tipranks_latest.csv",
+        "./tipranks_latest.csv",
+        "sub/tipranks_latest.csv",
+        "..\\tipranks_latest.csv",
+        ".",
+        "..",
+        "",
+    ):
+        bad_snap = TipRanksIngestor(cfg, filename=bad_name).read(now)
+        assert bad_snap.state == HealthState.DEAD, bad_name
+        assert not bad_snap.usable
+
+    # 3d. Symlinked sidecar inside DATA_DIR pointing outside -> ignored without following symlink
+    sidecar_link = real_dir / "tipranks_latest.meta.json"
+    sidecar_link.symlink_to(outside_sidecar)
+    ok_despite_bad_sidecar = TipRanksIngestor(cfg).read(now)
+    assert ok_despite_bad_sidecar.state == HealthState.OK
+    sidecar_link.unlink()
+
+    # 3e. Secret file accidentally dropped as tipranks_latest.csv -> DEAD, zero secret bytes echoed
+    canary = "SYNTH_CANARY_CREDENTIAL_DO_NOT_LEAK_8842"
+    (real_dir / "tipranks_latest.csv").write_text(
+        f"ALPACA_SECRET_KEY={canary}\nTIPRANKS_PASSWORD={canary}\n",
+        encoding="utf-8",
+    )
+    health = ProviderHealthRegistry(config=cfg, now=lambda: now)
+    poisoned_snap = TipRanksIngestor(cfg, health=health).read(now)
+    assert poisoned_snap.state == HealthState.DEAD
+    assert canary not in poisoned_snap.reason
+    st = health.get_status("tipranks", "screener")
+    assert canary not in (st.last_error_summary or "")
+

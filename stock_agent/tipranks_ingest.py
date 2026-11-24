@@ -282,12 +282,14 @@ def _parse_export_timestamp(raw: Any) -> datetime | None:
 def _resolve_confined_path(data_dir: Path | str, filename: str) -> tuple[Path | None, str | None]:
     if not filename or not isinstance(filename, str):
         return None, "invalid TipRanks filename"
+    if "/" in filename or "\\" in filename or "\x00" in filename or filename in {".", ".."}:
+        return None, "TipRanks path escapes DATA_DIR"
     rel = Path(filename)
-    if rel.is_absolute() or ".." in rel.parts or len(rel.parts) != 1:
+    if rel.is_absolute() or ".." in rel.parts or len(rel.parts) != 1 or filename != rel.name:
         return None, "TipRanks path escapes DATA_DIR"
     raw_dir = Path(data_dir)
     try:
-        if raw_dir.exists() and raw_dir.is_symlink():
+        if raw_dir.is_symlink():
             return None, "DATA_DIR must not be a symlink"
         base = raw_dir.resolve(strict=False)
         target = base / rel.name
@@ -340,12 +342,26 @@ def _read_regular_file_bytes(
         if lst_before.st_size > max_bytes:
             return None, None, f"CSV exceeds max size ({lst_before.st_size} bytes)", False
 
+        dir_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        dir_fd = -1
         try:
-            fd = os.open(path, flags)
+            dir_fd = os.open(path.parent, dir_flags)
+            fd = os.open(path.name, flags, dir_fd=dir_fd)
         except FileNotFoundError:
             return None, None, None, True
         except OSError as exc:
             return None, None, f"refused open ({type(exc).__name__})", False
+        finally:
+            if dir_fd >= 0:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
 
         try:
             fst_open = os.fstat(fd)
@@ -454,7 +470,7 @@ def _parse_csv_bytes(raw: bytes) -> tuple[dict[str, TipRanksRow], datetime | Non
                 sector=_clean_text(_cell(raw_row, "Sector"), max_len=64),
             )
     except csv.Error as exc:
-        return {}, None, f"CSV parse error ({exc})"
+        return {}, None, f"CSV parse error ({type(exc).__name__})"
 
     if not rows:
         return {}, None, "0 valid rows in CSV"
