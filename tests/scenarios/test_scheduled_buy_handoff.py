@@ -10,6 +10,7 @@ import pytest
 
 from stock_agent.config import Config
 from stock_agent.ledger import JobStatus
+from stock_agent.research_pipeline import _FRESH_SET
 from tests.fakes import ET
 
 _SUNDAY = datetime(2026, 11, 15, 17, tzinfo=ET)
@@ -113,6 +114,10 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
             assert job.detail["entry_funnel"]["passed_conviction"] == 1
             world.assert_no_orders()
 
+            # A healthy pre-open BUY must survive fallback even if an unrelated
+            # symbol never established a healthy scheduled set.
+            if fresh_offhours_quote:
+                scheduler.store.kv_set(_FRESH_SET, None)
             await advance(target_day, 9, 35)
             world.price("AAPL", 100, spread=0.02)
             if not scheduler.engine.normalised:
@@ -122,10 +127,10 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
             scheduler._schedule_research_catchup(world.clock.now_et())
             await drain("catchup")
             catch = scheduler.ledger.job_status("catchup", f"2026-11-{target_day}:regular")
-            if kind == "weekly":
+            if kind == "weekly" or fresh_offhours_quote:
                 assert catch.status is JobStatus.DONE
-                assert catch.detail["reviewed"] == 0  # Do not replace the Sunday thesis.
-                assert len(replies) == 1
+                assert catch.detail["reviewed"] == 0  # Do not replace the scheduled thesis.
+                assert replies[-1] == (False, "BUY", 100)
             else:
                 assert scheduler.research.has_fresh_thesis_set(world.clock.now())
                 assert catch is None
