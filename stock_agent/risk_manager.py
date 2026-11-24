@@ -81,6 +81,7 @@ class TradeIntent:
     structure_id: str | None = None
     reason: str | None = None
     thesis_change: str | None = None
+    initial_reaffirmation: bool = False
 
 
 @dataclass(frozen=True)
@@ -1249,9 +1250,13 @@ class RiskManager:
         if kind == TradeKind.ADD:
             if stock is None or stock.qty <= 0:
                 return target, held, "top_up_requires_holding"
-            if (type(intent.last_filled_conviction) is not int
-                    or not 1 <= intent.last_filled_conviction <= 10
-                    or intent.effective_conviction < max(8, intent.last_filled_conviction)):
+            prior = intent.last_filled_conviction
+            if intent.effective_conviction < 8 or (
+                prior is None and not intent.initial_reaffirmation
+            ) or (
+                prior is not None
+                and (type(prior) is not int or not 1 <= prior <= 10 or intent.effective_conviction < prior)
+            ):
                 return target, held, "top_up_conviction"
             if intent.thesis_change not in ("strengthened", "unchanged"):
                 return target, held, "top_up_thesis_change"

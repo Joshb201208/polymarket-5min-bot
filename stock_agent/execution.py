@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 from stock_agent.broker import AlpacaClient, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, round_price
 from stock_agent.config import Config
-from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent, TopUpAlreadyToday
+from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent, ThesisRecord, ThesisRole, TopUpAlreadyToday
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -444,7 +444,10 @@ class ExecutionEngine:
             self._funnel(it, "ordered", order_id=order.id)
         self.ledger.ack_intent(it.intent_id, status, broker_order_id=order.id, meta=meta)
         if status == IntentStatus.FILLED:
-            self._funnel(it, "filled", qty=filled, avg_price=price, order_id=order.id)
+            provenance = {
+                key: it.meta[key] for key in ("top_up_baseline_provenance", "top_up_baseline_grade") if key in it.meta
+            }
+            self._funnel(it, "filled", qty=filled, avg_price=price, order_id=order.id, **provenance)
         elif code:
             self._funnel(it, "skipped", code, f"order ended {order.status}")
         if status == IntentStatus.REJECTED:
@@ -710,22 +713,25 @@ class ExecutionEngine:
         if why:
             code = "position_changed" if why.startswith("top-up") else "research_stale"
             return self._skip(intent, why, code)
-        add_payload = None
+        thesis = None
         last_filled_conviction = None
+        initial_reaffirmation = False
         if add:
             thesis = self.ledger.get_thesis(intent.thesis_ids[0]) if len(intent.thesis_ids) == 1 else None
             draft = thesis.payload.get("draft") if thesis is not None else None
-            if thesis is None or thesis.symbol != intent.symbol or not isinstance(draft, dict) or (
+            if thesis is None or not thesis.actionable or thesis.symbol != intent.symbol or not isinstance(draft, dict) or (
                 draft.get("direction") != "BUY"
             ):
                 return self._skip(intent, "top-up requires a linked BUY thesis", "top_up_thesis_direction")
-            add_payload = thesis.payload
-            last_fill = self.ledger.last_filled_thesis(intent.position_id)
-            if last_fill is not None:
-                last_filled_conviction = last_fill.payload.get("effective_conviction")
+            last_filled_conviction, may_initialize = self.ledger.top_up_baseline(intent.position_id)
+            initial_reaffirmation = (
+                may_initialize and thesis.role == ThesisRole.HELD_REVIEW
+                and "/" in thesis.source and thesis.payload.get("legacy_v0") is not True
+            )
         dist = await self._stop_distance(intent.symbol, ask)
-        ti = self._trade_intent(intent, limit, q, dist, add_payload=add_payload,
-                                last_filled_conviction=last_filled_conviction)
+        ti = self._trade_intent(intent, limit, q, dist, add_thesis=thesis,
+                                last_filled_conviction=last_filled_conviction,
+                                initial_reaffirmation=initial_reaffirmation)
         controls = self._risk_controls()
         qty = int(self.risk.propose_equity_qty(snap, ti, now=self.now(), controls=controls))
         from dataclasses import replace
@@ -747,7 +753,10 @@ class ExecutionEngine:
             pass  # not QUEUED any more: claim below reports it
         self._funnel(intent, "passed_risk", qty=qty)
         try:
-            claimed = self.ledger.claim_intent(intent.intent_id, top_up_session=self.session_date() if add else None)
+            claimed = self.ledger.claim_intent(
+                intent.intent_id, top_up_session=self.session_date() if add else None,
+                top_up_baseline_grade=ti.effective_conviction if initial_reaffirmation else None,
+            )
         except TopUpAlreadyToday as e:
             return self._skip(intent, str(e), "top_up_already_today")
         except LedgerError as e:
@@ -841,17 +850,18 @@ class ExecutionEngine:
         return intent.created_at
 
     def _trade_intent(self, intent: OrderIntent, limit: float, q: Any, dist: Any, *,
-                      add_payload=None, last_filled_conviction=None):
+                      add_thesis: ThesisRecord | None = None, last_filled_conviction: int | None = None,
+                      initial_reaffirmation: bool = False):
         from stock_agent.risk_manager import TradeIntent, TradeKind
 
         m = dict(intent.meta or {})
-        add = add_payload is not None
+        add = add_thesis is not None
         if add:
             # The thesis/grade used for approval comes from the ledger, not
             # a stale or optimistic copy in a queued order's metadata.
-            m.update(raw_conviction=add_payload.get("raw_conviction"),
-                     effective_conviction=add_payload.get("effective_conviction"),
-                     thesis_change=add_payload["draft"].get("thesis_change"))
+            m.update(raw_conviction=add_thesis.payload.get("raw_conviction"),
+                     effective_conviction=add_thesis.payload.get("effective_conviction"),
+                     thesis_change=add_thesis.payload["draft"].get("thesis_change"))
         kw: dict[str, Any] = dict(
             kind=TradeKind.ADD if add else TradeKind.BUY,
             symbol=intent.symbol,
@@ -862,9 +872,10 @@ class ExecutionEngine:
             effective_conviction=m.get("effective_conviction", m.get("conviction")),
             last_filled_conviction=last_filled_conviction,
             thesis_change=m.get("thesis_change") if add else None,
+            initial_reaffirmation=initial_reaffirmation,
             stop_distance=dist.fraction,
             analysis_price=intent.reference_price,
-            signal_at=self._signal_at(intent),
+            signal_at=add_thesis.generated_at if add else self._signal_at(intent),
             quote_at=getattr(q, "as_of", None),
         )
         if m.get("minimum_conviction") is not None:
