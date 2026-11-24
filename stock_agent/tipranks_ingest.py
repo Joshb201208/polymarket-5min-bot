@@ -28,11 +28,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from stock_agent.asset_registry import AssetRegistry, CanonicalSector
+from stock_agent.asset_registry import AssetRegistry
 from stock_agent.config import Config
 from stock_agent.health import HealthState, ProviderHealthRegistry
 from stock_agent.research_schemas import Evidence, utc_datetime
-from stock_agent.risk_manager import _LEVERAGED_2X, _LEVERAGED_3X, normalize_sector
+from stock_agent.risk_manager import _LEVERAGED_2X, _LEVERAGED_3X
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +40,12 @@ DEFAULT_TIPRANKS_FILENAME = "tipranks_latest.csv"
 FRESH_MAX_AGE = timedelta(days=8)
 STALE_MAX_AGE = timedelta(days=15)
 DEFAULT_MAX_CSV_BYTES = 5 * 1024 * 1024  # 5 MiB ceiling (~80x a 300-row export)
+MAX_CSV_ROWS = 2_000
 _MAX_SIDECAR_BYTES = 16 * 1024
 
-_REQUIRED_COLUMNS = frozenset({"Ticker", "Smart Score", "Analyst Consensus"})
+_REQUIRED_COLUMNS = frozenset({"Ticker", "Smart Score"})
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}(?:\.[A-Z])?$")
+_UNIVERSE_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z])?$")
 _MUTUAL_FUND_5X_RE = re.compile(r"^[A-Z]{4}X$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
@@ -171,7 +173,8 @@ class _CachedParse:
     content_sha256: str
     rows: dict[str, TipRanksRow]
     file_mtime: datetime
-    claimed_exported_at: datetime | None
+    sidecar_exported_at: datetime | None
+    embedded_exported_at: datetime | None
     parse_error: str | None = None
 
 
@@ -436,22 +439,25 @@ def _parse_csv_bytes(raw: bytes) -> tuple[dict[str, TipRanksRow], datetime | Non
 
     rows: dict[str, TipRanksRow] = {}
     embedded_exported_at: datetime | None = None
+    data_row_count = 0
 
     try:
         for raw_row in reader:
+            data_row_count += 1
+            if data_row_count > MAX_CSV_ROWS:
+                return {}, None, f"CSV exceeds maximum row limit ({MAX_CSV_ROWS})"
             if None in raw_row and raw_row[None]:
                 # Extra unquoted delimiters in row; skip malformed row safely
                 continue
+            for ts_col in ("Exported At", "Export Date", "As Of"):
+                ts_val = _parse_export_timestamp(_cell(raw_row, ts_col))
+                if ts_val is not None:
+                    embedded_exported_at = (
+                        ts_val if embedded_exported_at is None else min(embedded_exported_at, ts_val)
+                    )
             symbol = _normalize_ticker(_cell(raw_row, "Ticker"))
             if symbol is None or symbol in rows:
                 continue
-
-            if embedded_exported_at is None:
-                for ts_col in ("Exported At", "Export Date", "As Of"):
-                    ts_val = _parse_export_timestamp(_cell(raw_row, ts_col))
-                    if ts_val is not None:
-                        embedded_exported_at = ts_val
-                        break
 
             rows[symbol] = TipRanksRow(
                 symbol=symbol,
@@ -521,10 +527,13 @@ class TipRanksIngestor:
             return None, _stat_sig(st_after)
         if not isinstance(payload, dict):
             return None, _stat_sig(st_after)
-        for key in ("exported_at", "as_of", "export_date"):
-            parsed = _parse_export_timestamp(payload.get(key))
-            if parsed is not None:
-                return parsed, _stat_sig(st_after)
+        parsed_candidates = [
+            parsed
+            for key in ("exported_at", "as_of", "export_date")
+            if (parsed := _parse_export_timestamp(payload.get(key))) is not None
+        ]
+        if parsed_candidates:
+            return min(parsed_candidates), _stat_sig(st_after)
         return None, _stat_sig(st_after)
 
     def _record_health(
@@ -665,7 +674,6 @@ class TipRanksIngestor:
 
             digest = hashlib.sha256(raw).hexdigest()
             parsed_rows, embedded_dt, parse_err = _parse_csv_bytes(raw)
-            claimed_dt = sidecar_dt or embedded_dt
             mtime_dt = datetime.fromtimestamp(fst.st_mtime, tz=timezone.utc)
             cached = _CachedParse(
                 file_sig=_stat_sig(fst),
@@ -673,7 +681,8 @@ class TipRanksIngestor:
                 content_sha256=digest,
                 rows=parsed_rows,
                 file_mtime=mtime_dt,
-                claimed_exported_at=claimed_dt,
+                sidecar_exported_at=sidecar_dt,
+                embedded_exported_at=embedded_dt,
                 parse_error=parse_err,
             )
             self._cache = cached
@@ -695,10 +704,11 @@ class TipRanksIngestor:
                 reason=cached.parse_error,
             )
 
-        effective_mtime = min(cached.file_mtime, now_utc)
-        effective_as_of = effective_mtime
-        if cached.claimed_exported_at is not None and cached.claimed_exported_at <= now_utc + timedelta(hours=1):
-            effective_as_of = min(effective_mtime, min(cached.claimed_exported_at, now_utc))
+        candidate_dts = [min(cached.file_mtime, now_utc)]
+        for claimed in (cached.sidecar_exported_at, cached.embedded_exported_at):
+            if claimed is not None and claimed <= now_utc + timedelta(hours=1):
+                candidate_dts.append(min(claimed, now_utc))
+        effective_as_of = min(candidate_dts)
 
         age = max(timedelta(0), now_utc - effective_as_of)
         age_days = age.total_seconds() / 86400.0
@@ -739,11 +749,13 @@ class TipRanksIngestor:
             return ("disabled", int(getattr(self.config, "UNIVERSE_SIZE", 50)))
         snap = self.read(now)
         return (
-            snap.state.value if snap.usable else "unusable",
+            snap.state.value,
             snap.content_sha256 if snap.usable else None,
+            snap.exported_at.isoformat() if (snap.usable and snap.exported_at is not None) else None,
             int(getattr(self.config, "TIPRANKS_MIN_SMART_SCORE", 8)),
             int(getattr(self.config, "TIPRANKS_UNIVERSE_SLICE", 20)),
             int(getattr(self.config, "TIPRANKS_UNIVERSE_LIMIT", 100)),
+            float(getattr(self.config, "MIN_MARKET_CAP", 0.0) or 0.0),
             int(getattr(self.config, "UNIVERSE_SIZE", 50)),
         )
 
@@ -760,8 +772,8 @@ class TipRanksIngestor:
             return ()
 
         now_utc = utc_datetime(now)
-        published_at = min(snap.exported_at, now_utc)
-        export_date_iso = published_at.date().isoformat()
+        export_dt = min(snap.exported_at, now_utc)
+        export_date_iso = export_dt.date().isoformat()
         stale_tag = "; STALE >8d" if snap.stale else ""
         score_str = f"Smart Score {row.smart_score}/10" if row.smart_score is not None else "Smart Score unknown"
         consensus_str = (
@@ -785,7 +797,7 @@ class TipRanksIngestor:
                 evidence_id=f"tipranks:{export_date_iso}:{norm_sym}",
                 url=f"https://www.tipranks.com/stocks/{norm_sym.lower()}/forecast",
                 title=title,
-                published_at=published_at,
+                published_at=None,
                 retrieved_at=now_utc,
                 publisher="TipRanks Screener Export",
                 snippet=snippet,
@@ -804,8 +816,11 @@ class TipRanksIngestor:
         snap = self.read(now)
         if not snap.usable:
             return []
+        if hasattr(assets, "active_symbols") and not assets.active_symbols():
+            return []
 
         min_score = int(getattr(self.config, "TIPRANKS_MIN_SMART_SCORE", 8))
+        min_mcap = float(getattr(self.config, "MIN_MARKET_CAP", 0.0) or 0.0)
         hard_limit = max(0, int(getattr(self.config, "TIPRANKS_UNIVERSE_LIMIT", 100)))
         cap = min(hard_limit, max(0, int(max_names))) if max_names is not None else hard_limit
         if cap <= 0:
@@ -818,20 +833,18 @@ class TipRanksIngestor:
                 continue
             if row.analyst_consensus not in _ELIGIBLE_UNIVERSE_CONSENSUS:
                 continue
+            if row.market_cap is not None and min_mcap > 0.0 and row.market_cap < min_mcap:
+                continue
             if is_fund_ticker(row.symbol, row.name):
                 continue
             resolved = assets.resolve_symbol(row.symbol)
-            if not resolved or resolved in excluded:
+            if not resolved or resolved in excluded or not _UNIVERSE_SYMBOL_RE.match(resolved):
                 continue
             meta = assets.get_asset_meta(resolved)
-            if not meta.tradable or meta.renamed_to:
+            if meta is None or not meta.tradable or meta.renamed_to:
                 continue
             if is_fund_ticker(resolved, meta.company_name):
                 continue
-            if meta.canonical_sector == CanonicalSector.UNKNOWN and row.sector:
-                norm_sec = normalize_sector(row.sector)
-                if norm_sec != CanonicalSector.UNKNOWN:
-                    assets.set_sector(resolved, row.sector)
             eligible.append((row, resolved))
 
         eligible.sort(

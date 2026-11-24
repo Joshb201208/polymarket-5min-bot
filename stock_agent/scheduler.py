@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import math
 import sqlite3
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
@@ -156,6 +157,9 @@ class StockAgentScheduler:
         self.market_move_vix = getattr(services, "market_move_vix", None)
         self.health_registry = self.health
         self._universe_symbols: tuple[str, ...] = ()
+        self._baseline_universe_symbols: tuple[str, ...] = ()
+        self._baseline_universe_at: datetime | None = None
+        self._tipranks_universe_symbols: tuple[str, ...] = ()
         self.fundamentals = service("fundamentals", lambda: FundamentalsService(
             self.http, config=self.config, health=self.health, assets=self.assets, prices=self.prices,
             focus_symbols=self._pollable_focus, now=_now_utc, universe_size=self.config.UNIVERSE_SIZE,
@@ -172,7 +176,7 @@ class StockAgentScheduler:
             self.prices, self.news, list_universe=self._list_universe, fetch_company=self.fundamentals.fetch_company,
             cached_company=getattr(self.fundamentals, "cached_company", None),
             fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
-            tipranks=self.tipranks,
+            tipranks=self.tipranks, baseline_due=self._baseline_universe_due,
         ))
         self.research_health = service("research_health", lambda: ResearchInputHealth(
             self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
@@ -537,10 +541,10 @@ class StockAgentScheduler:
         current = self.ledger.last_snapshot()
         held = (position.symbol for position in current.holdings) if current else ()
         catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
-        tr_syms = tuple(self.tipranks.read(_now_utc()).rows) if self.tipranks is not None else ()
+        # Only the selected TipRanks slice (already inside _universe_symbols) is tracked; never raw CSV rows.
         return tuple(dict.fromkeys([
             *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
-            *self._universe_symbols, *tr_syms, *catalogue,
+            *self._universe_symbols, *self._baseline_universe_symbols, *catalogue,
         ]))
 
     def _resolve_symbols(self, symbols) -> tuple[str, ...]:
@@ -571,13 +575,54 @@ class StockAgentScheduler:
             return JobOutcome(JobStatus.FAILED, detail={"reason": "active_assets_unavailable"})
         return None
 
+    async def _universe_price_ok(self, symbols: tuple[str, ...]) -> set[str]:
+        if not symbols:
+            return set()
+        price_ok = getattr(self.fundamentals, "_price_ok", None)
+        if callable(price_ok):
+            return await price_ok(symbols)
+        if self.prices is None:
+            return set(symbols)
+        try:
+            batch = await self.prices.get_quotes(list(symbols), purpose="brief")
+        except Exception:
+            return set()
+        return {
+            s
+            for s, q in batch.quotes.items()
+            if q is not None
+            and math.isfinite(px := float(getattr(q, "price", 0.0) or 0.0))
+            and px >= 5.0
+        }
+
+    def _baseline_universe_due(self, now: datetime) -> bool:
+        return self._baseline_universe_at is None or now - self._baseline_universe_at >= timedelta(hours=12)
+
     async def _list_universe(self) -> tuple[str, ...]:
-        now = _now_utc()
+        now = getattr(self.research_sources, "_active_universe_now", None) or _now_utc()
         cap = max(1, int(self.config.UNIVERSE_SIZE))
         priority = self._resolve_symbols(self.config.PRIORITY_SYMBOLS)[:cap]
         seen = set(priority)
 
-        raw_downstream = await self.fundamentals.list_universe()
+        if (
+            hasattr(self.fundamentals, "list_universe_with_baseline")
+            and "list_universe" not in getattr(self.fundamentals, "__dict__", {})
+        ):
+            raw_downstream, baseline_downstream = await self.fundamentals.list_universe_with_baseline()
+        else:
+            raw_downstream = await self.fundamentals.list_universe()
+            baseline_downstream = raw_downstream
+        # Direct options scan keeps exact 185f9c6 baseline composition AND 12h refresh cadence
+        # (pre-TipRanks, pre-round-robin), unaffected by <12h TipRanks invalidations; when due,
+        # an empty refresh clears _baseline_universe_symbols immediately (falling back to sorted
+        # active_symbols) while retaining last-success timestamp semantics so the next call retries.
+        if self._baseline_universe_due(now):
+            baseline_candidates = tuple(dict.fromkeys(
+                self._resolve_symbols((*self.config.PRIORITY_SYMBOLS, *baseline_downstream))
+            ))[:self.config.UNIVERSE_SIZE]
+            self._baseline_universe_symbols = baseline_candidates
+            if baseline_candidates:
+                self._baseline_universe_at = now
         focus_set = set(self._pollable_focus(now=now))
         downstream = tuple(
             sym for sym in self._resolve_symbols(raw_downstream)
@@ -591,21 +636,42 @@ class StockAgentScheduler:
         )
         remaining_after_priority = max(0, cap - len(priority))
         tipranks_names: tuple[str, ...] = ()
-        if self.tipranks is not None and remaining_after_priority > 0 and tr_cap > 0:
-            tipranks_names = tuple(
-                self.tipranks.universe_candidates(
-                    now,
-                    assets=self.assets,
-                    exclude=seen | focus_set,
-                    max_names=min(remaining_after_priority, tr_cap),
-                )
-            )
-            seen.update(tipranks_names)
+        selected_tr_key: tuple[object, ...] | None = None
+        if self.tipranks is not None:
+            selected_tr_key = tuple(self.tipranks.universe_cache_key(now))
+            if remaining_after_priority > 0 and tr_cap > 0:
+                # Bounded prefilter (<= TIPRANKS_UNIVERSE_LIMIT), then the same live-quote $5 floor
+                # that other discovered names pass; verify snapshot key across await so mid-build
+                # file removal or replacement never commits superseded candidates.
+                for _attempt in range(3):
+                    key_before = tuple(self.tipranks.universe_cache_key(now))
+                    prefilter = tuple(
+                        self.tipranks.universe_candidates(
+                            now,
+                            assets=self.assets,
+                            exclude=seen | focus_set,
+                        )
+                    )
+                    passed = await self._universe_price_ok(prefilter)
+                    key_after = tuple(self.tipranks.universe_cache_key(now))
+                    if key_after == key_before:
+                        tipranks_names = tuple(
+                            s for s in prefilter if s in passed
+                        )[:min(remaining_after_priority, tr_cap)]
+                        selected_tr_key = key_after
+                        break
+                else:
+                    tipranks_names = ()
+                    selected_tr_key = ("__unstable__",)
+                seen.update(tipranks_names)
 
         remaining_after_tr = max(0, cap - len(priority) - len(tipranks_names))
         screener_names = tuple(sym for sym in downstream if sym not in seen)[:remaining_after_tr]
 
         self._universe_symbols = (*priority, *tipranks_names, *screener_names)
+        self._tipranks_universe_symbols = tipranks_names
+        if hasattr(self.research_sources, "record_tipranks_members"):
+            self.research_sources.record_tipranks_members(tipranks_names, cache_key=selected_tr_key)
         source_counts = {
             "priority": len(priority),
             "tipranks": len(tipranks_names),
@@ -635,7 +701,8 @@ class StockAgentScheduler:
     def _option_universe(self) -> tuple[str, ...]:
         current = self.ledger.last_snapshot()
         held = (position.symbol for position in current.holdings) if current else ()
-        candidates = self._universe_symbols or self.assets.active_symbols()[:self.config.UNIVERSE_SIZE]
+        # Baseline (pre-TipRanks) composition only: TipRanks never adds, removes or displaces option names.
+        candidates = self._baseline_universe_symbols or self.assets.active_symbols()[:self.config.UNIVERSE_SIZE]
         return self._resolve_symbols((*held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS, *candidates))
 
     async def market_gate(self, purpose: str, *, rule: str | None = None) -> GateDecision:

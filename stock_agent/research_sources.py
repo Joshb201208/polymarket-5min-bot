@@ -29,6 +29,7 @@ class ResearchSources:
         asset_for: Callable[[str], Any] | None = None,
         health=None,
         tipranks=None,
+        baseline_due: Callable[[datetime], bool] | None = None,
         fundamental_limit: int = 10,
     ):
         self.prices = prices
@@ -40,17 +41,28 @@ class ResearchSources:
         self.asset_for = asset_for or (lambda _symbol: None)
         self.health = health
         self.tipranks = tipranks
+        self.baseline_due = baseline_due
         self.fundamental_limit = max(0, fundamental_limit)
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._universe_tipranks_key: tuple[Any, ...] | None = None
         self.last_universe_sources: dict[str, int] = {}
+        self._tipranks_members: tuple[str, ...] = ()
+        self._tipranks_members_recorded: bool = False
+        self._built_tipranks_key: tuple[Any, ...] | None = None
+        self._active_universe_now: datetime | None = None
         self._news_at: dict[str, datetime] = {}
         self._quote_at: dict[str, datetime] = {}
         self._companies: dict[str, tuple[datetime, Any]] = {}
 
     def record_universe_sources(self, counts: Mapping[str, int]) -> None:
         self.last_universe_sources = {str(k): int(v) for k, v in counts.items()}
+
+    def record_tipranks_members(self, symbols, *, cache_key: tuple[Any, ...] | None = None) -> None:
+        self._tipranks_members = tuple(symbols)
+        self._tipranks_members_recorded = True
+        if cache_key is not None:
+            self._built_tipranks_key = tuple(cache_key)
 
     def _tipranks_universe_key(self, now: datetime) -> tuple[Any, ...]:
         key_fn = getattr(self.tipranks, "universe_cache_key", None)
@@ -60,19 +72,60 @@ class ResearchSources:
 
     async def universe(self, now: datetime) -> tuple[str, ...]:
         tr_key = self._tipranks_universe_key(now)
-        if (
-            self._universe_at is None
-            or now - self._universe_at >= timedelta(hours=12)
-            or tr_key != self._universe_tipranks_key
-        ):
-            candidates = await self.list_universe()
+        ttl_expired = self._universe_at is None or now - self._universe_at >= timedelta(hours=12)
+        b_due = bool(self.baseline_due(now)) if self.baseline_due is not None else False
+        if ttl_expired or b_due or tr_key != self._universe_tipranks_key:
+            prior_tipranks = set(self._tipranks_members)
+            had_recorded = self._tipranks_members_recorded
+            prior_committed_key = self._universe_tipranks_key
+            built: tuple[str, ...] = ()
+            candidates: tuple[str, ...] = ()
+            committed_key: tuple[Any, ...] = tr_key
+            for _attempt in range(3):
+                pre_key = self._tipranks_universe_key(now)
+                self._built_tipranks_key = None
+                self._active_universe_now = now
+                try:
+                    built = tuple(await self.list_universe())
+                finally:
+                    self._active_universe_now = None
+                selected_key = self._built_tipranks_key if self._built_tipranks_key is not None else pre_key
+                post_key = self._tipranks_universe_key(now)
+                if selected_key == post_key:
+                    candidates = built
+                    committed_key = selected_key
+                    break
+            else:
+                if self._tipranks_members_recorded:
+                    stale_tr = set(self._tipranks_members)
+                    candidates = tuple(s for s in built if s not in stale_tr)
+                    self._tipranks_members = ()
+                else:
+                    candidates = ()
+                committed_key = ("__unstable__",)
+            key_changed = prior_committed_key is not None and committed_key != prior_committed_key
             if candidates:
                 self._universe = tuple(dict.fromkeys(candidates))
-                self._universe_at = now
-                self._universe_tipranks_key = self._tipranks_universe_key(now)
-            elif self._universe_at and now - self._universe_at > timedelta(days=2):
-                self._universe = ()
-                self._universe_tipranks_key = tr_key
+                if ttl_expired or b_due or self._universe_at is None:
+                    self._universe_at = now
+                self._universe_tipranks_key = committed_key
+            else:
+                if key_changed or tr_key != prior_committed_key:
+                    # TipRanks membership was invalidated: clear TipRanks-sourced names (or all
+                    # cached names when membership wasn't tracked per-source) even on empty rebuild.
+                    if had_recorded:
+                        self._universe = tuple(s for s in self._universe if s not in prior_tipranks)
+                    else:
+                        self._universe = ()
+                    self._tipranks_members = ()
+                    self._universe_tipranks_key = committed_key
+                    if not self._universe:
+                        self._universe_at = None
+                elif prior_committed_key is None:
+                    self._universe_tipranks_key = committed_key
+                if self._universe_at and now - self._universe_at > timedelta(days=2):
+                    self._universe = ()
+                    self._universe_tipranks_key = committed_key
         return self._universe
 
     def quote_ok(self, symbol: str, now: datetime) -> bool:

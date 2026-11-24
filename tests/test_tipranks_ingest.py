@@ -458,6 +458,7 @@ def test_option_b_universe_order_slice_cap_fallback_cache_invalidation_and_funne
     catalogue_seeded = ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD"]
     for sym in ("ANET", "JPM", *tr_tickers, *catalogue_seeded):
         world.alpaca.add_asset(sym)
+        world.price(sym, 100.0, spread=0.02)
 
     async def _run():
         sched = world.scheduler()
@@ -667,3 +668,727 @@ def test_tipranks_security_no_credential_refs_and_strict_dir_fd_confinement(tmp_
     st = health.get_status("tipranks", "screener")
     assert canary not in (st.last_error_summary or "")
 
+
+def test_regression_asset_registry_sector_invariance_selected_and_unselected(world) -> None:
+    from stock_agent.asset_registry import AssetRegistry
+    from stock_agent.risk_manager import CanonicalSector
+
+    now = world.clock.now()
+    for sym in ("ZZQA", "ZZQB"):
+        world.alpaca.add_asset(sym, name=f"Synthetic {sym} Corp")
+        world.price(sym, 50.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            assert sched.assets.get_asset_meta("ZZQA").canonical_sector == CanonicalSector.UNKNOWN
+            assert sched.assets.get_asset_meta("ZZQB").canonical_sector == CanonicalSector.UNKNOWN
+
+            _write_csv(
+                world.data_dir,
+                [
+                    _row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$50,000,000,000", sector="Utilities"),
+                    _row("ZZQB", smart_score="9", consensus="Strong Buy", market_cap="$40,000,000,000", sector="Energy"),
+                ],
+                mtime=now - timedelta(hours=2),
+            )
+            picked = sched.tipranks.universe_candidates(now, assets=sched.assets, max_names=1)
+            assert picked == ["ZZQA"]
+
+            # Neither selected nor unselected row may mutate AssetRegistry sector metadata
+            assert sched.assets.get_asset_meta("ZZQA").canonical_sector == CanonicalSector.UNKNOWN
+            assert sched.assets.get_asset_meta("ZZQB").canonical_sector == CanonicalSector.UNKNOWN
+
+            reloaded = AssetRegistry(sched.http, config=sched.config, store=sched.store, now=world.clock.now)
+            reloaded.load_state()
+            assert reloaded.get_asset_meta("ZZQA").canonical_sector == CanonicalSector.UNKNOWN
+            assert reloaded.get_asset_meta("ZZQB").canonical_sector == CanonicalSector.UNKNOWN
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.world_start(datetime(2026, 11, 23, 10, 15, tzinfo=ET))
+def test_regression_direct_options_universe_exact_baseline_parity_and_ranked_thesis_path(world, monkeypatch) -> None:
+    monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", ["ANET"])
+    monkeypatch.setattr(Config, "UNIVERSE_SIZE", 5)
+    monkeypatch.setattr(Config, "TIPRANKS_UNIVERSE_SLICE", 2)
+    monkeypatch.setattr(Config, "TIPRANKS_MIN_SMART_SCORE", 8)
+    monkeypatch.setattr(Config, "OPTIONS_ENABLED", True)
+
+    downstream_syms = ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL"]
+    tr_syms = ["TRQA", "TRQB"]
+    for sym in ("ANET", "SPY", "QQQ", *downstream_syms, *tr_syms):
+        world.alpaca.add_asset(sym)
+        world.price(sym, 100.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            now = world.clock.now()
+            _write_csv(
+                world.data_dir,
+                [
+                    _row("TRQA", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000"),
+                    _row("TRQB", smart_score="9", consensus="Strong Buy", market_cap="$80,000,000,000"),
+                ],
+                mtime=now - timedelta(hours=2),
+            )
+
+            async def _fixed_downstream():
+                return tuple(downstream_syms)
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _fixed_downstream)
+
+            eq_universe = await sched.research.sources.universe(now)
+            # Equity universe gets TipRanks slice: ANET + TRQA, TRQB + AAPL, MSFT (displacing NVDA, AVGO)
+            assert eq_universe == ("ANET", "TRQA", "TRQB", "AAPL", "MSFT")
+
+            # Direct options universe must match baseline (ANET + AAPL, MSFT, NVDA, AVGO) with ZERO TipRanks names
+            opt_universe = sched._option_universe()
+            assert "TRQA" not in opt_universe
+            assert "TRQB" not in opt_universe
+            for displaced in ("NVDA", "AVGO"):
+                assert displaced in opt_universe
+
+            # Normal ranked research path: a TipRanks-discovered name with primary dated evidence
+            # and a qualified BEARISH thesis may still emit an OptionIdea via the existing research->options hook
+            import json
+
+            from stock_agent.research_schemas import Direction
+
+            for sym in eq_universe:
+                world.news(
+                    [sym],
+                    f"{sym} updates quarterly guidance",
+                    summary="The issuer publishes updated guidance.",
+                    at=now - timedelta(minutes=5),
+                )
+            for benchmark in ("SPY", "QQQ"):
+                world.alpaca.seed_daily_bars(benchmark, [100.0, 100.0], end=now.date())
+                world.price(benchmark, 99.0, spread=0.02)
+            world.perplexity.fail(
+                "/v1/agent", "status", status=401, body={"error": {"code": "insufficient_credits"}}, times=None
+            )
+
+            def _draft(body: dict) -> dict:
+                text = body["messages"][0]["content"] if "messages" in body else body["input"]
+                data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
+                sym = data["symbol"]
+                dated_story = next(item for item in data["evidence"] if item["published_at"])
+                if sym == "TRQA":
+                    return {
+                        "symbol": "TRQA",
+                        "direction": "BEARISH",
+                        "conviction": 9,
+                        "summary": "Bearish setup on primary dated release.",
+                        "bull_case": "Limited upside.",
+                        "bear_case": "Material guidance cut.",
+                        "claims": [{"text": "Guidance cut filed.", "evidence_ids": [dated_story["evidence_id"]]}],
+                        "catalysts": ["Next quarter print"],
+                        "risks": ["Short squeeze"],
+                        "thesis_break": "Reclaims prior highs on raised guidance.",
+                        "target_price": 75.0,
+                        "thesis_change": "new",
+                        "horizon_days": 20,
+                    }
+                return {
+                    "symbol": sym,
+                    "direction": "HOLD",
+                    "conviction": 5,
+                    "summary": "Hold.",
+                    "bull_case": "Upside.",
+                    "bear_case": "Downside.",
+                    "claims": [],
+                    "catalysts": [],
+                    "risks": [],
+                    "thesis_break": "None.",
+                    "target_price": None,
+                    "thesis_change": "unchanged",
+                    "horizon_days": 10,
+                }
+
+            world.openai.respond_with(_draft)
+            await sched._run_execution_cycle()
+            await sched.research.observe_regime()
+            outcome = await sched.research.run("weekly", work_scope="options-parity-check")
+            assert any(
+                idea.symbol == "TRQA" and idea.direction is Direction.BEARISH and idea.source == "research"
+                for idea in outcome.option_candidates
+            )
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.world_start(datetime(2026, 11, 23, 10, 15, tzinfo=ET))
+def test_regression_empty_universe_rebuild_clears_expired_or_absent_tipranks_membership(world, monkeypatch) -> None:
+    monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", [])
+    monkeypatch.setattr(Config, "UNIVERSE_SIZE", 10)
+    world.alpaca.add_asset("ZZQA")
+    world.price("ZZQA", 40.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+
+            async def _empty_downstream():
+                return ()
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _empty_downstream)
+            monkeypatch.setattr(sched, "_pollable_focus", lambda **_kw: ())
+
+            now = world.clock.now()
+            csv_path = _write_csv(
+                world.data_dir,
+                [_row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$20,000,000,000")],
+                mtime=now - timedelta(days=1),
+            )
+            assert await sched.research.sources.universe(now) == ("ZZQA",)
+
+            # 1. Removing the CSV -> absent -> universe immediately clears to (), not stale ZZQA
+            csv_path.unlink()
+            now_absent = now + timedelta(minutes=5)
+            assert await sched.research.sources.universe(now_absent) == ()
+            assert sched._universe_symbols == ()
+
+            # 2. Re-populate, then age past 15d -> dead -> universe immediately clears to ()
+            _write_csv(
+                world.data_dir,
+                [_row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$20,000,000,000")],
+                mtime=now_absent,
+            )
+            assert await sched.research.sources.universe(now_absent + timedelta(minutes=1)) == ("ZZQA",)
+            now_dead = now_absent + timedelta(days=16)
+            assert await sched.research.sources.universe(now_dead) == ()
+            assert sched._universe_symbols == ()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.world_start(datetime(2026, 11, 23, 10, 15, tzinfo=ET))
+def test_regression_live_quote_floor_min_market_cap_and_selected_slice_tracked_symbols(world, monkeypatch) -> None:
+    monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", [])
+    monkeypatch.setattr(Config, "UNIVERSE_SIZE", 10)
+    monkeypatch.setattr(Config, "TIPRANKS_UNIVERSE_SLICE", 2)
+    monkeypatch.setattr(Config, "TIPRANKS_UNIVERSE_LIMIT", 10)
+    monkeypatch.setattr(Config, "MIN_MARKET_CAP", 2_000_000_000.0)
+
+    for sym in ("TRPEN", "TRNOQ", "TRCAP", "TRGDA", "TRGDB", "TRGDC", "AAPL"):
+        world.alpaca.add_asset(sym)
+    # TRPEN has CSV price $50.00, but live broker quote is $4.50 (< $5.00 floor) -> must be rejected!
+    world.price("TRPEN", 4.50, spread=0.02)
+    # TRNOQ has no live quote seeded -> must be rejected!
+    world.price("TRCAP", 25.0, spread=0.02)
+    world.price("TRGDA", 25.0, spread=0.02)
+    world.price("TRGDB", 30.0, spread=0.02)
+    world.price("TRGDC", 35.0, spread=0.02)
+    world.price("AAPL", 150.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+
+            async def _downstream():
+                return ("AAPL",)
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _downstream)
+            monkeypatch.setattr(sched, "_pollable_focus", lambda **_kw: ())
+
+            now = world.clock.now()
+            _write_csv(
+                world.data_dir,
+                [
+                    _row("TRPEN", price="$50.00", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000"),
+                    _row("TRNOQ", price="$60.00", smart_score="10", consensus="Strong Buy", market_cap="$85,000,000,000"),
+                    # TRCAP fails MIN_MARKET_CAP ($500M < $2B)
+                    _row("TRCAP", price="$25.00", smart_score="10", consensus="Strong Buy", market_cap="$500,000,000"),
+                    # TRGDA has blank market cap (permitted) & $25 quote; TRGDB has $40B & $30 quote; TRGDC is outside 2-slot slice
+                    _row("TRGDB", price="$30.00", smart_score="9", consensus="Strong Buy", market_cap="$40,000,000,000"),
+                    _row("TRGDA", price="$25.00", smart_score="9", consensus="Strong Buy", market_cap=""),
+                    _row("TRGDC", price="$35.00", smart_score="8", consensus="Strong Buy", market_cap="$30,000,000,000"),
+                ],
+                mtime=now - timedelta(hours=1),
+            )
+
+            # Before universe build, _tracked_symbols must NOT include raw CSV tickers
+            pre_tracked = sched._tracked_symbols()
+            for raw_sym in ("TRPEN", "TRNOQ", "TRCAP", "TRGDA", "TRGDB", "TRGDC"):
+                assert raw_sym not in pre_tracked
+
+            u = await sched.research.sources.universe(now)
+            # Slice refills past TRPEN, TRNOQ, TRCAP to pick TRGDB and TRGDA (2 slots), then AAPL
+            assert u == ("TRGDB", "TRGDA", "AAPL")
+
+            # After universe build, ONLY the selected slice (TRGDB, TRGDA) reaches _tracked_symbols
+            post_tracked = sched._tracked_symbols()
+            assert "TRGDB" in post_tracked and "TRGDA" in post_tracked
+            for unselected in ("TRPEN", "TRNOQ", "TRCAP", "TRGDC"):
+                assert unselected not in post_tracked
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+def test_regression_conservative_export_date_across_all_rows_sidecar_and_mtime(tmp_path: Path) -> None:
+    now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+    cfg = Config(DATA_DIR=tmp_path)
+    ingestor = TipRanksIngestor(cfg)
+    header_with_ts = _CSV_HEADER.rstrip("\n") + ",Exported At\n"
+
+    # 1. Same-day sidecar + fresh mtime CANNOT revive a 16-day-old embedded export date
+    old_iso = (now - timedelta(days=16)).date().isoformat()
+    fresh_iso = now.isoformat()
+    _write_csv(
+        tmp_path,
+        [_row("AAPL", smart_score="10").rstrip("\n") + f',"{old_iso}"\n'],
+        mtime=now - timedelta(minutes=5),
+        header=header_with_ts,
+    )
+    sidecar = tmp_path / "tipranks_latest.meta.json"
+    sidecar.write_text(f'{{"exported_at": "{fresh_iso}"}}', encoding="utf-8")
+    snap_conflict = ingestor.read(now)
+    assert snap_conflict.state == HealthState.DEAD
+    assert not snap_conflict.usable
+
+    # 2. Future/bogus sidecar also cannot mask the 16-day-old embedded date
+    future_iso = (now + timedelta(days=5)).isoformat()
+    sidecar.write_text(f'{{"exported_at": "{future_iso}"}}', encoding="utf-8")
+    snap_future_sidecar = ingestor.read(now)
+    assert snap_future_sidecar.state == HealthState.DEAD
+    sidecar.unlink()
+
+    # 3. Multi-row CSV where row 1 is fresh today and row 2 is 84 days old must use the oldest row date -> DEAD
+    very_old_iso = (now - timedelta(days=84)).date().isoformat()
+    _write_csv(
+        tmp_path,
+        [
+            _row("SYNA", smart_score="10").rstrip("\n") + f',"{now.date().isoformat()}"\n',
+            _row("SYNB", smart_score="10").rstrip("\n") + f',"{very_old_iso}"\n',
+        ],
+        mtime=now - timedelta(minutes=1),
+        header=header_with_ts,
+    )
+    snap_multirow = ingestor.read(now)
+    assert snap_multirow.state == HealthState.DEAD
+    assert not snap_multirow.usable
+
+
+def test_regression_tipranks_evidence_undated_keeps_web_search_and_blocks_standalone_buy_or_exit(world) -> None:
+    from stock_agent.analyst import ResearchTask
+    from stock_agent.llm_client import ModelRoute, ProviderUnavailable
+    from stock_agent.research_schemas import Evidence
+
+    now = world.clock.now()
+    _write_csv(
+        world.data_dir,
+        [_row("AAPL", smart_score="10", consensus="Strong Buy", upside_pct="30.00%", target="$130.00")],
+        mtime=now - timedelta(days=10),  # stale 10d CSV
+    )
+    cfg = Config(DATA_DIR=world.data_dir)
+    ingestor = TipRanksIngestor(cfg)
+    ev_tuple = ingestor.evidence_for("AAPL", now)
+    assert len(ev_tuple) == 1
+    tr_ev = ev_tuple[0]
+
+    # 1. published_at must be None so TipRanks never suppresses web_search grounding
+    assert tr_ev.published_at is None
+    assert "STALE >8d" in tr_ev.snippet
+    needs_search = not any(item.published_at is not None and item.published_at <= now for item in ev_tuple)
+    assert needs_search is True
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+
+            # 2. Standalone BUY / BEARISH / EXIT_PROPOSED citing only tipranks:... must all be rejected
+            for bad_direction in ("BUY", "BEARISH", "EXIT_PROPOSED"):
+                for provider_fake in (world.perplexity, world.openai):
+                    provider_fake.respond_with(lambda _b, d=bad_direction: {
+                        "symbol": "AAPL",
+                        "direction": d,
+                        "conviction": 8,
+                        "summary": f"{d} solely on TipRanks score.",
+                        "bull_case": "High score.",
+                        "bear_case": "Macro risk.",
+                        "claims": [{"text": "Smart Score is 10.", "evidence_ids": [tr_ev.evidence_id]}],
+                        "catalysts": ["Momentum"],
+                        "risks": ["Valuation"],
+                        "thesis_break": "Revenue growth turns negative.",
+                        "target_price": 130.0 if d == "BUY" else 75.0,
+                        "thesis_change": "broken" if d == "EXIT_PROPOSED" else "new",
+                        "horizon_days": 30,
+                    })
+                only_tr_input = ResearchInput(
+                    symbol="AAPL",
+                    company_name="Apple Inc",
+                    sector="Information Technology",
+                    as_of=world.clock.now(),
+                    price=100.0,
+                    quote_at=world.clock.now(),
+                    metrics={},
+                    evidence=(tr_ev,),
+                    holding={"held": True} if bad_direction == "EXIT_PROPOSED" else None,
+                )
+                with pytest.raises(ProviderUnavailable):
+                    await sched.analyst.evaluate(only_tr_input, task=ResearchTask.THESIS, grounded=False)
+                world.clock.advance(minutes=15)
+
+            # 3. Standalone confirm_exit citing only tipranks:... must also be rejected
+            now_exit = world.clock.now()
+            for provider_fake in (world.anthropic, world.perplexity, world.openai):
+                provider_fake.respond_with(lambda _b: {
+                    "symbol": "AAPL",
+                    "verdict": "CONFIRM_BREAK",
+                    "conviction": 8,
+                    "reason": "Only TipRanks cited.",
+                    "evidence_ids": [tr_ev.evidence_id],
+                })
+            held_tr_input = ResearchInput(
+                symbol="AAPL",
+                company_name="Apple Inc",
+                sector="Information Technology",
+                as_of=now_exit,
+                price=100.0,
+                quote_at=now_exit,
+                metrics={},
+                evidence=(tr_ev,),
+                holding={"held": True, "opened_at": (now_exit - timedelta(days=5)).isoformat()},
+            )
+            with pytest.raises(ProviderUnavailable):
+                await sched.analyst.confirm_exit(held_tr_input, primary=ModelRoute("openai", "gpt-5.4"))
+
+            # Advance past provider invalid_output backoff window before checking valid dated + TipRanks BUY
+            world.clock.advance(minutes=15)
+            now_after = world.clock.now()
+
+            # 4. BUY citing BOTH tipranks:... AND a primary dated news/SEC Evidence item succeeds!
+            dated_ev = Evidence(
+                evidence_id="sec:aapl:10q",
+                url="https://www.sec.gov/Archives/edgar/data/0000320193/synthetic-10q.htm",
+                title="Form 10-Q",
+                published_at=now_after - timedelta(hours=4),
+                retrieved_at=now_after,
+                publisher="SEC",
+                snippet="Quarterly revenue accelerated.",
+            )
+            for provider_fake in (world.perplexity, world.openai):
+                provider_fake.respond_with(lambda _b: {
+                    "symbol": "AAPL",
+                    "direction": "BUY",
+                    "conviction": 8,
+                    "summary": "Buy on SEC 10-Q supported by TipRanks context.",
+                    "bull_case": "Revenue acceleration.",
+                    "bear_case": "Macro risk.",
+                    "claims": [{"text": "10-Q growth + Smart Score 10.", "evidence_ids": [dated_ev.evidence_id, tr_ev.evidence_id]}],
+                    "catalysts": ["Product cycle"],
+                    "risks": ["FX"],
+                    "thesis_break": "Operating margin contracts below 25%.",
+                    "target_price": 130.0,
+                    "thesis_change": "new",
+                    "horizon_days": 30,
+                })
+            combined_input = ResearchInput(
+                symbol="AAPL",
+                company_name="Apple Inc",
+                sector="Information Technology",
+                as_of=now_after,
+                price=100.0,
+                quote_at=now_after,
+                metrics={},
+                evidence=(tr_ev, dated_ev),
+            )
+            eval_ok = await sched.analyst.evaluate(combined_input, task=ResearchTask.THESIS, grounded=False)
+            assert eval_ok.record.draft.direction.value == "BUY"
+            assert set(eval_ok.record.draft.claims[0].evidence_ids) == {dated_ev.evidence_id, tr_ev.evidence_id}
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+def test_regression_row_ceiling_2000_and_minimal_required_columns(tmp_path: Path, world) -> None:
+    now = world.clock.now()
+    cfg = Config(DATA_DIR=tmp_path)
+    ingestor = TipRanksIngestor(cfg)
+
+    def _synth_ticker(idx: int) -> str:
+        # Deterministic 4-letter synthetic equities avoiding X-ending mutual-fund pattern
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWYZ"
+        a, rem = divmod(idx, 25 * 25 * 25)
+        b, rem = divmod(rem, 25 * 25)
+        c, d = divmod(rem, 25)
+        return f"{letters[a]}{letters[b]}{letters[c]}{letters[d]}"
+
+    # 1. Exactly 2,000 rows is accepted
+    rows_2000 = [_row(_synth_ticker(i), smart_score="9") for i in range(2_000)]
+    _write_csv(tmp_path, rows_2000, mtime=now - timedelta(hours=1))
+    ok_2000 = ingestor.read(now)
+    assert ok_2000.state == HealthState.OK
+    assert len(ok_2000.rows) == 2_000
+
+    # 2. 2,001 rows exceeds MAX_CSV_ROWS=2,000 -> rejected as DEAD
+    rows_2001 = [*rows_2000, _row(_synth_ticker(2_000), smart_score="9")]
+    _write_csv(tmp_path, rows_2001, mtime=now - timedelta(minutes=30))
+    dead_2001 = ingestor.read(now)
+    assert dead_2001.state == HealthState.DEAD
+    assert not dead_2001.usable
+    assert dead_2001.rows == {}
+
+    # 3. Minimal header with ONLY Ticker and Smart Score is accepted as OK (evidence-only, 0 universe slice)
+    world.alpaca.add_asset("AAPL")
+    _write_csv(
+        tmp_path,
+        ['"AAPL","10"\n'],
+        mtime=now - timedelta(minutes=10),
+        header="Ticker,Smart Score\n",
+    )
+    min_snap = ingestor.read(now)
+    assert min_snap.state == HealthState.OK
+    ev = ingestor.evidence_for("AAPL", now)
+    assert len(ev) == 1
+    assert "Smart Score 10/10" in ev[0].snippet
+    assert "Analyst Consensus unknown" in ev[0].snippet
+
+    async def _check_universe() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            assert ingestor.universe_candidates(now, assets=sched.assets) == []
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_check_universe())
+
+
+@pytest.mark.world_start(datetime(2026, 11, 23, 10, 15, tzinfo=ET))
+def test_regression_mid_build_csv_removal_and_replacement_and_baseline_options_cadence(
+    world, monkeypatch
+) -> None:
+    monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", [])
+    monkeypatch.setattr(Config, "UNIVERSE_SIZE", 5)
+    monkeypatch.setattr(Config, "TIPRANKS_UNIVERSE_SLICE", 2)
+    monkeypatch.setattr(Config, "TIPRANKS_MIN_SMART_SCORE", 8)
+    monkeypatch.setattr(Config, "OPTIONS_ENABLED", True)
+
+    for sym in ("ZZQA", "ZZQB", "BASEA", "BASEB"):
+        world.alpaca.add_asset(sym)
+        world.price(sym, 100.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            now = world.clock.now()
+            csv_path = world.data_dir / "tipranks_latest.csv"
+
+            # --- Part 1: CSV removed during await _universe_price_ok ---
+            _write_csv(
+                world.data_dir,
+                [_row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000")],
+                mtime=now - timedelta(hours=1),
+            )
+
+            async def _empty_downstream():
+                return ()
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _empty_downstream)
+            orig_price_ok = sched._universe_price_ok
+            removed_once = False
+
+            async def _price_ok_unlink(symbols: tuple[str, ...]) -> set[str]:
+                nonlocal removed_once
+                res = await orig_price_ok(symbols)
+                if not removed_once and "ZZQA" in symbols:
+                    removed_once = True
+                    csv_path.unlink()
+                return res
+
+            monkeypatch.setattr(sched, "_universe_price_ok", _price_ok_unlink)
+            first_after_mid_remove = await sched.research.sources.universe(now)
+            assert first_after_mid_remove == ()
+            assert sched._universe_symbols == ()
+            assert sched._tipranks_universe_symbols == ()
+            next_after_mid_remove = await sched.research.sources.universe(now + timedelta(minutes=1))
+            assert next_after_mid_remove == ()
+
+            # --- Part 2: CSV atomically replaced during await _universe_price_ok ---
+            now2 = now + timedelta(minutes=5)
+            _write_csv(
+                world.data_dir,
+                [_row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000")],
+                mtime=now2 - timedelta(minutes=3),
+            )
+            replaced_once = False
+
+            async def _price_ok_replace(symbols: tuple[str, ...]) -> set[str]:
+                nonlocal replaced_once
+                res = await orig_price_ok(symbols)
+                if not replaced_once and "ZZQA" in symbols:
+                    replaced_once = True
+                    _write_csv(
+                        world.data_dir,
+                        [_row("ZZQB", smart_score="10", consensus="Strong Buy", market_cap="$95,000,000,000")],
+                        mtime=now2 - timedelta(minutes=1),
+                    )
+                return res
+
+            monkeypatch.setattr(sched, "_universe_price_ok", _price_ok_replace)
+            first_after_mid_replace = await sched.research.sources.universe(now2)
+            assert first_after_mid_replace == ("ZZQB",)
+            assert sched._universe_symbols == ("ZZQB",)
+            assert sched._tipranks_universe_symbols == ("ZZQB",)
+            next_after_mid_replace = await sched.research.sources.universe(now2 + timedelta(minutes=1))
+            assert next_after_mid_replace == ("ZZQB",)
+
+            # --- Part 3: Baseline direct-options refresh cadence is isolated from <12h TipRanks rebuilds ---
+            monkeypatch.setattr(sched, "_universe_price_ok", orig_price_ok)
+            downstream_current = ["BASEA"]
+
+            async def _mutable_downstream():
+                return tuple(downstream_current)
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _mutable_downstream)
+            # Force initial baseline population at t0
+            sched._baseline_universe_at = None
+            sched._baseline_universe_symbols = ()
+            t0 = now2 + timedelta(hours=13)
+            eq_t0 = await sched.research.sources.universe(t0)
+            assert eq_t0 == ("ZZQB", "BASEA")
+            assert tuple(sched._option_universe()) == ("BASEA",)
+
+            # 2 hours later (<12h TTL): live downstream changes to BASEB AND TipRanks CSV is removed.
+            # Equity universe rebuilds immediately on TipRanks invalidation, but direct options
+            # must preserve its 12h baseline cadence ("BASEA",) until 12h elapses!
+            downstream_current[:] = ["BASEB"]
+            csv_path.unlink()
+            t_plus_2h = t0 + timedelta(hours=2)
+            eq_t2h = await sched.research.sources.universe(t_plus_2h)
+            assert eq_t2h == ("BASEB",)
+            assert tuple(sched._option_universe()) == ("BASEA",)
+
+            # Once >=12h has elapsed since t0, baseline options refreshes to ("BASEB",)
+            t_plus_12h = t0 + timedelta(hours=12, minutes=1)
+            await sched.research.sources.universe(t_plus_12h)
+            assert tuple(sched._option_universe()) == ("BASEB",)
+
+            # Due (+13h) empty refresh clears _baseline_universe_symbols immediately so
+            # _option_universe() falls back to sorted active_symbols (matching 185f9c6), while
+            # retaining last-success timestamp semantics so a subsequent call retries right away
+            downstream_current[:] = []
+            t_due_empty = t_plus_12h + timedelta(hours=13)
+            await sched.research.sources.universe(t_due_empty)
+            assert sched._baseline_universe_symbols == ()
+            expected_active_fallback = tuple(sched.assets.active_symbols()[: sched.config.UNIVERSE_SIZE])
+            assert tuple(sched._option_universe()) == expected_active_fallback
+            downstream_current[:] = ["BASEA"]
+            await sched.research.sources.universe(t_due_empty + timedelta(minutes=5))
+            assert tuple(sched._option_universe()) == ("BASEA",)
+
+            # --- Part 4: Standalone ResearchSources (custom list_universe without Scheduler) ---
+            t_sa = t_due_empty + timedelta(minutes=10)
+            _write_csv(
+                world.data_dir,
+                [_row("ZZQA", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000")],
+                mtime=t_sa - timedelta(minutes=1),
+            )
+            from stock_agent.research_sources import ResearchSources
+
+            standalone_ingestor = TipRanksIngestor(sched.config)
+            unlinked_sa = False
+
+            async def _standalone_list() -> tuple[str, ...]:
+                nonlocal unlinked_sa
+                cands = tuple(standalone_ingestor.universe_candidates(t_sa, assets=sched.assets))
+                await asyncio.sleep(0)
+                if not unlinked_sa and cands:
+                    unlinked_sa = True
+                    csv_path.unlink()
+                return cands
+
+            standalone_sources = ResearchSources(
+                sched.prices,
+                sched.news,
+                list_universe=_standalone_list,
+                tipranks=standalone_ingestor,
+            )
+            assert await standalone_sources.universe(t_sa) == ()
+            assert await standalone_sources.universe(t_sa + timedelta(minutes=1)) == ()
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.world_start(datetime(2026, 11, 23, 10, 15, tzinfo=ET))
+def test_regression_empty_due_baseline_retries_on_next_call_with_fresh_csv_present(
+    world, monkeypatch
+) -> None:
+    monkeypatch.setattr(Config, "PRIORITY_SYMBOLS", [])
+    monkeypatch.setattr(Config, "UNIVERSE_SIZE", 1)
+    monkeypatch.setattr(Config, "TIPRANKS_UNIVERSE_SLICE", 1)
+    monkeypatch.setattr(Config, "TIPRANKS_MIN_SMART_SCORE", 8)
+    monkeypatch.setattr(Config, "OPTIONS_ENABLED", True)
+
+    for sym in ("AAAA", "TRQA", "ZZZZ"):
+        world.alpaca.add_asset(sym)
+        world.price(sym, 100.0, spread=0.02)
+
+    async def _run() -> None:
+        sched = world.scheduler()
+        try:
+            await sched.startup()
+            await sched._refresh_assets()
+            monkeypatch.setattr(sched, "_pollable_focus", lambda **_kw: ())
+            now = world.clock.now()
+            _write_csv(
+                world.data_dir,
+                [_row("TRQA", smart_score="10", consensus="Strong Buy", market_cap="$90,000,000,000")],
+                mtime=now - timedelta(hours=1),
+            )
+            downstream_current = ["ZZZZ"]
+
+            async def _mutable_downstream():
+                return tuple(downstream_current)
+
+            monkeypatch.setattr(sched.fundamentals, "list_universe", _mutable_downstream)
+
+            # t0: equity gets TRQA, direct options gets ZZZZ
+            assert await sched.research.sources.universe(now) == ("TRQA",)
+            assert tuple(sched._option_universe()) == ("ZZZZ",)
+
+            # t0 + 13h: downstream returns empty while fresh TRQA CSV keeps equity non-empty;
+            # direct options immediately falls back to first sorted active asset ("AAAA", ...)
+            downstream_current[:] = []
+            t_due_empty = now + timedelta(hours=13)
+            assert await sched.research.sources.universe(t_due_empty) == ("TRQA",)
+            assert sched._baseline_universe_symbols == ()
+            first_sorted_active = tuple(sched.assets.active_symbols()[:1])
+            assert tuple(sched._option_universe()) == first_sorted_active
+            assert "ZZZZ" not in first_sorted_active
+
+            # t0 + 13h05m (+5m): downstream recovers to ZZZZ while fresh TRQA CSV is unchanged;
+            # independent baseline-due timer forces immediate retry -> options recovers to ("ZZZZ",)
+            downstream_current[:] = ["ZZZZ"]
+            assert await sched.research.sources.universe(t_due_empty + timedelta(minutes=5)) == ("TRQA",)
+            assert tuple(sched._option_universe()) == ("ZZZZ",)
+        finally:
+            await sched._cleanup()
+
+    asyncio.run(_run())
