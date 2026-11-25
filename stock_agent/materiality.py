@@ -99,6 +99,7 @@ MATERIAL_8K_ITEMS: frozenset[str] = frozenset(
         "1.01",
         "1.02",
         "1.03",
+        "1.05",
         "2.01",
         "2.02",
         "2.04",
@@ -108,6 +109,7 @@ MATERIAL_8K_ITEMS: frozenset[str] = frozenset(
         "4.01",
         "4.02",
         "5.02",
+        "7.01",
     }
 )
 

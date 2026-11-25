@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from stock_agent.research_focus import focus_symbols, owner_backed
 from stock_agent.research_pipeline import NewsEvent, SecurityInputs, SourceUnavailable
 from stock_agent.research_schemas import Evidence, utc_datetime
 
@@ -46,6 +47,8 @@ class ResearchSources:
         tipranks=None,
         baseline_due: Callable[[datetime], bool] | None = None,
         fundamental_limit: int = 10,
+        focus_for: Callable[..., Sequence[str]] | None = None,
+        directives_for: Callable[..., Mapping[str, Any]] | None = None,
     ):
         self.prices = prices
         self.news_service = news
@@ -58,6 +61,8 @@ class ResearchSources:
         self.tipranks = tipranks
         self.baseline_due = baseline_due
         self.fundamental_limit = max(0, fundamental_limit)
+        self.focus_for = focus_for or focus_symbols
+        self.directives_for = directives_for or owner_backed
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._universe_tipranks_key: tuple[Any, ...] | None = None
@@ -221,15 +226,22 @@ class ResearchSources:
             items = await self._poll(symbols, scope="scheduled_research", include_market=False, lookback_hours=72)
         except SourceUnavailable:
             return {}  # Independent news health blocks entries; held research may continue.
-        result: dict[str, list[Evidence]] = {symbol: [] for symbol in symbols}
+        result: dict[str, list[tuple[tuple[bool, float, datetime], Evidence]]] = {symbol: [] for symbol in symbols}
         for item in items:
             evidence = _news_evidence(item)
             if evidence is not None:
+                rank_key = (
+                    getattr(item, "kind", None) == "sec_filing",
+                    _finite(getattr(item, "materiality_score", 0)) or 0.0,
+                    evidence.published_at or evidence.retrieved_at,
+                )
                 for symbol in item.symbols:
                     if symbol in result:
-                        result[symbol].append(evidence)
-        return {symbol: tuple(sorted(rows, key=lambda e: e.published_at or e.retrieved_at, reverse=True)[:6])
-                for symbol, rows in result.items()}
+                        result[symbol].append((rank_key, evidence))
+        return {
+            symbol: tuple(ev for _rank, ev in sorted(rows, key=lambda pair: pair[0], reverse=True)[:6])
+            for symbol, rows in result.items()
+        }
 
     async def refresh_entry_inputs(self, symbol: str, now: datetime) -> None:
         """Revalidate after model latency without replacing the analysis price."""
@@ -255,7 +267,10 @@ class ResearchSources:
         getter = getattr(self.prices, "get_daily_bars", None)
         if getter is None:
             return None
-        bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        try:
+            bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        except Exception:
+            return None
         return _price(bars[-1].close) if bars and bars[-1].session_date == session_date else None
 
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
@@ -302,6 +317,57 @@ class ResearchSources:
                 self._quote_at[symbol] = stamp
         return quotes
 
+    def _priority_evidence_symbols(self, now: datetime) -> set[str]:
+        out: set[str] = set()
+        resolve = getattr(self.news_service, "_resolve_symbol", None)
+        for getter in (self.focus_for, self.directives_for):
+            try:
+                raw = getter(now=now)
+            except Exception:
+                continue
+            for item in raw:
+                sym = str(item or "").strip().upper()
+                if not sym:
+                    continue
+                out.add(sym)
+                if callable(resolve):
+                    try:
+                        resolved = str(resolve(sym) or "").strip().upper()
+                        if resolved:
+                            out.add(resolved)
+                    except Exception:
+                        pass
+        return out
+
+    async def _brief_quotes(self, symbols: Sequence[str]):
+        """Analysis-only 20m quote fallback; never updates _quote_at execution proof."""
+        if not symbols or self.prices is None:
+            return {}
+        try:
+            batch = await self.prices.get_quotes(
+                list(symbols), purpose="brief", max_age_s=int(_NEWS_TTL.total_seconds())
+            )
+        except Exception:
+            return {}
+        return getattr(batch, "quotes", None) or {}
+
+    async def _recent_filings_evidence(
+        self, symbols: Sequence[str], now: datetime
+    ) -> dict[str, tuple[Evidence, ...]]:
+        fetch_recent = getattr(self.news_service, "fetch_recent_filings", None)
+        if not symbols or not callable(fetch_recent):
+            return {}
+        try:
+            batches = await fetch_recent(tuple(symbols), now=now)
+        except Exception:
+            return {}
+        out: dict[str, tuple[Evidence, ...]] = {}
+        for symbol, items in (batches or {}).items():
+            parsed = tuple(ev for item in items if (ev := _news_evidence(item)) is not None)
+            if parsed:
+                out[symbol] = parsed
+        return out
+
     async def securities(self, symbols: tuple[str, ...], now: datetime) -> dict[str, SecurityInputs]:
         limiter = asyncio.Semaphore(5)
         cached = {
@@ -332,8 +398,19 @@ class ResearchSources:
                 self._companies[symbol] = (now, snapshot)
             return snapshot
 
-        fundamentals = await asyncio.gather(*(company(symbol) for symbol in symbols))
-        quotes = await self._quotes(symbols, purpose="order_sizing")
+        priority = self._priority_evidence_symbols(now)
+        filing_targets = tuple(dict.fromkeys(symbol for symbol in symbols if symbol in priority))
+        fundamentals, quotes, recent_filings = await asyncio.gather(
+            asyncio.gather(*(company(symbol) for symbol in symbols)),
+            self._quotes(symbols, purpose="order_sizing"),
+            self._recent_filings_evidence(filing_targets, now),
+        )
+        missing_priority_quotes = [
+            symbol for symbol in filing_targets if quotes.get(symbol) is None
+        ]
+        fallback_quotes = (
+            await self._brief_quotes(missing_priority_quotes) if missing_priority_quotes else {}
+        )
         out = {}
         for symbol, snapshot in zip(symbols, fundamentals, strict=True):
             asset = self.asset_for(symbol)
@@ -351,14 +428,21 @@ class ResearchSources:
                 tradable = False
             raw_metrics = getattr(snapshot, "metrics", {})
             metrics = _metrics(raw_metrics)
-            quote = quotes.get(symbol)
+            quote = quotes.get(symbol) or fallback_quotes.get(symbol)
             ev_fn = getattr(self.tipranks, "evidence_for", None)
             tr_evidence = tuple(ev_fn(symbol, now)) if ev_fn is not None else ()
+            filing_evidence = recent_filings.get(symbol, ())
             snap_evidence = tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))
+            merged_evidence = tuple(
+                {
+                    ev.evidence_id: ev
+                    for ev in (*tr_evidence, *filing_evidence, *snap_evidence)
+                }.values()
+            )[:12]
             out[symbol] = SecurityInputs(
                 symbol, str(display_name), str(sector), _price(quote.price) if quote else None,
                 utc_datetime(quote.as_of) if quote else None, tradable, metrics,
-                (*tr_evidence, *snap_evidence)[:12],
+                merged_evidence,
                 _provenance(raw_metrics),
             )
         return out

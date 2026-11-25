@@ -297,3 +297,180 @@ def test_scheduler_defaults_build_shared_research_sources_offline(world):
 
     asyncio.run(run())
     world.assert_no_orders()
+
+
+def test_securities_enriches_priority_symbols_with_tipranks_edgar_and_brief_quote_without_weakening_quote_ok():
+    from decimal import Decimal
+    from stock_agent.news_service import NewsItem
+    from stock_agent.research_schemas import Evidence
+
+    now = datetime(2026, 11, 25, 11, 31, tzinfo=UTC)
+    brief_as_of = now - timedelta(minutes=8)
+    quote_calls: list[tuple[tuple[str, ...], str, int]] = []
+
+    class FakePrices:
+        async def get_quotes(self, symbols, *, purpose, max_age_s):
+            quote_calls.append((tuple(symbols), purpose, max_age_s))
+            if purpose == "order_sizing":
+                return SimpleNamespace(quotes={})
+            return SimpleNamespace(
+                quotes={"NVDA": SimpleNamespace(price=Decimal("142.50"), as_of=brief_as_of)}
+            )
+
+    filing_calls: list[tuple[str, ...]] = []
+
+    class FakeNews:
+        async def fetch_recent_filings(self, symbols, *, now=None):
+            filing_calls.append(tuple(symbols))
+            return {
+                "NVDA": (
+                    NewsItem(
+                        id="sec-nvda-000104581026000090",
+                        symbols=("NVDA",),
+                        headline="NVDA filed SEC Form 8-K (Items 5.02)",
+                        summary="SEC EDGAR Form 8-K filed on 2026-11-23 (Items 5.02).",
+                        source="SEC EDGAR",
+                        published_at=datetime(2026, 11, 23, 21, 10, tzinfo=UTC),
+                        url="https://www.sec.gov/Archives/edgar/data/1045810/000104581026000090/0001045810-26-000090-index.htm",
+                        retrieved_at=now,
+                        provider="sec",
+                        provider_id="0001045810-26-000090",
+                        kind="sec_filing",
+                        sec_form="8-K",
+                        sec_items=("5.02",),
+                        materiality=8,
+                        materiality_reasons=("sec_8k_material_item",),
+                    ),
+                )
+            }
+
+    tr_ev = Evidence(
+        evidence_id="tipranks:NVDA:2026-11-25",
+        title="NVDA TipRanks screener snapshot (2026-11-25)",
+        url="https://www.tipranks.com/stocks/nvda/forecast",
+        publisher="TipRanks",
+        published_at=datetime(2026, 11, 25, 0, 0, tzinfo=UTC),
+        retrieved_at=now,
+        snippet="TipRanks Smart Score 7/10; analyst consensus Strong Buy.",
+    )
+    snap_ev = Evidence(
+        evidence_id="finnhub-metrics:NVDA:2026-11-25",
+        title="NVDA key financial metrics",
+        url="https://finnhub.io/docs/api/company-basic-financials?symbol=NVDA",
+        publisher="Finnhub",
+        published_at=now,
+        retrieved_at=now,
+        snippet="TTM metrics.",
+    )
+
+    class FakeTipRanks:
+        def evidence_for(self, symbol, _now):
+            return (tr_ev,) if symbol == "NVDA" else ()
+
+    async def fake_company(symbol):
+        return SimpleNamespace(
+            company_name=f"{symbol} Corp",
+            canonical_sector="Technology",
+            tradable=True,
+            metrics={},
+            evidence=(snap_ev,) if symbol == "NVDA" else (),
+        )
+
+    async def list_uni():
+        return ("NVDA", "EEE")
+
+    sources = ResearchSources(
+        FakePrices(),
+        FakeNews(),
+        list_universe=list_uni,
+        fetch_company=fake_company,
+        tipranks=FakeTipRanks(),
+        focus_for=lambda *, now=None: ("ORCL",),
+        directives_for=lambda *, now=None: {"NVDA": SimpleNamespace(symbol="NVDA")},
+    )
+
+    rows = asyncio.run(sources.securities(("NVDA", "EEE"), now))
+    assert filing_calls == [("NVDA",)]
+    assert quote_calls == [
+        (("NVDA", "EEE"), "order_sizing", 90),
+        (("NVDA",), "brief", 1200),
+    ]
+    assert rows["NVDA"].price == Decimal("142.50")
+    assert rows["NVDA"].quote_at == brief_as_of
+    # Brief quote fallback must NEVER satisfy 90s execution quote freshness.
+    assert not sources.quote_ok("NVDA", now)
+    assert [ev.publisher for ev in rows["NVDA"].evidence] == ["TipRanks", "SEC EDGAR", "Finnhub"]
+    assert rows["EEE"].price is None
+
+
+def test_background_prefers_sec_filings_and_material_stories_over_tangential_noise():
+    from stock_agent.news_service import NewsFeedBatch, NewsItem
+
+    now = datetime(2026, 11, 25, 15, 0, tzinfo=UTC)
+    noise_items = [
+        NewsItem(
+            id=f"fh-noise-{i}",
+            symbols=("NVDA",),
+            headline=f"Market wrap tangent #{i}",
+            summary="Tangential mention.",
+            source="Yahoo",
+            published_at=now - timedelta(minutes=i + 1),
+            url=f"https://finance.yahoo.com/news/wrap-{i}",
+            retrieved_at=now,
+            provider="finnhub",
+            materiality=2,
+        )
+        for i in range(6)
+    ]
+    filing_item = NewsItem(
+        id="sec-nvda-8k",
+        symbols=("NVDA",),
+        headline="NVDA filed SEC Form 8-K (Items 5.02)",
+        summary="SEC EDGAR Form 8-K filed on 2026-11-23 (Items 5.02).",
+        source="SEC EDGAR",
+        published_at=now - timedelta(hours=40),
+        url="https://www.sec.gov/Archives/edgar/data/1045810/000104581026000090/0001045810-26-000090-index.htm",
+        retrieved_at=now,
+        provider="sec",
+        kind="sec_filing",
+        sec_form="8-K",
+        sec_items=("5.02",),
+        materiality=8,
+    )
+    catalyst_item = NewsItem(
+        id="alp-nvda-guidance",
+        symbols=("NVDA",),
+        headline="NVIDIA raises Q4 revenue guidance",
+        summary="Stronger data center demand.",
+        source="Benzinga",
+        published_at=now - timedelta(hours=20),
+        url="https://www.benzinga.com/nvda-guidance",
+        retrieved_at=now,
+        provider="alpaca",
+        materiality=7,
+    )
+
+    class FakeNews:
+        async def poll_news(self, symbols, **kwargs):
+            all_items = (*noise_items, catalyst_item, filing_item)
+            return NewsFeedBatch(
+                ok=True,
+                degraded=False,
+                as_of=now,
+                items=all_items,
+                new_items=all_items,
+                material_new_items=(catalyst_item, filing_item),
+                errors={},
+                covered_symbols=tuple(symbols),
+            )
+
+    async def list_uni():
+        return ("NVDA",)
+
+    sources = ResearchSources(None, FakeNews(), list_universe=list_uni)
+    bg = asyncio.run(sources.background(("NVDA",)))["NVDA"]
+    assert len(bg) == 6
+    ids = [ev.evidence_id for ev in bg]
+    assert ids[0] == "sec-nvda-8k"
+    assert ids[1] == "alp-nvda-guidance"
+

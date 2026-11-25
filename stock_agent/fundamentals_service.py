@@ -270,7 +270,7 @@ class FundamentalsService:
 
     def __init__(
         self, http, *, health=None, assets=None, prices=None, config=Config,
-        focus_symbols: Iterable[str] | Callable[[], Iterable[str]] = (),
+        focus_symbols: Iterable[str] | Callable[[], Iterable[str]] | None = None,
         now: Callable[[], datetime] | None = None,
         universe_size: int = 150, release_lookback_days: int = 3, finnhub_per_minute: int = 45,
     ):
@@ -347,10 +347,12 @@ class FundamentalsService:
         return data
 
     def focus(self) -> tuple[str, ...]:
-        raw = self._focus() if callable(self._focus) else self._focus
-        if not raw:
+        if self._focus is None:
             from stock_agent.research_focus import focus_symbols
-            raw = focus_symbols(now=self.now())
+
+            raw: Iterable[str] = focus_symbols(now=self.now(), cadence="live")
+        else:
+            raw = self._focus() if callable(self._focus) else self._focus
         return tuple(dict.fromkeys(_norm(s) for s in raw if s and s.strip()))
 
     def _meta(self, symbol: str):
@@ -553,6 +555,10 @@ class FundamentalsService:
             return cached
         meta = self._meta(symbol)
         cik = getattr(meta, "cik", None)
+        if not cik and getattr(self.config, "SEC_USER_AGENT", ""):
+            from stock_agent.news_service import DEFAULT_CIK_MAP
+
+            cik = DEFAULT_CIK_MAP.get(symbol)
         (fin, fin_ev), (sec, sec_ev), profile, fmp = await asyncio.gather(
             self._finnhub_metrics(symbol, now), self._sec_dollars(symbol, cik, now),
             self._finnhub_profile(symbol), self._fmp_profile(symbol))
