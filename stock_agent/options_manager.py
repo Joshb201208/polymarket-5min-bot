@@ -200,8 +200,12 @@ class OptionsManager:
         config: Any = None,
         settings: OptionsSettings | None = None,
         now: Callable[[], datetime] | None = None,
+        research_refresh: Callable[[str, datetime], Any] | None = None,
     ) -> None:
         self.broker = broker
+        # ResearchSources.refresh_entry_inputs(symbol, now): re-reads a stale quote/news proof
+        # before an owner re-verify (a no-op while fresh); same hook ExecutionEngine uses
+        self._research_refresh = research_refresh
         self.store = store
         self.gate = gate
         self.risk = risk
@@ -611,6 +615,7 @@ class OptionsManager:
         gate issues after re-reading the focus file and the current thesis; idea metadata is
         only cross-checked against it, never trusted on its own."""
         self._owner_release_voided(sym)
+        await self._owner_refresh(sym)
         try:
             el = await _maybe(self.gate.is_entry_eligible(sym, now, allow_owner=True, owner_lane="option"))
         except TypeError:
@@ -693,6 +698,18 @@ class OptionsManager:
         except Exception:
             return False
 
+    async def _owner_refresh(self, sym: str) -> None:
+        """Refresh the research gate's quote/news inputs before an owner re-verify, so a ladder
+        that outlives the quote TTL is judged on a fresh quote, never on a relaxed gate.
+        Never raises; a failed refresh only means the gate sees the old input and refuses."""
+        if self._research_refresh is None:
+            return
+        try:
+            async with asyncio.timeout(10):
+                await _maybe(self._research_refresh(sym, self._now()))
+        except (Exception, TimeoutError) as e:
+            logger.warning("owner research refresh for %s failed: %s", sym, type(e).__name__)
+
     async def _owner_reverify(self, sym: str, proof: Any, reservation_id: str | None) -> str | None:
         """Fresh proof from the gate, which re-reads the focus file and thesis and applies the
         veto latch and any session hold; it must match the proof the structure was sized on."""
@@ -714,6 +731,7 @@ class OptionsManager:
     async def _owner_still_valid(self, st: Structure) -> str | None:
         """Re-verify an owner structure before every rung (rung 0 included): same directive,
         not vetoed or held, claim still ours."""
+        await self._owner_refresh(st.underlying)
         try:
             el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
                                                           owner_lane="option", reservation_id=st.id))
@@ -839,6 +857,8 @@ class OptionsManager:
         )
         # final risk recheck -> write-ahead reservation under the shared capital lock, so an
         # equity lane can't size from the same free cash at the same moment
+        if proof is not None:
+            await self._owner_refresh(sym)  # network outside the lock; the in-lock re-verify is local
         async with self._capital_lock_cm():
             full_controls = RiskControls(
                 pause_new_buys=getattr(controls, "pause_new_buys", False),

@@ -443,3 +443,57 @@ def test_definitive_broker_rejection_releases_the_shot_eagerly(world, tmp_path, 
     v = next(x for x in m.structures if x.source == "owner")
     assert v.st is StructState.VOID and v.zero_fill_confirmed and v.owner_claim_released
     assert gate.ledger.claims == {} and gate.ledger.released == [v.id]
+
+
+class QuoteTTLGate(StrictOwnerGate):
+    """Every owner-lane proof needs a quote refreshed since the previous gate call
+    (a ladder outlives the gate's quote TTL)."""
+
+    def __init__(self):
+        super().__init__()
+        self.ledger = ReleasingLedger()
+        self.fresh = False
+        self.refreshes = 0
+
+    def refresh(self, symbol, now):
+        self.refreshes += 1
+        self.fresh = True
+
+    def is_entry_eligible(self, symbol, now, *, allow_owner=False, owner_lane="stock", reservation_id=None):
+        if allow_owner and owner_lane == "option":
+            fresh, self.fresh = self.fresh, False
+            if not fresh:
+                gen = now - timedelta(hours=1)
+                return Eligibility(False, ("quote_stale_or_unavailable",), f"th-{symbol}",
+                                   self.raw, self.owner, Direction.BUY, gen)
+        return super().is_entry_eligible(symbol, now, allow_owner=allow_owner, owner_lane=owner_lane,
+                                         reservation_id=reservation_id)
+
+
+def test_owner_ladder_refreshes_the_quote_before_each_reverify(world, tmp_path, monkeypatch):
+    gate = QuoteTTLGate()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    m._research_refresh = gate.refresh
+    m.settings = dataclasses.replace(m.settings, fill_wait_seconds=0)
+    fills = {"n": 0}
+    real = world.alpaca._try_fill_mleg
+
+    def fill_from_rung_two(o, at):  # rung 0 dies unfilled; a later rung fills
+        fills["n"] += 1
+        if len({x.id for x in world.alpaca.orders.values() if x.order_class == "mleg"}) >= 2:
+            real(o, at)
+
+    monkeypatch.setattr(world.alpaca, "_try_fill_mleg", fill_from_rung_two)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    st = next(x for x in m.structures if x.source == "owner")
+    assert out[0].opened == st.id and st.st is StructState.OPEN, st.notes
+    assert len([x for x in world.alpaca.orders.values() if x.order_class == "mleg"]) >= 2  # really laddered
+    assert gate.refreshes >= 4  # scan start, before the lock, rung 0, rung 1
+    assert gate.ledger.claims == {("AAA", ADDED): st.id}
+
+
+def test_owner_without_refresh_hook_stops_on_a_stale_quote(world, tmp_path):
+    gate = QuoteTTLGate()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    assert not out[0].opened and "quote_stale" in out[0].reason and not world.orders_sent()
