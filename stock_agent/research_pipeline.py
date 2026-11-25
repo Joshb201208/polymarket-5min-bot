@@ -846,9 +846,15 @@ class ResearchPipeline:
         confirmation_requested = False
         new_owner_hold = False
         with self.store.store.transaction():
+            checked_at = self.clock()
             exit_pending = self.store.has_unqueued_exit(symbol, now) or self.store.has_pending_confirmation(symbol, now)
             waiting_owner = (
-                owner is None and self.store.has_waiting_owner_buy(symbol, session.date.isoformat(), self.clock())
+                owner is None and self.store.has_waiting_owner_buy(symbol, session.date.isoformat(), checked_at)
+            )
+            protect_held_option = (
+                holding is not None and held_owner_option is None and direction is Direction.HOLD
+                and record.draft.thesis_change in {"unchanged", "strengthened"}
+                and self._has_pending_held_owner_option(symbol, session.date, checked_at)
             )
             if (waiting_owner and kind in {"news", "earnings"}
                     and direction in {Direction.AVOID, Direction.BEARISH, Direction.EXIT_PROPOSED}):
@@ -858,7 +864,7 @@ class ResearchPipeline:
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=not (exit_pending or (waiting_owner and not holding)),
+                activate=not (exit_pending or (waiting_owner and not holding) or protect_held_option),
             )
             if option_from_held and not exit_pending and security.tradable:
                 self._qualify_owner_option(
@@ -1111,6 +1117,17 @@ class ResearchPipeline:
             self.store.record_option_idea(idea_id, idea, session.closes_at)
             funnel.option_ideas += 1
         return tuple(dict.fromkeys(rejected))
+
+    def _has_pending_held_owner_option(self, symbol: str, session: date, now: datetime) -> bool:
+        # Look up the exact current thesis after the review, inside the same
+        # transaction as activation, rather than trusting the earlier inputs.
+        current = self.ledger.current_thesis(symbol)
+        if current is None or current.role is not ThesisRole.HELD_REVIEW:
+            return False
+        added = current.payload.get("owner_option_directive_added")
+        if not isinstance(added, str) or current.payload.get("job") != "prescan":
+            return False
+        return self.store.has_pending_option_idea(f"owner:{symbol}:{added}:{session}", current.thesis_id, now)
 
     def _qualify_owner_option(self, owner, thesis_id, evidence_ids, record, session, funnel):
         now = self.clock()

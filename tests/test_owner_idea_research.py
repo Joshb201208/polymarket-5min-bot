@@ -517,9 +517,16 @@ def test_option_scheduler_waits_for_stock_proposal_queue_and_working_order(tmp_p
     assert not ready()
 
 
-@pytest.mark.parametrize(("change", "option_expected"), [("unchanged", True), ("weakened", False)])
+@pytest.mark.parametrize(("change", "option_expected", "later_change", "handled"), [
+    ("unchanged", True, None, False),
+    ("weakened", False, None, False),
+    ("unchanged", True, "unchanged", False),
+    ("unchanged", True, "strengthened", False),
+    ("unchanged", True, "weakened", False),
+    ("unchanged", True, "unchanged", True),
+])
 def test_later_held_review_reuses_one_model_call_and_never_overrides_stock_grade(
-    tmp_path, monkeypatch, change, option_expected,
+    tmp_path, monkeypatch, change, option_expected, later_change, handled,
 ):
     clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=FILING)
     directive = FocusItem("ABC", None, "Veto on a guidance cut.", START.date() - timedelta(days=2),
@@ -538,7 +545,7 @@ def test_later_held_review_reuses_one_model_call_and_never_overrides_stock_grade
         raw = response(body, direction="HOLD", conviction=6).json()
         item = raw["output"][-1]["content"][0]
         value = json.loads(item["text"])
-        value["thesis_change"] = change
+        value["thesis_change"] = change if len(calls) == 1 else later_change
         item["text"] = json.dumps(value)
         return httpx.Response(200, json=raw)
 
@@ -547,13 +554,30 @@ def test_later_held_review_reuses_one_model_call_and_never_overrides_stock_grade
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
             pipe = make_pipe(http)
             pipe.directives = research_focus.owner_backed
-            _prescan(pipe, clock)
-            return await pipe.run("prescan")
+            opens = _prescan(pipe, clock)
+            prescan = await pipe.run("prescan")
+            initial = ledger.current_thesis("ABC")
+            if later_change:
+                (idea,) = prescan.option_candidates
+                if handled:
+                    pipe.store.acknowledge_options((idea.story_id,))
+                clock.t = opens + timedelta(minutes=5)
+                await ledger.refresh("fixture")
+                await pipe.run("weekly")
+                current = ledger.current_thesis("ABC")
+                kept = later_change in {"unchanged", "strengthened"} and not handled
+                proof = pipe.gate.is_entry_eligible("ABC", clock.t, allow_owner=True, owner_lane="option")
+                assert (current.thesis_id == initial.thesis_id) is kept
+                assert (proof.ok and proof.owner_entry is not None) is kept
+                if kept:
+                    assert proof.owner_entry.thesis_id == idea.thesis_id == initial.thesis_id
+                work = pipe.store.work_state(f"weekly:{clock.t.date()}:ABC")
+                assert work["thesis_id"] != initial.thesis_id  # The newer HOLD is still recorded.
+            return prescan, initial
 
-    outcome = asyncio.run(run())
+    outcome, thesis = asyncio.run(run())
     assert not outcome.intents
-    assert len(calls) == 1
-    thesis = ledger.current_thesis("ABC")
+    assert len(calls) == (2 if later_change else 1)
     assert thesis.role is ThesisRole.HELD_REVIEW
     assert thesis.payload["raw_conviction"] == thesis.payload["effective_conviction"] == 6
     assert thesis.payload["adjustment_reason"] == ""

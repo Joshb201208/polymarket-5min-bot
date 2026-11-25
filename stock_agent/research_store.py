@@ -370,6 +370,13 @@ class ResearchStore:
             (int(now.timestamp()),),
         )]
 
+    def has_pending_option_idea(self, story_id: str, thesis_id: str, now: datetime) -> bool:
+        return bool(self.store.query(
+            """SELECT 1 FROM research_option_ideas WHERE story_id=? AND handled=0 AND expires_at_s>?
+               AND json_extract(payload_json, '$.thesis_id')=?""",
+            (story_id, int(now.timestamp()), thesis_id),
+        ))
+
     def acknowledge_options(self, story_ids: tuple[str, ...]) -> None:
         with self.store.transaction() as conn:
             conn.executemany("UPDATE research_option_ideas SET handled=1 WHERE story_id=?",
