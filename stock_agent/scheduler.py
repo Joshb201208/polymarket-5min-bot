@@ -4,8 +4,10 @@ import logging
 import math
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -23,7 +25,7 @@ from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
 from stock_agent.ledger import JobStatus, NewIntent, filled_thesis_grade
 from stock_agent.llm_client import LLMClient
-from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus, Session
 from stock_agent.news_service import NewsService
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
@@ -70,6 +72,13 @@ OPTIONS_RESCAN_OUTSIDE_WINDOW = "outside_options_window"
 OPTIONS_RESCAN_NO_MANAGER = "no_options_manager"
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
+
+
+@dataclass(frozen=True)
+class _PrescanLaunch:
+    session: Session
+    deadline: tuple[float, datetime]
+
 
 DRAWDOWN_CLOSE_CAUSES = {
     "close_clock_unverified": "The broker clock did not confirm the scheduled session had closed",
@@ -971,10 +980,10 @@ class StockAgentScheduler:
                 continue
             if not self._shutdown and due(now_et):
                 if name == "prescan":
-                    session = self.calendar.session_on(now_et.date())
-                    timeout = prescan_runtime_seconds(_now_et(), session.opens_at) if session else 0
-                    if timeout <= 0:
+                    launch, timeout = self._prescan_launch()
+                    if launch is None or launch.session.date.isoformat() != day_key:
                         continue
+                    callback = partial(callback, launch)
                 key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
                 self._schedule_job(name, key, callback, timeout=timeout, replay=name not in {
                     "morning_brief", "daily_summary",
@@ -1719,8 +1728,27 @@ class StockAgentScheduler:
     async def _run_midweek_analysis(self):
         return await self._run_research("midweek")
 
-    async def _run_daily_prescan(self):
-        return await self._run_research("prescan")
+    def _prescan_launch(self) -> tuple[_PrescanLaunch | None, float]:
+        started = asyncio.get_running_loop().time()
+        now = _now_et()
+        session = self.calendar.session_on(now.date())
+        runtime = prescan_runtime_seconds(now, session.opens_at) if session is not None else 0.0
+        if session is None or runtime <= 0:
+            return None, 0.0
+        return _PrescanLaunch(session, (started + runtime, now + timedelta(seconds=runtime))), runtime
+
+    async def _run_daily_prescan(self, launch: _PrescanLaunch | None = None):
+        if launch is None:
+            launch, _ = self._prescan_launch()
+        now = _now_et()
+        session = self.calendar.session_on(now.date())
+        if (launch is None or session is None or session != launch.session or now >= session.opens_at
+                or now >= launch.deadline[1] or asyncio.get_running_loop().time() >= launch.deadline[0]):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "prescan_dispatch_cutoff", "deferred": 1})
+        if self.research is None:
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "research_not_configured"})
+        async with asyncio.timeout_at(launch.deadline[0]):
+            return await self.research.run("prescan", prescan_deadline=launch.deadline)
 
     async def _run_earnings_reactive(self):
         return await self._run_research("earnings")
