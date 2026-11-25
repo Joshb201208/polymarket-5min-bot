@@ -20,7 +20,6 @@ from tests.scenarios.owner_support import ADDED, OwnerHarness, et, owner_item
 
 START = et(2026, 11, 25, 7, 0)
 SESSION = date(2026, 11, 25)
-pending = pytest.mark.xfail(strict=False, reason="FIX FIRST fix pending; drop once the owner commits land")
 
 
 def drive(h, scenario):
@@ -124,7 +123,6 @@ def is_mleg(body):
 
 
 # ---------------------------------------------------------------- stock first (lead ruling on the 09:35 race)
-@pending
 @pytest.mark.world_start(START)
 def test_stock_lane_goes_first_then_the_option_lane_opens(world, monkeypatch, tmp_path):
     h = OwnerHarness(world, monkeypatch).install(tmp_path=tmp_path)
@@ -143,7 +141,6 @@ def test_stock_lane_goes_first_then_the_option_lane_opens(world, monkeypatch, tm
     drive(h, scenario)
 
 
-@pending
 @pytest.mark.world_start(START)
 def test_day1_stock_refused_and_spread_opened_day2_stock_still_enters(world, monkeypatch, tmp_path):
     """Day 1 the broker refuses the stock buy, so the option lane proceeds and opens the spread. Day 2 the
@@ -178,7 +175,6 @@ NOISE = (
 )
 
 
-@pending
 @pytest.mark.parametrize("headline", BLOCKING)
 @pytest.mark.world_start(START)
 def test_single_issuer_catalyst_between_scan_and_handoff_blocks_both_lanes(world, monkeypatch, tmp_path, headline):
@@ -215,7 +211,6 @@ def test_24_nov_noise_does_not_defer_the_owner_handoff(world, monkeypatch, tmp_p
 
 
 # ---------------------------------------------------------------- 2. 8-K deferral, then the options lane (F1c)
-@pending
 @pytest.mark.world_start(START)
 def test_8k_deferral_also_stops_the_owner_option_lane(world, monkeypatch, tmp_path):
     h = OwnerHarness(world, monkeypatch).install(tmp_path=tmp_path)
@@ -236,7 +231,6 @@ def test_8k_deferral_also_stops_the_owner_option_lane(world, monkeypatch, tmp_pa
 
 # ---------------------------------------------------------------- 3. live review while staged (F1b, F1c)
 LIVE_STORY = "US weighs new AI chip export curbs"  # material (score 7) but not an issuer-led NVDA event
-@pending
 @pytest.mark.parametrize("verdict", ["AVOID", "BEARISH"])
 @pytest.mark.world_start(START)
 def test_live_bearish_review_while_staged_holds_owner_idea_for_the_session(world, monkeypatch, tmp_path, verdict):
@@ -287,7 +281,6 @@ def test_live_hold_or_insufficient_review_keeps_the_staged_owner_thesis(world, m
 
 
 # ---------------------------------------------------------------- 4. day-1 option zero fill, day-2 retry (F2)
-@pending
 @pytest.mark.world_start(START)
 def test_day1_option_zero_fill_releases_the_shot_and_day2_opens_the_spread(world, monkeypatch, tmp_path):
     h = OwnerHarness(world, monkeypatch, ordinary="HOLD").install(tmp_path=tmp_path)
@@ -316,7 +309,6 @@ def test_day1_option_zero_fill_releases_the_shot_and_day2_opens_the_spread(world
 
 
 # ---------------------------------------------------------------- 5. uncertain option submit, reconcile, alert (F2)
-@pending
 @pytest.mark.world_start(START)
 def test_uncertain_option_submit_voided_by_reconcile_alerts_once_and_stays_spent(world, monkeypatch, tmp_path):
     import httpx
@@ -353,7 +345,6 @@ def test_uncertain_option_submit_voided_by_reconcile_alerts_once_and_stays_spent
 
 
 # ---------------------------------------------------------------- 6. directive edited mid-open (F3)
-@pending
 @pytest.mark.parametrize("edit", ["removed", "conviction_6"])
 @pytest.mark.world_start(START)
 def test_directive_edited_during_the_option_open_submits_nothing(world, monkeypatch, tmp_path, edit):
@@ -378,7 +369,7 @@ def test_directive_edited_during_the_option_open_submits_nothing(world, monkeypa
 
 
 # ---------------------------------------------------------------- 7. mixed-date veto (F5a, F5b)
-@pytest.mark.parametrize("cites", [pytest.param("all", marks=pending), "oldest"])
+@pytest.mark.parametrize("cites", ["all", "oldest"])
 @pytest.mark.world_start(START)
 def test_pre_added_evidence_cannot_veto_and_does_not_block_other_entries(world, monkeypatch, tmp_path, cites):
     """NVDA owner review answers AVOID citing a 20 Nov 10-Q (before "added") with or without a 25 Nov item.
@@ -411,7 +402,6 @@ def test_pre_added_evidence_cannot_veto_and_does_not_block_other_entries(world, 
 
 
 # ---------------------------------------------------------------- 8. grounding for daily names (F4a, F4b)
-@pending
 @pytest.mark.world_start(et(2026, 11, 25, 11, 0))
 def test_organic_midweek_review_of_a_daily_focus_name_keeps_web_grounding(world, monkeypatch, tmp_path):
     h = OwnerHarness(world, monkeypatch, symbol="MSFT", ordinary="AVOID")
@@ -430,7 +420,6 @@ def test_organic_midweek_review_of_a_daily_focus_name_keeps_web_grounding(world,
     drive(h, scenario)
 
 
-@pending
 @pytest.mark.world_start(START)
 def test_owner_prescan_with_only_an_old_edgar_stub_is_grounded(world, monkeypatch, tmp_path):
     h = OwnerHarness(world, monkeypatch).install(tmp_path=tmp_path)
