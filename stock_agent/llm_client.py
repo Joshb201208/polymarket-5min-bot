@@ -53,6 +53,18 @@ _OUTPUT_CODES = frozenset({
     "thesis_unknown_evidence", "thesis_missing_dated_evidence", "thesis_missing_invalidation",
     "thesis_missing_trigger_evidence", "owner_stop", "owner_veto_claim", "owner_veto_text", "owner_veto_date",
 })
+_SCHEMA_PATHS = frozenset({
+    "$", "symbol", "direction", "conviction", "summary", "bull_case", "bear_case", "claims", "claims[]",
+    "claims[].text", "claims[].evidence_ids", "claims[].evidence_ids[]", "catalysts", "catalysts[]",
+    "risks", "risks[]", "thesis_break", "thesis_change", "target_price", "horizon_days", "stop_price",
+    "veto_claim_index", "verdict", "reason", "evidence_ids", "evidence_ids[]",
+})
+_SCHEMA_ERROR_TYPES = frozenset({
+    "validation_error", "missing", "extra_forbidden", "string_type", "string_too_long", "string_too_short",
+    "int_type", "float_type", "list_type", "dict_type", "model_type", "model_attributes_type",
+    "too_short", "too_long", "greater_than", "greater_than_equal", "less_than", "less_than_equal",
+    "finite_number", "enum", "literal_error", "json_invalid", "null_required",
+})
 _ENDPOINTS = {
     "openai": "https://api.openai.com/v1/responses",
     "perplexity": "https://api.perplexity.ai/v1/agent",
@@ -91,12 +103,21 @@ class ProviderError(Exception):
     code: str | None = None
     retry_after: float | None = None
     has_answer: bool = False
+    schema_issues: tuple[str, ...] = ()
 
     @property
     def safe_code(self) -> str | None:
         if self.kind in {"invalid_output", "decision_rejected"} and isinstance(self.code, str) and self.code in _OUTPUT_CODES:
             return self.code
         return _provider_code(self.code)
+
+    @property
+    def safe_schema_issues(self) -> tuple[str, ...]:
+        if self.kind not in {"invalid_output", "decision_rejected"}:
+            return ()
+        return tuple(issue for issue in self.schema_issues[:4] if isinstance(issue, str)
+                     and (parts := issue.split(":"))[0] in _SCHEMA_PATHS
+                     and len(parts) == 2 and parts[1] in _SCHEMA_ERROR_TYPES)
 
 
 class OutputRuleError(ValueError):
@@ -114,12 +135,35 @@ class ProviderUnavailable(Exception):
 
     @property
     def failure_codes(self) -> dict[str, list[str]]:
-        codes = [f"{a.provider}:{code}" for a in self.attempts if (code := a.safe_code)]
+        codes = []
+        for attempt in self.attempts:
+            if code := attempt.safe_code:
+                codes.append(f"{attempt.provider}:{code}")
+            codes.extend(f"{attempt.provider}:{issue}" for issue in attempt.safe_schema_issues)
         return {"failure_codes": codes} if codes else {}
 
 
 def _provider_code(*candidates: object) -> str | None:
     return next((value for value in candidates if isinstance(value, str) and value in _PROVIDER_CODES), None)
+
+
+def _schema_issues(errors) -> tuple[str, ...]:
+    tags = {}
+    for error in errors:
+        path = ""
+        loc = error["loc"]
+        if error["type"] == "extra_forbidden":
+            loc = loc[:-1]  # The extra key is untrusted even if it matches an allowlisted field.
+        for part in loc:
+            candidate = path + "[]" if type(part) is int else f"{path}.{part}" if path else part
+            if candidate == "$" or candidate not in _SCHEMA_PATHS:
+                break  # Unexpected keys and union branch names are not safe to print.
+            path = candidate
+        error_type = error["type"] if error["type"] in _SCHEMA_ERROR_TYPES else "validation_error"
+        tags[f"{path or '$'}:{error_type}"] = None
+        if len(tags) == 4:
+            break
+    return tuple(tags)
 
 
 @dataclass(frozen=True)
@@ -246,22 +290,25 @@ class LLMClient:
                         value = strict_json(request.value_type, response.text)
                     except ValidationError as error:
                         issues = error.errors(include_input=False, include_context=False, include_url=False)
+                        safe_issues = _schema_issues(issues)
                         if request.local_decision_validation and all(
                             item["loc"] == ("direction",) and item["type"] == "literal_error"
                             for item in issues
                         ):
                             # A complete thesis with a disallowed owner vote is still a decision.
                             attempts.append(ProviderError(route.provider, route.model, "decision_rejected",
-                                                          code="schema_direction"))
+                                                          code="schema_direction", schema_issues=safe_issues))
                             break
                         types = {item["type"] for item in issues}
                         code = ("schema_direction" if all(item["loc"] == ("direction",) for item in issues)
                                 else "schema_missing_field" if types == {"missing"}
                                 else "schema_extra_field" if types == {"extra_forbidden"}
                                 else "schema_invalid")
-                        raise ProviderError(route.provider, route.model, "invalid_output", code=code) from None
+                        raise ProviderError(route.provider, route.model, "invalid_output", code=code,
+                                            schema_issues=safe_issues) from None
                     except ValueError:
-                        raise ProviderError(route.provider, route.model, "invalid_output", code="answer_json") from None
+                        raise ProviderError(route.provider, route.model, "invalid_output", code="answer_json",
+                                            schema_issues=("$:json_invalid",)) from None
                     if request.grounded and not response.evidence:
                         raise ProviderError(route.provider, route.model, "no_grounding", has_answer=True)
                     try:
@@ -319,8 +366,8 @@ class LLMClient:
         report_failure = getattr(self.health, "record_llm_failure", None)
         if report_failure is not None and error.kind not in {"budget", "input_limit"}:
             report_failure(route.provider, summary=error.kind, status_code=error.status, at=now)
-        logger.warning("Research %s route failed (%s, %s, code=%s)", route.provider, error.kind, error.status,
-                       error.safe_code)
+        logger.warning("Research %s route failed (%s, %s, code=%s, schema=%s)", route.provider, error.kind,
+                       error.status, error.safe_code, ",".join(error.safe_schema_issues) or None)
         if self.on_failure is not None:
             try:
                 await self.on_failure(error)

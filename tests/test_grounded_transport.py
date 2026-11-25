@@ -233,7 +233,10 @@ def test_owner_retries_transport_but_not_a_parsed_decision(first, kind, code, ca
                     await llm.complete(request(validate=validate))
                 attempts = exc.value.attempts
             assert [(error.kind, error.code) for error in attempts] == [(kind, code)]
-            assert ProviderUnavailable(attempts).failure_codes == ({"failure_codes": [f"perplexity:{code}"]} if code else {})
+            tags = [f"perplexity:{code}"] if code else []
+            if code == "answer_json":
+                tags.append("perplexity:$:json_invalid")
+            assert ProviderUnavailable(attempts).failure_codes == ({"failure_codes": tags} if tags else {})
 
     asyncio.run(run())
     assert calls == ["api.perplexity.ai"] + (["api.openai.com"] * 2 if can_fallback else [])
@@ -264,11 +267,19 @@ def test_only_allowlisted_error_codes_are_kept():
 @pytest.mark.parametrize(("failure", "code"), [
     ("request_rejected", "invalid_type"),
     ("invalid_output", "answer_json"),
+    ("invalid_output", "schema_invalid"),
 ])
-def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path, failure, code):
+def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path, failure, code, caplog):
     clock, ledger, _, make_pipeline = rig(tmp_path)
 
     def endpoint(_):
+        if code == "schema_invalid":
+            return httpx.Response(200, json=completed(json.dumps({
+                "symbol": "ABC", "direction": "BUY", "conviction": 8, "summary": "hidden" * 200,
+                "bull_case": "bull", "bear_case": "bear", "claims": [{"text": "claim", "evidence_ids": []}],
+                "catalysts": [], "risks": [], "thesis_break": None, "thesis_change": "unchanged",
+                "target_price": None, "horizon_days": 2, "hidden_key": "never record",
+            })))
         if failure == "invalid_output":
             return httpx.Response(200, json=completed("never record this hidden malformed answer"))
         return httpx.Response(400, json={"error": {
@@ -283,23 +294,28 @@ def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path,
             work = pipe.store.work_state(f"weekly:{clock.t.date()}:ABC")
             details = json.loads(work["details_json"])
             assert details["failures"] == [f"openai:{failure}"]
-            assert details["failure_codes"] == [f"openai:{code}"]
+            issues = {
+                "answer_json": ["$:json_invalid"],
+                "schema_invalid": ["summary:string_too_long", "claims[].evidence_ids:too_short", "$:extra_forbidden"],
+            }.get(code, [])
+            assert details["failure_codes"] == [f"openai:{tag}" for tag in [code, *issues]]
             assert "never record" not in work["details_json"] and "hidden" not in work["details_json"]
 
     asyncio.run(run())
+    assert "never record" not in caplog.text and "hidden" not in caplog.text
 
 
-@pytest.mark.parametrize(("answer", "code"), [
-    ("", "answer_empty"),
-    ("x" * 22_001, "answer_too_large"),
-    ('{"direction":"BUY","direction":"HOLD","conviction":8,"note":null}', "answer_json"),
-    ('{"direction":"BUY","conviction":NaN,"note":null}', "answer_json"),
-    ('{"direction":"hidden","conviction":8,"note":null}', "schema_direction"),
-    ('{"direction":"BUY","conviction":8}', "schema_missing_field"),
-    ('{"direction":"BUY","conviction":8,"note":null,"hidden":true}', "schema_extra_field"),
-    ('{"direction":"BUY","conviction":"hidden","note":null}', "schema_invalid"),
+@pytest.mark.parametrize(("answer", "code", "issue"), [
+    ("", "answer_empty", None),
+    ("x" * 22_001, "answer_too_large", None),
+    ('{"direction":"BUY","direction":"HOLD","conviction":8,"note":null}', "answer_json", "$:json_invalid"),
+    ('{"direction":"BUY","conviction":NaN,"note":null}', "answer_json", "$:json_invalid"),
+    ('{"direction":"hidden","conviction":8,"note":null}', "schema_direction", "direction:enum"),
+    ('{"direction":"BUY","conviction":8}', "schema_missing_field", "$:missing"),
+    ('{"direction":"BUY","conviction":8,"note":null,"hidden":true}', "schema_extra_field", "$:extra_forbidden"),
+    ('{"direction":"BUY","conviction":"hidden","note":null}', "schema_invalid", "conviction:int_type"),
 ])
-def test_ungrounded_invalid_answer_codes_are_safe(answer, code, caplog):
+def test_ungrounded_invalid_answer_codes_are_safe(answer, code, issue, caplog):
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(
             lambda _: httpx.Response(200, json=completed(answer, [])),
@@ -308,7 +324,8 @@ def test_ungrounded_invalid_answer_codes_are_safe(answer, code, caplog):
             with pytest.raises(ProviderUnavailable) as exc:
                 await llm.complete(request(grounded=False))
             assert exc.value.attempts[0].kind == "invalid_output"
-            assert exc.value.failure_codes == {"failure_codes": [f"perplexity:{code}"]}
+            assert exc.value.attempts[0].safe_schema_issues == ((issue,) if issue else ())
+            assert exc.value.failure_codes == {"failure_codes": [f"perplexity:{tag}" for tag in (code, issue) if tag]}
 
     asyncio.run(run())
     assert f"code={code}" in caplog.text and "hidden" not in caplog.text
