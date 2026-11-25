@@ -504,7 +504,7 @@ class ResearchPipeline:
                 )
                 (intent_id,) = self.ledger.enqueue_intents((queued,), job="entry_handoff")
             self.store.finish_pending_buy(key, code, intent_id=intent_id)
-        if code not in {"handoff_promoted", "handoff_reanchored"}:
+        if code not in {"handoff_promoted", "handoff_reanchored", "handoff_owner_news_deferred"}:
             alert = getattr(self.alerts, "alert_blocked_buy", None)
             if alert is not None:
                 alert(intent.symbol, code, session_date=intent.session_date, risk_reasons=reasons)
@@ -591,7 +591,9 @@ class ResearchPipeline:
         material_since = getattr(self.sources, "handoff_material_news", None)
         current = self.ledger.current_thesis(symbol)
         inputs_as_of = utc_datetime(current.payload.get("inputs_as_of"))
-        material = await material_since(symbol, inputs_as_of, self.clock()) if material_since and inputs_as_of else ()
+        material = await material_since(
+            symbol, inputs_as_of, self.clock(), **({"owner": True} if owner else {}),
+        ) if material_since and inputs_as_of else ()
         code, holding = check_identity()
         if code:
             return refuse(code)
@@ -602,7 +604,16 @@ class ResearchPipeline:
             return rejection
         if owner:
             if material:
-                return refuse("handoff_reanchor_unavailable", "new_material_news_after_owner_review")
+                code = refuse("handoff_owner_news_deferred", "new_material_issuer_news_after_owner_review")
+                if code == "handoff_owner_news_deferred":
+                    self._owner_event(owner, "handoff_deferred", evidence_ids=tuple(item.evidence_id for item in material))
+                    await self._owner_alert(
+                        owner, "handoff deferred",
+                        "New material issuer news blocked today's stock handoff. The stock lane remains unused "
+                        "and can be reviewed at the next pre-open session if the directive is still active.\n"
+                        + "\n".join(f"{item.title}: {item.url}" for item in material[:3]),
+                    )
+                return code
             if intent.reference_price is None:
                 return refuse("handoff_reanchor_unavailable", "missing_owner_reference_price")
             return refuse("handoff_promoted")
@@ -794,10 +805,13 @@ class ResearchPipeline:
         confirmation_requested = False
         with self.store.store.transaction():
             exit_pending = self.store.has_unqueued_exit(symbol, now) or self.store.has_pending_confirmation(symbol, now)
+            protect_owner_handoff = (
+                not holding and owner is None and self.store.has_waiting_owner_buy(symbol, session.date.isoformat(), now)
+            )
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=not exit_pending,
+                activate=not (exit_pending or protect_owner_handoff),
             )
             if option_from_held and not exit_pending and security.tradable:
                 self._qualify_owner_option(
@@ -865,7 +879,7 @@ class ResearchPipeline:
         if alert is None:
             return
         now = self.clock()
-        suffix = f":{now.astimezone(NY).date()}" if kind == "unavailable" else ""
+        suffix = f":{now.astimezone(NY).date()}" if kind in {"unavailable", "handoff deferred"} else ""
         key = f"owner_directive:{kind}:{owner.symbol}:{owner.added}{suffix}"
         if not self.store.claim_work(key, owner.symbol, now):
             return

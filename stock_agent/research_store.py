@@ -318,6 +318,15 @@ class ResearchStore:
             (symbol, session_date),
         ))
 
+    def has_waiting_owner_buy(self, symbol: str, session_date: str, now: datetime) -> bool:
+        return bool(self.store.query(
+            """SELECT 1 FROM research_pending_buys p JOIN current_thesis t
+               ON t.symbol=p.symbol AND t.thesis_id=p.thesis_id
+               WHERE p.symbol=? AND p.session_date=? AND p.status='waiting' AND p.expires_at_s>?
+               AND json_extract(p.details_json, '$.intent.meta.owner_directive_added') IS NOT NULL LIMIT 1""",
+            (symbol, session_date, int(now.timestamp())),
+        ))
+
     def finish_pending_buy(self, key: str, status: str, *, intent_id: str | None = None,
                            retry_at: datetime | None = None, hold_reason: str | None = None) -> bool:
         with self.store.transaction() as conn:

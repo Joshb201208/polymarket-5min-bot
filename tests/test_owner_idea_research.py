@@ -12,6 +12,7 @@ from stock_agent.ledger import ThesisRole
 from stock_agent.llm_client import ModelRoute
 from stock_agent.market_calendar import Session
 from stock_agent.research_focus import FocusItem
+from stock_agent.research_schemas import Evidence
 from tests.test_review_research import START
 from tests.test_scheduled_best_ideas import FILING, response, rig
 
@@ -231,6 +232,80 @@ def test_analysis_anchors_option_only_research_while_underlying_quote_is_stale(t
     outcome = asyncio.run(run())
     assert not outcome.intents
     assert [idea.source for idea in outcome.option_candidates] == ["owner"]
+
+
+@pytest.mark.parametrize("has_issuer_event", [False, True])
+def test_staged_owner_handoff_survives_ordinary_review_or_defers_without_spending(
+    tmp_path, monkeypatch, has_issuer_event,
+):
+    clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=FILING)
+    directive = FocusItem("ABC", None, "Check for a guidance cut.", START.date() - timedelta(days=2),
+                          START.date() + timedelta(days=5), stance="bullish", owner_conviction=8)
+    monkeypatch.setattr(research_focus, "owner_backed", lambda **_: {"ABC": directive})
+    alerts, reviews, checks = [], [], []
+    quoted = False
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        owner_review = "Act as a risk reviewer" in body["instructions"]
+        reviews.append(owner_review)
+        return _reply(body, direction="BUY", stop=17) if owner_review else response(body, direction="AVOID")
+
+    async def get_quotes(symbols, **_):
+        return SimpleNamespace(quotes={
+            sym: SimpleNamespace(price=20, as_of=clock.t) for sym in symbols if quoted
+        })
+
+    async def prior_close(*_):
+        return 20
+
+    async def issuer_events(symbol, after, now, *, owner):
+        assert symbol == "ABC" and owner and after == START and now > after
+        checks.append(now)
+        if not has_issuer_event:
+            return ()
+        return (Evidence(evidence_id="issuer-event", url=FILING, title="New issuer announcement", publisher="SEC",
+                         published_at=after + timedelta(minutes=2), retrieved_at=now, snippet=""),)
+
+    async def run():
+        nonlocal quoted
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            pipe = make_pipe(http)
+            pipe.directives = research_focus.owner_backed
+            pipe.alerts = SimpleNamespace(alert=lambda *args, **kwargs: alerts.append((args, kwargs)))
+            pipe.sources.prices.get_quotes = get_quotes
+            pipe.sources.completed_close = prior_close
+            pipe.sources.handoff_material_news = issuer_events
+            opens = _prescan(pipe, clock)
+            pipe.calendar.previous_session = lambda day: SimpleNamespace(date=day - timedelta(days=1))
+            initial = await pipe.run("prescan")
+            assert not initial.intents and initial.option_candidates
+            thesis_id = ledger.current_thesis("ABC").thesis_id
+            quoted = True
+            clock.t = START + timedelta(minutes=10)
+            await ledger.refresh("fixture")
+            await pipe.run("weekly")
+            assert ledger.current_thesis("ABC").thesis_id == thesis_id
+            clock.t = opens + timedelta(minutes=5)
+            await ledger.refresh("fixture")
+            result = await pipe.run_entry_handoff()
+            expected = "handoff_owner_news_deferred" if has_issuer_event else "handoff_promoted"
+            assert result.detail["handoff_outcomes"] == {expected: 1}
+            assert not (await pipe.run_entry_handoff()).detail["handoff_outcomes"]
+            assert not ledger.owner_directive_used("ABC", directive.added)
+            assert not ledger.owner_directive_used("ABC", directive.added, lane="option")
+            assert not ledger.owner_directive_vetoed("ABC", directive.added)
+            assert reviews == [True, False] and len(checks) == 1
+            assert bool(alerts) == has_issuer_event and len(alerts) <= 1
+            if has_issuer_event:
+                clock.t = START + timedelta(days=1)
+                _prescan(pipe, clock)
+                await ledger.refresh("fixture")
+                next_scan = await pipe.run("prescan")
+                assert next_scan.intents and reviews == [True, False, True]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(("change", "option_expected"), [("unchanged", True), ("weakened", False)])

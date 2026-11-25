@@ -9,7 +9,9 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlsplit
 
+from stock_agent.materiality import score_materiality
 from stock_agent.research_focus import focus_symbols, owner_backed
 from stock_agent.research_pipeline import NewsEvent, SecurityInputs, SourceUnavailable
 from stock_agent.research_schemas import Evidence, utc_datetime
@@ -19,20 +21,48 @@ _QUOTE_TTL = timedelta(seconds=90)
 _COMPANY_TTL = timedelta(hours=6)
 _MARKET = ("SPY", "QQQ")
 _NEWS_LIMIT = 5
+_OWNER_HANDOFF_HIGH_MATERIALITY = 8
+_REGULATORS = ("sec.gov", "bis.gov", "commerce.gov", "federalregister.gov", "justice.gov", "ftc.gov", "fda.gov")
+_OWNER_WRAP = re.compile(
+    r"\b(?:euphoria|roundup|commentary|opinion|market (?:wrap|recap)|price[- ]move|price target|"
+    r"(?:shares|stock|stocks) (?:move|jump|fall|rise|drop|slump|slide|rally)\w*|"
+    r"(?:fell|rose|jumped|dropped|slumped|gained) \d+(?:\.\d+)?%)(?=\W|$)",
+    re.I,
+)
 
 
-def _issuer_headline(symbol: str, company: str | None, headline: str) -> bool:
+def _issuer_headline(symbol: str, company: str | None, headline: str, *, leading: bool = False) -> bool:
     # Provider tags alone do not make a market wrap issuer-specific. A title
     # hit is an exemption from the indirect-work quota, not proof of materiality.
-    if re.search(rf"(?<!\w)\${re.escape(symbol)}(?!\w)", headline, re.IGNORECASE):
+    if leading:
+        headline = re.sub(r"^\s*(?:(?:exclusive|breaking|update)\s*:\s*)?", "", headline, flags=re.I)
+    start = "^" if leading else r"(?<!\w)"
+    if re.search(rf"{start}\${re.escape(symbol)}(?!\w)", headline, re.IGNORECASE):
         return True
-    if len(symbol) >= 2 and re.search(rf"(?<!\w){re.escape(symbol)}(?!\w)", headline):
+    if len(symbol) >= 2 and re.search(rf"{start}{re.escape(symbol)}(?!\w)", headline):
         return True
     words = re.findall(r"[a-z0-9]+", (company or "").lower())
     while words and words[-1] in {"inc", "incorporated", "corp", "corporation", "plc", "ltd", "limited", "com"}:
         words.pop()
     title = " " + " ".join(re.findall(r"[a-z0-9]+", headline.lower())) + " "
-    return bool(words and " " + " ".join(words) + " " in title)
+    company_match = " " + " ".join(words) + " "
+    return bool(words and (title.startswith(company_match) if leading else company_match in title))
+
+
+def _owner_handoff_event(item, evidence: Evidence, symbol: str, company: str | None) -> bool:
+    if getattr(item, "kind", None) == "sec_filing":
+        return True  # The caller already checked the filing's issuer tag.
+    try:
+        host = (urlsplit(evidence.url).hostname or "").lower()
+    except ValueError:
+        return False
+    if any(host == domain or host.endswith("." + domain) for domain in _REGULATORS):
+        return _issuer_headline(symbol, company, evidence.title)
+    if _OWNER_WRAP.search(evidence.title) or not _issuer_headline(symbol, company, evidence.title, leading=True):
+        return False
+    # Re-score without a focus/target boost so watchlist membership cannot block a handoff.
+    verdict = score_materiality(evidence.title, evidence.snippet or "", symbols=item.symbols)
+    return verdict.score >= _OWNER_HANDOFF_HIGH_MATERIALITY
 
 
 class ResearchSources:
@@ -250,15 +280,22 @@ class ResearchSources:
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
 
-    async def handoff_material_news(self, symbol: str, after: datetime, now: datetime) -> tuple[Evidence, ...]:
-        """Use the live-news materiality threshold on the opening symbol's newest stories."""
+    async def handoff_material_news(
+        self, symbol: str, after: datetime, now: datetime, *, owner: bool = False,
+    ) -> tuple[Evidence, ...]:
+        """Ordinary handoffs retain the live threshold; owner handoffs require issuer events."""
         items = await self._poll((symbol,), scope="scheduled_research", include_market=False, lookback_hours=24)
         evidence = []
+        company = getattr(self.asset_for(symbol), "company_name", None) if owner else None
         for item in items:
-            score = _finite(item.materiality_score)
             parsed = _news_evidence(item)
-            if (symbol in item.symbols and score is not None and score >= _NEWS_LIMIT and parsed is not None
-                    and parsed.published_at is not None and after < parsed.published_at <= now):
+            if (symbol not in item.symbols or parsed is None or parsed.published_at is None
+                    or not after < parsed.published_at <= now):
+                continue
+            if owner:
+                if _owner_handoff_event(item, parsed, symbol, company):
+                    evidence.append(parsed)
+            elif (_finite(item.materiality_score) or 0) >= _NEWS_LIMIT:
                 evidence.append(parsed)
         return tuple(sorted(evidence, key=lambda row: row.published_at, reverse=True)[:6])
 

@@ -73,6 +73,42 @@ def test_source_health_uses_explicit_symbol_coverage_and_provider_quote_time():
     asyncio.run(run())
 
 
+def test_owner_handoff_news_requires_fresh_issuer_catalysts_without_focus_boost():
+    def item(key, headline, *, score=10, age=1, kind="news", url="https://example.org/news", symbols=("NVDA",)):
+        return SimpleNamespace(
+            story_id=key, headline=headline, snippet="", url=url, publisher="Fixture", symbols=symbols,
+            kind=kind, materiality_score=score, published_at=NOW - timedelta(minutes=age), retrieved_at=NOW,
+        )
+
+    items = (
+        item("peer", "IREN announces merger and raises guidance after NVIDIA news"),
+        item("wrap", "Stocks move lower as Nvidia euphoria wears off"),
+        item("focus", "Nvidia reports earnings", score=8),
+        item("high", "Nvidia reports earnings and announces acquisition"),
+        item("filing", "Filed Form 8-K", score=3, kind="sec_filing"),
+        item("regulator", "Agency announces binding restriction on Nvidia", score=3,
+             url="https://www.bis.gov/notice"),
+        item("foreign", "Nvidia reports earnings and announces acquisition", symbols=("IREN",)),
+        item("past", "Nvidia reports earnings and announces acquisition", age=90),
+        item("future", "Nvidia reports earnings and announces acquisition", age=-1),
+    )
+
+    async def poll(*args, **kwargs):
+        assert kwargs["lookback_hours"] == 24 and not kwargs["include_market"]
+        return SimpleNamespace(ok=True, as_of=NOW, covered_symbols={"NVDA"}, items=items)
+
+    async def run():
+        source = ResearchSources(None, SimpleNamespace(poll_news=poll), list_universe=None,
+                                 asset_for=lambda _: SimpleNamespace(company_name="NVIDIA Corporation"))
+        after = NOW - timedelta(minutes=90)
+        ordinary = await source.handoff_material_news("NVDA", after, NOW)
+        owner = await source.handoff_material_news("NVDA", after, NOW, owner=True)
+        assert {ev.evidence_id for ev in ordinary} == {"peer", "wrap", "focus", "high"}
+        assert {ev.evidence_id for ev in owner} == {"high", "filing", "regulator"}
+
+    asyncio.run(run())
+
+
 def test_global_feed_health_cannot_substitute_for_symbol_coverage():
     class News:
         fails = False
@@ -473,4 +509,3 @@ def test_background_prefers_sec_filings_and_material_stories_over_tangential_noi
     ids = [ev.evidence_id for ev in bg]
     assert ids[0] == "sec-nvda-8k"
     assert ids[1] == "alp-nvda-guidance"
-
