@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from stock_agent.llm_client import LLMClient, LLMRequest, LLMResult, ModelRoute, OutputRuleError
 from stock_agent.research_schemas import (
+    BEST_IDEAS_DIRECTIONS,
     Direction,
     Evidence,
     ExitConfirmation,
@@ -17,13 +18,14 @@ from stock_agent.research_schemas import (
     ResearchTask,
     ThesisDraft,
     ThesisRecord,
+    thesis_output_limits,
     utc_datetime,
 )
 from stock_agent.research_focus import FocusItem
 
-THESIS_PROMPT_VERSION = "thesis-2026-11-v1"
-BEST_IDEAS_PROMPT_VERSION = "thesis-2026-11-best-ideas-v1"
-OWNER_IDEA_PROMPT_VERSION = "thesis-2026-11-owner-idea-v2"
+THESIS_PROMPT_VERSION = "thesis-2026-11-v2"
+BEST_IDEAS_PROMPT_VERSION = "thesis-2026-11-best-ideas-v2"
+OWNER_IDEA_PROMPT_VERSION = "thesis-2026-11-owner-idea-v3"
 EXIT_PROMPT_VERSION = "exit-blind-2026-11-v1"
 _ENTRY = {Direction.BUY, Direction.BEARISH}
 _RUBRIC = """Conviction is a 1–10 evidence grade, not a probability or an order.
@@ -204,9 +206,7 @@ class Analyst:
         def validate(draft: ThesisDraft, web: tuple[Evidence, ...]) -> None:
             if draft.symbol != data.symbol:
                 raise OutputRuleError("thesis_symbol")
-            if best_ideas and draft.direction not in {
-                Direction.BUY, Direction.BEARISH, Direction.AVOID, Direction.INSUFFICIENT_EVIDENCE,
-            }:
+            if best_ideas and draft.direction not in BEST_IDEAS_DIRECTIONS:
                 raise OutputRuleError("thesis_direction")
             if draft.direction is Direction.EXIT_PROPOSED and (not held or draft.thesis_change not in {"weakened", "broken"}):
                 raise OutputRuleError("thesis_exit_rule")
@@ -248,10 +248,19 @@ class Analyst:
 
         prompt = (_OWNER + "\n\n" + _RUBRIC.split("\nIf evidence is weak", 1)[0] if owner else
                   _BEST_IDEAS if best_ideas else _THESIS + (_NEWS if task is ResearchTask.NEWS else "") + _RUBRIC)
+        value_type = OwnerThesisDraft if owner else ThesisDraft
+        prompt += (
+            "\nOutput limits (include every key; use null only for nullable fields):\n"
+            + thesis_output_limits(value_type)
+            + "\nEvery claim must cite 1–5 evidence IDs from the supplied or returned sources, "
+            "using the exact citation form specified above. Anything you cannot cite is not a claim. "
+            "Put missing-evidence statements in summary, risks, or thesis_break as applicable, "
+            "subject to the decision rules above. Return an empty claims list when no claim can be cited."
+        )
         request = LLMRequest(
-            task, OwnerThesisDraft if owner else ThesisDraft, version, prompt, inputs, grounded,
+            task, value_type, version, prompt, inputs, grounded,
             validate=validate, exit_work=held, single_review=owner is not None or single_review,
-            local_decision_validation=owner is not None, long_search=long_search,
+            local_decision_validation=owner is not None, long_search=long_search, best_ideas=best_ideas,
         )
         result = await self.llm.complete(request)
         known = _index_evidence(data, result.evidence)
@@ -279,7 +288,7 @@ class Analyst:
             provider=result.route.provider, model=result.route.model,
             prompt_version=version, generated_at=result.completed_at,
             inputs_as_of=data.as_of, evidence=list({item.evidence_id: item for item in known.values()}.values()),
-            input_hash=result.input_hash,
+            input_hash=result.input_hash, normalization_notes=dict(result.normalization_notes),
         ), result, inputs, getattr(result.value, "stop_price", None) if owner else None)
 
     async def confirm_exit(self, data: ResearchInput, primary: ModelRoute) -> ConfirmedReview:

@@ -13,7 +13,7 @@ from stock_agent.llm_client import LLMClient, LLMRequest, ProviderError, Provide
 from stock_agent.market_calendar import Session
 from stock_agent.research_focus import FocusItem
 from stock_agent.research_pipeline import prescan_runtime_seconds
-from stock_agent.research_schemas import Evidence, ResearchTask
+from stock_agent.research_schemas import Evidence, OwnerThesisDraft, ResearchTask, ThesisDraft, transport_schema
 from tests.fakes.base import FakeInternet
 from tests.fakes.providers import FakeOpenAI, FakePerplexity, LLMReply
 from tests.test_research_contracts import NOW, TinyDraft, settings
@@ -355,6 +355,130 @@ def test_best_ideas_codes_distinguish_parsed_thesis_validation(direction, cite, 
                 await analyst.evaluate(data, best_ideas=True)
             assert exc.value.attempts[0].kind == "invalid_output"
             assert exc.value.failure_codes == {"failure_codes": [f"perplexity:{code}"]}
+
+    asyncio.run(run())
+
+
+def test_thesis_schema_keeps_provider_safe_bounds_and_limits_only_best_ideas_directions():
+    for provider in ("anthropic", "openai", "perplexity"):
+        schema = transport_schema(ThesisDraft, provider=provider, best_ideas=True)
+        assert schema["$defs"]["Direction"]["enum"] == ["BUY", "BEARISH", "AVOID", "INSUFFICIENT_EVIDENCE"]
+        ids = schema["$defs"]["Claim"]["properties"]["evidence_ids"]
+        assert ids.get("minItems") == (None if provider == "perplexity" else 1)
+        assert ids.get("maxItems") == (5 if provider == "openai" else None)
+        props = schema["properties"]
+        assert props["risks"].get("maxItems") == (6 if provider == "openai" else None)
+        assert props["conviction"].get("minimum") == (1 if provider == "openai" else None)
+        assert "maxLength" not in props["summary"]
+        assert props["target_price"]["anyOf"][-1] == {"type": "null"}
+    assert "HOLD" in transport_schema(ThesisDraft)["$defs"]["Direction"]["enum"]
+    owner = transport_schema(OwnerThesisDraft, provider="anthropic")
+    assert owner["properties"]["direction"]["enum"] == ["BUY", "BEARISH", "AVOID"]
+
+
+@pytest.mark.parametrize(("direction", "best_ideas", "owner", "problem", "code"), [
+    ("INSUFFICIENT_EVIDENCE", True, False, "empty", None),
+    ("AVOID", True, False, "empty", None),
+    ("HOLD", False, False, "empty", None),
+    ("HOLD", True, False, "empty", "thesis_direction"),
+    ("BUY", True, False, "bounded_lists", None),
+    ("BUY", True, False, "empty", "schema_invalid"),
+    ("BEARISH", True, False, "empty", "schema_invalid"),
+    ("EXIT_PROPOSED", False, False, "empty", "schema_invalid"),
+    ("BUY", False, True, "empty", "schema_invalid"),
+    ("AVOID", False, True, "empty", "schema_invalid"),
+    ("BEARISH", False, True, "empty", "schema_invalid"),
+    ("INSUFFICIENT_EVIDENCE", True, False, "unknown_id", "thesis_unknown_evidence"),
+    ("INSUFFICIENT_EVIDENCE", True, False, "long_text", "schema_invalid"),
+    ("INSUFFICIENT_EVIDENCE", True, False, "too_many_claims", "schema_invalid"),
+    ("INSUFFICIENT_EVIDENCE", True, False, "extra_key", "schema_invalid"),
+    ("INSUFFICIENT_EVIDENCE", True, False, "invalid_tail", "schema_invalid"),
+])
+def test_thesis_normalizes_only_authorized_lists_and_uncited_abstention_claims(
+    direction, best_ideas, owner, problem, code,
+):
+    calls = []
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        calls.append(body)
+        draft = json.loads(response(body, direction=direction).json()["output"][-1]["content"][0]["text"])
+        draft.update(risks=[f"risk {i}" for i in range(8)], catalysts=[f"catalyst {i}" for i in range(7)],
+                     claims=[{"text": "Supported", "evidence_ids": ["source"]}])
+        if problem != "bounded_lists":
+            draft["claims"].append({"text": "Not documented", "evidence_ids": []})
+        if problem == "unknown_id":
+            draft["claims"][0]["evidence_ids"] = ["unrecognized"]
+        elif problem == "long_text":
+            draft["claims"][-1]["text"] = "x" * 701
+        elif problem == "too_many_claims":
+            draft["claims"] *= 5
+        elif problem == "extra_key":
+            draft["claims"][-1]["foreign_field"] = "untrusted"
+        elif problem == "invalid_tail":
+            draft["risks"][-1] = {"invalid": "not a string"}
+        if owner:
+            draft.update(stop_price=17 if direction == "BUY" else None,
+                         veto_claim_index=None if direction == "BUY" else 1)
+        return httpx.Response(200, json=completed(json.dumps(draft), [
+            {"url": SOURCES[0]["url"], "id": "source", "published_at": (NOW - timedelta(days=1)).isoformat()},
+        ]))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            analyst = Analyst(LLMClient(settings(OPENAI_API_KEY=""), client=http, now=lambda: NOW))
+            data = ResearchInput("ABC", NOW, "ABC", "t", 20, None, {}, ())
+            directive = FocusItem("ABC", None, "Veto condition", NOW.date() - timedelta(days=5), NOW.date(),
+                                  stance="bullish", owner_conviction=8) if owner else None
+            if code:
+                with pytest.raises(ProviderUnavailable) as exc:
+                    await analyst.evaluate(data, best_ideas=best_ideas, owner=directive, grounded=True)
+                assert exc.value.attempts[0].safe_code == code
+                assert exc.value.attempts[0].kind == "invalid_output"
+                return
+            result = await analyst.evaluate(data, best_ideas=best_ideas, grounded=True)
+            assert result.record.draft.risks == [f"risk {i}" for i in range(6)]
+            assert result.record.draft.catalysts == [f"catalyst {i}" for i in range(6)]
+            assert [claim.text for claim in result.record.draft.claims] == ["Supported"]
+            notes = {"risks": 2, "catalysts": 1}
+            if problem == "empty":
+                notes["claims"] = 1
+            assert result.record.model_dump(mode="json")["normalization_notes"] == notes
+
+    asyncio.run(run())
+    assert len(calls) == 1
+    assert "strict" not in calls[0]["response_format"]["json_schema"]
+    prompt = calls[0]["instructions"]
+    assert "claims[].evidence_ids: minimum items: 1, maximum items: 5" in prompt
+    assert "Anything you cannot cite is not a claim" in prompt
+    assert "risks: maximum items: 6" in prompt
+    assert "summary: minimum characters: 1, maximum characters: 1000" in prompt
+    assert "target_price: greater than: 0, null allowed" in prompt
+    assert ("veto_claim_index: minimum inclusive: 0, maximum inclusive: 7, null allowed" in prompt) is owner
+
+
+def test_normalization_counts_are_persisted_in_a_scheduled_thesis(tmp_path):
+    _, ledger, _, make_pipeline = rig(tmp_path)
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        if "tools" in body:
+            return response(body)
+        wire = response(body, direction="INSUFFICIENT_EVIDENCE").json()
+        part = wire["output"][-1]["content"][0]
+        draft = json.loads(part["text"])
+        draft.update(claims=[{"text": "Unverified", "evidence_ids": []}], risks=["risk"] * 8)
+        part["text"] = json.dumps(draft)
+        return httpx.Response(200, json=wire)
+
+    async def run():
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            outcome = await make_pipeline(http).run("weekly")
+            assert outcome.status is JobStatus.DONE and not outcome.intents
+            payload = ledger.current_thesis("ABC").payload
+            assert payload["normalization_notes"] == {"claims": 1, "risks": 2}
+            assert payload["draft"]["claims"] == []
 
     asyncio.run(run())
 
