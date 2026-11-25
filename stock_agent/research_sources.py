@@ -93,7 +93,96 @@ _FALLBACK_ISSUER_NAMES: dict[str, str] = {
 }
 
 
-def _issuer_headline(symbol: str, company: str | None, headline: str, *, leading: bool = False) -> bool:
+_COMPANY_TRAIL_RE = re.compile(r"(?:\([^)]*\)|\beach\s+representing\b.*$)", re.I)
+_SHARE_CLASS_SUFFIXES: tuple[tuple[str, ...], ...] = (
+    ("shares", "of", "beneficial", "interest"),
+    ("new", "york", "registry", "shares"),
+    ("american", "depositary", "shares"),
+    ("american", "depositary", "receipts"),
+    ("global", "depositary", "shares"),
+    ("global", "depositary", "receipts"),
+    ("subordinate", "voting", "shares"),
+    ("non", "voting", "shares"),
+    ("limited", "partnership", "units"),
+    ("depositary", "shares"),
+    ("depositary", "receipts"),
+    ("registry", "shares"),
+    ("beneficial", "interest"),
+    ("sponsored", "adr"),
+    ("unsponsored", "adr"),
+    ("common", "stock"),
+    ("common", "shares"),
+    ("common", "units"),
+    ("ordinary", "shares"),
+    ("capital", "stock"),
+    ("preferred", "stock"),
+    ("preference", "shares"),
+    ("voting", "shares"),
+    ("class", "a"),
+    ("class", "b"),
+    ("class", "c"),
+    ("cl", "a"),
+    ("cl", "b"),
+    ("cl", "c"),
+    ("series", "a"),
+    ("series", "b"),
+    ("series", "c"),
+    ("n", "v"),
+    ("s", "a"),
+    ("a", "s"),
+    ("and", "company"),
+    ("and", "co"),
+)
+_LEGAL_ENTITY_SUFFIXES = frozenset(
+    {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "plc",
+        "ltd",
+        "limited",
+        "llc",
+        "lp",
+        "nv",
+        "sa",
+        "ag",
+        "se",
+        "adr",
+        "ads",
+        "gdr",
+        "com",
+    }
+)
+
+
+def _issuer_words(company: str | None) -> list[str]:
+    cleaned = _COMPANY_TRAIL_RE.sub(" ", company or "")
+    words = re.findall(r"[a-z0-9]+", cleaned.lower())
+    changed = True
+    while changed and len(words) > 1:
+        changed = False
+        for phrase in _SHARE_CLASS_SUFFIXES:
+            n = len(phrase)
+            if len(words) > n and tuple(words[-n:]) == phrase:
+                del words[-n:]
+                changed = True
+                break
+        if not changed and len(words) > 1 and words[-1] in _LEGAL_ENTITY_SUFFIXES:
+            words.pop()
+            changed = True
+    return words
+
+
+def _issuer_headline(
+    symbol: str,
+    company: str | Sequence[str] | None,
+    headline: str,
+    *,
+    leading: bool = False,
+) -> bool:
     # Provider tags alone do not make a market wrap issuer-specific. A title
     # hit is an exemption from the indirect-work quota, not proof of materiality.
     if leading:
@@ -103,15 +192,23 @@ def _issuer_headline(symbol: str, company: str | None, headline: str, *, leading
         return True
     if len(symbol) >= 2 and re.search(rf"{start}{re.escape(symbol)}(?!\w)", headline):
         return True
-    words = re.findall(r"[a-z0-9]+", (company or "").lower())
-    while words and words[-1] in {"inc", "incorporated", "corp", "corporation", "plc", "ltd", "limited", "com"}:
-        words.pop()
+    names = (company,) if isinstance(company, str) else tuple(company or ())
+    if not names:
+        return False
     title = " " + " ".join(re.findall(r"[a-z0-9]+", headline.lower())) + " "
-    company_match = " " + " ".join(words) + " "
-    return bool(words and (title.startswith(company_match) if leading else company_match in title))
+    for candidate in names:
+        words = _issuer_words(candidate)
+        if not words:
+            continue
+        company_match = " " + " ".join(words) + " "
+        if title.startswith(company_match) if leading else company_match in title:
+            return True
+    return False
 
 
-def _owner_handoff_event(item, evidence: Evidence, symbol: str, company: str | None) -> bool:
+def _owner_handoff_event(
+    item, evidence: Evidence, symbol: str, company: str | Sequence[str] | None,
+) -> bool:
     if getattr(item, "kind", None) == "sec_filing":
         return True  # The caller already checked the filing's issuer tag.
     try:
@@ -347,21 +444,41 @@ class ResearchSources:
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
 
-    def _company_name(self, symbol: str) -> str | None:
-        asset_name = getattr(self.asset_for(symbol), "company_name", None)
-        if asset_name:
-            return str(asset_name)
+    def _company_names(self, symbol: str) -> tuple[str, ...]:
+        candidates: list[str] = []
         stamp = self._companies.get(symbol)
         if stamp is not None:
             snap_name = getattr(stamp[1], "company_name", None) or getattr(stamp[1], "name", None)
             if snap_name:
-                return str(snap_name)
+                candidates.append(str(snap_name))
         if self.cached_company is not None:
             cached = self.cached_company(symbol)
             cached_name = getattr(cached, "company_name", None) or getattr(cached, "name", None)
             if cached_name:
-                return str(cached_name)
-        return _FALLBACK_ISSUER_NAMES.get(symbol)
+                candidates.append(str(cached_name))
+        fallback = _FALLBACK_ISSUER_NAMES.get(symbol)
+        if fallback:
+            candidates.append(fallback)
+        asset_name = getattr(self.asset_for(symbol), "company_name", None)
+        if asset_name:
+            candidates.append(str(asset_name))
+        scored: list[tuple[int, int, int, str]] = []
+        seen_norm: set[str] = set()
+        for idx, raw in enumerate(candidates):
+            words = _issuer_words(raw)
+            if not words:
+                continue
+            norm = " ".join(words)
+            if norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            scored.append((len(words), len(norm), idx, raw))
+        scored.sort()
+        return tuple(item[3] for item in scored)
+
+    def _company_name(self, symbol: str) -> str | None:
+        names = self._company_names(symbol)
+        return names[0] if names else None
 
     async def handoff_material_news(
         self, symbol: str, after: datetime, now: datetime, *, owner: bool = False,
@@ -369,14 +486,14 @@ class ResearchSources:
         """Ordinary handoffs retain the live threshold; owner handoffs require issuer events."""
         items = await self._poll((symbol,), scope="scheduled_research", include_market=False, lookback_hours=24)
         evidence = []
-        company = self._company_name(symbol) if owner else None
+        companies = self._company_names(symbol) if owner else ()
         for item in items:
             parsed = _news_evidence(item)
             if (symbol not in item.symbols or parsed is None or parsed.published_at is None
                     or not after < parsed.published_at <= now):
                 continue
             if owner:
-                if _owner_handoff_event(item, parsed, symbol, company):
+                if _owner_handoff_event(item, parsed, symbol, companies):
                     evidence.append(parsed)
             elif (_finite(item.materiality_score) or 0) >= _NEWS_LIMIT:
                 evidence.append(parsed)

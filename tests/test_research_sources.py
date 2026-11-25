@@ -141,7 +141,7 @@ def test_owner_handoff_news_requires_fresh_issuer_catalysts_without_focus_boost(
                 return SimpleNamespace(ok=True, as_of=NOW, covered_symbols={"NVDA"}, items=(_single,))
 
             s1 = ResearchSources(None, SimpleNamespace(poll_news=poll_one), list_universe=None,
-                                 asset_for=lambda _: SimpleNamespace(company_name="NVIDIA Corporation"))
+                                 asset_for=lambda _: SimpleNamespace(company_name="NVIDIA Corporation Common Stock"))
             if await s1.handoff_material_news("NVDA", after, NOW, owner=True):
                 blocked_ids.add(single.story_id)
 
@@ -154,6 +154,92 @@ def test_owner_handoff_news_requires_fresh_issuer_catalysts_without_focus_boost(
             "filing",
             "regulator",
         }
+
+    asyncio.run(run())
+
+
+def test_owner_handoff_strips_alpaca_share_classes_and_prefers_shorter_company_names():
+    from stock_agent.research_sources import _issuer_headline
+
+    # Direct _issuer_headline checks (no _FALLBACK_ISSUER_NAMES table involved) for Alpaca share classes:
+    for alpaca_name, headline in (
+        ("NVIDIA Corporation Common Stock", "NVIDIA cuts Q4 revenue guidance"),
+        ("NVIDIA Corporation Common Stock", "NVIDIA delays Rubin shipments"),
+        ("NVIDIA Corporation Common Stock", "NVIDIA CEO Jensen Huang steps down"),
+        ("Apple Inc. Common Stock", "Apple cuts Q4 revenue guidance"),
+        ("Alphabet Inc. Class A Common Stock", "Alphabet announces acquisition of cloud vendor"),
+        ("Acme plc Ordinary Shares", "Acme cuts Q4 revenue guidance"),
+        ("Acme Corp. Depositary Shares", "Acme CEO steps down"),
+        ("Acme Co., Ltd. Sponsored ADR", "Acme delays server shipments"),
+        (
+            "Acme Group Limited American Depositary Shares (each representing four Ordinary Shares)",
+            "Acme Group cuts Q4 revenue guidance",
+        ),
+    ):
+        assert _issuer_headline("ZZZZ", alpaca_name, headline, leading=True), (alpaca_name, headline)
+
+    after = NOW - timedelta(minutes=90)
+
+    def make_story(sym, key, headline):
+        return SimpleNamespace(
+            story_id=key,
+            headline=headline,
+            snippet="",
+            url="https://example.org/news",
+            publisher="Fixture",
+            symbols=(sym,),
+            kind="news",
+            materiality_score=6,
+            published_at=NOW - timedelta(minutes=1),
+            retrieved_at=NOW,
+        )
+
+    async def run():
+        # 1. Unmapped symbol ("ACME") with Alpaca share-class suffix blocks without fallback map:
+        acme_items = (make_story("ACME", "acme_cut", "Acme cuts Q4 revenue guidance"),)
+
+        async def poll_acme(*_a, **_kw):
+            return SimpleNamespace(ok=True, as_of=NOW, covered_symbols={"ACME"}, items=acme_items)
+
+        s_acme = ResearchSources(
+            None,
+            SimpleNamespace(poll_news=poll_acme),
+            list_universe=None,
+            asset_for=lambda _: SimpleNamespace(company_name="Acme Corporation Common Stock"),
+        )
+        assert [ev.evidence_id for ev in await s_acme.handoff_material_news("ACME", after, NOW, owner=True)] == [
+            "acme_cut"
+        ]
+
+        # 2. Shorter FMP cached company_name ("Acme") wins when Alpaca asset_for has a longer corporate title:
+        s_fmp = ResearchSources(
+            None,
+            SimpleNamespace(poll_news=poll_acme),
+            list_universe=None,
+            asset_for=lambda _: SimpleNamespace(company_name="Acme Global Holdings Common Stock"),
+            cached_company=lambda _: SimpleNamespace(company_name="Acme Inc."),
+        )
+        assert s_fmp._company_name("ACME") == "Acme Inc."
+        assert [ev.evidence_id for ev in await s_fmp.handoff_material_news("ACME", after, NOW, owner=True)] == [
+            "acme_cut"
+        ]
+
+        # 3. Shorter _FALLBACK_ISSUER_NAMES entry ("Micron" / "TSMC") works alongside full Alpaca ADR/Common Stock name:
+        mu_items = (make_story("MU", "mu_cut", "Micron cuts Q4 revenue guidance"),)
+
+        async def poll_mu(*_a, **_kw):
+            return SimpleNamespace(ok=True, as_of=NOW, covered_symbols={"MU"}, items=mu_items)
+
+        s_mu = ResearchSources(
+            None,
+            SimpleNamespace(poll_news=poll_mu),
+            list_universe=None,
+            asset_for=lambda _: SimpleNamespace(company_name="Micron Technology, Inc. Common Stock"),
+        )
+        assert s_mu._company_name("MU") == "Micron"
+        assert [ev.evidence_id for ev in await s_mu.handoff_material_news("MU", after, NOW, owner=True)] == [
+            "mu_cut"
+        ]
 
     asyncio.run(run())
 
