@@ -13,8 +13,18 @@ from datetime import timedelta
 
 from stock_agent.config import Config
 from stock_agent.ledger import JobStatus
+from tests.fakes.providers import LLMReply
 
 SYMBOL = "AAPL"
+
+
+def with_grounding(body, draft):
+    """The canned provider returns tool results only when the request asks for them."""
+    if body.get("tools"):
+        return LLMReply(text=json.dumps(draft), sources=[
+            {"url": "https://example.com/fixture/issuer-filing", "title": "Synthetic issuer filing"},
+        ])
+    return draft
 
 
 @dataclass
@@ -52,22 +62,28 @@ class Harness:
         data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
         self.calls.append((self.world.clock.now_et(), self.reply.direction, data.get("reference_price")))
         evidence = next((item for item in data["evidence"] if item["published_at"]), None)
-        if evidence is None:  # nothing dated to cite: an honest no-claims HOLD (the pipeline won't act on it)
-            return {
-                "symbol": data.get("symbol") or self.symbol, "direction": "HOLD", "conviction": 1, "summary": "No new evidence.",
+        best_ideas = "No discrete catalyst is required" in body.get("instructions", "")
+        if evidence is None:  # nothing dated to cite
+            draft = {
+                "symbol": data.get("symbol") or self.symbol,
+                "direction": "INSUFFICIENT_EVIDENCE" if best_ideas else "HOLD",
+                "conviction": 1, "summary": "No new evidence.",
                 "bull_case": "None.", "bear_case": "None.", "claims": [], "catalysts": [], "risks": [],
                 "thesis_break": "Not applicable.", "target_price": None, "thesis_change": "unchanged",
                 "horizon_days": 15,
             }
-        return {
-            "symbol": data.get("symbol") or self.symbol, "direction": self.reply.direction, "conviction": self.reply.conviction,
-            "summary": "The issuer updated its outlook.", "bull_case": "Improving demand.",
-            "bear_case": "Demand may weaken.", "claims": [
-                {"text": "The issuer issued updated guidance.", "evidence_ids": [evidence["evidence_id"]]},
-            ],
-            "catalysts": [], "risks": [], "thesis_break": "Next release contradicts the update.",
-            "target_price": None, "thesis_change": self.reply.thesis_change, "horizon_days": 15,
-        }
+        else:
+            direction = "AVOID" if best_ideas and self.reply.direction == "HOLD" else self.reply.direction
+            draft = {
+                "symbol": data.get("symbol") or self.symbol, "direction": direction, "conviction": self.reply.conviction,
+                "summary": "The issuer updated its outlook.", "bull_case": "Improving demand.",
+                "bear_case": "Demand may weaken.", "claims": [
+                    {"text": "The issuer issued updated guidance.", "evidence_ids": [evidence["evidence_id"]]},
+                ],
+                "catalysts": [], "risks": [], "thesis_break": "Next release contradicts the update.",
+                "target_price": None, "thesis_change": self.reply.thesis_change, "horizon_days": 15,
+            }
+        return with_grounding(body, draft)
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self, scheduler=None):

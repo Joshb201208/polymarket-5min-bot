@@ -468,7 +468,7 @@ def test_prebuy_refresh_rolling_minute_budget_caps_slow_provider_storm(world, tm
         [iid] = eng.ledger.enqueue_intents([NewIntent(
             symbol=sym, side="buy", dedupe_key=f"market_move:2026-11-30:1:{sym}",
             reference_price=Decimal("50"), origin="market_move", thesis_ids=(tid,),
-            expires_at=datetime(2026, 11, 30, 16, 0, tzinfo=ET),
+            expires_at=datetime(2026, 12, 1, 16, 0, tzinfo=ET),
             meta={"effective_conviction": 8, "raw_conviction": 8, "sector": "Technology"},
         )])
         intents.append(eng.ledger.get_intent(iid))
@@ -495,16 +495,17 @@ def test_prebuy_refresh_rolling_minute_budget_caps_slow_provider_storm(world, tm
         assert [r.status for r in results] == [
             IntentStatus.FILLED,
             IntentStatus.FILLED,
-            IntentStatus.FILLED,
+            IntentStatus.SKIPPED,
             IntentStatus.QUEUED,
         ]
+        assert results[2].code == "new_stock_session_cap"
         assert results[3].code == "research_inputs_pending"
         # Crucially, DDD never even invoked slow_refresh once the 15s rolling-minute budget was exhausted.
         assert refresh_calls == ["AAA", "BBB", "CCC"]
 
-        # Advance past the 60s rolling refresh window and 5m retry hold -> DDD refreshes and fills.
-        fake_loop_time[0] += 61.0
-        world.clock.advance(minutes=6)
+        # A new NY session resets admissions as well as the 60s refresh window.
+        fake_loop_time[0] += 24 * 3600
+        world.clock.set_et(2026, 12, 1, 9, 36)
         world.price("DDD", 50.0, spread=0.02)
         ddd_retry = await eng.execute_intent(eng.ledger.get_intent(intents[3].intent_id))
         assert ddd_retry.status == IntentStatus.FILLED
