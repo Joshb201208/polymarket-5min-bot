@@ -670,12 +670,17 @@ class ResearchPipeline:
         anchor_kind = "quote" if fresh_quote else None
         if (scheduled or owner) and not fresh_quote:
             price = None
-            previous = self.calendar.previous_session(session.date)
+            previous_session = getattr(self.calendar, "previous_session", None)
+            previous = previous_session(session.date) if previous_session is not None else None
             completed = getattr(self.sources, "completed_close", None)
             if previous is not None and completed is not None:
                 price = await completed(symbol, previous.date)
                 if price is not None:
                     anchor_kind = "completed_split_adjusted_close"
+            if price is None and owner and _fresh_quote(security, now, max_age=timedelta(minutes=20)):
+                # An analysis anchor only, not the 90-second executable quote.
+                price = security.price
+                anchor_kind = "recent_research_quote"
         metrics = dict(security.metrics)
         if anchor_kind:
             metrics["reference_price_kind"] = anchor_kind
@@ -683,7 +688,8 @@ class ResearchPipeline:
             metrics["point_in_time_provenance"] = security.metric_provenance
         data = ResearchInput(
             symbol, now, security.name, security.sector, float(price) if anchor_kind else None,
-            quote_at if fresh_quote else None, metrics, tuple(evidence.values())[:24],
+            quote_at if anchor_kind in {"quote", "recent_research_quote"} else None,
+            metrics, tuple(evidence.values())[:24],
             (story.evidence.evidence_id,) if story else (), _safe_previous(entry),
             _safe_previous(baseline or current), {"held": True, "opened_at": holding.meta.opened_at.isoformat()
                                                if holding.meta and holding.meta.opened_at else None}

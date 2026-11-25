@@ -190,7 +190,8 @@ def test_unused_unheld_lane_gets_a_fresh_review_even_if_the_other_lane_was_used(
     assert ledger.owner_directive_vetoed("ABC", directive.added) is (direction == "AVOID")
 
 
-def test_completed_close_anchors_option_only_research_while_underlying_quote_is_stale(tmp_path, monkeypatch):
+@pytest.mark.parametrize("anchor_kind", ["completed_split_adjusted_close", "recent_research_quote"])
+def test_analysis_anchors_option_only_research_while_underlying_quote_is_stale(tmp_path, monkeypatch, anchor_kind):
     clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=FILING)
     directive = FocusItem("ABC", None, "Check for a guidance cut.", START.date() - timedelta(days=2),
                           START.date() + timedelta(days=5), stance="bullish", owner_conviction=8)
@@ -200,15 +201,19 @@ def test_completed_close_anchors_option_only_research_while_underlying_quote_is_
     def endpoint(req):
         body = json.loads(req.content)
         data = json.loads(body["input"].split("INPUT_JSON:\n")[1])
-        assert data["reference_price"] == 20 and data["quote_at"] is None
-        assert data["metrics"]["reference_price_kind"] == "completed_split_adjusted_close"
+        assert data["reference_price"] == 20
+        assert (data["quote_at"] is None) is (anchor_kind == "completed_split_adjusted_close")
+        assert data["metrics"]["reference_price_kind"] == anchor_kind
         return _reply(body, direction="BUY", stop=17)
 
-    async def get_quotes(*args, **kwargs):
-        return SimpleNamespace(quotes={})
+    async def get_quotes(symbols, **kwargs):
+        return SimpleNamespace(quotes={
+            sym: SimpleNamespace(price=20, as_of=clock.t - timedelta(minutes=5))
+            for sym in symbols if anchor_kind == "recent_research_quote"
+        })
 
     async def prior_close(symbol, date):
-        return 20
+        return 20 if anchor_kind == "completed_split_adjusted_close" else None
 
     async def run():
         await ledger.refresh("fixture")
