@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from stock_agent.config import Config
-from stock_agent.ledger import BookSnapshot
+from stock_agent.ledger import BookSnapshot, OpenOrder
 from stock_agent.research_gate import OwnerEntryProof
 
 DRAWDOWN_STATE_KEY = "drawdown"
@@ -298,6 +298,24 @@ class DrawdownState:
 
 
 @dataclass(frozen=True)
+class OwnerOptionScope:
+    """Exact owner option-book structure already matched to the ledger claim."""
+
+    symbol: str
+    added: date
+    positions: tuple[tuple[str, int], ...]
+    order_ids: frozenset[str] = frozenset()
+
+    def matches_order(self, order: OpenOrder) -> bool:
+        """Parent ID alone is not sufficient; broker legs must match the structure."""
+        return (
+            order.order_class == "mleg" and order.asset_class != "us_equity"
+            and (order.order_id in self.order_ids or order.client_order_id in self.order_ids)
+            and sorted(leg.symbol for leg in order.legs) == sorted(symbol for symbol, _ in self.positions)
+        )
+
+
+@dataclass(frozen=True)
 class RiskControls:
     pause_new_buys: bool = False
     drawdown: DrawdownState = field(default_factory=DrawdownState)
@@ -305,6 +323,7 @@ class RiskControls:
     pending_sectors: Mapping[str, str] = field(default_factory=dict)
     holding_convictions: Mapping[str, int] = field(default_factory=dict)
     owner_entry: OwnerEntryProof | None = None
+    owner_option_scope: OwnerOptionScope | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +567,36 @@ def classify_symbol(symbol: str, raw_sector: str | None = None) -> Classificatio
     clusters = tuple(name for name, members in Config.SYMBOL_CLUSTERS.items()
                      if aliases.intersection(members))
     return Classification(canonical, sector, clusters)
+
+
+def _owner_stock_issuer_clear(snapshot: BookSnapshot, owner: OwnerEntryProof,
+                              scope: OwnerOptionScope | None) -> bool:
+    issuer = classify_symbol(owner.symbol).issuer
+    if any(row.qty != 0 and classify_symbol(row.symbol).issuer == issuer for row in snapshot.holdings):
+        return False
+    if not isinstance(scope, OwnerOptionScope) or (scope.symbol, scope.added) != (owner.symbol, owner.added):
+        scope = None
+
+    def same_issuer_order(order: OpenOrder) -> bool:
+        symbol = order.symbol
+        occ_suffix = symbol[-15:]
+        is_occ = (len(symbol) > 15 and occ_suffix[:6].isdigit()
+                  and occ_suffix[6].upper() in ("C", "P") and occ_suffix[7:].isdigit())
+        return order.remaining_qty > 0 and (
+            classify_symbol(symbol).issuer == issuer
+            or ((order.asset_class == "us_option" or is_occ) and classify_symbol(symbol[:-15]).issuer == issuer)
+        )
+
+    for order in snapshot.open_orders:
+        if (same_issuer_order(order) or any(same_issuer_order(leg) for leg in order.legs)) and (
+            scope is None or not scope.matches_order(order)
+        ):
+            return False
+    positions = [(row.occ_symbol, row.qty) for row in snapshot.legs
+                 if row.qty != 0 and classify_symbol(row.underlying).issuer == issuer]
+    # Only the reconciled signed positions of the exact structure may remain.
+    # Do not mask extra contracts, naked legs or other option positions.
+    return not positions or (scope is not None and sorted(positions) == sorted(scope.positions))
 
 
 _SECTOR_NAMES = {
@@ -1212,17 +1261,7 @@ class RiskManager:
                 and owner.effective_conviction == effective
             )
             if valid and lane == "stock":
-                issuer = classify_symbol(owner.symbol).issuer
-                valid = not any(
-                    row.qty != 0 and classify_symbol(row.symbol).issuer == issuer for row in snapshot.holdings
-                ) and not any(
-                    candidate.remaining_qty > 0 and (
-                        classify_symbol(candidate.symbol).issuer == issuer
-                        or (candidate.asset_class == "us_option" and classify_symbol(candidate.symbol[:-15]).issuer
-                            == issuer)
-                    )
-                    for order in snapshot.open_orders for candidate in (order, *order.legs)
-                )
+                valid = _owner_stock_issuer_clear(snapshot, owner, controls.owner_option_scope)
             if not valid:
                 reasons.append("owner_directive_scope_mismatch")
         else:

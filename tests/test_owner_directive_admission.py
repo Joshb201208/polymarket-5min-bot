@@ -8,13 +8,14 @@ import pytest
 
 from stock_agent.execution import ExecutionEngine
 from stock_agent.ledger import IntentStatus, NewIntent, NewStockEntryRefused, ThesisRole
+from stock_agent.options_book import Leg, Structure
 from stock_agent.research_focus import FocusItem
 from stock_agent.research_gate import ResearchGate
 from stock_agent.risk_manager import RiskControls
 from stock_agent.scheduler import StockAgentScheduler
 from tests.exec_helpers import enqueue as enqueue_trade
 from tests.exec_helpers import make_engine
-from tests.test_risk_projection import NOW, buy, margin_book, order, snapshot, stock
+from tests.test_risk_projection import NOW, buy, leg, margin_book, order, snapshot, stock
 
 
 @pytest.fixture
@@ -157,6 +158,59 @@ def test_option_reservation_is_independent_and_veto_blocks_its_own_later_rung(se
     assert not ledger.claim_owner_option("NVDA", added, "one")
     assert not eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option",
                                                     reservation_id="one").ok
+
+
+def test_option_claim_waits_for_current_session_stock_attempt_to_finish(setup):
+    eng, added, _, enqueue = setup
+    ledger = eng.ledger
+    attempt = enqueue("stock-first")
+    assert ledger.owner_stock_attempt_in_progress("NVDA", added, eng.session_date())
+    assert not ledger.claim_owner_option("NVDA", added, "option-while-queued")
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    ledger.claim_intent(attempt.intent_id, new_stock_session=eng.session_date(), new_stock_limit=3, owner_entry=proof)
+    assert not ledger.claim_owner_option("NVDA", added, "option-while-working")
+    ledger.ack_intent(attempt.intent_id, IntentStatus.REJECTED)
+    assert not ledger.owner_stock_attempt_in_progress("NVDA", added, eng.session_date())
+    assert ledger.claim_owner_option("NVDA", added, "option-after-stock")
+
+
+def test_stock_scope_exempts_only_exact_owner_option_structure(setup):
+    eng, added, _, _ = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    proof = replace(proof, generated_at=NOW)
+    long, short = "NVDA261218C00100000", "NVDA261218C00110000"
+    structure = Structure("opt-test", "NVDA", "bull_call_spread", "bullish", 1, "2026-12-18",
+                          [Leg(long, "buy", "call", 100, "2026-12-18"),
+                           Leg(short, "sell", "call", 110, "2026-12-18")],
+                          state="open", source="owner", owner_directive_added=added.isoformat(),
+                          close_client_id="owned-close")
+    eng.options = SimpleNamespace(get=lambda sid: structure if sid == structure.id else None)
+    assert eng._owner_option_scope(proof) is None  # book metadata alone never authorizes
+    assert eng.ledger.claim_owner_option("NVDA", added, structure.id)
+    scope = eng._owner_option_scope(proof)
+    assert scope is not None
+    intent = buy("NVDA", qty="1", signal_at=NOW, raw_conviction=3, effective_conviction=8)
+    opt_legs = (replace(leg("NVDA", 1), occ_symbol=long), replace(leg("NVDA", -1), occ_symbol=short))
+    orders = tuple(replace(order(symbol, qty="1", done="0"), asset_class="us_option") for symbol in (long, short))
+    parent = replace(order("", qty="1", done="0"), order_class="mleg", asset_class="us_option",
+                     client_order_id="owned-close", legs=orders)
+    controls = RiskControls(owner_entry=proof, owner_option_scope=scope)
+    for book in (snapshot(legs=opt_legs), snapshot(orders=(parent,)), snapshot(legs=opt_legs, orders=(parent,))):
+        assert eng.risk.evaluate_trade(book, intent, controls=controls).ok
+        assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(
+            book, intent, controls=replace(controls, owner_option_scope=None),
+        ).reasons
+    extra_leg = replace(opt_legs[0], qty=D(2))
+    for book in (
+        snapshot(legs=(extra_leg, opt_legs[1])),
+        snapshot(orders=(parent, order("NVDA", qty="1", done="0"))),
+        snapshot(orders=(replace(parent, client_order_id="unrelated-close"),)),
+        snapshot(orders=(replace(orders[0], asset_class=""),)),
+        snapshot(orders=(replace(parent, legs=(orders[0], replace(orders[1], symbol="NVDA261218C00120000"))),)),
+    ):
+        assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(book, intent, controls=controls).reasons
+    structure.owner_directive_added = NOW.date().isoformat()
+    assert eng._owner_option_scope(proof) is None
 
 
 def test_option_zero_fill_release_is_compare_and_delete_and_never_undoes_veto(setup):

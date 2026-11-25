@@ -33,7 +33,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
@@ -1025,20 +1025,47 @@ class Ledger:
                             (self._owner_key(symbol, added, lane),)).fetchone()
             return row is not None and (reservation_id is None or row[0] != json.dumps(reservation_id))
 
+    @staticmethod
+    def _owner_stock_attempt_in(c, symbol: str, added: date, session: date) -> bool:
+        start = datetime.combine(session, time.min, _MARKET_TZ)
+        end = datetime.combine(session + timedelta(days=1), time.min, _MARKET_TZ)
+        return c.execute(
+            """SELECT 1 FROM order_intents
+               WHERE symbol=? AND kind='equity' AND side='buy'
+                 AND json_extract(meta_json,'$.owner_directive_added')=?
+                 AND status IN ('queued','submitting','submitted','ambiguous','partially_filled')
+                 AND (COALESCE(json_extract(meta_json,'$.new_stock_session'),session_date)=?
+                      OR (session_date IS NULL AND json_extract(meta_json,'$.new_stock_session') IS NULL
+                          AND julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?)))
+               LIMIT 1""", (symbol.strip().upper(), added.isoformat(), session.isoformat(), _iso(start), _iso(end)),
+        ).fetchone() is not None
+
+    def owner_stock_attempt_in_progress(self, symbol: str, added: date, session: date) -> bool:
+        with self.store.transaction() as c:
+            return self._owner_stock_attempt_in(c, symbol, added, session)
+
+    def owner_option_claim_id(self, symbol: str, added: date) -> str | None:
+        value = self.store.kv_get(self._owner_key(symbol, added, "option"))
+        return value if isinstance(value, str) and value else None
+
     def claim_owner_option(self, symbol: str, added: date, structure_id: str) -> bool:
         if not structure_id:
             return False
         with self.store.transaction() as c:
+            session = self.now().astimezone(_MARKET_TZ).date()
             if (self._owner_vetoed_in(c, symbol, added)
-                    or self._owner_held_in(c, symbol, self.now().astimezone(_MARKET_TZ).date())
+                    or self._owner_held_in(c, symbol, session)
                     or self._owner_exited_in(c, symbol, added)):
                 return False
             key = self._owner_key(symbol, added, "option")
             value = json.dumps(structure_id)
-            c.execute("INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
-                      (key, value, _iso(self.now())))
             row = c.execute("SELECT value_json FROM kv WHERE key=?", (key,)).fetchone()
-            return row is not None and row[0] == value
+            if row is not None:
+                return row[0] == value
+            if self._owner_stock_attempt_in(c, symbol, added, session):
+                return False
+            c.execute("INSERT INTO kv(key,value_json,updated_at) VALUES (?,?,?)", (key, value, _iso(self.now())))
+            return True
 
     def release_owner_option(self, symbol: str, added: date, structure_id: str) -> bool:
         """Release the exact claim after the caller proves a terminal zero-fill."""

@@ -817,7 +817,7 @@ class ExecutionEngine:
                                 initial_reaffirmation=initial_reaffirmation)
         controls = self._risk_controls()
         if owner_entry is not None:
-            controls = replace(controls, owner_entry=owner_entry)
+            controls = replace(controls, owner_entry=owner_entry, owner_option_scope=self._owner_option_scope(owner_entry))
         qty = int(self.risk.propose_equity_qty(snap, ti, now=self.now(), controls=controls))
 
         if qty < 1:
@@ -869,7 +869,8 @@ class ExecutionEngine:
                     return await self._hold(claimed, ", ".join(reasons), code="research_inputs_pending")
                 code = self._owner_skip_code(reasons)
                 return self._skip(claimed, ", ".join(reasons), code)
-            controls = replace(self._risk_controls(), owner_entry=el.owner_entry)
+            controls = replace(self._risk_controls(), owner_entry=el.owner_entry,
+                               owner_option_scope=self._owner_option_scope(el.owner_entry))
             verdict = self.risk.evaluate_trade(snap, ti, now=self.now(), controls=controls)
             if not verdict.ok:
                 return self._skip(claimed, "risk: " + "; ".join(verdict.reasons), "risk_refused",
@@ -919,6 +920,30 @@ class ExecutionEngine:
         meta = intent.meta or {}
         return (meta.get("adjustment_reason") == "owner_directive" or "owner_directive_added" in meta
                 or "owner_stock_claim" in meta)
+
+    def _owner_option_scope(self, proof):
+        """Link broker exposure to the exact same-generation owned options structure."""
+        from stock_agent.options_book import StructState, Structure
+        from stock_agent.risk_manager import OwnerOptionScope
+
+        get = getattr(self.options, "get", None)
+        if get is None:
+            return None
+        structure_id = self.ledger.owner_option_claim_id(proof.symbol, proof.added)
+        structure = get(structure_id) if structure_id is not None else None
+        if (not isinstance(structure, Structure) or structure.id != structure_id
+                or structure.source != "owner" or structure.underlying != proof.symbol
+                or structure.owner_directive_added != proof.added.isoformat()
+                or structure.state not in (StructState.PENDING, StructState.OPEN, StructState.CLOSING)
+                or structure.qty <= 0 or len(structure.legs) != 2
+                or any(leg.symbol[:-_OCC_LEN] != proof.symbol for leg in structure.legs)):
+            return None
+        positions = tuple(structure.expected_positions().items())
+        if len(positions) != 2:
+            return None
+        order_ids = frozenset(cid for cid in (structure.open_order_id, structure.open_client_id,
+                                             structure.close_order_id, structure.close_client_id) if cid)
+        return OwnerOptionScope(proof.symbol, proof.added, positions, order_ids)
 
     @staticmethod
     def _owner_skip_code(reasons: tuple[str, ...]) -> str:
