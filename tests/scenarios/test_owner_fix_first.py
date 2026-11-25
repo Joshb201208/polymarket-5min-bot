@@ -114,6 +114,11 @@ def structures(h):
     return [x for x in h.scheduler.options.structures if x.underlying == h.symbol]
 
 
+def opened(h):
+    """Owner structures that reached OPEN; the ladder may send several rungs for one structure."""
+    return [x for x in structures(h) if x.st.value == "open"]
+
+
 def is_mleg(body):
     return body.get("order_class") == "mleg"
 
@@ -153,12 +158,12 @@ def test_day1_stock_refused_and_spread_opened_day2_stock_still_enters(world, mon
         await stage(h)
         await open_session(h)
         assert not ok(h.buys()) and h.buys(), h.intent_states()
-        assert len(ok(h.option_orders())) == 1, h.option_orders()
+        assert len(opened(h)) == 1, [(x.st, x.notes) for x in structures(h)]
         refusing["on"] = False
         await stage(h, day=27, start=False, option_ideas=0)  # the option lane is already spent
         await open_session(h, day=27, until=(9, 45))
         assert len(ok(h.buys())) == 1, h.intent_states()
-        assert len(ok(h.option_orders())) == 1, "one structure per generation"
+        assert len(opened(h)) == 1 and len(structures(h)) == 1, "one structure per generation"
         assert h.scheduler.ledger.owner_directive_used(h.symbol, ADDED)
 
     drive(h, scenario)
@@ -303,8 +308,8 @@ def test_day1_option_zero_fill_releases_the_shot_and_day2_opens_the_spread(world
         await h.advance(27, 8, 0)  # NVDA is held now; the held review is HOLD / unchanged
         row = await h.run_job("prescan")
         assert row.detail["entry_funnel"]["option_ideas"] == 1, row.detail
-        await open_session(h, day=27, until=(9, 45))
-        assert len(ok(h.option_orders())) == 1, h.option_orders()
+        await open_session(h, day=27, until=(10, 15))
+        assert len(opened(h)) == 1, [(x.st, x.notes) for x in structures(h)]
         assert ledger.owner_directive_used(h.symbol, ADDED, lane="option")
 
     drive(h, scenario)
