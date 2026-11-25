@@ -561,26 +561,44 @@ class OptionsManager:
         return any(not (x.st is StructState.VOID and x.zero_fill_confirmed)
                    for x in self._owner_structures(sym, added))
 
-    def _owner_release_voided(self, sym: str) -> None:
-        """Hand back the durable claim of saved, broker-confirmed zero-fill owner structures,
-        before the gate is asked (the gate denies while the claim stands). Without the ledger
-        method the shot stays spent (fail closed)."""
+    def _owner_release(self, x: Structure) -> bool:
+        """Hand back the durable claim of one saved, broker-confirmed zero-fill owner structure.
+        Without the ledger method (or on any error) the shot stays spent (fail closed)."""
+        if not (x.source == "owner" and x.owner_directive_added and x.st is StructState.VOID
+                and x.zero_fill_confirmed and not x.owner_claim_released):
+            return False
         release = getattr(self._owner_ledger(), "release_owner_option", None)
         if release is None:
-            return
+            return False
+        try:
+            if release(x.underlying, date.fromisoformat(x.owner_directive_added), x.id) is not True:
+                return False
+        except Exception as e:
+            logger.warning("owner claim release failed for %s: %s", x.id, type(e).__name__)
+            return False
+        x.owner_claim_released = True
+        x.note("owner option claim released: confirmed zero fill")
+        self._j("options.owner_claim_released", structure_id=x.id, underlying=x.underlying,
+                owner_directive_added=x.owner_directive_added)
+        self._save()
+        return True
+
+    def _owner_release_voided(self, sym: str) -> None:
+        """Backstop before the gate is asked (the gate denies while the claim stands): release
+        any saved confirmed zero fill a crash left unreleased."""
         for x in self.structures:
-            if (x.source == "owner" and x.underlying == sym and x.owner_directive_added
-                    and x.st is StructState.VOID and x.zero_fill_confirmed and not x.owner_claim_released):
-                added = date.fromisoformat(x.owner_directive_added)
-                try:
-                    if release(sym, added, x.id) is True:
-                        x.owner_claim_released = True
-                        x.note("owner option claim released: confirmed zero fill")
-                        self._j("options.owner_claim_released", structure_id=x.id, underlying=sym,
-                                owner_directive_added=x.owner_directive_added)
-                        self._save()
-                except Exception as e:
-                    logger.warning("owner claim release failed for %s: %s", x.id, type(e).__name__)
+            if x.source == "owner" and x.underlying == sym:
+                self._owner_release(x)
+
+    async def _owner_settle(self, st: Structure) -> None:
+        """Eagerly, when an owner open ends VOID: a confirmed zero fill frees the shot now; a
+        void the broker never confirmed keeps it spent and tells the owner once (F2)."""
+        if st.source != "owner" or st.st is not StructState.VOID or not st.owner_directive_added:
+            return
+        if st.zero_fill_confirmed:
+            self._owner_release(st)
+        else:
+            await self._owner_spent_alert(st.underlying, st.owner_directive_added)
 
     async def _owner_proof(self, c: OptionCandidate, sym: str, now: datetime) -> tuple[Any, Any, str | None]:
         """(eligibility, proof, problem). The proof is the typed OwnerEntryProof the research
@@ -669,9 +687,27 @@ class OptionsManager:
         except Exception:
             return False
 
+    async def _owner_reverify(self, sym: str, proof: Any, reservation_id: str | None) -> str | None:
+        """Fresh proof from the gate, which re-reads the focus file and thesis and applies the
+        veto latch and any session hold; it must match the proof the structure was sized on."""
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(sym, self._now(), allow_owner=True,
+                                                          owner_lane="option", reservation_id=reservation_id))
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        fresh = getattr(el, "owner_entry", None) if el is not None and el.ok else None
+        if fresh is None:
+            reasons = ",".join(getattr(el, "reasons", ()) or ()) if el is not None else ""
+            return "owner directive no longer valid" + (f": {reasons}" if reasons else "")
+        if (fresh.symbol.upper() != sym or fresh.added != proof.added or fresh.thesis_id != proof.thesis_id
+                or fresh.effective_conviction != proof.effective_conviction
+                or getattr(fresh, "lane", "option") != "option"):
+            return "owner directive or thesis changed"
+        return None
+
     async def _owner_still_valid(self, st: Structure) -> str | None:
-        """Re-verify an owner structure before a later rung: same directive, not vetoed,
-        claim still ours."""
+        """Re-verify an owner structure before every rung (rung 0 included): same directive,
+        not vetoed or held, claim still ours."""
         try:
             el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
                                                           owner_lane="option", reservation_id=st.id))
@@ -831,6 +867,11 @@ class OptionsManager:
             if proof is not None:
                 if self._owner_book_used(sym, proof.added.isoformat()):
                     return ScanOutcome(sym, None, "owner directive already used for an option structure")
+                # re-verify from the gate (focus file, thesis, veto latch, session hold) under the
+                # capital lock, immediately before the claim (F1c/F3)
+                why = await self._owner_reverify(sym, proof, None)
+                if why:
+                    return ScanOutcome(sym, None, why, final=False)
                 if not self._owner_claim(sym, proof, sid):
                     return ScanOutcome(sym, None, "owner directive claim refused (used, vetoed or unavailable)")
             st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
@@ -931,11 +972,18 @@ class OptionsManager:
                 **self._owner_journal(st))
         order = None
         for attempt, limit in enumerate(self._open_ladder(prop)):  # same ladder as sized
+            if st.source == "owner":
+                why = await self._owner_still_valid(st)
+                if why:
+                    st.note(f"owner open stopped before rung {attempt}: {why}")
+                    if attempt == 0:  # nothing was sent: a confirmed zero fill
+                        st.state = StructState.VOID.value
+                        st.zero_fill_confirmed = True
+                    self._save()
+                    break
             if attempt:
                 ok, why = await self._gate("entry")
                 if not ok:
-                    break
-                if st.source == "owner" and await self._owner_still_valid(st):
                     break
                 st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
@@ -965,6 +1013,7 @@ class OptionsManager:
             self._save()
             if st.st is not StructState.VOID:
                 break
+        await self._owner_settle(st)
         if st.st is StructState.OPEN:
             self._j("options.opened", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                     direction=st.direction, qty=st.qty, entry_debit=st.entry_debit, max_loss=st.max_loss,
@@ -1077,6 +1126,8 @@ class OptionsManager:
                     st.note("no broker order under the client id; voided")
                 else:
                     self._apply_open_order(st, o)
+                if st.st is StructState.VOID:
+                    await self._owner_settle(st)  # F2: release a confirmed zero fill, alert otherwise
             elif st.st is StructState.CLOSING:
                 if o is None:
                     st.state = StructState.OPEN.value

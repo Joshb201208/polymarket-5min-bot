@@ -273,6 +273,9 @@ def test_unconfirmed_void_stays_spent_and_alerts_once(world, tmp_path, monkeypat
     run(m.scan(candidates=[_owner_candidate()]))
     v = next(x for x in m.structures if x.source == "owner")
     v.zero_fill_confirmed = False  # e.g. voided by reconcile after an ambiguous submit
+    v.owner_claim_released = False
+    gate.ledger.claims[("AAA", ADDED)] = v.id
+    gate.ledger.released.clear()
     monkeypatch.undo()
     for day in ("2026-11-24", "2026-11-25"):
         c = dataclasses.replace(_next_session(m, world), story_id=f"owner:AAA:{ADDED}:{day}")
@@ -333,3 +336,93 @@ def test_owner_idea_with_bearish_hint_is_rejected(world, tmp_path):
     c = dataclasses.replace(_owner_candidate(), direction_hint="BEARISH")
     out = run(m.scan(candidates=[c]))
     assert not out[0].opened and "bullish" in out[0].reason and not world.orders_sent()
+
+
+# ------------------------------------------- F2 eager release / reconcile, F3 re-verify
+def test_zero_fill_releases_the_shot_eagerly(world, tmp_path, monkeypatch):
+    gate = _strict()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    _never_fill(world, monkeypatch, m)
+    run(m.scan(candidates=[_owner_candidate()]))
+    v = next(x for x in m.structures if x.source == "owner")
+    assert v.st is StructState.VOID and v.zero_fill_confirmed
+    assert v.owner_claim_released and gate.ledger.released == [v.id] and gate.ledger.claims == {}
+
+
+def _pending_owner(m, gate, world, monkeypatch):
+    _never_fill(world, monkeypatch, m)
+    run(m.scan(candidates=[_owner_candidate()]))
+    v = next(x for x in m.structures if x.source == "owner")
+    v.state = StructState.PENDING.value  # as if the process crashed after an ambiguous submit
+    v.zero_fill_confirmed = v.owner_claim_released = False
+    gate.ledger.claims[("AAA", ADDED)] = v.id
+    gate.ledger.released.clear()
+    return v
+
+
+def test_reconcile_void_without_broker_order_alerts_once_and_keeps_the_shot(world, tmp_path, monkeypatch):
+    gate = _strict()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    v = _pending_owner(m, gate, world, monkeypatch)
+    v.open_client_id = "sa-opt-open-never-sent"
+    run(m.reconcile())
+    run(m.reconcile())
+    assert v.st is StructState.VOID and not v.zero_fill_confirmed
+    assert gate.ledger.claims == {("AAA", ADDED): v.id} and gate.ledger.released == []
+    assert len([a for a in m.alerts.sent if "Owner option idea spent" in a[1]]) == 1
+
+
+def test_reconcile_confirmed_zero_fill_releases_eagerly(world, tmp_path, monkeypatch):
+    gate = _strict()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    v = _pending_owner(m, gate, world, monkeypatch)  # client id is the cancelled rung's
+    run(m.reconcile())
+    assert v.st is StructState.VOID and v.zero_fill_confirmed and v.owner_claim_released
+    assert gate.ledger.claims == {} and not [a for a in m.alerts.sent if "spent" in a[1]]
+
+
+class FlipGate(StrictOwnerGate):
+    """Issues the proof for the first `good` owner-lane calls, then applies `change`."""
+
+    def __init__(self, good, change):
+        super().__init__()
+        self.ledger = ReleasingLedger()
+        self.good, self.change, self.n = good, change, 0
+
+    def is_entry_eligible(self, symbol, now, *, allow_owner=False, owner_lane="stock", reservation_id=None):
+        if allow_owner and owner_lane == "option":
+            self.n += 1
+            if self.n > self.good:
+                if self.change == "hold":
+                    gen = now - timedelta(hours=1)
+                    return Eligibility(False, ("owner_directive_session_hold",), f"th-{symbol}",
+                                       self.raw, self.owner, Direction.BUY, gen)
+                self.added = date(2026, 12, 2)  # owner edited the directive mid-open
+        return super().is_entry_eligible(symbol, now, allow_owner=allow_owner, owner_lane=owner_lane,
+                                         reservation_id=reservation_id)
+
+
+def test_session_hold_before_claim_sends_nothing_and_consumes_nothing(world, tmp_path):
+    gate = FlipGate(good=1, change="hold")  # proof at scan start, hold by claim time
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    assert not out[0].opened and "session_hold" in out[0].reason
+    assert gate.ledger.claims == {} and not world.orders_sent() and not m.structures
+
+
+def test_directive_edited_before_claim_is_rejected(world, tmp_path):
+    gate = FlipGate(good=1, change="edit")
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    assert not out[0].opened and "changed" in out[0].reason
+    assert gate.ledger.claims == {} and not world.orders_sent()
+
+
+def test_hold_before_rung_zero_voids_without_sending_and_frees_the_shot(world, tmp_path):
+    gate = FlipGate(good=2, change="hold")  # passes scan start and claim, held before rung 0
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    assert not out[0].opened and not world.orders_sent()
+    v = next(x for x in m.structures if x.source == "owner")
+    assert v.st is StructState.VOID and v.zero_fill_confirmed and v.owner_claim_released
+    assert gate.ledger.claims == {}
