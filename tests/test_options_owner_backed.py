@@ -426,3 +426,20 @@ def test_hold_before_rung_zero_voids_without_sending_and_frees_the_shot(world, t
     v = next(x for x in m.structures if x.source == "owner")
     assert v.st is StructState.VOID and v.zero_fill_confirmed and v.owner_claim_released
     assert gate.ledger.claims == {}
+
+
+def test_definitive_broker_rejection_releases_the_shot_eagerly(world, tmp_path, monkeypatch):
+    from stock_agent.broker import BrokerError
+
+    gate = _strict()
+    m, _, _ = _setup(world, tmp_path, gate=gate)
+
+    async def refuse(body):
+        raise BrokerError("rejected", "synthetic broker rejection", status=403)
+
+    monkeypatch.setattr(m.broker, "submit_raw_order", refuse)
+    out = run(m.scan(candidates=[_owner_candidate()]))
+    assert not out[0].opened and "rejected" in out[0].reason
+    v = next(x for x in m.structures if x.source == "owner")
+    assert v.st is StructState.VOID and v.zero_fill_confirmed and v.owner_claim_released
+    assert gate.ledger.claims == {} and gate.ledger.released == [v.id]

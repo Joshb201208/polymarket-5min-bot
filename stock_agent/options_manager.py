@@ -348,8 +348,14 @@ class OptionsManager:
 
     async def _rejected(self, st_or_symbol: Any, side: str, qty: int, reason: str, title: str, key: str) -> None:
         sym = st_or_symbol if isinstance(st_or_symbol, str) else st_or_symbol.underlying
-        if not await self._notify("alert_order_rejected", symbol=sym, side=side, qty=qty, reason=reason,
-                                  asset_class="option"):
+        fn = getattr(self.alerts, "alert_order_rejected", None) if self.alerts is not None else None
+        kw: dict[str, Any] = {"symbol": sym, "side": side, "qty": qty, "reason": reason}
+        try:  # older AlertService hooks take no asset_class
+            if fn is not None and "asset_class" in inspect.signature(fn).parameters:
+                kw["asset_class"] = "option"
+        except (TypeError, ValueError):
+            pass
+        if not await self._notify("alert_order_rejected", **kw):
             await self._alert("critical", title, reason, key=key)
 
     async def _flush_closed(self, now: datetime) -> None:
@@ -1003,6 +1009,7 @@ class OptionsManager:
                 st.zero_fill_confirmed = True  # definitive broker rejection: nothing was placed
                 st.note(f"open rejected: {e.message}")
                 self._save()
+                await self._owner_settle(st)  # F2: a definitive rejection frees the owner shot now
                 await self._rejected(st, "buy", st.qty, e.message, f"Options open rejected: {st.underlying}",
                                      key=f"opt-open-{st.id}")
                 return ScanOutcome(st.underlying, None, f"order rejected: {e.message}")
