@@ -61,6 +61,14 @@ class TopUpAlreadyToday(LedgerError):
     """Another top-up for this position filled or is still unresolved this session."""
 
 
+class NewStockEntryRefused(LedgerError):
+    """A new stock position could not reserve a common entry slot."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 # =========================================================================
 # Book snapshot (broker truth + local metadata)
 # =========================================================================
@@ -914,7 +922,8 @@ class Ledger:
         return it
 
     def claim_intent(self, intent_id: str, *, check_thesis: bool = True,
-                     top_up_session: date | None = None, top_up_baseline_grade: int | None = None) -> OrderIntent:
+                     top_up_session: date | None = None, top_up_baseline_grade: int | None = None,
+                     new_stock_session: date | None = None) -> OrderIntent:
         """Mark SUBMITTING before the HTTP call. Raises ``LedgerError`` when the
         intent is not QUEUED, is expired, or (buys) its thesis was superseded."""
         it = self.get_intent(intent_id)
@@ -937,7 +946,44 @@ class Ledger:
                 raise LedgerError(f"intent {intent_id}: position {it.position_id} is no longer open")
         if top_up_session is not None:
             return self._claim_top_up(it, top_up_session, top_up_baseline_grade)
+        if new_stock_session is not None:
+            return self._claim_new_stock(it, new_stock_session)
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
+
+    def _claim_new_stock(self, it: OrderIntent, session: date) -> OrderIntent:
+        from stock_agent.risk_manager import classify_symbol
+
+        if it.position_id or it.side != "buy" or it.kind != "equity":
+            raise LedgerError("only an opening stock buy can reserve a new-stock slot")
+        day = session.isoformat()
+        issuer = classify_symbol(it.symbol).issuer
+        with self.store.transaction() as c:
+            rows = c.execute(
+                """SELECT symbol, session_date, status, meta_json FROM order_intents
+                   WHERE kind='equity' AND side='buy' AND position_id IS NULL AND intent_id<>?
+                     AND (status IN ('submitting','submitted','ambiguous','partially_filled')
+                          OR (status='queued' AND json_extract(meta_json,'$.new_stock_session') IS NOT NULL)
+                          OR (COALESCE(json_extract(meta_json,'$.new_stock_fill_session'),
+                                       json_extract(meta_json,'$.new_stock_session'), session_date)=?
+                              AND (status='filled' OR CAST(json_extract(meta_json,'$.filled_qty') AS REAL)>0)))""",
+                (it.intent_id, day),
+            )
+            occupied = set()
+            for row in rows:
+                meta = json.loads(row["meta_json"] or "{}")
+                if row["status"] == IntentStatus.QUEUED and meta.get("new_stock_session") != day:
+                    # A confirmed unsent retry from a previous day does not reserve
+                    # today; if used again it goes through this claim again.
+                    continue
+                occupied.add(meta.get("new_stock_issuer") or classify_symbol(row["symbol"]).issuer)
+            if issuer in occupied:
+                raise NewStockEntryRefused("new_stock_issuer_already_admitted",
+                                           "this issuer filled today or already has an active entry reservation")
+            if len(occupied) >= 2:
+                raise NewStockEntryRefused("new_stock_session_cap",
+                                           "two new stock positions already filled or reserved this NY session")
+            return self._transition(it.intent_id, IntentStatus.SUBMITTING, bump_attempts=True,
+                                    meta={"new_stock_session": day, "new_stock_issuer": issuer})
 
     def _claim_top_up(self, it: OrderIntent, session: date, baseline_grade: int | None) -> OrderIntent:
         if not it.position_id or it.side != "buy" or it.kind != "equity":

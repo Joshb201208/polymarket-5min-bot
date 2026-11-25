@@ -33,12 +33,15 @@ class Screener:
         return None
 
     @staticmethod
-    def rank(companies: list[Candidate]) -> list[dict]:
+    def rank(companies: list[Candidate], *, include_relative_strength: bool = True) -> list[dict]:
         eligible = {row.symbol: row for row in companies if row.tradable}
+        factors = {name: spec for name, spec in _FACTORS.items()
+                   if include_relative_strength or name != "relative_strength"}
+        total_weight = sum(weight for weight, _ in factors.values())
         observations = {
             name: {ticker: row.metrics[name] * position for ticker, row in eligible.items()
                    if name in row.metrics and math.isfinite(row.metrics[name])}
-            for name, (_, position) in _FACTORS.items()
+            for name, (_, position) in factors.items()
         }
         ranked = []
         for symbol, row in eligible.items():
@@ -54,7 +57,7 @@ class Screener:
             # Unknown factors center at neutral rather than increasing score,
             # then factor coverage is prioritized at a tied composite. The
             # screener only directs research; it is never an entry gate.
-            composite = sum(weight * scores.get(name, 5.0) for name, (weight, _) in _FACTORS.items()) / 100
+            composite = sum(weight * scores.get(name, 5.0) for name, (weight, _) in factors.items()) / total_weight
             ranked.append({"symbol": symbol, "name": row.name, "scores": scores, "composite": composite,
                            "score": composite, "coverage": len(scores), "focus": row.focus})
         return sorted(ranked, key=lambda row: (-row["focus"], -row["composite"], -row["coverage"], row["symbol"]))
