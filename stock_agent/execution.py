@@ -327,6 +327,8 @@ class ExecutionEngine:
                 await self._resolve(it)
                 done.append(it.intent_id)
             except BrokerError as e:
+                if await self._notify_owner_stock_uncertainty(it):
+                    continue
                 await self.alert("critical", f"{it.symbol}: order still unresolved",
                                  f"Order {it.client_order_id} could not be resolved ({e}); retrying next tick.",
                                  key=f"pending-{it.intent_id}")
@@ -346,6 +348,8 @@ class ExecutionEngine:
             try:
                 await self._resolve(it)
             except BrokerError as e:
+                if await self._notify_owner_stock_uncertainty(it):
+                    continue
                 await self.alert("critical", f"{it.symbol}: order state unknown",
                                  f"Could not look up order {it.client_order_id} at the broker ({e}). "
                                  "No new order for this intent until it is resolved.",
@@ -401,6 +405,10 @@ class ExecutionEngine:
                         o = await self._cancel_confirm(o)
                 found.append(o)
         if not found:
+            if await self._notify_owner_stock_uncertainty(it):
+                # A missing lookup is not a confirmed zero-fill terminal order.
+                # Keep the owner generation reserved until a broker order is reconciled.
+                return
             if it.status == IntentStatus.AMBIGUOUS:
                 # The broker confirms no order exists under any of its ids: safe to retry later.
                 self.ledger.ack_intent(it.intent_id, IntentStatus.QUEUED, error="not found at broker after restart")
@@ -551,12 +559,17 @@ class ExecutionEngine:
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
         "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
         "new_stock_session_cap", "new_stock_issuer_already_admitted",
+        "owner_directive_invalid", "owner_directive_vetoed", "owner_directive_used",
         "nothing_to_sell", "exit_cap", "research_inputs_pending", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
         """Journal event `execution.buy_funnel` for the daily entry funnel (A14d). Never raises."""
         if it.side != "buy" or it.kind == "cover":
             return
+        if self._owner_marked(it):
+            meta = it.meta or {}
+            extra.update(adjustment_reason="owner_directive", owner_directive_added=meta.get("owner_directive_added"),
+                         raw_conviction=meta.get("raw_conviction"), owner_conviction=meta.get("owner_conviction"))
         try:
             self.ledger.journal.append("execution.buy_funnel", intent_id=it.intent_id, symbol=it.symbol,
                                        origin=it.origin, stage=stage, code=code or None,
@@ -588,6 +601,10 @@ class ExecutionEngine:
         try:
             if code == "research_stale" and self._superseded_by_live_buy(it):
                 return  # a newer thesis's buy for this symbol is live: not a blocked buy
+            if self._owner_marked(it):
+                meta = it.meta or {}
+                reason = (f"Owner directive (owner grade {meta.get('owner_conviction')}; "
+                          f"model grade {meta.get('raw_conviction')}): {reason}")
             fn(it.symbol, code, reason, session_date=self.session_date(), risk_reasons=tuple(risk_reasons))
         except Exception:
             logger.exception("blocked-buy alert failed")
@@ -660,9 +677,10 @@ class ExecutionEngine:
         if e.uncertain:
             if cur is not None and cur.status == IntentStatus.SUBMITTING:
                 self.ledger.ack_intent(intent.intent_id, IntentStatus.AMBIGUOUS, error=str(e))
-            await self.alert("critical", f"{intent.symbol}: order outcome unknown",
-                             f"{intent.side} {intent.symbol}: {e}. Not resubmitting until the broker "
-                             f"confirms order {intent.client_order_id}.", key=f"ambiguous-{intent.intent_id}")
+            if cur is None or not await self._notify_owner_stock_uncertainty(cur):
+                await self.alert("critical", f"{intent.symbol}: order outcome unknown",
+                                 f"{intent.side} {intent.symbol}: {e}. Not resubmitting until the broker "
+                                 f"confirms order {intent.client_order_id}.", key=f"ambiguous-{intent.intent_id}")
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.AMBIGUOUS, reason=str(e))
         if (intent.side == "buy" and intent.kind != "cover" and e.insufficient_buying_power
                 and cur is not None and cur.status == IntentStatus.SUBMITTING):
@@ -733,11 +751,20 @@ class ExecutionEngine:
         if released and res.filled_qty <= 0:
             await self._protect_symbol(intent.symbol)
         if res.filled_qty > 0:
+            grades = (f"; owner grade {claimed.meta.get('owner_conviction')}, "
+                      f"model grade {claimed.meta.get('raw_conviction')}" if self._owner_marked(claimed) else "")
             await self.alert("info", f"Bought {intent.symbol}",
-                             f"{res.filled_qty:g} shares at {res.avg_price or 0:.2f}", key=None)
+                             f"{res.filled_qty:g} shares at {res.avg_price or 0:.2f}{grades}", key=None)
         return res
 
     async def _authorise_and_submit_buy(self, intent: OrderIntent, q: Any, limit: float, ask: float):
+        from dataclasses import replace
+
+        owner_marked = self._owner_marked(intent)
+        if owner_marked:
+            # Do network reads before the final in-lock directive proof. An opening
+            # owner trade never cancels protection or any other issuer order.
+            dist = await self._stop_distance(intent.symbol, ask)
         snap = await self._snapshot("pre-buy")
         if intent.symbol in getattr(snap, "blocked_symbols", frozenset()):
             return self._skip(intent, "symbol blocked by reconcile", "symbol_blocked")
@@ -749,11 +776,21 @@ class ExecutionEngine:
             not add or h.meta is None or h.meta.position_id != intent.position_id
         ):
             return self._skip(intent, "top-up no longer matches the live position", "position_changed")
-        why, code = await self._research_verdict(intent, h)
-        if why:
-            if code == "research_inputs_pending":
-                return await self._hold(intent, why, code=code)
-            return self._skip(intent, why, code)
+        owner_entry = None
+        if owner_marked:
+            el = await self._opening_owner_eligibility(intent, h)
+            if el is None or el.owner_entry is None:
+                reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
+                if set(reasons) <= self.RESEARCH_TRANSIENT:
+                    return await self._hold(intent, ", ".join(reasons), code="research_inputs_pending")
+                return self._skip(intent, ", ".join(reasons), "owner_directive_invalid")
+            owner_entry = el.owner_entry
+        else:
+            why, code = await self._research_verdict(intent, h)
+            if why:
+                if code == "research_inputs_pending":
+                    return await self._hold(intent, why, code=code)
+                return self._skip(intent, why, code)
         thesis = None
         last_filled_conviction = None
         initial_reaffirmation = False
@@ -769,13 +806,15 @@ class ExecutionEngine:
                 may_initialize and thesis.role == ThesisRole.HELD_REVIEW
                 and "/" in thesis.source and thesis.payload.get("legacy_v0") is not True
             )
-        dist = await self._stop_distance(intent.symbol, ask)
+        if not owner_marked:
+            dist = await self._stop_distance(intent.symbol, ask)
         ti = self._trade_intent(intent, limit, q, dist, add_thesis=thesis,
                                 last_filled_conviction=last_filled_conviction,
                                 initial_reaffirmation=initial_reaffirmation)
         controls = self._risk_controls()
+        if owner_entry is not None:
+            controls = replace(controls, owner_entry=owner_entry)
         qty = int(self.risk.propose_equity_qty(snap, ti, now=self.now(), controls=controls))
-        from dataclasses import replace
 
         if qty < 1:
             why = self.risk.evaluate_trade(snap, replace(ti, qty=Decimal(1)), now=self.now(), controls=controls)
@@ -799,6 +838,7 @@ class ExecutionEngine:
                 top_up_baseline_grade=ti.effective_conviction if initial_reaffirmation else None,
                 new_stock_session=self.session_date() if not add else None,
                 new_stock_limit=self.config.MAX_NEW_STOCK_POSITIONS_PER_SESSION if not add else None,
+                **({"owner_entry": owner_entry} if owner_entry is not None else {}),
             )
         except TopUpAlreadyToday as e:
             return self._skip(intent, str(e), "top_up_already_today")
@@ -815,6 +855,20 @@ class ExecutionEngine:
             self.ledger.ack_intent(claimed.intent_id, IntentStatus.QUEUED, error=why, next_attempt_at=nxt,
                                    meta=self._code_meta("market_closed", why))
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.QUEUED, reason=why, code="market_closed")
+        if owner_entry is not None:
+            # A veto, file edit, or expired quote can arrive while reading the
+            # market clock. Re-read proof for this exact reservation at the wire.
+            el = await self._opening_owner_eligibility(claimed, h)
+            if el is None or el.owner_entry != owner_entry:
+                reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
+                if set(reasons) <= self.RESEARCH_TRANSIENT:
+                    return await self._hold(claimed, ", ".join(reasons), code="research_inputs_pending")
+                return self._skip(claimed, ", ".join(reasons), "owner_directive_invalid")
+            controls = replace(self._risk_controls(), owner_entry=el.owner_entry)
+            verdict = self.risk.evaluate_trade(snap, ti, now=self.now(), controls=controls)
+            if not verdict.ok:
+                return self._skip(claimed, "risk: " + "; ".join(verdict.reasons), "risk_refused",
+                                  risk_reasons=list(verdict.reasons))
         if verdict.allowed_existing_breaches if hasattr(verdict, "allowed_existing_breaches") else ():
             self.ledger.journal.append("risk.allowed_existing_breaches", intent_id=claimed.intent_id,
                                        symbol=intent.symbol, breaches=[
@@ -823,6 +877,8 @@ class ExecutionEngine:
         req = OrderRequest(symbol=intent.symbol, side="buy", qty=qty, type="limit", time_in_force="day",
                            limit_price=limit, client_order_id=claimed.client_order_id,
                            position_intent="buy_to_open")
+        if owner_marked:
+            return claimed, await self._place_and_wait(req), False
         # A top-up cannot rest next to our own sell stop (Alpaca rejects a
         # potential wash trade), so the stop is cancelled and confirmed first
         # and re-placed for the whole position straight after.
@@ -846,17 +902,67 @@ class ExecutionEngine:
     # and retried (it expires at the session close) instead of being skipped.
     RESEARCH_REFRESHABLE = frozenset({"quote_stale_or_unavailable", "news_stale_or_unavailable"})
     RESEARCH_TRANSIENT = RESEARCH_REFRESHABLE | frozenset({
-        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable"})
+        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable", "owner_proof_unavailable"})
     RESEARCH_REFRESH_TIMEOUT_S = 10.0
     # Aggregate cap so N due buys can't stall monitor_tick by N x 10s: at most this many seconds
     # of proof refresh per rolling minute; past it, stale proofs take the transient hold path.
     RESEARCH_REFRESH_BUDGET_S = 15.0
 
-    async def _eligibility(self, symbol: str) -> Any:
-        g = self._research_gate.is_entry_eligible(symbol, self.now())
+    @staticmethod
+    def _owner_marked(intent: OrderIntent) -> bool:
+        meta = intent.meta or {}
+        return (meta.get("adjustment_reason") == "owner_directive" or "owner_directive_added" in meta
+                or "owner_stock_claim" in meta)
+
+    async def _notify_owner_stock_uncertainty(self, intent: OrderIntent) -> bool:
+        meta = intent.meta or {}
+        added = meta.get("owner_stock_claim")
+        if added is None:
+            return False
+        if self.ledger.mark_owner_stock_uncertainty_notified(intent.symbol, date.fromisoformat(added)):
+            await self.alert(
+                "critical", f"{intent.symbol}: owner stock order outcome unknown",
+                f"Owner grade {meta.get('owner_conviction')}; model grade {meta.get('raw_conviction')}. "
+                f"The {added} stock entry remains reserved until order {intent.client_order_id} is reconciled. "
+                "Check the broker before deciding whether to re-arm the directive.",
+                key=f"owner-stock-uncertain-{intent.symbol}-{added}",
+            )
+        return True
+
+    async def _eligibility(self, symbol: str, **kwargs: Any) -> Any:
+        g = self._research_gate.is_entry_eligible(symbol, self.now(), **kwargs)
         if hasattr(g, "__await__"):
             g = await g
         return g
+
+    async def _opening_owner_eligibility(self, intent: OrderIntent, holding: Any) -> Any:
+        from stock_agent.research_gate import Eligibility, OwnerEntryProof
+
+        if (self._research_gate is None or intent.origin != "prescan" or intent.position_id
+                or (holding is not None and holding.qty != 0)):
+            return None
+        try:
+            el = await self._eligibility(intent.symbol, allow_owner=True, reservation_id=intent.intent_id)
+        except Exception as exc:
+            logger.warning("Owner entry proof unavailable for %s (%s)", intent.symbol, type(exc).__name__)
+            return Eligibility(False, ("owner_proof_unavailable",))
+        if getattr(el, "ok", None) is not True:
+            return el
+        proof = getattr(el, "owner_entry", None)
+        meta = intent.meta or {}
+        if not isinstance(proof, OwnerEntryProof) or proof.lane != "stock":
+            return Eligibility(False, ("owner_directive_wrong_proof_lane",))
+        if proof.thesis_id not in intent.thesis_ids:
+            return Eligibility(False, ("owner_directive_thesis_mismatch",))
+        expected = {
+            "adjustment_reason": "owner_directive", "owner_directive_added": proof.added.isoformat(),
+            "owner_conviction": proof.effective_conviction, "raw_conviction": proof.raw_conviction,
+            "effective_conviction": proof.effective_conviction,
+        }
+        mismatched = [field for field, value in expected.items() if meta.get(field) != value]
+        if mismatched:
+            return Eligibility(False, ("owner_directive_mismatch: " + ", ".join(mismatched),))
+        return el
 
     def _blocking_reasons(self, g: Any) -> tuple[str, ...]:
         if getattr(g, "ok", None) is True:
@@ -869,7 +975,8 @@ class ExecutionEngine:
                 or intent.origin not in self.RESEARCH_ORIGINS):
             return
         try:
-            g = await self._eligibility(intent.symbol)
+            g = (await self._eligibility(intent.symbol, allow_owner=True, reservation_id=intent.intent_id)
+                 if self._owner_marked(intent) else await self._eligibility(intent.symbol))
             if not set(self._blocking_reasons(g)) & self.RESEARCH_REFRESHABLE:
                 return
             loop = asyncio.get_running_loop()  # same clock as asyncio.timeout

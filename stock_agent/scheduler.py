@@ -21,7 +21,7 @@ from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsSer
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
-from stock_agent.ledger import JobStatus, NewIntent
+from stock_agent.ledger import JobStatus, NewIntent, filled_thesis_grade
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
 from stock_agent.news_service import NewsService
@@ -417,7 +417,9 @@ class StockAgentScheduler:
             if (thesis is None or not thesis.actionable) and holding.meta is not None:
                 thesis = self.ledger.last_filled_thesis(holding.meta.position_id)
             if thesis is not None and thesis.actionable:
-                grade = thesis.payload.get("effective_conviction")
+                owner_grade = (thesis.payload.get("adjustment_reason") == "owner_directive"
+                               or "owner_directive_added" in thesis.payload)
+                grade = filled_thesis_grade(thesis) if owner_grade else thesis.payload.get("effective_conviction")
                 if type(grade) is int and 1 <= grade <= 10:
                     convictions[holding.symbol] = grade
         commitments = getattr(self.options, "risk_commitments", None)

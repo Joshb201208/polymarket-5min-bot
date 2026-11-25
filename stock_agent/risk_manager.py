@@ -1,12 +1,13 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import StrEnum
 from typing import Protocol
 
 from stock_agent.config import Config
 from stock_agent.ledger import BookSnapshot
+from stock_agent.research_gate import OwnerEntryProof
 
 DRAWDOWN_STATE_KEY = "drawdown"
 _ZERO = Decimal(0)
@@ -303,6 +304,7 @@ class RiskControls:
     option_commitments: tuple[OptionCommitment, ...] = ()
     pending_sectors: Mapping[str, str] = field(default_factory=dict)
     holding_convictions: Mapping[str, int] = field(default_factory=dict)
+    owner_entry: OwnerEntryProof | None = None
 
 
 @dataclass(frozen=True)
@@ -1196,12 +1198,39 @@ class RiskManager:
         raw, effective = intent.raw_conviction, intent.effective_conviction
         floor = self.config.MIN_CONVICTION
         effective_floor = max(8 if option else floor, intent.minimum_conviction)
-        if (type(raw) is not int or type(effective) is not int
-                or not floor <= raw <= 10 or not effective_floor <= effective <= 10):
-            reasons.append("conviction_floor")
-        elif abs(raw - effective) > self.config.CONVICTION_MAX_ADJUSTMENT:
-            reasons.append("conviction_adjustment")
         now = now or snapshot.as_of
+        owner = controls.owner_entry
+        if owner is not None:
+            lane = {TradeKind.BUY: "stock", TradeKind.OPTION_OPEN: "option"}.get(kind)
+            valid = (
+                isinstance(owner, OwnerEntryProof) and lane is not None and owner.lane == lane
+                and intent.symbol.strip().upper() == owner.symbol
+                and owner.generated_at == intent.signal_at and now.utcoffset() is not None
+                and owner.added <= now.astimezone(UTC).date() <= owner.expires
+                and type(raw) is int and 1 <= raw <= 10 and owner.raw_conviction == raw
+                and type(effective) is int and max(floor, effective_floor, 7) <= effective <= 9
+                and owner.effective_conviction == effective
+            )
+            if valid and lane == "stock":
+                issuer = classify_symbol(owner.symbol).issuer
+                valid = not any(
+                    row.qty != 0 and classify_symbol(row.symbol).issuer == issuer for row in snapshot.holdings
+                ) and not any(
+                    candidate.remaining_qty > 0 and (
+                        classify_symbol(candidate.symbol).issuer == issuer
+                        or (candidate.asset_class == "us_option" and classify_symbol(candidate.symbol[:-15]).issuer
+                            == issuer)
+                    )
+                    for order in snapshot.open_orders for candidate in (order, *order.legs)
+                )
+            if not valid:
+                reasons.append("owner_directive_scope_mismatch")
+        else:
+            if (type(raw) is not int or type(effective) is not int
+                    or not floor <= raw <= 10 or not effective_floor <= effective <= 10):
+                reasons.append("conviction_floor")
+            elif abs(raw - effective) > self.config.CONVICTION_MAX_ADJUSTMENT:
+                reasons.append("conviction_adjustment")
         if not 0 <= (now - snapshot.as_of).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
             reasons.append("stale_broker_book")
         if intent.signal_at is None or not (
