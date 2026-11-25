@@ -471,26 +471,16 @@ def test_sec_recent_filings_scans_past_form4s_clamps_preopen_and_caches(world):
         if entry.get("symbol"):
             assert entry["symbol"] in DEFAULT_CIK_MAP
 
-    # Items 1.05 and 7.01 score as material 8-K items (score 8 vs sec_8k_other score 5).
-    non_mat = score_materiality(
-        "NVDA filed SEC Form 8-K (Items 9.01)",
-        "",
-        symbols=("NVDA",),
-        held_or_target={"NVDA"},
-        sec_form="8-K",
-        sec_items=("9.01",),
-    )
-    assert "sec_8k_other" in non_mat.reasons and non_mat.score == 5
-    for code in ("1.05", "7.01"):
+    # F6: Items 1.05 and 7.01 remain non-material 8-K items on ordinary universe symbols (identical to master).
+    for code in ("9.01", "1.05", "7.01"):
         verdict = score_materiality(
-            f"NVDA filed SEC Form 8-K (Items {code})",
+            f"XYZ filed SEC Form 8-K (Items {code})",
             "",
-            symbols=("NVDA",),
-            held_or_target={"NVDA"},
+            symbols=("XYZ",),
             sec_form="8-K",
             sec_items=(code,),
         )
-        assert verdict.is_material and "sec_8-k" in verdict.reasons and verdict.score == 8
+        assert "sec_8k_other" in verdict.reasons and verdict.score == 4 and not verdict.is_material
 
     preopen_now = datetime(2026, 11, 25, 11, 31, tzinfo=UTC)
     forms = ["4"] * 25 + ["8-K", "10-Q"]
@@ -546,4 +536,47 @@ def test_sec_recent_filings_scans_past_form4s_clamps_preopen_and_caches(world):
     assert nvda_filings[0].url == (
         "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000090/0001045810-26-000090-index.htm"
     )
+
+
+def test_fetch_recent_filings_preserves_order_up_to_25_plus_and_logs_overflow(world, caplog):
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 11, 25, 11, 31, tzinfo=UTC)
+    requested = [f"SYM{i:02d}" for i in range(28)]
+    queried: list[str] = []
+
+    def lookup_cik(sym: str) -> str:
+        idx = int(sym[3:]) + 1
+        return f"{idx:010d}"
+
+    def handle_any_sec(request):
+        cik = request.url.path.split("CIK")[1].split(".")[0]
+        queried.append(cik)
+        return {"cik": cik, "filings": {"recent": {"form": [], "filingDate": [], "accessionNumber": []}}}
+
+    world.sec.on("GET", "/submissions/*.json", handle_any_sec)
+    svc = NewsService(
+        config=make_cfg(),
+        cik_lookup=lookup_cik,
+        enable_sec_filings=True,
+        now=lambda: now,
+    )
+
+    async def run_test():
+        try:
+            with caplog.at_level(logging.WARNING, logger="stock_agent.news_service"):
+                # Default max_symbols=30 handles all 28 (>= 25 focus cap) in exact caller order without dropping.
+                await svc.fetch_recent_filings(requested[:25], now=now)
+                assert queried == [f"{i + 1:010d}" for i in range(25)]
+
+                queried.clear()
+                svc._recent_filings_cache.clear()
+                await svc.fetch_recent_filings(requested, now=now, max_symbols=25)
+                assert queried == [f"{i + 1:010d}" for i in range(25)]
+        finally:
+            await svc.aclose()
+
+    run(run_test())
+    assert any("SYM25,SYM26,SYM27" in rec.message for rec in caplog.records)
+
 

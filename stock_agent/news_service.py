@@ -944,6 +944,7 @@ class NewsService:
         now: datetime | None = None,
         lookback_days: int = 120,
         per_symbol_limit: int = 4,
+        max_symbols: int = 30,
     ) -> dict[str, tuple[NewsItem, ...]]:
         """Return recent issuer EDGAR filings (8-K/10-Q/10-K/6-K/20-F) cached per symbol."""
         if not self.enable_sec_filings or not symbols or lookback_days <= 0 or per_symbol_limit <= 0:
@@ -952,9 +953,20 @@ class NewsService:
         if self.health.is_blocked("sec", "edgar", now=now_utc):
             return {}
         since_day_iso = (now_utc.astimezone(ET).date() - timedelta(days=lookback_days)).isoformat()
-        resolved_syms = list(
+        all_resolved = list(
             dict.fromkeys(self._resolve_symbol(str(s)) for s in symbols if s and str(s).strip())
-        )[:15]
+        )
+        cap = max(1, int(max_symbols))
+        if len(all_resolved) > cap:
+            dropped = tuple(all_resolved[cap:])
+            logger.warning(
+                "fetch_recent_filings capped at %d symbols; dropped=%s",
+                cap,
+                ",".join(dropped),
+            )
+            resolved_syms = all_resolved[:cap]
+        else:
+            resolved_syms = all_resolved
         focus_live = set()
         try:
             focus_live = {self._resolve_symbol(s) for s in focus_symbols(now=now_utc, cadence="live")}
