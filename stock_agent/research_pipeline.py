@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, StaleBook, ThesisRole
-from stock_agent.llm_client import ModelRoute, ProviderUnavailable
+from stock_agent.llm_client import ModelRoute, ProviderUnavailable, SCHEDULED_REVIEW_TRANSPORT_SECONDS
 from stock_agent.research_focus import FocusItem, focus_symbols, owner_backed
 from stock_agent.research_notes import load_notes, research_notes_payload
 from stock_agent.research_schemas import Direction, Evidence, OwnerThesisDraft, ResearchTask, utc_datetime
@@ -28,6 +28,10 @@ _INPUT_BLOCKERS = {"broker_book_blocked", "broker_book_unavailable", "quote_stal
                    "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
 _FRESH_SET = "research:fresh_scheduled_set"
 _SCHEDULED = {"prescan", "weekly", "midweek"}
+PRESCAN_MAX_RUNTIME = 2_100
+_PRESCAN_OPEN_BUFFER = timedelta(minutes=10)
+_PRESCAN_PRICE_TIMEOUT = 15
+_PRESCAN_REVIEW_BUDGET = SCHEDULED_REVIEW_TRANSPORT_SECONDS + _PRESCAN_PRICE_TIMEOUT + 10
 _HANDOFF_TRANSIENT = {"broker_book_unavailable",
                       "quote_stale_or_unavailable", "news_stale_or_unavailable", "llm_unavailable"}
 
@@ -43,6 +47,10 @@ def _edgar_filing(url: str) -> bool:
 
 def _edgar_index_only(url: str) -> bool:
     return _edgar_filing(url) and urlsplit(url).path.lower().endswith(("-index.htm", "-index.html"))
+
+
+def prescan_runtime_seconds(now: datetime, opens_at: datetime) -> float:
+    return max(0.0, min(PRESCAN_MAX_RUNTIME, (opens_at - _PRESCAN_OPEN_BUFFER - now).total_seconds()))
 
 
 class SourceUnavailable(RuntimeError):
@@ -212,13 +220,19 @@ class ResearchPipeline:
     async def run(self, kind: str, snapshot: BookSnapshot | None = None, *, work_scope: str | None = None) -> JobOutcome:
         # Avoid overlapping scheduled/news windows superseding a thesis
         # during its independent review. Broker protection has its own lane.
+        started_at = self.clock() if kind == "prescan" and work_scope is None else None
+        started = asyncio.get_running_loop().time() if started_at is not None else None
         async with self._analysis_lock:
             funnel = _EntryFunnel()
             session = self._session(self.clock())
             if session is None:
                 return JobOutcome(JobStatus.SKIPPED, detail={"reason": "no_execution_session"})
+            deadline = None
+            if started_at is not None and started_at < session.opens_at:
+                runtime = prescan_runtime_seconds(started_at, session.opens_at)
+                deadline = started + runtime, started_at + timedelta(seconds=runtime)
             try:
-                outcome = await self._run(kind, snapshot, session, funnel, work_scope)
+                outcome = await self._run(kind, snapshot, session, funnel, work_scope, deadline=deadline)
             except SourceUnavailable:
                 intents, ideas = self._recover()
                 funnel.rejected_by_reason["required_source_unavailable"] += 1
@@ -233,7 +247,7 @@ class ResearchPipeline:
                 detail["universe_sources"] = dict(universe_sources)
             return replace(outcome, detail=detail)
 
-    async def _run(self, kind, snapshot, session, funnel, work_scope) -> JobOutcome:
+    async def _run(self, kind, snapshot, session, funnel, work_scope, *, deadline=None) -> JobOutcome:
         now = self.clock()
         held = {row.symbol: row for row in (snapshot or self.ledger.snapshot()).holdings if row.qty > 0}
         for pending in self.store.due_confirmations(now):
@@ -312,7 +326,9 @@ class ResearchPipeline:
                 ranked_symbols.sort(key=lambda symbol: not _fresh_quote(
                     securities[symbol], screen_at, max_age=timedelta(seconds=90),
                 ))
-            chosen = tuple(dict.fromkeys((*held, *directives, *focus, *(daily if prescan else ()), *ranked_symbols[:8])))
+            order = ((*directives, *held, *daily, *ranked_symbols[:8], *focus) if prescan
+                     else (*held, *directives, *focus, *ranked_symbols[:8]))
+            chosen = tuple(dict.fromkeys(order))
             background = getattr(self.sources, "background", None)
             if background is not None:
                 stories = await background(chosen)
@@ -322,7 +338,7 @@ class ResearchPipeline:
                         securities[symbol] = replace(row, evidence=(*stories.get(symbol, ()), *row.evidence))
             work = [(sym, f"{work_scope or kind}:{now.astimezone(NY).date()}:{sym}", None) for sym in chosen]
 
-        failed = attempted = deferred = 0
+        failed = attempted = deferred = time_deferred = 0
         for symbol, key, story in work:
             if (work_scope and work_scope.startswith("catchup-")
                     and self._has_scheduled_entry(symbol, session.date)):
@@ -347,6 +363,13 @@ class ResearchPipeline:
                     owner = directive
             if directive and symbol not in held and owner is None:
                 funnel.rejected_by_reason["owner_directive_inactive"] += 1
+                continue
+            if deadline is not None and min(deadline[0] - asyncio.get_running_loop().time(),
+                                            (deadline[1] - as_of).total_seconds()) <= _PRESCAN_REVIEW_BUDGET:
+                # Do not claim or make a reservation for an unstarted tail.
+                # An in-flight provider can bill even when its caller cancels.
+                if self.store.ready(key, as_of):
+                    time_deferred += 1
                 continue
             if not self.store.claim_work(key, symbol, as_of):
                 state = self.store.work_state(key)
@@ -386,13 +409,17 @@ class ResearchPipeline:
                 )
         collected, ideas = self._recover()
         incomplete = (attempted and failed == attempted and not collected and not ideas) or (deferred and kind != "news")
+        if time_deferred:
+            funnel.rejected_by_reason["prescan_time_budget"] += time_deferred
         status = JobStatus.FAILED if incomplete else JobStatus.DONE
         if kind in _SCHEDULED and funnel.screened and funnel.healthy_unheld_theses and not funnel.handoff_staged and (
-            not failed and not deferred and not
+            not failed and not deferred and not time_deferred and not
             ((_INPUT_BLOCKERS | {"target_session_closed"}) & funnel.rejected_by_reason.keys())
         ):
             self.store.store.kv_set(_FRESH_SET, now.isoformat())
-        return JobOutcome(status, collected, {"reviewed": attempted, "unavailable": failed, "deferred": deferred}, ideas)
+        return JobOutcome(status, collected, {
+            "reviewed": attempted, "unavailable": failed, "deferred": deferred + time_deferred,
+        }, ideas)
 
     def _has_scheduled_entry(self, symbol: str, session_date: date) -> bool:
         if self.store.protects_scheduled_buy(symbol, session_date.isoformat()):
@@ -731,7 +758,14 @@ class ResearchPipeline:
             previous = previous_session(session.date) if previous_session is not None else None
             completed = getattr(self.sources, "completed_close", None)
             if previous is not None and completed is not None:
-                price = await completed(symbol, previous.date)
+                if kind == "prescan" and reanchor is None:
+                    try:
+                        async with asyncio.timeout(_PRESCAN_PRICE_TIMEOUT):
+                            price = await completed(symbol, previous.date)
+                    except TimeoutError:
+                        price = None
+                else:
+                    price = await completed(symbol, previous.date)
                 if price is not None:
                     anchor_kind = "completed_split_adjusted_close"
         if anchor_kind is None and scheduled and now.astimezone(NY).date() == session.date:
@@ -758,18 +792,22 @@ class ResearchPipeline:
         # web search is useful when it fills a gap, not a second mandatory feed.
         needs_search = not grounding_evidence
         best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
+        search_policy = ({"long_search": True} if (reanchor is None and story is None
+                         and kind in {"prescan", "weekly", "market_move"} and key.startswith(f"{kind}:")) else {})
         if owner:
             if data.price is None:
                 raise OwnerReviewUnavailable("no_quote_or_completed_close")
-            result = await self.analyst.evaluate(data, task=task, grounded=True, owner=owner)
+            result = await self.analyst.evaluate(data, task=task, grounded=True, owner=owner, **search_policy)
         elif best_ideas:
             # A dated market story or provider metric does not replace filing
             # research. Do not infer official issuer domains from ticker symbols.
-            result = await self.analyst.evaluate(data, task=task, grounded=recent_primary is None, best_ideas=True)
+            result = await self.analyst.evaluate(data, task=task, grounded=recent_primary is None, best_ideas=True,
+                                                 **search_policy)
         else:
             result = await self.analyst.evaluate(
                 data, task=task, grounded=bool(held_owner_option) or needs_search,
                 **({"single_review": True} if held_owner_option else {}),
+                **search_policy,
             )
         record = result.record
         direction = record.draft.direction

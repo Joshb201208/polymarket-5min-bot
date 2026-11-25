@@ -583,6 +583,59 @@ def test_protection_continues_while_live_news_waits(tmp_path, monkeypatch):
     asyncio.run(check())
 
 
+def test_prescan_does_not_block_morning_brief_or_reconcile(tmp_path, monkeypatch):
+    async def check():
+        now = datetime(2026, 11, 27, 8, tzinfo=ET)
+        sched, _ = build(tmp_path, monkeypatch, now, engine=EngineStub([]), research=object())
+        sched.store.open()
+        sched._normalised = sched._reconciled = sched._engine_resumed = True
+        sched._last_reconcile_at = now
+        started, release, brief_ran = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        reconcile = []
+        timeouts = {}
+        schedule = sched._schedule_job
+
+        def record(name, key, callback, *, timeout, **kwargs):
+            timeouts[name] = timeout
+            return schedule(name, key, callback, timeout=timeout, **kwargs)
+
+        async def prescan():
+            started.set()
+            await release.wait()
+
+        async def brief():
+            brief_ran.set()
+
+        async def reconcile_tick(reason):
+            reconcile.append(reason)
+
+        monkeypatch.setattr(sched, "_schedule_job", record)
+        monkeypatch.setattr(sched, "_run_daily_prescan", prescan)
+        monkeypatch.setattr(sched, "_send_morning_brief", brief)
+        monkeypatch.setattr(sched, "_reconcile_scheduler", reconcile_tick)
+        monkeypatch.setattr(sched, "_should_run_weekly", lambda _: True)
+        monkeypatch.setattr(sched, "_should_run_earnings_check", lambda _: False)
+        monkeypatch.setattr(sched, "_should_run_macro_check", lambda _: False)
+        monkeypatch.setattr(sched, "_should_refresh_assets", lambda _: False)
+        try:
+            await sched._tick(now)
+            await asyncio.wait_for(started.wait(), 1)
+            assert timeouts == {"prescan": 2100}
+            later = now + timedelta(minutes=15)
+            monkeypatch.setattr(module, "_now_et", lambda: later)
+            monkeypatch.setattr(module, "_now_utc", lambda: later)
+            await sched._tick(later)
+            await asyncio.wait_for(brief_ran.wait(), 1)
+            assert not sched._job_tasks["prescan"].done()
+            assert reconcile == ["scheduler tick"]
+            assert timeouts["morning_brief"] == 90 and "weekly" not in timeouts
+        finally:
+            release.set()
+            await sched._cleanup()
+
+    asyncio.run(check())
+
+
 def test_readiness_follows_reconcile_and_shutdown_wakes_idle_loop(tmp_path, monkeypatch):
     async def check():
         now = datetime(2026, 11, 27, 22, tzinfo=ET)

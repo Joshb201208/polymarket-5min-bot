@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -7,8 +8,11 @@ import httpx
 import pytest
 
 from stock_agent.analyst import Analyst, ResearchInput, _index_evidence
+from stock_agent.ledger import JobStatus
 from stock_agent.llm_client import LLMClient, LLMRequest, ProviderError, ProviderUnavailable
+from stock_agent.market_calendar import Session
 from stock_agent.research_focus import FocusItem
+from stock_agent.research_pipeline import prescan_runtime_seconds
 from stock_agent.research_schemas import Evidence, ResearchTask
 from tests.fakes.base import FakeInternet
 from tests.fakes.providers import FakeOpenAI, FakePerplexity, LLMReply
@@ -34,7 +38,7 @@ def completed(text=ANSWER, sources=SOURCES):
 
 def test_openai_search_payload_and_reservation_match_contract():
     fake = FakeOpenAI()
-    fake.reply(LLMReply(text=ANSWER, sources=SOURCES))
+    fake.reply(LLMReply(text="Search results", sources=SOURCES), ANSWER)
     reservations = []
     ledger = SimpleNamespace(reserve=lambda *args, **kwargs: reservations.append(args[2]) or True,
                              settle=lambda *args: None)
@@ -50,8 +54,116 @@ def test_openai_search_payload_and_reservation_match_contract():
             assert result.route.provider == "openai"
             assert fake.prompts[0]["tools"] == [{"type": "web_search"}]
             assert reservations[0] > 90_000  # Includes the documented search-window allowance.
+            assert 0 < reservations[1] < 10_000  # Only structure, no additional search fee.
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("use_supplied_id", [True, False])
+def test_openai_structures_against_returned_source_ids_and_ignores_second_pass_sources(use_supplied_id):
+    real_url = "https://example.org/returned-annotation"
+    fake_url = "https://example.org/made-up-by-structured-pass"
+    bodies = []
+    def endpoint(req):
+        body = json.loads(req.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(200, json={"status": "completed", "output": [
+                {"type": "web_search_call", "status": "completed", "action": {"sources": [
+                    *({"url": f"https://example.org/other/{index}"} for index in range(20)),
+                    {"url": real_url, "published_at": (NOW - timedelta(days=1)).isoformat()},
+                ]}},
+                {"type": "message", "content": [{"type": "output_text", "text": "Search notes", "annotations": [
+                    {"type": "url_citation", "url": real_url, "title": "Returned primary evidence"},
+                ]}]},
+            ]})
+        assert "tools" not in body and body["text"]["format"]["strict"]
+        web = json.loads(body["input"].split("INPUT_JSON:\n")[1])["web_evidence"]
+        assert len(web) == 8 and web[0]["url"] == real_url and web[0]["title"] == "Returned primary evidence"
+        wire = response(body, cite=web[0]["evidence_id"] if use_supplied_id else fake_url).json()
+        wire["output"][0]["action"]["sources"] = [{"url": fake_url, "published_at": NOW.isoformat()}]
+        return httpx.Response(200, json=wire)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            analyst = Analyst(LLMClient(settings(PERPLEXITY_API_KEY=""), client=http, now=lambda: NOW))
+            data = ResearchInput("ABC", NOW, "ABC", "t", 20, None, {}, ())
+            if use_supplied_id:
+                result = await analyst.evaluate(data, best_ideas=True)
+                assert result.record.draft.claims[0].evidence_ids == [result.result.evidence[0].evidence_id]
+                assert not any(item.url == fake_url for item in result.result.evidence)
+            else:
+                with pytest.raises(ProviderUnavailable) as exc:
+                    await analyst.evaluate(data, best_ideas=True)
+                assert exc.value.failure_codes == {"failure_codes": ["openai:thesis_unknown_evidence"]}
+
+    asyncio.run(run())
+    assert len(bodies) == 2
+
+
+def test_scheduled_search_has_longer_timeouts_only_on_search_post(monkeypatch):
+    posted_timeouts, outer = [], []
+    actual_timeout = asyncio.timeout
+
+    def track_timeout(seconds):
+        outer.append(seconds)
+        return actual_timeout(seconds)
+
+    def endpoint(req):
+        posted_timeouts.append(req.extensions["timeout"]["read"])
+        return httpx.Response(200, json=completed())
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            llm = LLMClient(settings(PERPLEXITY_API_KEY=""), client=http, now=lambda: NOW)
+            await llm.complete(replace(request(), long_search=True))
+            await llm.complete(request())
+            await llm.complete(replace(request(grounded=False), long_search=True))
+
+    monkeypatch.setattr(asyncio, "timeout", track_timeout)
+    asyncio.run(run())
+    assert posted_timeouts == [75, 25, 25, 25, 25]
+    assert outer == [90, 30, 30, 30, 30]
+
+
+def test_prescan_prioritizes_directive_held_daily_and_defers_uncharged_tail(tmp_path):
+    clock, ledger, _, make_pipeline = rig(tmp_path)
+    ledger.broker.pos("HELD", 5, 20)
+    reviews = []
+
+    async def run():
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: pytest.fail("LLM must not be called"))) as http:
+            pipe = make_pipeline(http)
+            start = clock.t
+            opens = start + timedelta(minutes=90)
+            pipe.calendar.session_on = lambda day: Session(day, opens, opens + timedelta(hours=6))
+            pipe.directives = lambda **_: {"OWNER": FocusItem(
+                "OWNER", None, "Fixture", start.date(), start.date(), stance="bullish", owner_conviction=8,
+            )}
+            pipe.daily_focus = lambda **_: ("DAILY",)
+            pipe.focus = lambda **_: ("FOCUS",)
+
+            async def review(kind, key, item, holding, *_, **kwargs):
+                reviews.append((item.symbol, holding is not None, kwargs["owner"] is not None))
+                pipe.store.finish_work(key, "no_action")
+                if item.symbol == "DAILY":
+                    clock.t = start + timedelta(minutes=30)
+
+            pipe._review = review
+            outcome = await pipe.run("prescan")
+            assert outcome.status is JobStatus.DONE and outcome.detail["reviewed"] == 3
+            assert outcome.detail["deferred"] == 2 and outcome.detail["unavailable"] == 0
+            assert outcome.detail["entry_funnel"]["rejected_by_reason"]["prescan_time_budget"] == 2
+            assert pipe.store.work_state(f"prescan:{start.date()}:ABC") is None
+            assert pipe.store.work_state(f"prescan:{start.date()}:FOCUS") is None
+            assert pipe.store.available_budget(clock.t)["billed_or_reserved_microusd"] == 0
+            assert prescan_runtime_seconds(start, opens) == 2100
+            assert prescan_runtime_seconds(opens - timedelta(minutes=31), opens) == 1260
+            assert prescan_runtime_seconds(opens - timedelta(minutes=9), opens) == 0
+
+    asyncio.run(run())
+    assert reviews == [("OWNER", False, True), ("HELD", True, False), ("DAILY", False, False)]
 
 
 def test_perplexity_fake_counts_search_and_answer_against_one_cap():
@@ -124,7 +236,7 @@ def test_owner_retries_transport_but_not_a_parsed_decision(first, kind, code, ca
             assert ProviderUnavailable(attempts).failure_codes == ({"failure_codes": [f"perplexity:{code}"]} if code else {})
 
     asyncio.run(run())
-    assert calls == ["api.perplexity.ai"] + (["api.openai.com"] if can_fallback else [])
+    assert calls == ["api.perplexity.ai"] + (["api.openai.com"] * 2 if can_fallback else [])
     if kind in {"decision_rejected", "no_grounding"}:
         assert not health
 

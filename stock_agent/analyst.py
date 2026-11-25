@@ -185,6 +185,7 @@ class Analyst:
         self, data: ResearchInput, *, task: ResearchTask = ResearchTask.THESIS,
         adjustment: int = 0, adjustment_reason: str = "", grounded: bool = True,
         best_ideas: bool = False, owner: FocusItem | None = None, single_review: bool = False,
+        long_search: bool = False,
     ) -> ThesisEvaluation:
         _validate_inputs(data)
         held = data.holding is not None
@@ -250,7 +251,7 @@ class Analyst:
         request = LLMRequest(
             task, OwnerThesisDraft if owner else ThesisDraft, version, prompt, inputs, grounded,
             validate=validate, exit_work=held, single_review=owner is not None or single_review,
-            local_decision_validation=owner is not None,
+            local_decision_validation=owner is not None, long_search=long_search,
         )
         result = await self.llm.complete(request)
         known = _index_evidence(data, result.evidence)

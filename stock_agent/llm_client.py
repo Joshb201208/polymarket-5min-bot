@@ -27,6 +27,15 @@ _INPUT_BUDGET = 48_000
 _SEARCH_TOKENS = 2_500
 _OPENAI_SEARCH_WINDOW = 128_000
 _TOOL_CALLS = 2
+_HTTP_TIMEOUT = (25.0, 30)
+_SCHEDULED_SEARCH_TIMEOUT = (75.0, 90)
+# Perplexity one search POST, OpenAI and Claude one search + one structured
+# POST each. Prescan uses this to avoid dispatching work it cannot finish.
+SCHEDULED_REVIEW_TRANSPORT_SECONDS = 3 * _SCHEDULED_SEARCH_TIMEOUT[1] + 2 * _HTTP_TIMEOUT[1]
+_SEARCH_INSTRUCTIONS = (
+    "Search for primary evidence relevant to the supplied symbol. Use exactly one focused web "
+    "search query and do not search again. Return brief source-cited facts, not a recommendation."
+)
 _PROVIDER_CODES = frozenset({
     "insufficient_quota", "quota_exceeded", "insufficient_credits", "billing_hard_limit_reached",
     "invalid_request_error", "invalid_request", "invalid_type", "invalid_value", "unsupported_value",
@@ -127,6 +136,7 @@ class LLMRequest(Generic[T]):
     exit_work: bool = False
     single_review: bool = False
     local_decision_validation: bool = False
+    long_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -320,19 +330,38 @@ class LLMClient:
     async def _execute(self, route: ModelRoute, request: LLMRequest, blob: str) -> _Response:
         evidence: tuple[Evidence, ...] = ()
         added_cost: int | None = 0
-        if route.provider == "anthropic" and request.grounded:
-            # Claude's native web citations are incompatible with JSON mode.
+        split_search = request.grounded and route.provider in {"anthropic", "openai"}
+        if split_search:
+            # Search first, then supply the source IDs explicitly. A single
+            # structured OpenAI response cannot know our post-search IDs.
             ground = self._payload(route, request, blob, evidence_pass=True)
             grounded_data, added_cost = await self._post(route, request, ground, search=True)
-            # The evidence pass can end at its token cap after the server
-            # already returned result blocks. Only the blocks feed pass two.
+            if route.provider == "openai":
+                self._require_completed(route, grounded_data)
+            # Claude's evidence pass can reach its token cap after the
+            # tool already returned results. Only evidence feeds pass two.
             evidence = self._evidence(route.provider, grounded_data)
             if not evidence:
                 raise ProviderError(route.provider, route.model, "no_grounding")
-            bounded = [item.model_dump(mode="json") for item in evidence[:8]]
-            blob = json.dumps({"original_input": json.loads(blob), "web_evidence": bounded}, ensure_ascii=False)
+            original = json.loads(blob)
+            if route.provider == "openai":
+                # Only supplied sources may be resolved by the second pass.
+                # Trim to the largest bounded list that fits the actual wire.
+                evidence = evidence[:8]
+                while evidence:
+                    bounded = [item.model_dump(mode="json") for item in evidence]
+                    candidate = json.dumps({"original_input": original, "web_evidence": bounded}, ensure_ascii=False)
+                    if len(json.dumps(self._payload(route, request, candidate), ensure_ascii=False).encode()) <= _INPUT_BUDGET:
+                        blob = candidate
+                        break
+                    evidence = evidence[:-1]
+                if not evidence:
+                    raise ProviderError(route.provider, route.model, "input_limit")
+            else:
+                bounded = [item.model_dump(mode="json") for item in evidence[:8]]
+                blob = json.dumps({"original_input": original, "web_evidence": bounded}, ensure_ascii=False)
         payload = self._payload(route, request, blob)
-        live = request.grounded and route.provider != "anthropic"
+        live = request.grounded and not split_search
         data, cost = await self._post(route, request, payload, search=live)
         if route.provider == "anthropic":
             if data.get("stop_reason") != "end_turn":
@@ -340,24 +369,29 @@ class LLMClient:
                                     code=_provider_code(data.get("stop_reason")))
             text = "".join(row.get("text", "") for row in data["content"] if row["type"] == "text")
         else:
-            if data.get("status") != "completed" or data.get("error") or data.get("incomplete_details"):
-                incomplete, error = data.get("incomplete_details"), data.get("error")
-                raise ProviderError(route.provider, route.model, "incomplete_output", code=_provider_code(
-                    incomplete.get("reason") if isinstance(incomplete, dict) else None,
-                    error.get("code") if isinstance(error, dict) else None,
-                    error.get("type") if isinstance(error, dict) else None,
-                ))
+            self._require_completed(route, data)
             text = "".join(
                 part["text"] for row in data["output"] if row.get("type") == "message"
                 for part in row.get("content", ()) if part.get("type") == "output_text"
             )
-            evidence = self._evidence(route.provider, data)
+            if not split_search:
+                evidence = self._evidence(route.provider, data)
             if live and not evidence and not request.single_review:
                 raise ProviderError(route.provider, route.model, "no_grounding")
         if not text or len(text.encode()) > 22_000:
             raise ProviderError(route.provider, route.model, "invalid_output",
                                 code="answer_too_large" if text else "answer_empty")
         return _Response(text, evidence, None if added_cost is None or cost is None else added_cost + cost, data.get("model"))
+
+    @staticmethod
+    def _require_completed(route: ModelRoute, data: dict) -> None:
+        if data.get("status") != "completed" or data.get("error") or data.get("incomplete_details"):
+            incomplete, error = data.get("incomplete_details"), data.get("error")
+            raise ProviderError(route.provider, route.model, "incomplete_output", code=_provider_code(
+                incomplete.get("reason") if isinstance(incomplete, dict) else None,
+                error.get("code") if isinstance(error, dict) else None,
+                error.get("type") if isinstance(error, dict) else None,
+            ))
 
     def _payload(self, route: ModelRoute, request: LLMRequest, blob: str, *, evidence_pass: bool = False) -> dict:
         schema = transport_schema(request.value_type)
@@ -369,10 +403,7 @@ class LLMClient:
                 "messages": [{"role": "user", "content": bounded}],
             }
             if evidence_pass:
-                body["system"] = (
-                    "Search for primary evidence relevant to the supplied symbol. Use exactly one focused web "
-                    "search query and do not search again. Return brief source-cited facts, not a recommendation."
-                )
+                body["system"] = _SEARCH_INSTRUCTIONS
                 body["tools"] = [{
                     "name": "web_search", "type": "web_search_20250305", "max_uses": 1,
                     **({"allowed_domains": list(request.domains)} if request.domains else {}),
@@ -396,8 +427,8 @@ class LLMClient:
         else:
             body["store"] = False
             body["reasoning"] = {"effort": "low"}
-            body["text"] = {"format": {"type": "json_schema", "name": schema_name, "schema": schema, "strict": True}}
-            if request.grounded:
+            if evidence_pass:
+                body["instructions"] = _SEARCH_INSTRUCTIONS
                 body["tool_choice"] = "required"
                 body["max_tool_calls"] = _TOOL_CALLS
                 body["include"] = ["web_search_call.action.sources"]
@@ -405,6 +436,13 @@ class LLMClient:
                     "type": "web_search",
                     **({"filters": {"allowed_domains": list(request.domains)}} if request.domains else {}),
                 }]
+            else:
+                body["text"] = {"format": {"type": "json_schema", "name": schema_name, "schema": schema, "strict": True}}
+                if request.grounded:
+                    body["instructions"] += (
+                        "\nFor citations, use the exact evidence_id from original_input.evidence or web_evidence. "
+                        "Do not invent IDs or use source numbers. Omit claims you cannot support."
+                    )
         return body
 
     async def _post(self, route: ModelRoute, request: LLMRequest, body: dict, *, search: bool) -> tuple[dict, int | None]:
@@ -429,13 +467,14 @@ class LLMClient:
             raise ProviderError(route.provider, route.model, "budget")
         cost = None
         try:
+            client_timeout, outer_timeout = _SCHEDULED_SEARCH_TIMEOUT if search and request.long_search else _HTTP_TIMEOUT
             if self._client is None:
-                self._client = httpx.AsyncClient(timeout=25.0)
+                self._client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT[0])
             headers = {"Authorization": f"Bearer {self._key(route.provider)}"}
             if route.provider == "anthropic":
                 headers["anthropic-version"] = "2026-10-21"
-            async with asyncio.timeout(30):
-                resp = await self._client.post(_ENDPOINTS[route.provider], json=body, headers=headers)
+            async with asyncio.timeout(outer_timeout):
+                resp = await self._client.post(_ENDPOINTS[route.provider], json=body, headers=headers, timeout=client_timeout)
             try:
                 data = resp.json()
                 invalid_json = False
@@ -533,10 +572,12 @@ class LLMClient:
                 rows.extend((row, "claude_search" if provider == "anthropic" else None) for row in content or ())
             elif kind == "message":
                 for piece in item.get("content", ()):
-                    rows.extend((row, None) for row in piece.get("annotations", ()) if row.get("type") == "url_citation")
+                    rows.extend((row, "openai_citation" if provider == "openai" else None)
+                                for row in piece.get("annotations", ()) if row.get("type") == "url_citation")
             elif kind == "text":
                 rows.extend((row, None) for row in item.get("citations") or ())
         found: dict[str, Evidence] = {}
+        annotated = {}
         claude_result = False
         now = self.now()
         for row, source in rows:
@@ -545,21 +586,32 @@ class LLMClient:
                 continue
             if source == "claude_search" and row.get("type") == "web_search_result":
                 claude_result = True
-            evidence_id = str(row.get("id") or hashlib.sha256(url.encode()).hexdigest()[:16])
+            if source == "openai_citation":
+                annotated[url] = None
+            evidence_id = str((row.get("id") if provider != "openai" else None)
+                              or hashlib.sha256(url.encode()).hexdigest()[:16])
             if source == "perplexity_search":
                 published = utc_datetime(row.get("published_at"))
                 day_bound = _earliest_publication(row.get("date"), now) if published is None else None
             else:
                 published = utc_datetime(row.get("published_at") or row.get("date"))
                 day_bound = None
-            found.setdefault(url, Evidence(
+            item = Evidence(
                 evidence_id=evidence_id, url=url, title=str(row.get("title") or "")[:250],
                 published_at=published or day_bound, date_precision="day" if day_bound else "instant",
                 retrieved_at=now, publisher=urlsplit(url).hostname or "",
                 snippet=str(row.get("snippet") or row.get("cited_text") or "")[:800],
-            ))
+            )
+            prior = found.setdefault(url, item)
+            if source == "openai_citation" and prior is not item:
+                # The tool source list often contains only URLs; keep citation
+                # titles without replacing real metadata from the same URL.
+                found[url] = prior.model_copy(update={"title": prior.title or item.title,
+                                                       "snippet": prior.snippet or item.snippet})
         if claude_search_limit and not claude_result:
             raise ProviderError(provider, "", "search_failed", code="max_uses_exceeded")
+        if annotated:
+            found = {**{url: found[url] for url in annotated}, **found}
         return tuple(found.values())[:16]
 
 

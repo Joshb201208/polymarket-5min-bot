@@ -32,7 +32,7 @@ from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_health import ResearchInputHealth
-from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline
+from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline, prescan_runtime_seconds
 from stock_agent.research_sources import ResearchSources
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import (
@@ -952,7 +952,7 @@ class StockAgentScheduler:
             ("assets", self._should_refresh_assets, self._refresh_session_assets, 90),
             ("macro", self._should_run_macro_check, self._run_macro_check, 120),
             ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
-            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
+            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, None),
             ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
             ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 55),
             ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
@@ -965,7 +965,16 @@ class StockAgentScheduler:
                 continue
             if name in {"weekly", "prescan", "midweek"} and "catchup" in self._job_tasks:
                 continue
+            if name in {"weekly", "midweek"} and "prescan" in self._job_tasks:
+                continue
+            if name == "prescan" and any(other in self._job_tasks for other in ("earnings", "weekly", "midweek")):
+                continue
             if not self._shutdown and due(now_et):
+                if name == "prescan":
+                    session = self.calendar.session_on(now_et.date())
+                    timeout = prescan_runtime_seconds(_now_et(), session.opens_at) if session else 0
+                    if timeout <= 0:
+                        continue
                 key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
                 self._schedule_job(name, key, callback, timeout=timeout, replay=name not in {
                     "morning_brief", "daily_summary",

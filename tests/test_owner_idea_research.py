@@ -17,7 +17,7 @@ from stock_agent.research_pipeline import NewsEvent, OptionIdea
 from stock_agent.research_schemas import Direction, Evidence
 from stock_agent.scheduler import StockAgentScheduler
 from tests.test_review_research import START
-from tests.test_scheduled_best_ideas import FILING, response, rig
+from tests.test_scheduled_best_ideas import FILING, openai_search_pass, original_input, response, rig
 
 
 def _prescan(pipe, clock):
@@ -60,9 +60,12 @@ def test_owner_decision_is_priced_evidence_bound_and_never_silently_abstains(
     def endpoint(req):
         body = json.loads(req.content)
         calls.append(body)
+        if openai_search_pass(body):
+            assert original_input(body)["owner_directive"]["note"] == directive.note
+            return response(body)
         assert "Act as a risk reviewer" in body["instructions"]
-        assert body["tools"]  # An EDGAR input (even when dated) does not disable owner grounding.
-        assert json.loads(body["input"].split("INPUT_JSON:\n")[1])["owner_directive"]["note"] == directive.note
+        assert "web_evidence" in body["input"]
+        assert original_input(body)["owner_directive"]["note"] == directive.note
         return _reply(body, direction=direction, stop=stop)
 
     async def run():
@@ -81,7 +84,7 @@ def test_owner_decision_is_priced_evidence_bound_and_never_silently_abstains(
     outcome = asyncio.run(run())
     journal = list(ledger.journal.read({"research.owner_directive"}))
     assert [row["outcome"] for row in journal] == [expected]
-    assert len(calls) == 1
+    assert len(calls) == 2 and openai_search_pass(calls[0])
     assert ledger.owner_directive_vetoed("ABC", directive.added) is (expected == "vetoed")
     assert not ledger.owner_directive_used("ABC", directive.added)
     if expected == "proposed":
@@ -110,7 +113,9 @@ def test_daily_cadence_only_adds_forced_review_in_preopen_prescan(tmp_path):
 
     def endpoint(req):
         body = json.loads(req.content)
-        data = json.loads(body["input"].split("INPUT_JSON:\n")[1])
+        data = original_input(body)
+        if openai_search_pass(body):
+            return response(body)
         seen.append(data["symbol"])
         return response(body, direction="AVOID", symbol=data["symbol"])
 
@@ -141,6 +146,8 @@ def test_pre_directive_concern_can_be_noted_as_a_risk_in_one_priced_review(tmp_p
 
     def endpoint(req):
         body = json.loads(req.content)
+        if openai_search_pass(body):
+            return response(body)
         calls.append(body)
         raw = _reply(body, direction="BUY", stop=17).json()
         item = raw["output"][-1]["content"][0]
@@ -180,6 +187,8 @@ def test_unused_unheld_lane_gets_a_fresh_review_even_if_the_other_lane_was_used(
 
     def endpoint(req):
         body = json.loads(req.content)
+        if openai_search_pass(body):
+            return response(body)
         calls.append(body)
         return _reply(body, direction=direction, stop=17 if direction == "BUY" else None)
 
@@ -208,7 +217,7 @@ def test_analysis_anchors_option_only_research_while_underlying_quote_is_stale(t
 
     def endpoint(req):
         body = json.loads(req.content)
-        data = json.loads(body["input"].split("INPUT_JSON:\n")[1])
+        data = original_input(body)
         assert data["reference_price"] == 20
         assert (data["quote_at"] is None) is (anchor_kind == "completed_split_adjusted_close")
         assert data["metrics"]["reference_price_kind"] == anchor_kind
@@ -255,6 +264,8 @@ def test_staged_owner_handoff_survives_ordinary_review_or_defers_without_spendin
 
     def endpoint(req):
         body = json.loads(req.content)
+        if openai_search_pass(body):
+            return response(body)
         owner_review = "Act as a risk reviewer" in body["instructions"]
         reviews.append(owner_review)
         return _reply(body, direction="BUY", stop=17) if owner_review else response(body, direction="AVOID")
@@ -373,8 +384,10 @@ def test_metadata_only_filings_leave_ordinary_grounding_and_brief_stays_preopen(
 
     def endpoint(req):
         body = json.loads(req.content)
-        inputs = json.loads(body["input"].split("INPUT_JSON:\n")[1])
-        assert body["tools"]
+        inputs = original_input(body)
+        if not openai_search_pass(body):
+            assert "web_evidence" in body["input"]
+            return response(body, direction="AVOID")
         assert len(inputs["evidence"]) == 24
         assert any(row["evidence_id"] == "metadata" for row in inputs["evidence"])
         assert inputs["reference_price"] == (20 if preopen else None)
@@ -538,8 +551,10 @@ def test_later_held_review_reuses_one_model_call_and_never_overrides_stock_grade
 
     def endpoint(req):
         body = json.loads(req.content)
+        if openai_search_pass(body):
+            return response(body)
         calls.append(body)
-        data = json.loads(body["input"].split("INPUT_JSON:\n")[1])
+        data = original_input(body)
         assert data["holding"]["held"] is True
         assert "owner_directive" not in data
         raw = response(body, direction="HOLD", conviction=6).json()
