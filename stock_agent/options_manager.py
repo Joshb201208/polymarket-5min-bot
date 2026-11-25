@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import inspect
 import logging
+import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -59,8 +60,8 @@ from stock_agent.options_policy import (
     apply_result,
     breaks_thesis,
     build_proposal,
-    close_limit,
     exit_reason,
+    fallback_close_limit,
     in_cooldown,
     parse_direction,
     parse_occ,
@@ -1451,107 +1452,225 @@ class OptionsManager:
             total += lg.sign * lg.ratio * px
         return round(total, 4)
 
-    def _close_body(self, st: Structure, limit: float | None) -> dict:
+    def _close_body(self, st: Structure, limit: float) -> dict:
+        """Always a limit order: Alpaca rejects option market orders when there is no quote
+        ("please reenter with a limit order", live 25 Nov 2026). `limit` is the closing
+        value per share: + we receive, - we pay."""
         cid = st.close_client_id
         if len(st.legs) == 1:
             lg = st.legs[0]
             side = "sell" if lg.side == "buy" else "buy"
-            body = {"symbol": lg.symbol, "side": side, "qty": str(st.qty * lg.ratio),
-                    "time_in_force": "day", "position_intent": lg.close_intent, "client_order_id": cid}
-            if limit is None:
-                body["type"] = "market"
-            else:
-                body.update(type="limit", limit_price=f"{max(limit, 0.01):.2f}")
-            return body
-        body = {
+            px = limit if lg.side == "buy" else -limit  # sell at >= px / buy back at <= px
+            return {"symbol": lg.symbol, "side": side, "qty": str(st.qty * lg.ratio), "type": "limit",
+                    "limit_price": f"{max(px, 0.01):.2f}", "time_in_force": "day",
+                    "position_intent": lg.close_intent, "client_order_id": cid}
+        # mleg: positive = debit, negative = credit. A closing credit is sent negative.
+        return {
             "order_class": "mleg", "qty": str(st.qty), "time_in_force": "day", "client_order_id": cid,
+            "type": "limit", "limit_price": f"{(-limit) + 0.0:.2f}",
             "legs": [{"symbol": lg.symbol, "side": "sell" if lg.side == "buy" else "buy",
                       "ratio_qty": str(lg.ratio), "position_intent": lg.close_intent} for lg in st.legs],
         }
-        if limit is None:
-            body["type"] = "market"
+
+    @staticmethod
+    def _never_pays(st: Structure) -> bool:
+        """Closing a long-only structure or a debit vertical can never require paying."""
+        if all(lg.side == "buy" for lg in st.legs):
+            return True
+        # a debit vertical only while both legs are still there (a repair leaves a lone short)
+        return (st.strat.value in ("bull_call_spread", "bear_put_spread") and len(st.legs) == 2
+                and {lg.side for lg in st.legs} == {"buy", "sell"})
+
+    def _quote_limit(self, st: Structure, quotes: dict, frac: float) -> tuple[float | None, Any, Any]:
+        """(limit, natural, mid) from option quotes; None if they can't price the close."""
+        natural = self._value(st, quotes, "natural")
+        mid = self._value(st, quotes, "mid")
+        if natural is None or mid is None:
+            return None, natural, mid
+        px = mid - max(mid - natural, 0.0) * frac
+        limit = math.floor(round(px * 100, 6)) / 100
+        if self._never_pays(st):
+            floor_px = 0.01 if len(st.legs) == 1 else 0.0
+            if limit <= floor_px:
+                return None, natural, mid  # no real bid: price from intrinsic instead
+        return limit, natural, mid
+
+    def _close_quote_bad(self, q: ContractQuote | None, now: datetime) -> bool:
+        """Missing, crossed or stale quotes can't price a close (a zero bid on a long can)."""
+        if q is None or q.ask is None or q.ask <= 0:
+            return True
+        if q.bid is not None and q.ask < q.bid:
+            return True
+        return q.quote_at is not None and (now - q.quote_at).total_seconds() > self.settings.max_quote_age_s
+
+    def _close_session_reset(self, st: Structure, today: date) -> None:
+        if st.close_session != today.isoformat():
+            st.close_session = today.isoformat()
+            st.close_tries_session = 0
+            st.close_retry_after = None
+            st.close_zero_form = None
+
+    async def _close_alert_once(self, st: Structure, severity: str, title: str, body: str) -> None:
+        """One alert per structure per session, durable across restarts."""
+        key = f"opt-close-{st.id}-{st.close_session}"
+        seen = self.meta.setdefault("close_alerted", [])
+        if key in seen:
+            return
+        seen.append(key)
+        del seen[:-200]
+        self._save()
+        await self._alert(severity, title, body, key=key)
+
+    async def _close_try_failed(self, st: Structure, now: datetime, why: str, info: dict[str, Any],
+                                loud: bool = True) -> None:
+        """Count an unfilled or rejected close try: back off, and stop after the session cap.
+        Alerts once per session: at the first failure when `loud`, else when the cap is hit."""
+        s = self.settings
+        st.close_tries_session += 1
+        n = st.close_tries_session
+        steps = s.close_backoff_minutes or (15,)
+        st.close_retry_after = (now + timedelta(minutes=steps[min(n - 1, len(steps) - 1)])).isoformat()
+        deep = bool(info.get("deep_otm"))
+        done = n >= s.close_max_tries_per_session or st.close_zero_form == "stopped"
+        detail = (f"{why}. Legs {self._legs_summary(st)}, qty {st.qty}, spot {info.get('spot')}, "
+                  f"net intrinsic {info.get('intrinsic')}, limit tried {info.get('limit')}. ")
+        if done:
+            st.close_retry_after = None
+            st.note(f"close tries used up this session ({n}): "
+                    + ("deep out of the money, left to expire" if deep else "manual close needed"))
+            self._j("options.close_stopped", structure_id=st.id, underlying=st.underlying, tries=n,
+                    deep_otm=deep, **{k: v for k, v in info.items() if k != "deep_otm"})
+        self._save()
+        if not (done or loud):
+            return
+        if deep:
+            await self._close_alert_once(
+                st, "info", f"Options left to expire: {st.underlying}",
+                detail + f"Deep out of the money: at most {s.close_max_tries_per_session} limit tries this "
+                "session, never at market and never paying; otherwise it expires worthless.")
         else:
-            # mleg: positive = debit, negative = credit. A closing credit is sent negative.
-            body.update(type="limit", limit_price=f"{-limit:.2f}")
-        return body
+            await self._close_alert_once(
+                st, "critical", f"Options close not filled: {st.underlying}",
+                detail + f"Retrying with back-off, at most {s.close_max_tries_per_session} tries this "
+                "session, never at market. Close manually if it must not reach expiry.")
 
     async def _close(self, st: Structure, reason: ExitReason, now: datetime) -> str:
-        """Close a structure: limit rungs from mid towards the natural price, then
-        market on later attempts or when getting out is urgent."""
+        """Close a structure with limit orders only: rungs from mid towards the natural
+        price, the natural price when urgent, and, when the option quotes are unusable on an
+        expiry-driven or repair exit, a limit from the underlying's intrinsic value. Unfilled
+        or rejected tries back off (1, 2, 4, 8, 15 min) up to a per-session cap, with one alert."""
+        s = self.settings
         today = self._today(now)
+        self._close_session_reset(st, today)
+        if st.close_zero_form == "stopped" or st.close_tries_session >= s.close_max_tries_per_session:
+            return "close tries used up this session"
+        if st.close_retry_after and now < (_parse_ts(st.close_retry_after) or now):
+            return "backing off"
         days_left = self._trading_days(today, st.expiry_date)
-        # a lone short leg is closed at market straight away; time and ex-dividend exits
-        # escalate to market close to expiry or after two unfilled attempts
         urgent = reason is ExitReason.REPAIR or (
-            reason in (ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND)
-            and (days_left is None or days_left <= 1 or st.close_attempts >= 2))
+            reason in _EXPIRY_DRIVEN and (days_left is None or days_left <= 1 or st.close_attempts >= 2))
         if urgent or st.close_attempts >= 3:
-            fracs: list[float | None] = [None]
+            fracs = [1.0]
         elif st.close_attempts == 0:
-            fracs = [self.settings.limit_slippage_frac, 0.6, 1.0]
+            fracs = [s.limit_slippage_frac, 0.6, 1.0]
         else:
             fracs = [1.0]
         fallback = StructState.REPAIR if reason is ExitReason.REPAIR else StructState.OPEN
+        may_fallback = reason in _EXPIRY_DRIVEN or reason is ExitReason.REPAIR
         status = "not sent"
-        for i, frac in enumerate(fracs):
-            if i:
+        info: dict[str, Any] = {}
+        rung = 0
+        qty0 = st.qty
+        for frac in fracs:
+            if rung:
                 ok, _ = await self._gate("exit")
                 if not ok:
                     break
-            limit: float | None = None
-            natural = mid = None
-            if frac is not None:
-                try:
-                    quotes = await self._quotes([lg.symbol for lg in st.legs])
-                except BrokerError as e:
-                    if e.uncertain or e.kind == "auth":
-                        raise
-                    quotes = {}
-                natural = self._value(st, quotes, "natural")
-                mid = self._value(st, quotes, "mid")
-                if natural is not None and mid is not None:
-                    limit = close_limit(natural, mid, frac)
-                if limit is None or limit <= 0:
-                    if reason in _EXPIRY_DRIVEN:
-                        # nothing may be carried into expiry: without a usable quote, go market
-                        st.note("no usable quote for an expiry-driven exit; closing at market")
-                        limit = None
-                    else:
-                        # no usable quote: don't send a market order on a bad mark
-                        st.note("close skipped: no usable quote")
-                        self._save()
-                        return "no usable quote"
-            st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + i)
-            st.exit_reason = reason.value
-            st.state = StructState.CLOSING.value
-            self._save()  # write-ahead
-            self._j("options.exit_submitted", structure_id=st.id, underlying=st.underlying, reason=reason.value,
-                    attempt=st.close_attempts, rung=i, limit_credit=limit, natural=natural, mid=mid)
             try:
-                order = await self.broker.submit_raw_order(self._close_body(st, limit))
+                quotes = await self._quotes([lg.symbol for lg in st.legs])
             except BrokerError as e:
-                if e.uncertain:
-                    self._save()
+                if e.uncertain or e.kind == "auth":
                     raise
-                st.state = fallback.value
-                st.close_attempts += 1
-                st.note(f"close rejected: {e.message}")
-                self._save()
-                await self._rejected(st, "close", st.qty, e.message, f"Options close rejected: {st.underlying}",
-                                     key=f"opt-close-{st.id}")
-                return f"rejected: {e.message}"
-            st.close_order_id = order.id
-            self._save()
-            order = await self._wait_or_cancel(order)
-            self._apply_close_order(st, order, now, fallback_state=fallback, count_attempt=False)
-            self._save()
-            await self._flush_closed(now)
-            status = order.status
+                quotes = {}
+            stale = any(self._close_quote_bad(quotes.get(lg.symbol), now) for lg in st.legs)
+            limit, natural, mid = (None, None, None) if stale else self._quote_limit(st, quotes, frac)
+            info = {"limit": limit, "natural": natural, "mid": mid, "source": "quotes"}
+            if limit is None:
+                if not may_fallback:
+                    st.note("close skipped: no usable quote")
+                    self._save()
+                    return "no usable quote"
+                spot, why = await self._spot_now(st.underlying, now)
+                if spot is None:
+                    info = {"limit": None, "spot": None, "source": "none"}
+                    st.note(f"close not sent: no usable option quote and no underlying quote ({why})")
+                    await self._close_try_failed(st, now, f"No usable quote for {st.underlying} ({why})", info)
+                    return "no usable quote"
+                fb = fallback_close_limit(
+                    st.legs, spot, haircut=s.close_noquote_haircut, cushion_pct=s.close_short_cushion_pct,
+                    cushion_min=s.close_short_cushion_min, deep_otm_pct=s.close_deep_otm_pct,
+                    debit_vertical=self._never_pays(st) and len(st.legs) > 1)
+                limit = fb.credit
+                info = {"limit": limit, "spot": spot, "intrinsic": fb.intrinsic, "deep_otm": fb.deep_otm,
+                        "source": "intrinsic"}
+                if limit == 0 and len(st.legs) > 1 and st.close_zero_form == "credit_0.01":
+                    limit = 0.01  # a 0.00 net limit was rejected once: the 0.01-credit form, once
+                    info["limit"] = limit
+            res = await self._send_close(st, reason, now, limit, rung, info, fallback)
+            rung += 1
+            if res[0] == "rejected":
+                # a 0.00 net limit may not be accepted (UNVERIFIED): try a 0.01 credit once, then stop
+                if info.get("source") == "intrinsic" and len(st.legs) > 1 and limit == 0 \
+                        and st.close_zero_form is None:
+                    st.close_zero_form = "credit_0.01"
+                    info = {**info, "limit": 0.01}
+                    res = await self._send_close(st, reason, now, 0.01, rung, info, fallback)
+                    rung += 1
+                    if res[0] == "rejected":
+                        st.close_zero_form = "stopped"
+                if res[0] == "rejected":
+                    st.close_attempts += 1
+                    await self._close_try_failed(st, now, f"Options close rejected: {res[1]}", info)
+                    return f"rejected: {res[1]}"
+            status = res[1]
             if st.st is StructState.CLOSED:
                 return status
+            if info.get("source") == "intrinsic":
+                break  # no quotes to walk a ladder on: one intrinsic try per pass
         st.close_attempts += 1
+        if st.st is not StructState.CLOSED and status != "not sent" and st.qty >= qty0:
+            # a partial fill is progress, not a failed try
+            await self._close_try_failed(st, now, f"Options close not filled ({status})", info, loud=may_fallback)
         self._save()
         return status
+
+    async def _send_close(self, st: Structure, reason: ExitReason, now: datetime, limit: float, rung: int,
+                          info: dict[str, Any], fallback: StructState) -> tuple[str, str]:
+        """One limit close order: ('rejected', message) or ('done', order status)."""
+        st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + rung)
+        st.exit_reason = reason.value
+        st.state = StructState.CLOSING.value
+        self._save()  # write-ahead
+        self._j("options.exit_submitted", structure_id=st.id, underlying=st.underlying, reason=reason.value,
+                attempt=st.close_attempts, rung=rung, limit_credit=limit, natural=info.get("natural"),
+                mid=info.get("mid"), price_source=info.get("source"), spot=info.get("spot"))
+        try:
+            order = await self.broker.submit_raw_order(self._close_body(st, limit))
+        except BrokerError as e:
+            if e.uncertain:
+                self._save()
+                raise
+            st.state = fallback.value
+            st.note(f"close rejected: {e.message}")
+            self._save()
+            return "rejected", e.message
+        st.close_order_id = order.id
+        self._save()
+        order = await self._wait_or_cancel(order)
+        self._apply_close_order(st, order, now, fallback_state=fallback, count_attempt=False)
+        self._save()
+        await self._flush_closed(now)
+        return "done", order.status
 
     def _apply_close_order(self, st: Structure, order: BrokerOrder, now: datetime,
                            fallback_state: StructState | None = None, count_attempt: bool = True) -> None:
@@ -1600,16 +1719,23 @@ class OptionsManager:
                 return CloseResult(False, 0, None, None, "market_closed", why)
             quotes = await self._quotes([contract])
             q = quotes.get(contract)
-            limit = q.ask if q is not None and q.ask else None
+            limit = q.ask if q is not None and q.ask and not self._close_quote_bad(q, now) else None
+            if limit is None:
+                # never at market (Alpaca rejects it without a quote): intrinsic plus a cushion
+                spot, why = await self._spot_now(occ.underlying, now)
+                if spot is None:
+                    return CloseResult(False, 0, None, None, "refused",
+                                       f"no usable option quote and no underlying quote ({why})")
+                s = self.settings
+                limit = max(math.ceil(round((max(spot - occ.strike, 0.0)
+                                             + max(s.close_short_cushion_min, s.close_short_cushion_pct * spot))
+                                            * 100, 6)) / 100, 0.01)
             cid = _cid("bsc", f"{contract}-{self._today(now).isoformat()}", int(self.meta.get("bsc_attempts", 0)))
             self.meta["bsc_attempts"] = int(self.meta.get("bsc_attempts", 0)) + 1
             self._save()
             body = {"symbol": contract, "side": "buy", "qty": str(qty), "time_in_force": "day",
                     "position_intent": "buy_to_close", "client_order_id": cid}
-            if limit is None:
-                body["type"] = "market"
-            else:
-                body.update(type="limit", limit_price=f"{limit:.2f}")
+            body.update(type="limit", limit_price=f"{limit:.2f}")
             self._j("options.exit_submitted", contract=contract, reason="normalise_short_call", qty=qty, limit=limit)
             try:
                 order = await self.broker.submit_raw_order(body)

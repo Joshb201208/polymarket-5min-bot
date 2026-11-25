@@ -70,6 +70,14 @@ class OptionsSettings:
     # news-driven entries
     max_news_opens_per_session: int = 2
     # order handling
+    # closing without usable option quotes (Alpaca rejects option market orders with no quote:
+    # "no available quote ... please reenter with a limit order", seen live 25 Nov 2026)
+    close_noquote_haircut: float = 0.10  # of net intrinsic, for what we receive
+    close_short_cushion_pct: float = 0.02  # of spot, per short contract, for what we may pay
+    close_short_cushion_min: float = 0.10
+    close_deep_otm_pct: float = 0.05  # every short this far OTM and no intrinsic: may expire
+    close_backoff_minutes: tuple[int, ...] = (1, 2, 4, 8, 15)
+    close_max_tries_per_session: int = 6
     fill_wait_seconds: int = 60
     fill_poll_seconds: float = 2.0
 

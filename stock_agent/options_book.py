@@ -99,6 +99,10 @@ class Structure:
     close_client_id: str | None = None
     close_order_id: str | None = None
     close_attempts: int = 0
+    close_session: str | None = None  # session (ISO date) the try counters below belong to
+    close_tries_session: int = 0  # unfilled or rejected close tries this session
+    close_retry_after: str | None = None  # back-off: no close order before this time
+    close_zero_form: str | None = None  # "0.00" rejected -> "credit_0.01" tried once -> "stopped"
     exit_reason: str | None = None
     exit_credit: float | None = None  # per share, from fills
     realized_pnl: float | None = None
