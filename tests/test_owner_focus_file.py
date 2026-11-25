@@ -25,6 +25,13 @@ _NOW = datetime(2026, 11, 25, 12, tzinfo=UTC)
 _ACTIVE = {"added": "2026-11-25", "expires": "2027-01-25"}
 
 
+def test_nvda_owner_generation_starts_on_date_directive_was_given(monkeypatch):
+    monkeypatch.setattr(research_focus, "load_focus", lambda *, now: load_focus(now=now, path=FOCUS_PATH))
+    assert "NVDA" not in research_focus.owner_backed(now=datetime(2026, 11, 24, 23, 59, tzinfo=UTC))
+    directive = research_focus.owner_backed(now=_NOW)["NVDA"]
+    assert directive.added == date(2026, 11, 25)
+
+
 def test_focus_cadence_and_first_three_active_directives(monkeypatch, tmp_path, caplog):
     path = tmp_path / "focus.json"
     rows = [
