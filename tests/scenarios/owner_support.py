@@ -32,6 +32,10 @@ OWNER_NOTE = ("Bullish: Rubin shipments and AI demand support growth. Veto on da
               "Q4 guidance cut, a material Rubin delay or the CEO leaving.")
 # research_pipeline_engineer is adding a required veto_claim_index; send it only once the schema has it.
 _HAS_VETO_INDEX = "veto_claim_index" in OwnerThesisDraft.model_fields
+ALPACA_NAMES = {
+    "NVDA": "NVIDIA Corporation Common Stock", "AAPL": "Apple Inc. Common Stock",
+    "MSFT": "Microsoft Corporation Common Stock", "AMD": "Advanced Micro Devices, Inc. Common Stock",
+}
 OWNER_PROMPT = "Act as a risk reviewer"
 BREAK = "The issuer cut Q4 revenue guidance."  # a veto's break claim repeats thesis_break verbatim
 
@@ -65,6 +69,10 @@ class OwnerHarness(Harness):
     prompts: list = field(default_factory=list)  # (et, kind, direction, tools?, evidence ids)
 
     def install(self, *, price: float = SPOT, focus: tuple[dict, ...] | None = None, tmp_path: Path) -> OwnerHarness:
+        # Alpaca asset names carry the share class, e.g. "Apple Inc. Common Stock"
+        # (https://docs.alpaca.markets/us/openapi/trading-api.json, Assets schema example).
+        for symbol in (self.symbol, *self.others):
+            self.world.alpaca.add_asset(symbol, name=ALPACA_NAMES.get(symbol, f"{symbol} Inc. Common Stock"))
         super().install(price=price)
         # The owner review is a single review with no fallback; route it to the scripted provider.
         self.monkeypatch.setattr(Config, "RESEARCH_PROVIDER_ORDER", ("openai",))

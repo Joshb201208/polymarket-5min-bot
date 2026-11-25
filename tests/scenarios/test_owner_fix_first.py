@@ -35,7 +35,7 @@ def drive(h, scenario):
     asyncio.run(wrapper())
 
 
-async def stage(h, day: int = 25, *, start: bool = True):
+async def stage(h, day: int = 25, *, start: bool = True, option_ideas: int = 1):
     """Start, one dated issuer story, a 10-minute-old quote, then the 08:00 prescan stages the owner BUY."""
     if start:
         await h.start()
@@ -45,7 +45,7 @@ async def stage(h, day: int = 25, *, start: bool = True):
     await h.advance(day, 8, 0)
     row = await h.run_research("prescan")
     assert row.detail["entry_funnel"].get("handoff_staged") == 1, row.detail
-    assert row.detail["entry_funnel"]["option_ideas"] == 1, row.detail
+    assert row.detail["entry_funnel"]["option_ideas"] == option_ideas, row.detail
     return row
 
 
@@ -55,6 +55,7 @@ async def open_session(h, day: int = 25, *, at=(9, 35), until=(9, 50)):
     h.requote_chain(100.0)
     minutes = (until[0] * 60 + until[1]) - (at[0] * 60 + at[1])
     await h.execute(2 * minutes)
+    await h.scheduler.alerts.flush()  # the heartbeat loop delivers queued alerts in production
 
 
 def handoff_outcomes(h):
@@ -78,8 +79,14 @@ def held_for_session(h, session=SESSION):
     return probe is not None and probe(h.symbol, session)
 
 
-def owner_alerts(h, needle):
-    return [t for t in h.world.alert_texts() if needle.lower() in t.lower()]
+def owner_alerts(h, needle=""):
+    """Owner-directive alerts as delivered on Discord (Telegram mirrors some; count one channel)."""
+    return [t for t in h.world.discord.texts()
+            if "owner directive" in t.lower() and h.symbol in t and needle.lower() in t.lower()]
+
+
+def rearm_alerts(h):
+    return [t for t in h.world.discord.texts() if "re-arm" in t.lower() and h.symbol in t]
 
 
 def ok(requests):
@@ -119,7 +126,9 @@ def test_stock_lane_goes_first_then_the_option_lane_opens(world, monkeypatch, tm
         await open_session(h)
         stock, options = ok(h.buys()), ok(h.option_orders())
         assert stock and options, (h.intent_states(), h.option_orders())
-        assert stock[0].at < options[0].at, "the owner option must wait until the stock attempt is terminal"
+        sent = h.world.net.recorded
+        assert sent.index(stock[0]) < sent.index(options[0]), "the owner option waits for the stock attempt"
+        assert h.scheduler.ledger.list_intents(symbol=h.symbol)[0].status.value == "filled", h.intent_states()
         assert h.scheduler.ledger.owner_directive_used(h.symbol, ADDED)
         assert h.scheduler.ledger.owner_directive_used(h.symbol, ADDED, lane="option")
 
@@ -143,7 +152,7 @@ def test_day1_stock_refused_and_spread_opened_day2_stock_still_enters(world, mon
         assert not ok(h.buys()) and h.buys(), h.intent_states()
         assert len(ok(h.option_orders())) == 1, h.option_orders()
         refusing["on"] = False
-        await stage(h, day=27, start=False)
+        await stage(h, day=27, start=False, option_ideas=0)  # the option lane is already spent
         await open_session(h, day=27, until=(9, 45))
         assert len(ok(h.buys())) == 1, h.intent_states()
         assert len(ok(h.option_orders())) == 1, "one structure per generation"
@@ -236,8 +245,7 @@ def test_live_bearish_review_while_staged_holds_owner_idea_for_the_session(world
         assert not h.buys() and not h.option_orders(), (h.intent_states(), h.option_orders())
         assert held_for_session(h)
         assert lanes_unspent(h), "a session hold consumes nothing and does not latch"
-        held = [t for t in h.world.alert_texts() if "NVDA" in t and "hold" in t.lower()]
-        assert len(held) == 1, h.world.alert_texts()
+        assert len(owner_alerts(h)) == 1, h.world.discord.texts()
         # The next session's prescan reviews the owner idea afresh.
         h.ordinary = "HOLD"
         await h.advance(27, 7, 50)
@@ -323,7 +331,7 @@ def test_uncertain_option_submit_voided_by_reconcile_alerts_once_and_stays_spent
         ledger = h.scheduler.ledger
         assert ledger.owner_directive_used(h.symbol, ADDED, lane="option")
         assert [(x.st, x.zero_fill_confirmed) for x in structures(h)] == [(StructState.VOID, False)]
-        spent = owner_alerts(h, "re-arm")
+        spent = rearm_alerts(h)
         assert len(spent) == 1, h.world.alert_texts()
         await h.advance(27, 7, 50)
         h.fresh_quote()
@@ -331,7 +339,7 @@ def test_uncertain_option_submit_voided_by_reconcile_alerts_once_and_stays_spent
         await h.run_job("prescan")
         await open_session(h, day=27, until=(9, 45))
         assert len(lost) == 1 and not ok(h.option_orders()), "no second structure unless re-armed"
-        assert len(owner_alerts(h, "re-arm")) == 1
+        assert len(rearm_alerts(h)) == 1
 
     drive(h, scenario)
 
