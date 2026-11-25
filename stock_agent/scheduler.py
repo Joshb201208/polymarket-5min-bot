@@ -207,6 +207,7 @@ class StockAgentScheduler:
             universe=self._option_universe, risk_controls=self._risk_controls, journal=self.journal,
             alerts=self.alerts, config=self.config, now=_now_utc,
             capital_lock=self.capital_lock, defer_load=True,
+            research_refresh=getattr(self.research_sources, "refresh_entry_inputs", None),
         ))
         if isinstance(self.engine, ExecutionEngine):
             self.engine.options = self.options
