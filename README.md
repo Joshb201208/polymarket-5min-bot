@@ -12,7 +12,7 @@ For provider key rotation, server `.env` cleanup (`scripts/clean_server_env.py`)
 - **Entry pause switch (`STOCK_TRADING_PAUSED` / `data/PAUSED`):** Setting `STOCK_TRADING_PAUSED=true` or creating an empty `data/PAUSED` (or `data/stock_agent/PAUSED`) file immediately blocks new equity and option entries while keeping protective stop repairs, exits, broker reconciliation, and alerts active.
 - **Overnight Reg T margin with excess-margin buffers (`MARGIN_ENABLED=true`):** Long-only equities (no short stock; `no_shorting` enforced) borrow on an overnight Reg T basis only (`regt_buying_power`, gross long cap `MAX_GROSS_EXPOSURE_PCT=2.0`, never intraday 4x day-trading buying power). New buys are refused if projected maintenance excess `(equity - maintenance_margin) / equity` would fall below `MARGIN_MIN_EXCESS_PCT` (`0.25`); if excess drops below `MARGIN_TRIM_EXCESS_PCT` (`0.15`), a critical alert fires and positions are trimmed back to `>= 25%` excess before the broker ever needs to liquidate. At the `15%` drawdown tier, new borrowing is halted alongside half-sizing. Setting `MARGIN_ENABLED=false` restores `1.0x` cash-only rules. Legacy `MAX_TOTAL_EXPOSURE_PCT` is retired and ignored with a startup notice.
 - **Defined-risk options by default (`OPTIONS_MODE=defined_risk`):** Valid modes are `off`, `close_only`, and `defined_risk` (legacy `OPTIONS_ENABLED=false` maps to `off`). Long option debits cannot be bought on margin (funded from `options_buying_power` / non-marginable buying power). `defined_risk` allows debit structures (`order_class="mleg"` vertical spreads, long calls, long puts) while rejecting naked short options; `close_only` never opens new contracts while continuing to manage, repair, and exit existing option positions ahead of expiration (`T-2` / `T-1` DTE).
-- **Owner watch list (`stock_agent/owner_focus.json`):** Optional list of up to 25 time-bounded (`added` .. `expires`, max 16 KiB) `symbol` or `theme` entries loaded via `stock_agent/research_focus.py`. Entries boost news-polling and research-queue **priority only — never eligibility to trade**, position sizing, or risk/execution gates. Expired or malformed entries are ignored cleanly.
+- **Owner watch list (`stock_agent/owner_focus.json`):** Optional list of up to 25 time-bounded (`added` .. `expires`, max 16 KiB) `symbol` or `theme` entries. A normal entry changes research priority only. An explicitly bullish directive can supply the conviction for an initial stock buy and one defined-risk bullish option structure, independently, but neither can bypass evidence or execution checks.
 - **Protected execution & broker reconciliation:** Equity entries verify market hours, quote freshness, spread width, Reg T buying power, wash-trade conflicts, and protective stop coverage, reconciling local state (`ledger.py`, `reconcile.py`) against Alpaca fills and positions before trading.
 - **Zero-leak logging:** `stock_agent/logging_setup.py` clamps `httpx`/`httpcore` request logging to `WARNING` and scrubs query-string API keys, Telegram bot tokens, auth headers, and configured secrets across stdout/stderr and rotating log files (`data/stock_agent/logs/stock_agent.log`, 10 MB x 12 backups).
 
@@ -100,7 +100,11 @@ Edit `stock_agent/owner_focus.json` to spotlight specific tickers or macro/secto
 ]
 ```
 
-Each entry specifies either `"symbol"` or `"theme"` (never both), a `"note"` (up to 300 chars), and ISO `"added"` / `"expires"` dates. Active items increase research and news-polling **priority only** — every trade still requires corroborated thesis output and must pass all liquidity, exposure, cluster, margin, and execution gates.
+Each entry specifies either `"symbol"` or `"theme"` (never both), a `"note"` (up to 300 chars), and ISO `"added"` / `"expires"` dates. The default `"cadence": "live"` gives a ticker ordinary focus priority. `"cadence": "daily"` adds it to the pre-open scan without giving it focus priority for news or other research passes. It can still rank on its merits or receive normal held-position reviews.
+
+Up to three active ticker entries can additionally set `"stance": "bullish"` and an integer `"owner_conviction"` from 7 through 9. A pre-open owner review sees the note and records the model's own grade separately. A BUY needs a valid reference price, cited dated evidence, and a reviewed stop/invalidation. The reviewed stop documents downside; broker stop placement still follows the normal execution rules. The owner's conviction applies only when the trade path rechecks the active directive. Ordinary news, held-stock reviews, adds and exits continue to use the model's own grade.
+
+There is at most one stock entry and one defined-risk bullish options structure per directive, tracked separately by ticker and `added` date. A cited thesis break after `added` vetoes both lanes until the owner explicitly changes `added`; a missing price, evidence or model response does not veto or enter. Confirmed zero fills do not consume a lane. Exiting an opened position does not re-arm it. The existing portfolio and order controls still apply.
 
 ### Adding a New Setting
 
@@ -140,7 +144,7 @@ stock_agent/
 ├── fundamentals_service.py        # Cached fundamentals with per-endpoint plan/health tracking
 ├── news_service.py / materiality.py # Deduplicated news, SEC filings & materiality filter
 ├── macro_monitor.py / screener.py # Macro regime checks & candidate universe screening
-├── owner_focus.json / research_focus.py # Time-bounded owner watch list (priority only, never eligibility)
+├── owner_focus.json / research_focus.py # Time-bounded owner watch list and explicit bullish directives
 ├── llm_client.py / analyst.py     # Multi-provider LLM router, structured schemas & thesis synthesis
 ├── research_pipeline.py / research_sources.py # Budgeted thesis pipeline, gates (`research_gate.py`) & store (`research_store.py`)
 ├── options_settings.py / options_policy.py # `OPTIONS_MODE` (`off` | `close_only` | `defined_risk`) & structure rules

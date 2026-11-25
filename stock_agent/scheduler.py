@@ -187,7 +187,8 @@ class StockAgentScheduler:
         ))
         self.research = service("research", lambda: ResearchPipeline(
             self.config, self.ledger, self.calendar, self.analyst, self.research_store,
-            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus, alerts=self.alerts,
+            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus,
+            daily_focus=self._daily_focus, alerts=self.alerts,
         ))
         self.capital_lock = asyncio.Lock()
         self._asset_lock = asyncio.Lock()
@@ -545,7 +546,7 @@ class StockAgentScheduler:
         catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
         # Only the selected TipRanks slice (already inside _universe_symbols) is tracked; never raw CSV rows.
         return tuple(dict.fromkeys([
-            *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
+            *held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS,
             *self._universe_symbols, *self._baseline_universe_symbols, *catalogue,
         ]))
 
@@ -555,7 +556,10 @@ class StockAgentScheduler:
         ))
 
     def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
-        return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc(), cadence="live"))
+
+    def _daily_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc(), cadence="daily"))
 
     def _build_news_service(self) -> NewsService:
         return NewsService(
@@ -1504,7 +1508,10 @@ class StockAgentScheduler:
         if not (await self.market_gate("entry")).allowed:
             return
         candidates = [OptionCandidate(idea.symbol, source=getattr(idea, "source", "news"), story_id=idea.story_id,
-                                      direction_hint=idea.direction.value) for idea in ideas]
+                                      direction_hint=idea.direction.value,
+                                      **({"thesis_id": idea.thesis_id,
+                                          "owner_directive_added": idea.owner_directive_added}
+                                         if idea.source == "owner" else {})) for idea in ideas]
         await self.options.scan(_now_utc(), candidates=candidates)
         handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
         if handled:

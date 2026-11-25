@@ -1,9 +1,11 @@
 [
   {
     "symbol": "NVDA",
-    "note": "CEO reinstated 23 Nov; board investigation and reported SEC scrutiny continue. Bullish only if deliveries, orders and margins are corroborated; bearish only on a primary-source disclosure worsening accounting, export or demand. A rebound alone is not a trigger.",
+    "note": "Bullish: Rubin shipments and AI demand support growth. Veto on dated issuer/regulator evidence of a Q4 guidance cut, material Rubin/customer delays, material restatement/non-reliance, a binding export restriction impairing guidance, or Huang leaving again.",
+    "stance": "bullish",
+    "owner_conviction": 8,
     "added": "2026-11-23",
-    "expires": "2026-12-04"
+    "expires": "2027-01-25"
   },
   {
     "symbol": "AMD",
@@ -28,5 +30,16 @@
     "note": "Watch cash conversion, new debt and lease terms, and delayed capacity to tell durable demand from funding stress. A liquidity shock is a reason to re-score cluster risk, not to open proxy shorts on banks.",
     "added": "2026-11-23",
     "expires": "2026-12-10"
-  }
+  },
+  {"symbol": "FIX", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "NVT", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "VST", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "ORCL", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "PANW", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "TSM", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "MSFT", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "AVGO", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "ASML", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "ABBV", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"},
+  {"symbol": "UNH", "cadence": "daily", "note": "Owner TipRanks watchlist, 25 Nov 2026", "added": "2026-11-25", "expires": "2027-01-25"}
 ]

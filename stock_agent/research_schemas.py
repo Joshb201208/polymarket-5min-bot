@@ -61,6 +61,11 @@ class ThesisDraft(StrictModel):
     horizon_days: int = Field(ge=1, le=180)
 
 
+class OwnerThesisDraft(ThesisDraft):
+    direction: Literal[Direction.BUY, Direction.BEARISH, Direction.AVOID]
+    stop_price: float | None = Field(gt=0)
+
+
 class ExitConfirmation(StrictModel):
     symbol: str = Field(min_length=1, max_length=15)
     verdict: Literal["CONFIRM_BREAK", "DISAGREE", "INSUFFICIENT_EVIDENCE"]

@@ -81,6 +81,7 @@ class LLMRequest(Generic[T]):
     domains: tuple[str, ...] = ()
     validate: Callable[[T, tuple[Evidence, ...]], None] | None = None
     exit_work: bool = False
+    single_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -204,10 +205,16 @@ class LLMClient:
                 except ProviderError as error:
                     attempts.append(error)
                     await self._failed(route, error, now)
+                    # These two fail before sending a request. A configured
+                    # route that can actually execute is still eligible.
+                    if request.single_review and error.kind not in {"budget", "input_limit"}:
+                        break
                 except (ValueError, KeyError, TypeError, IndexError, AttributeError):
                     error = ProviderError(route.provider, route.model, "invalid_output")
                     attempts.append(error)
                     await self._failed(route, error, now)
+                    if request.single_review:
+                        break
         raise ProviderUnavailable(tuple(attempts))
 
     async def _failed(self, route: ModelRoute, error: ProviderError, now: datetime) -> None:

@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, StaleBook, ThesisRole
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
-from stock_agent.research_focus import focus_symbols
+from stock_agent.research_focus import FocusItem, focus_symbols, owner_backed
 from stock_agent.research_notes import load_notes, research_notes_payload
 from stock_agent.research_schemas import Direction, Evidence, ResearchTask, utc_datetime
 from stock_agent.research_store import NY, ResearchStore
@@ -43,6 +43,10 @@ def _edgar_filing(url: str) -> bool:
 
 class SourceUnavailable(RuntimeError):
     """A required data request failed rather than returning a healthy empty result."""
+
+
+class OwnerReviewUnavailable(RuntimeError):
+    """A directive cannot be safely reviewed with the current evidence."""
 
 @dataclass(frozen=True)
 class NewsEvent:
@@ -102,6 +106,7 @@ class OptionIdea:
     generated_at: datetime
     evidence_ids: tuple[str, ...]
     source: str = "news"
+    owner_directive_added: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict):
@@ -109,7 +114,7 @@ class OptionIdea:
             payload["symbol"], Direction(payload["direction"]), payload["story_id"], payload["thesis_id"],
             payload["raw_conviction"], payload["effective_conviction"],
             datetime.fromisoformat(payload["generated_at"]), tuple(payload["evidence_ids"]),
-            payload.get("source", "news"),
+            payload.get("source", "news"), payload.get("owner_directive_added"),
         )
 
 
@@ -174,7 +179,7 @@ def _reconstitute(payload: dict) -> NewIntent:
 
 class ResearchPipeline:
     def __init__(self, config, ledger, calendar, analyst: Analyst, store: ResearchStore, sources: Sources, gate,
-                 *, clock=None, context=None, focus=focus_symbols, alerts=None):
+                 *, clock=None, context=None, focus=None, daily_focus=None, directives=owner_backed, alerts=None):
         self.config = config
         self.ledger = ledger
         self.calendar = calendar
@@ -184,7 +189,9 @@ class ResearchPipeline:
         self.gate = gate
         self.clock = clock or ledger.now
         self.context = context or (lambda: {})
-        self.focus = focus
+        self.focus = focus or (lambda *, now: focus_symbols(now=now, cadence="live"))
+        self.daily_focus = daily_focus or (lambda *, now: focus_symbols(now=now, cadence="daily"))
+        self.directives = directives
         self.alerts = alerts
         self._analysis_lock = asyncio.Lock()
 
@@ -224,6 +231,10 @@ class ResearchPipeline:
         for pending in self.store.due_confirmations(now):
             await self._confirm(pending["work_key"], held.get(pending["symbol"]))
         focus = tuple(self.focus(now=now))
+        daily = tuple(dict.fromkeys(self.daily_focus(now=now)))
+        prescan = (kind == "prescan" and work_scope is None
+                   and now.astimezone(NY).date() == session.date and now < session.opens_at)
+        directives = self.directives(now=now) if prescan else {}
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
         if kind in {"news", "earnings"}:
@@ -273,6 +284,8 @@ class ResearchPipeline:
             securities = await self.sources.securities(tuple(dict.fromkeys(item.symbol for item in stories)), now)
             work = [(item.symbol, self._story_key(item), item) for item in stories]
         else:
+            if prescan:
+                symbols = tuple(dict.fromkeys((*held, *directives, *focus, *daily, *symbols)))
             securities = await self.sources.securities(symbols, now)
             ranked = Screener.rank([
                 Candidate(row.symbol, row.name, row.sector, row.tradable, row.metrics, row.symbol in focus)
@@ -289,7 +302,7 @@ class ResearchPipeline:
                 ranked_symbols.sort(key=lambda symbol: not _fresh_quote(
                     securities[symbol], screen_at, max_age=timedelta(seconds=90),
                 ))
-            chosen = tuple(dict.fromkeys((*held, *focus, *ranked_symbols[:8])))
+            chosen = tuple(dict.fromkeys((*held, *directives, *focus, *(daily if prescan else ()), *ranked_symbols[:8])))
             background = getattr(self.sources, "background", None)
             if background is not None:
                 stories = await background(chosen)
@@ -310,6 +323,19 @@ class ResearchPipeline:
                 continue
             item = securities.get(symbol, SecurityInputs(symbol, symbol, "Unknown"))
             as_of = self.clock()
+            directive = directives.get(symbol)
+            owner = None
+            held_owner_option = None
+            if (directive and as_of < session.opens_at
+                    and not self.ledger.owner_directive_vetoed(symbol, directive.added)):
+                option_used = self.ledger.owner_directive_used(symbol, directive.added, lane="option")
+                if symbol in held:
+                    held_owner_option = None if option_used else directive
+                elif not option_used or not self.ledger.owner_directive_used(symbol, directive.added):
+                    owner = directive
+            if directive and symbol not in held and owner is None:
+                funnel.rejected_by_reason["owner_directive_inactive"] += 1
+                continue
             if not self.store.claim_work(key, symbol, as_of):
                 state = self.store.work_state(key)
                 if state is not None and state["status"] == "retry":
@@ -317,11 +343,21 @@ class ResearchPipeline:
                 continue
             attempted += 1
             try:
-                await self._review(kind, key, item, held.get(symbol), story, session, as_of, funnel)
+                await self._review(kind, key, item, held.get(symbol), story, session, as_of, funnel,
+                                   owner=owner, held_owner_option=held_owner_option)
+            except OwnerReviewUnavailable as exc:
+                failed += 1
+                await self._owner_unavailable(key, owner, str(exc), funnel)
             except ProviderUnavailable as exc:
                 failed += 1
                 failures = {error.kind for error in exc.attempts}
                 funnel.rejected_by_reason.update(f"llm_{reason}" for reason in failures or {"no_available_route"})
+                owner_review = owner or held_owner_option
+                if owner_review:
+                    await self._owner_unavailable(
+                        key, owner_review, ", ".join(sorted(failures)) or "no_available_route", funnel,
+                    )
+                    continue
                 state = self.store.work_state(key)
                 can_retry = state["attempts"] < 3 and _can_retry(exc)
                 if can_retry:
@@ -511,7 +547,9 @@ class ResearchPipeline:
             return None, holding
 
         def gate_rejection():
-            gate = self.gate.is_entry_eligible(symbol, self.clock())
+            gate = self.gate.is_entry_eligible(
+                symbol, self.clock(), **({"allow_owner": True} if owner else {}),
+            )
             if not gate.ok:
                 if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
                     return self._retry_handoff(key, intent, gate.reasons[0])
@@ -526,6 +564,10 @@ class ResearchPipeline:
                     return refuse("handoff_gate_refused", "top_up_baseline_changed")
             return None
 
+        generation = intent.meta.get("owner_directive_added")
+        owner = self.directives(now=self.clock()).get(symbol) if generation else None
+        if generation and (owner is None or generation != owner.added.isoformat()):
+            return refuse("handoff_gate_refused", "owner_directive_changed")
         if self.store.pending_buy(reanchor_key) is not None:
             return refuse("handoff_reanchored")
         code, holding = check_identity()
@@ -558,6 +600,12 @@ class ResearchPipeline:
             return "handoff_execution_window_closed"
         if rejection := gate_rejection():
             return rejection
+        if owner:
+            if material:
+                return refuse("handoff_reanchor_unavailable", "new_material_news_after_owner_review")
+            if intent.reference_price is None:
+                return refuse("handoff_reanchor_unavailable", "missing_owner_reference_price")
+            return refuse("handoff_promoted")
         if material and intent.meta.get("handoff_reviewed"):
             return refuse("handoff_reanchor_unavailable", "new_material_news_after_single_review")
         if intent.reference_price is not None and not material:
@@ -588,7 +636,8 @@ class ResearchPipeline:
             return refuse("handoff_reanchored")
         return refuse("handoff_reanchor_unavailable", "targeted_review_did_not_qualify")
 
-    async def _review(self, kind, key, security, holding, story, session, now, funnel, *, reanchor=None) -> None:
+    async def _review(self, kind, key, security, holding, story, session, now, funnel, *,
+                      reanchor=None, owner: FocusItem | None = None, held_owner_option: FocusItem | None = None) -> None:
         symbol = security.symbol
         position_id = holding.meta.position_id if holding and holding.meta else None
         entry = self.ledger.entry_thesis(position_id) if position_id else None
@@ -619,7 +668,7 @@ class ResearchPipeline:
         scheduled = scheduled_job and now < session.opens_at
         fresh_quote = _fresh_quote(security, now, max_age=timedelta(seconds=90) if scheduled else timedelta(minutes=20))
         anchor_kind = "quote" if fresh_quote else None
-        if scheduled and not fresh_quote:
+        if (scheduled or owner) and not fresh_quote:
             price = None
             previous = self.calendar.previous_session(session.date)
             completed = getattr(self.sources, "completed_close", None)
@@ -645,7 +694,15 @@ class ResearchPipeline:
         # web search is useful when it fills a gap, not a second mandatory feed.
         needs_search = not any(item.published_at is not None and item.published_at <= now for item in data.evidence)
         best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
-        if best_ideas:
+        if owner:
+            if data.price is None:
+                raise OwnerReviewUnavailable("no_quote_or_completed_close")
+            primary = any(
+                item.published_at is not None and now - item.published_at <= timedelta(days=120)
+                and _edgar_filing(item.url) for item in data.evidence
+            )
+            result = await self.analyst.evaluate(data, task=task, grounded=not primary, owner=owner)
+        elif best_ideas:
             # A dated market story or provider metric does not replace filing
             # research. Do not infer official issuer domains from ticker symbols.
             needs_search = not any(
@@ -654,7 +711,9 @@ class ResearchPipeline:
             )
             result = await self.analyst.evaluate(data, task=task, grounded=needs_search, best_ideas=True)
         else:
-            result = await self.analyst.evaluate(data, task=task, grounded=needs_search)
+            result = await self.analyst.evaluate(
+                data, task=task, grounded=needs_search, **({"single_review": True} if held_owner_option else {}),
+            )
         record = result.record
         direction = record.draft.direction
         entry_direction = direction in {Direction.BUY, Direction.BEARISH}
@@ -673,7 +732,10 @@ class ResearchPipeline:
             floor = max(floor, 8)
         if reanchor is not None:
             floor = max(floor, reanchor.meta["minimum_conviction"])
-        conviction_ok = entry_direction and record.raw_conviction >= 7 and record.effective_conviction >= floor
+        conviction_ok = (
+            (direction is Direction.BUY if owner else entry_direction and record.raw_conviction >= 7)
+            and record.effective_conviction >= floor
+        )
         if conviction_ok:
             funnel.passed_conviction += 1
             refresh = getattr(self.sources, "refresh_entry_inputs", None)
@@ -687,7 +749,41 @@ class ResearchPipeline:
                 f"{err.provider}:{err.kind}" for err in result.result.attempts
             ],
         }
+        if owner:
+            payload.update(
+                owner_directive_added=owner.added.isoformat(), owner_conviction=owner.owner_conviction,
+                model_effective_conviction=record.raw_conviction, owner_review_stop=result.owner_stop_price,
+            )
         evidence_ids = tuple(dict.fromkeys(ref for claim in record.draft.claims for ref in claim.evidence_ids))
+        option_from_held = (
+            held_owner_option is not None and direction in {Direction.BUY, Direction.HOLD}
+            and record.draft.thesis_change in {"unchanged", "strengthened"}
+            and any(item.evidence_id in evidence_ids and item.published_at for item in record.evidence)
+        )
+        if option_from_held:
+            payload.update(
+                owner_option_directive_added=held_owner_option.added.isoformat(),
+                owner_option_conviction=held_owner_option.owner_conviction,
+            )
+        if owner and direction is not Direction.BUY:
+            with self.store.store.transaction():
+                thesis_id = self.ledger.record_thesis(
+                    symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
+                    generated_at=record.generated_at,
+                )
+                first = self.ledger.latch_owner_directive_veto(symbol, owner.added)
+                self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "owner_directive_veto"})
+            funnel.rejected_by_reason["owner_directive_veto"] += 1
+            self._owner_event(owner, "vetoed", raw_conviction=record.raw_conviction,
+                              thesis_id=thesis_id, evidence_ids=evidence_ids)
+            if first:
+                cited = [
+                    item.url for item in record.evidence
+                    if item.evidence_id in evidence_ids and item.published_at
+                    and utc_datetime(item.published_at).date() > owner.added
+                ]
+                await self._owner_alert(owner, "veto", f"{record.draft.summary}\n" + "\n".join(cited[:3]))
+            return
         entry_blockers = ()
         confirmation_requested = False
         with self.store.store.transaction():
@@ -697,15 +793,20 @@ class ResearchPipeline:
                 generated_at=record.generated_at,
                 activate=not exit_pending,
             )
+            if option_from_held and not exit_pending and security.tradable:
+                self._qualify_owner_option(
+                    held_owner_option, thesis_id, evidence_ids, record, session, funnel,
+                )
             if direction is not Direction.EXIT_PROPOSED or not position_id:
                 rejected = self._record_entry(
                     key, symbol, kind, security, holding, position_id, baseline, story, session,
                     thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel,
                     scheduled=scheduled and not exit_pending, anchor_kind=anchor_kind, reanchor=reanchor,
+                    owner=owner, owner_stop=result.owner_stop_price if owner else None,
                 )
                 if entry_direction or not holding:
                     funnel.rejected_by_reason.update(rejected)
-                if conviction_ok and session.opens_at <= self.clock() < session.closes_at:
+                if conviction_ok and (owner or session.opens_at <= self.clock() < session.closes_at):
                     entry_blockers = tuple(reason for reason in rejected if reason in _INPUT_BLOCKERS)
                 if story:
                     self.ledger.journal.append(
@@ -733,6 +834,9 @@ class ResearchPipeline:
             else:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
         if direction is not Direction.EXIT_PROPOSED or not position_id:
+            if owner and entry_blockers:
+                await self._owner_unavailable(key, owner, ", ".join(entry_blockers), funnel)
+                return
             if entry_blockers and self.alerts is not None:
                 alert = self.alerts.alert(
                     "warning", "Research entry input unavailable", f"{symbol}: {', '.join(entry_blockers)}",
@@ -743,6 +847,32 @@ class ResearchPipeline:
             return
         if confirmation_requested:
             await self._confirm(key, holding)
+
+    def _owner_event(self, owner: FocusItem, outcome: str, **detail) -> None:
+        self.ledger.journal.append(
+            "research.owner_directive", symbol=owner.symbol, owner_directive_added=owner.added.isoformat(),
+            owner_conviction=owner.owner_conviction, reason="owner_directive", outcome=outcome, **detail,
+        )
+
+    async def _owner_alert(self, owner: FocusItem, kind: str, body: str) -> None:
+        alert = getattr(self.alerts, "alert", None)
+        if alert is None:
+            return
+        now = self.clock()
+        suffix = f":{now.astimezone(NY).date()}" if kind == "unavailable" else ""
+        key = f"owner_directive:{kind}:{owner.symbol}:{owner.added}{suffix}"
+        if not self.store.claim_work(key, owner.symbol, now):
+            return
+        result = alert("warning", f"Owner directive {kind}", f"{owner.symbol}: {body}", key=key)
+        if inspect.isawaitable(result):
+            await result
+        self.store.finish_work(key, "no_action")
+
+    async def _owner_unavailable(self, key, owner: FocusItem, reason: str, funnel) -> None:
+        self.store.finish_work(key, "unavailable", detail={"reason": "owner_directive_unavailable", "input": reason})
+        funnel.rejected_by_reason["owner_directive_unavailable"] += 1
+        self._owner_event(owner, "unavailable", input=reason)
+        await self._owner_alert(owner, "unavailable", reason)
 
     async def _confirm(self, key: str, holding) -> None:
         row = self.store.claim_confirmation(key, self.clock())
@@ -802,7 +932,7 @@ class ResearchPipeline:
 
     def _record_entry(self, key, symbol, kind, security, holding, position_id, baseline, story, session,
                       thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel, *,
-                      scheduled=False, anchor_kind=None, reanchor=None):
+                      scheduled=False, anchor_kind=None, reanchor=None, owner=None, owner_stop=None):
         direction = record.draft.direction
         rejected = []
         now = self.clock()
@@ -819,7 +949,7 @@ class ResearchPipeline:
                 rejected.append("quote_stale_or_unavailable")
             if not rejected or (scheduled and direction is Direction.BUY
                                 and rejected == ["quote_stale_or_unavailable"]):
-                gate = self.gate.is_entry_eligible(symbol, now)
+                gate = self.gate.is_entry_eligible(symbol, now, **({"allow_owner": True} if owner else {}))
                 rejected.extend(gate.reasons)
                 if gate.thesis_id != thesis_id:
                     rejected.append("active_thesis_changed")
@@ -829,6 +959,15 @@ class ResearchPipeline:
                     rejected.append("research_direction_changed")
         qualifies = not rejected
         defer = scheduled and set(rejected) == {"quote_stale_or_unavailable"}
+        stock_used = bool(owner and self.ledger.owner_directive_used(symbol, owner.added))
+        # Options own their underlying/chain quote and execution checks. They
+        # can use this priced research anchor even while stock awaits a quote.
+        if owner and conviction_ok and security.tradable and price is not None:
+            self._qualify_owner_option(owner, thesis_id, evidence_ids, record, session, funnel)
+        if stock_used:
+            self.store.finish_work(key, "no_action", thesis_id=thesis_id,
+                                   detail={"reason": "owner_directive_stock_already_used"})
+            return ()
         baseline_grade, may_initialize = self.ledger.top_up_baseline(position_id) if position_id else (None, False)
         reaffirmed = (
             position_id is not None and record.draft.thesis_change in {"strengthened", "unchanged"}
@@ -849,6 +988,12 @@ class ResearchPipeline:
                                    "sector": security.sector, "thesis_change": record.draft.thesis_change,
                                    "signal_at": record.generated_at.isoformat(),
                                    "baseline_thesis_id": baseline.thesis_id if baseline else None})
+            if owner:
+                intent = replace(intent, meta={
+                    **intent.meta, "adjustment_reason": "owner_directive",
+                    "owner_directive_added": owner.added.isoformat(), "owner_conviction": owner.owner_conviction,
+                    "owner_review_stop": owner_stop,
+                })
             if defer or reanchor is not None:
                 reviewed = {"handoff_reviewed": True} if reanchor is not None else {}
                 if reanchor is not None and reanchor.reference_price is not None:
@@ -865,6 +1010,9 @@ class ResearchPipeline:
             else:
                 self.store.record_proposal(key, thesis_id, intent)
                 funnel.buy_candidates += 1
+            if owner:
+                self._owner_event(owner, "proposed", raw_conviction=record.raw_conviction,
+                                  thesis_id=thesis_id, staged=defer or reanchor is not None)
         else:
             self.store.finish_work(key, "no_action", thesis_id=thesis_id)
             if (qualifies or defer) and direction is Direction.BUY:
@@ -877,6 +1025,30 @@ class ResearchPipeline:
             self.store.record_option_idea(idea_id, idea, session.closes_at)
             funnel.option_ideas += 1
         return tuple(dict.fromkeys(rejected))
+
+    def _qualify_owner_option(self, owner, thesis_id, evidence_ids, record, session, funnel):
+        now = self.clock()
+        if now >= session.closes_at:
+            return
+        gate = self.gate.is_entry_eligible(owner.symbol, now, allow_owner=True, owner_lane="option")
+        if gate.thesis_id != thesis_id:
+            return
+        if gate.ok and gate.owner_entry is not None:
+            grade = gate.owner_entry.effective_conviction
+        elif set(gate.reasons) == {"quote_stale_or_unavailable"}:
+            # Persist an idea, not authorization. The option lane must fetch
+            # a fresh underlying quote and obtain its own typed proof.
+            grade = owner.owner_conviction
+        else:
+            return
+        added = owner.added.isoformat()
+        idea_id = f"owner:{owner.symbol}:{added}:{session.date}"
+        idea = OptionIdea(
+            owner.symbol, Direction.BUY, idea_id, thesis_id, record.raw_conviction,
+            grade, record.generated_at, evidence_ids, "owner", added,
+        )
+        self.store.record_option_idea(idea_id, idea, session.closes_at)
+        funnel.option_ideas += 1
 
     @staticmethod
     def _intent(key, symbol, side, position_id, thesis_ids, price, evidence_ids, kind, session, meta=None):
