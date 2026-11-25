@@ -423,7 +423,8 @@ class ExecutionEngine:
         notional = sum(_f(o.filled_qty) * _f(o.filled_avg_price) for o in found)
         last = found[-1]
         if it.side == "sell":
-            await self._finish_sell(it, last, filled, notional / filled if filled else None)
+            confirmed = next((o for o in reversed(found) if o.filled_qty > 0 and o.filled_at is not None), None)
+            await self._finish_sell(it, last, filled, notional / filled if filled else None, confirmed=confirmed)
             await self._protect_symbol(it.symbol)
         else:
             await self._finish(it, last, extra_filled=filled - _f(last.filled_qty),
@@ -1278,8 +1279,9 @@ class ExecutionEngine:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e))
         capped = rule not in self.s.uncapped_exit_rules
         try:
-            filled, avg, last = await self._sell_qty(intent.symbol, want_qty, claimed.client_order_id, reason=rule,
-                                                     own_only=margin_trim)
+            filled, avg, last, confirmed = await self._sell_qty(
+                intent.symbol, want_qty, claimed.client_order_id, reason=rule, own_only=margin_trim,
+            )
         except BaseException:
             if capped:  # an order may have reached the broker: count it, never under-count
                 self._count_model_exit()
@@ -1302,7 +1304,7 @@ class ExecutionEngine:
             return ExecResult(claimed.intent_id, intent.symbol, IntentStatus.REJECTED, reason="nothing sellable")
         if capped:
             self._count_model_exit()
-        res = await self._finish_sell(claimed, last, filled, avg)
+        res = await self._finish_sell(claimed, last, filled, avg, confirmed=confirmed)
         await self._protect_symbol(intent.symbol)
         if filled > 0:
             await self.alert("info", f"Sold {intent.symbol}", f"{filled:g} shares at {avg or 0:.2f} ({rule})")
@@ -1312,14 +1314,30 @@ class ExecutionEngine:
                              key=f"exit-nofill-{intent.intent_id}")
         return res
 
-    async def _finish_sell(self, it: OrderIntent, last: BrokerOrder, filled: float, avg: float | None) -> ExecResult:
+    async def _finish_sell(self, it: OrderIntent, last: BrokerOrder, filled: float, avg: float | None, *,
+                           confirmed: BrokerOrder | None = None) -> ExecResult:
         status = IntentStatus.FILLED if filled > 0 else IntentStatus.CANCELLED
         cur = self.ledger.get_intent(it.intent_id)
         if cur is not None and cur.status == IntentStatus.SUBMITTING:
             self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=last.id)
+        if confirmed is not None:
+            await self._latch_confirmed_owner_exit(it.symbol, confirmed)
         self.ledger.ack_intent(it.intent_id, status, broker_order_id=last.id,
                                meta={"filled_qty": filled, "avg_price": avg})
         return ExecResult(it.intent_id, it.symbol, status, filled, avg, last.status, last.id)
+
+    async def _latch_confirmed_owner_exit(self, symbol: str, order: BrokerOrder) -> None:
+        """Keep the sell pending while checking flat, so neither owner lane can race it."""
+        from stock_agent import research_focus
+
+        at = order.filled_at
+        if (order.symbol != symbol or order.side != "sell" or order.asset_class != "us_equity"
+                or order.filled_qty <= 0 or at is None or at.utcoffset() is None
+                or symbol not in research_focus.owner_backed(now=at.astimezone(ET))):
+            return
+        pos = await self.broker.get_position(symbol)  # on failure, leave SUBMITTED for recovery
+        if pos is None or pos.qty == 0:
+            self.ledger.record_confirmed_stock_flatten(symbol, filled_at=at, order_id=order.id)
 
     async def _free_shares(self, symbol: str, pos: BrokerPosition, *, own_only: bool = False) -> Decimal:
         """Shares we could sell after cancelling sell orders (only the bot's own when
@@ -1351,21 +1369,21 @@ class ExecutionEngine:
         return out
 
     async def _sell_qty(self, symbol: str, qty: float, cid: str, *, reason: str, own_only: bool = False
-                        ) -> tuple[float, float | None, BrokerOrder | None]:
+                        ) -> tuple[float, float | None, BrokerOrder | None, BrokerOrder | None]:
         """Cancel our sell orders, confirm, then sell up to `qty` (capped at free shares)."""
         for o in await self._open_orders(symbol):
             if o.side == "sell" and (not own_only or _is_own(o)):
                 await self._cancel_confirm(o)
         pos = await self.broker.get_position(symbol)
         if pos is None or not pos.is_long:
-            return 0.0, None, None
+            return 0.0, None, None, None
         whole = min(_floor(qty), pos.free_whole_qty)
         frac = 0.0
         if _D(qty) >= _D(pos.qty):  # selling everything: include any fraction
             frac = float(_D(pos.qty) - pos.whole_qty)
             if _D(frac) > _D(pos.qty_available) - whole:
                 frac = 0.0
-        filled, notional, last = 0.0, 0.0, None
+        filled, notional, last, confirmed = 0.0, 0.0, None, None
         if whole >= 1:
             q = None
             try:
@@ -1378,6 +1396,8 @@ class ExecutionEngine:
                                    limit_price=round_price(bid * (1 - self.s.sell_limit_offset_pct)),
                                    client_order_id=cid, position_intent="sell_to_close")
                 last = await self._place_and_wait(req)
+                if last.filled_qty > 0 and last.filled_at is not None:
+                    confirmed = last
                 filled += _f(last.filled_qty)
                 notional += _f(last.filled_qty) * _f(last.filled_avg_price)
             remaining = whole - (_f(last.filled_qty) if last else 0)
@@ -1388,6 +1408,8 @@ class ExecutionEngine:
                     req = OrderRequest(symbol=symbol, side="sell", qty=rem, type="market", time_in_force="day",
                                        client_order_id=f"{cid}-m"[:128], position_intent="sell_to_close")
                     last = await self._place_and_wait(req)
+                    if last.filled_qty > 0 and last.filled_at is not None:
+                        confirmed = last
                     filled += _f(last.filled_qty)
                     notional += _f(last.filled_qty) * _f(last.filled_avg_price)
         if frac > 0:
@@ -1395,10 +1417,12 @@ class ExecutionEngine:
                                client_order_id=f"{cid}-f"[:128], position_intent="sell_to_close")
             o = await self._place_and_wait(req)
             last = last or o
+            if o.filled_qty > 0 and o.filled_at is not None:
+                confirmed = o
             filled += _f(o.filled_qty)
             notional += _f(o.filled_qty) * _f(o.filled_avg_price)
         avg = notional / filled if filled > 0 else None
-        return filled, avg, last
+        return filled, avg, last, confirmed
 
     # ------------------------------------------------------------------ cover
     def _cover_cid(self, symbol: str) -> str:
@@ -1795,7 +1819,7 @@ class ExecutionEngine:
                 trim = math.ceil((_f(p.market_value) - cap * equity) / _f(p.current_price))
                 cid = f"sa-{self.session_date():%Y%m%d}-{sym}-trim-{uuid.uuid4().hex[:10]}"
                 try:
-                    filled, _, _ = await self._sell_qty(sym, float(trim), cid, reason="normalise")
+                    filled, _, _, _ = await self._sell_qty(sym, float(trim), cid, reason="normalise")
                 finally:
                     await self._protect_symbol(sym)
                 if filled < trim:

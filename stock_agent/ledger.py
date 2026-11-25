@@ -979,17 +979,34 @@ class Ledger:
                  JOIN broker_activities a ON a.symbol=p.symbol
                WHERE p.symbol=? AND p.asset_class='us_equity' AND p.closed_at IS NOT NULL
                  AND a.activity_type='FILL' AND a.side LIKE 'sell%' AND a.qty>0
-                 AND a.ts>=? AND julianday(a.ts)>=julianday(COALESCE(p.opened_at, a.ts))
+                 AND julianday(a.ts)>=julianday(?) AND julianday(a.ts)>=julianday(COALESCE(p.opened_at, a.ts))
                  AND ((p.close_cause LIKE 'sell fill %' AND substr(a.ts,1,10)=substr(p.close_cause,-10))
                       OR (p.close_cause='flat_then_reopened' AND julianday(a.ts)<=julianday(p.closed_at)))
-               ORDER BY a.ts DESC LIMIT 1""",
-            (symbol.strip().upper(), added.isoformat()),
+               ORDER BY julianday(a.ts) DESC LIMIT 1""",
+            (symbol.strip().upper(), _iso(datetime.combine(added, time.min, _MARKET_TZ))),
         ).fetchone()
         if row is None:
             return False
         c.execute("INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
                   (key, json.dumps({"filled_at": row[0], "order_id": row[1]}), _iso(self.now())))
         return True
+
+    def record_confirmed_stock_flatten(self, symbol: str, *, filled_at: datetime, order_id: str) -> bool:
+        """Latch an active generation when execution verifies a sell fill and broker flat."""
+        from stock_agent import research_focus
+
+        if filled_at.utcoffset() is None:
+            return False
+        fill_session = filled_at.astimezone(_MARKET_TZ)
+        directive = research_focus.owner_backed(now=fill_session).get(symbol)
+        if directive is None or not directive.added <= fill_session.date() <= directive.expires:
+            return False
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                (self._owner_key(symbol, directive.added, "stock_exit"),
+                 json.dumps({"filled_at": filled_at.isoformat(), "order_id": order_id}), _iso(self.now())),
+            ).rowcount == 1
 
     def owner_directive_exited(self, symbol: str, added: date) -> bool:
         """Whether a reconciled stock flatten closed both lanes for this generation."""

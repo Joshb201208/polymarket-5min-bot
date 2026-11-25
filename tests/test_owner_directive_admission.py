@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
 
@@ -15,6 +15,7 @@ from stock_agent.risk_manager import RiskControls
 from stock_agent.scheduler import StockAgentScheduler
 from tests.exec_helpers import enqueue as enqueue_trade
 from tests.exec_helpers import make_engine
+from tests.ledger_helpers import StubBroker, make_ledger
 from tests.test_risk_projection import NOW, buy, leg, margin_book, order, snapshot, stock
 
 
@@ -84,16 +85,42 @@ def test_stock_exit_to_zero_latches_unspent_lanes_across_restart(setup, world, t
     assert not eng.ledger.owner_directive_exited("NVDA", added)
     assert world.alpaca.position("NVDA").qty == 6
 
+    observed = []
+    original = type(eng.broker).get_position
+
+    async def during_verify(self, symbol):
+        position = await original(self, symbol)
+        if position is None and not observed:
+            proof = eng._research_gate.is_entry_eligible(symbol, eng.now(), allow_owner=True, owner_lane="option")
+            observed.append(proof.reasons)
+        return position
+
+    monkeypatch.setattr(type(eng.broker), "get_position", during_verify)
     flat = enqueue_trade(eng, "NVDA", "sell", rule="hard_stop")
     assert asyncio.run(eng.execute_intent(flat)).filled_qty == 6
-    asyncio.run(eng.ledger.refresh("confirmed full exit"))
     assert world.alpaca.position("NVDA") is None
+    assert observed and "pending_exit" in observed[0]
+    assert eng.ledger.open_position_meta("NVDA") is not None  # reconcile has not run
+    assert eng.ledger.owner_directive_exited("NVDA", added)
+    assert not eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option").ok
     reopened = make_engine(world, tmp_path, monkeypatch)
     assert reopened.ledger.owner_directive_exited("NVDA", added)
     for lane in ("stock", "option"):
         assert not reopened.ledger.owner_directive_used("NVDA", added, lane=lane)
     assert not reopened.ledger.claim_owner_option("NVDA", added, "old-generation")
     assert not reopened.ledger.owner_directive_exited("NVDA", eng.session_date() + timedelta(days=1))
+
+
+def test_evening_sell_does_not_latch_next_ny_session_generation(tmp_path):
+    broker = StubBroker()
+    broker.pos("NVDA", 10, 100)
+    ledger = make_ledger(tmp_path, broker=broker)
+    asyncio.run(ledger.refresh("existing position"))
+    broker.fill("NVDA", "sell", 10, 99, ts="2026-11-26T00:15:00Z")  # Nov 25, 19:15 New York
+    del broker.positions["NVDA"]
+    asyncio.run(ledger.refresh("confirmed close with evening fill"))
+    assert ledger.owner_directive_exited("NVDA", date(2026, 11, 25))
+    assert not ledger.owner_directive_exited("NVDA", date(2026, 11, 26))
 
 
 @pytest.mark.parametrize("change", ["removed", "score", "veto", "throw", "intent_score", "health"])
