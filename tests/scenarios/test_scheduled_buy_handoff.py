@@ -12,6 +12,7 @@ from stock_agent.config import Config
 from stock_agent.ledger import JobStatus
 from stock_agent.research_pipeline import _FRESH_SET
 from tests.fakes import ET
+from tests.scenarios.v1_restore_support import with_grounding
 
 _SUNDAY = datetime(2026, 11, 15, 17, tzinfo=ET)
 
@@ -42,7 +43,7 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
         direction = "HOLD" if regular else "BUY"
         replies.append((regular, direction, data["reference_price"]))
         evidence = next(item for item in data["evidence"] if item["published_at"])
-        return {
+        return with_grounding(body, {
             "symbol": "AAPL", "direction": direction, "conviction": 9,
             "summary": "The issuer updated its outlook.", "bull_case": "Improving demand.",
             "bear_case": "Demand may weaken.", "claims": [
@@ -50,7 +51,7 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
             ],
             "catalysts": [], "risks": [], "thesis_break": "Next release contradicts the update.",
             "target_price": None, "thesis_change": "new", "horizon_days": 15,
-        }
+        })
 
     world.openai.respond_with(draft)
     world.perplexity.fail("/v1/agent", "status", status=401, times=None)

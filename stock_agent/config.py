@@ -274,6 +274,7 @@ class Settings(BaseModel):
     MARGIN_TRIM_EXCESS_PCT: float = Field(default=0.15, gt=0.0, lt=1.0)
     MARGIN_INTEREST_RATE_PCT: float = Field(default=6.5, ge=0.0, le=100.0)
     MAX_POSITIONS: int = Field(default=20, ge=1)
+    MAX_NEW_STOCK_POSITIONS_PER_SESSION: int = Field(default=3, ge=1)
     MAX_SECTOR_PCT: float = Field(default=0.40, gt=0.0, le=1.0)
     MAX_CLUSTER_PCT: float = Field(default=0.48, gt=0.0, le=1.0)
     MIN_FREE_CASH_PCT: float = Field(default=0.02, ge=0.0, lt=1.0)
@@ -547,6 +548,7 @@ class Settings(BaseModel):
                 "drawdown_rolling_sessions": self.DRAWDOWN_ROLLING_SESSIONS,
                 "drawdown_pause_max_sessions": self.DRAWDOWN_PAUSE_MAX_SESSIONS,
                 "max_positions": self.MAX_POSITIONS,
+                "max_new_stock_positions_per_session": self.MAX_NEW_STOCK_POSITIONS_PER_SESSION,
                 "min_conviction": self.MIN_CONVICTION,
                 "research_weekly_budget_usd": self.RESEARCH_WEEKLY_BUDGET_USD,
             },

@@ -71,6 +71,13 @@ def _migrate_handoff(conn) -> None:
         ON research_pending_buys(symbol,session_date,thesis_id)""")
 
 
+def _migrate_indirect_news(conn) -> None:
+    conn.execute("""CREATE TABLE research_indirect_news (
+        ny_date TEXT NOT NULL, symbol TEXT NOT NULL, story_id TEXT NOT NULL,
+        PRIMARY KEY(ny_date, symbol)
+    )""")
+
+
 class ResearchStore:
     def __init__(self, store: StateStore, config):
         self.store = store
@@ -79,6 +86,15 @@ class ResearchStore:
         store.register_migration(2, "research", _migrate_retry)
         store.register_migration(3, "research", _migrate_confirmation)
         store.register_migration(4, "research", _migrate_handoff)
+        store.register_migration(5, "research", _migrate_indirect_news)
+
+    def reserve_indirect_news(self, ny_date: str, symbol: str, story_id: str) -> bool:
+        """One indirect trigger per unheld symbol/day; that story may retry."""
+        with self.store.transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO research_indirect_news VALUES (?,?,?)",
+                         (ny_date, symbol, story_id))
+            return conn.execute("SELECT story_id FROM research_indirect_news WHERE ny_date=? AND symbol=?",
+                                (ny_date, symbol)).fetchone()[0] == story_id
 
     def available_budget(self, now: datetime) -> dict:
         rows = self.store.query(

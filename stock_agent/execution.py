@@ -36,7 +36,9 @@ from zoneinfo import ZoneInfo
 
 from stock_agent.broker import AlpacaClient, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, round_price
 from stock_agent.config import Config
-from stock_agent.ledger import IntentStatus, LedgerError, NewIntent, OrderIntent, ThesisRecord, ThesisRole, TopUpAlreadyToday
+from stock_agent.ledger import (
+    IntentStatus, LedgerError, NewIntent, NewStockEntryRefused, OrderIntent, ThesisRecord, ThesisRole, TopUpAlreadyToday,
+)
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -435,6 +437,10 @@ class ExecutionEngine:
         if cur is not None and cur.status == IntentStatus.SUBMITTING:
             self.ledger.ack_intent(it.intent_id, IntentStatus.SUBMITTED, broker_order_id=order.id)
         meta = {"filled_qty": filled, "avg_price": price, "order_status": order.status}
+        if filled > 0 and it.side == "buy" and it.kind == "equity" and not it.position_id:
+            fill_at = order.filled_at
+            fill_day = fill_at.astimezone(ET).date() if fill_at is not None and fill_at.tzinfo else self.session_date()
+            meta["new_stock_fill_session"] = fill_day.isoformat()
         code = ""
         if status == IntentStatus.REJECTED:
             code = "broker_rejected"
@@ -544,6 +550,7 @@ class ExecutionEngine:
         "symbol_blocked", "short_open", "research_stale", "position_changed", "risk_size_zero",
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
         "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
+        "new_stock_session_cap", "new_stock_issuer_already_admitted",
         "nothing_to_sell", "exit_cap", "research_inputs_pending", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
@@ -790,9 +797,13 @@ class ExecutionEngine:
             claimed = self.ledger.claim_intent(
                 intent.intent_id, top_up_session=self.session_date() if add else None,
                 top_up_baseline_grade=ti.effective_conviction if initial_reaffirmation else None,
+                new_stock_session=self.session_date() if not add else None,
+                new_stock_limit=self.config.MAX_NEW_STOCK_POSITIONS_PER_SESSION if not add else None,
             )
         except TopUpAlreadyToday as e:
             return self._skip(intent, str(e), "top_up_already_today")
+        except NewStockEntryRefused as e:
+            return self._skip(intent, str(e), e.code)
         except LedgerError as e:
             return ExecResult(intent.intent_id, intent.symbol, IntentStatus.SKIPPED, reason=str(e), code="duplicate")
         # Sizing takes bar/quote/book round trips; the entry window can close meanwhile

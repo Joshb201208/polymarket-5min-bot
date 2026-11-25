@@ -11,6 +11,7 @@ full quantity.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from datetime import date, datetime, time
 
 import pytest
@@ -124,14 +125,9 @@ def _gross(a) -> float:
     return sum(p.qty * a.quotes[s].last for s, p in a.positions.items() if p.qty > 0) / a.equity()
 
 
-@pytest.mark.world_start(et(2026, 11, 23, 7, 0))
-def test_leveraged_week_buys_past_100pct_gross_and_stops_at_the_caps(world, monkeypatch):
+def _assert_leveraged_limits(a):
     from stock_agent.risk_manager import classify_symbol
 
-    a, runner, low = _idea_week(world, monkeypatch)
-    log = runner.summary()
-    assert _bought(a), log
-    assert low < 0 and _gross(a) > 1.0, (low, _gross(a), log)       # borrowed past 100% gross
     eq = a.equity()
     assert _gross(a) <= 2.0 + 1e-6                                  # MAX_GROSS_EXPOSURE_PCT
     longs = {s: p.qty * a.quotes[s].last for s, p in a.positions.items() if p.qty > 0}
@@ -144,8 +140,41 @@ def test_leveraged_week_buys_past_100pct_gross_and_stops_at_the_caps(world, monk
     assert all(v <= 0.40 * eq + 1e-6 for v in sectors.values()), sectors
     assert _excess(a) >= 0.25, _excess(a)
     assert a._regt_buying_power() >= 0.02 * eq - 1e-6                 # overnight buying-power floor
+    return longs
+
+
+@pytest.mark.world_start(et(2026, 11, 23, 7, 0))
+def test_leveraged_week_buys_past_100pct_gross_and_stops_at_the_caps(world, monkeypatch):
+    from stock_agent.config import Config
+
+    # Isolate the exposure and buying-power controls from the daily pacing control.
+    monkeypatch.setattr(Config, "MAX_NEW_STOCK_POSITIONS_PER_SESSION", len(_IDEAS))
+    a, runner, low = _idea_week(world, monkeypatch)
+    log = runner.summary()
+    assert _bought(a), log
+    assert low < 0 and _gross(a) > 1.0, (low, _gross(a), log)       # borrowed past 100% gross
+    longs = _assert_leveraged_limits(a)
     qtys = [float(o.qty) for o in _bought(a)]
     assert len(longs) == 20 or min(qtys) < max(qtys), qtys             # the last buy was cut at a cap
+
+
+@pytest.mark.world_start(et(2026, 11, 23, 7, 0))
+def test_leveraged_week_with_default_entry_limit_is_paced_and_stays_within_caps(world, monkeypatch):
+    a, runner, low = _idea_week(world, monkeypatch)
+    log = runner.summary()
+    assert low < 0 and _gross(a) > 1.0, (low, _gross(a), log)
+    _assert_leveraged_limits(a)
+    first_fill = {}
+    for order in sorted(_bought(a), key=lambda o: o.filled_at):
+        first_fill.setdefault(order.symbol, order.filled_at.astimezone(ET).date())
+    by_session = defaultdict(set)
+    for symbol, day in first_fill.items():
+        by_session[day].add(symbol)
+    assert len(by_session) >= 2 and max(map(len, by_session.values())) == 3, (dict(by_session), log)
+    assert any(
+        row.get("code") == "new_stock_session_cap"
+        for row in runner.agent.journal.read(kinds={"execution.buy_funnel"})
+    ), log
 
 
 @pytest.mark.world_start(et(2026, 11, 23, 7, 0))

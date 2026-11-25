@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,20 @@ _QUOTE_TTL = timedelta(seconds=90)
 _COMPANY_TTL = timedelta(hours=6)
 _MARKET = ("SPY", "QQQ")
 _NEWS_LIMIT = 5
+
+
+def _issuer_headline(symbol: str, company: str | None, headline: str) -> bool:
+    # Provider tags alone do not make a market wrap issuer-specific. A title
+    # hit is an exemption from the indirect-work quota, not proof of materiality.
+    if re.search(rf"(?<!\w)\${re.escape(symbol)}(?!\w)", headline, re.IGNORECASE):
+        return True
+    if len(symbol) >= 2 and re.search(rf"(?<!\w){re.escape(symbol)}(?!\w)", headline):
+        return True
+    words = re.findall(r"[a-z0-9]+", (company or "").lower())
+    while words and words[-1] in {"inc", "incorporated", "corp", "corporation", "plc", "ltd", "limited", "com"}:
+        words.pop()
+    title = " " + " ".join(re.findall(r"[a-z0-9]+", headline.lower())) + " "
+    return bool(words and " " + " ".join(words) + " " in title)
 
 
 class ResearchSources:
@@ -190,8 +205,15 @@ class ResearchSources:
                 continue
             evidence = _news_evidence(item)
             if evidence is not None:
-                events.extend(NewsEvent(symbol, item.story_id, evidence, round(score))
-                              for symbol in item.symbols if symbol in allowed)
+                for symbol in item.symbols:
+                    if symbol not in allowed:
+                        continue
+                    asset = self.asset_for(symbol)
+                    company = getattr(asset, "company_name", None)
+                    direct = getattr(item, "kind", None) == "sec_filing" or _issuer_headline(
+                        symbol, company, evidence.title,
+                    )
+                    events.append(NewsEvent(symbol, item.story_id, evidence, round(score), direct))
         return tuple(events)
 
     async def background(self, symbols: tuple[str, ...]) -> dict[str, tuple[Evidence, ...]]:

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from stock_agent.analyst import EXIT_PROMPT_VERSION, Analyst, ResearchInput
 from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent, StaleBook, ThesisRole
@@ -31,6 +32,15 @@ _HANDOFF_TRANSIENT = {"broker_book_unavailable",
                       "quote_stale_or_unavailable", "news_stale_or_unavailable", "llm_unavailable"}
 
 
+def _edgar_filing(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname in {"sec.gov", "www.sec.gov"}
+                and parsed.path.lower().startswith("/archives/edgar/data/"))
+    except ValueError:
+        return False
+
+
 class SourceUnavailable(RuntimeError):
     """A required data request failed rather than returning a healthy empty result."""
 
@@ -40,15 +50,18 @@ class NewsEvent:
     story_id: str
     evidence: Evidence
     materiality: int
+    issuer_specific: bool = True
 
     def payload(self) -> dict:
         return {"symbol": self.symbol, "story_id": self.story_id, "materiality": self.materiality,
+                "issuer_specific": self.issuer_specific,
                 "evidence": self.evidence.model_dump(mode="json")}
 
     @classmethod
     def from_payload(cls, payload: dict) -> NewsEvent:
         return cls(payload["symbol"], payload["story_id"],
-                   Evidence.model_validate_json(json.dumps(payload["evidence"])), payload["materiality"])
+                   Evidence.model_validate_json(json.dumps(payload["evidence"])), payload["materiality"],
+                   payload.get("issuer_specific", True) is True)
 
 
 @dataclass(frozen=True)
@@ -237,7 +250,26 @@ class ResearchPipeline:
                 seen.add(item.story_id)
                 stories.append(item)
             # A live pass must remain bounded even with an exceptionally busy tape.
-            stories = [item for item in stories if self.store.ready(self._story_key(item), as_of)][:4]
+            selected = []
+            for item in stories:
+                key = self._story_key(item)
+                if not self.store.ready(key, as_of):
+                    continue
+                if kind == "news" and item.symbol not in held and not item.issuer_specific:
+                    day = as_of.astimezone(NY).date().isoformat()
+                    if not self.store.reserve_indirect_news(day, item.symbol, item.story_id):
+                        # Count the suppressed story once per symbol/day without
+                        # consuming its ordinary work key (e.g. if it becomes held).
+                        skip_key = f"indirect-news-skip:{day}:{item.symbol}:{key}"
+                        if self.store.claim_work(skip_key, item.symbol, as_of):
+                            code = "indirect_news_symbol_cap"
+                            self.store.finish_work(skip_key, "no_action", detail={"reason": code})
+                            funnel.rejected_by_reason[code] += 1
+                        continue
+                selected.append(item)
+                if len(selected) == 4:
+                    break
+            stories = selected
             securities = await self.sources.securities(tuple(dict.fromkeys(item.symbol for item in stories)), now)
             work = [(item.symbol, self._story_key(item), item) for item in stories]
         else:
@@ -245,7 +277,7 @@ class ResearchPipeline:
             ranked = Screener.rank([
                 Candidate(row.symbol, row.name, row.sector, row.tradable, row.metrics, row.symbol in focus)
                 for row in securities.values()
-            ])
+            ], include_relative_strength=kind not in _SCHEDULED or work_scope is not None)
             funnel.screened = len(ranked)
             if not ranked:
                 funnel.rejected_by_reason["no_tradable_universe"] += 1
@@ -583,7 +615,8 @@ class ResearchPipeline:
         quote_at = security.quote_at
         # Catch-up uses the weekly prompt but is a fallback, not an original
         # scheduled decision. Keep its preopen/regular recovery semantics.
-        scheduled = kind in _SCHEDULED and key.startswith(f"{kind}:") and story is None and now < session.opens_at
+        scheduled_job = kind in _SCHEDULED and key.startswith(f"{kind}:") and story is None
+        scheduled = scheduled_job and now < session.opens_at
         fresh_quote = _fresh_quote(security, now, max_age=timedelta(seconds=90) if scheduled else timedelta(minutes=20))
         anchor_kind = "quote" if fresh_quote else None
         if scheduled and not fresh_quote:
@@ -611,7 +644,17 @@ class ResearchPipeline:
         # Dated feed evidence can ground this evaluation directly; external
         # web search is useful when it fills a gap, not a second mandatory feed.
         needs_search = not any(item.published_at is not None and item.published_at <= now for item in data.evidence)
-        result = await self.analyst.evaluate(data, task=task, grounded=needs_search)
+        best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
+        if best_ideas:
+            # A dated market story or provider metric does not replace filing
+            # research. Do not infer official issuer domains from ticker symbols.
+            needs_search = not any(
+                item.published_at is not None and now - item.published_at <= timedelta(days=120)
+                and _edgar_filing(item.url) for item in data.evidence
+            )
+            result = await self.analyst.evaluate(data, task=task, grounded=needs_search, best_ideas=True)
+        else:
+            result = await self.analyst.evaluate(data, task=task, grounded=needs_search)
         record = result.record
         direction = record.draft.direction
         entry_direction = direction in {Direction.BUY, Direction.BEARISH}
