@@ -37,6 +37,7 @@ ALPACA_NAMES = {
     "MSFT": "Microsoft Corporation Common Stock", "AMD": "Advanced Micro Devices, Inc. Common Stock",
 }
 OWNER_PROMPT = "Act as a risk reviewer"
+SEARCH_PASS = "Search for primary evidence"  # system/instructions of a two-pass review's search step
 BREAK = "The issuer cut Q4 revenue guidance."  # a veto's break claim repeats thesis_break verbatim
 
 
@@ -102,13 +103,22 @@ class OwnerHarness(Harness):
     def _owner_draft(self, body):
         text = body.get("input") or body["messages"][0]["content"]
         data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
-        owner = OWNER_PROMPT in body.get("instructions", "")
+        instructions = body.get("instructions") or body.get("system") or ""
+        if body.get("tools") and instructions.startswith(SEARCH_PASS):
+            # Search-only first pass of a two-pass grounded review: only its sources are used.
+            return LLMReply(text="Synthetic issuer facts.", sources=[
+                {"url": "https://example.com/fixture/issuer-filing", "title": "Synthetic issuer filing"},
+            ])
+        # The structured second pass wraps the input next to the searched sources.
+        grounded = bool(body.get("tools")) or "web_evidence" in data
+        data = data.get("original_input", data)
+        owner = OWNER_PROMPT in instructions
         policy = self.owner if owner else self.ordinary
         direction = policy(body, data) if callable(policy) else policy
         dated = sorted((e for e in data.get("evidence", []) if e.get("published_at")),
                        key=lambda e: e["published_at"])
         self.prompts.append((self.world.clock.now_et(), "owner" if owner else "ordinary", direction,
-                             bool(body.get("tools")), [e["evidence_id"] for e in dated]))
+                             grounded, [e["evidence_id"] for e in dated]))
         symbol = data.get("symbol") or self.symbol
         if not dated:
             direction = "INSUFFICIENT_EVIDENCE" if not owner else "AVOID"
