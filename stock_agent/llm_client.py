@@ -36,6 +36,14 @@ _PROVIDER_CODES = frozenset({
     "invalid_tool_input", "unavailable", "max_uses_exceeded", "too_many_requests",
     "query_too_long", "request_too_large",
 })
+_OUTPUT_CODES = frozenset({
+    "response_json", "response_envelope", "answer_empty", "answer_too_large", "answer_json",
+    "schema_invalid", "schema_direction", "schema_missing_field", "schema_extra_field",
+    "decision_validation", "confirmation_same_model",
+    "thesis_symbol", "thesis_direction", "thesis_exit_rule", "thesis_target_band",
+    "thesis_unknown_evidence", "thesis_missing_dated_evidence", "thesis_missing_invalidation",
+    "thesis_missing_trigger_evidence", "owner_stop", "owner_veto_claim", "owner_veto_text", "owner_veto_date",
+})
 _ENDPOINTS = {
     "openai": "https://api.openai.com/v1/responses",
     "perplexity": "https://api.perplexity.ai/v1/agent",
@@ -75,6 +83,20 @@ class ProviderError(Exception):
     retry_after: float | None = None
     has_answer: bool = False
 
+    @property
+    def safe_code(self) -> str | None:
+        if self.kind in {"invalid_output", "decision_rejected"} and isinstance(self.code, str) and self.code in _OUTPUT_CODES:
+            return self.code
+        return _provider_code(self.code)
+
+
+class OutputRuleError(ValueError):
+    """A local decision rule failed; only allowlisted names may be emitted."""
+
+    def __init__(self, code: str):
+        self.code = code if code in _OUTPUT_CODES else "decision_validation"
+        super().__init__(self.code)
+
 
 class ProviderUnavailable(Exception):
     def __init__(self, attempts: tuple[ProviderError, ...]):
@@ -83,7 +105,7 @@ class ProviderUnavailable(Exception):
 
     @property
     def failure_codes(self) -> dict[str, list[str]]:
-        codes = [f"{a.provider}:{a.code}" for a in self.attempts if _provider_code(a.code)]
+        codes = [f"{a.provider}:{code}" for a in self.attempts if (code := a.safe_code)]
         return {"failure_codes": codes} if codes else {}
 
 
@@ -213,29 +235,40 @@ class LLMClient:
                     try:
                         value = strict_json(request.value_type, response.text)
                     except ValidationError as error:
+                        issues = error.errors(include_input=False, include_context=False, include_url=False)
                         if request.local_decision_validation and all(
                             item["loc"] == ("direction",) and item["type"] == "literal_error"
-                            for item in error.errors(include_input=False, include_context=False)
+                            for item in issues
                         ):
                             # A complete thesis with a disallowed owner vote is still a decision.
-                            attempts.append(ProviderError(route.provider, route.model, "decision_rejected"))
+                            attempts.append(ProviderError(route.provider, route.model, "decision_rejected",
+                                                          code="schema_direction"))
                             break
-                        raise
+                        types = {item["type"] for item in issues}
+                        code = ("schema_direction" if all(item["loc"] == ("direction",) for item in issues)
+                                else "schema_missing_field" if types == {"missing"}
+                                else "schema_extra_field" if types == {"extra_forbidden"}
+                                else "schema_invalid")
+                        raise ProviderError(route.provider, route.model, "invalid_output", code=code) from None
+                    except ValueError:
+                        raise ProviderError(route.provider, route.model, "invalid_output", code="answer_json") from None
                     if request.grounded and not response.evidence:
                         raise ProviderError(route.provider, route.model, "no_grounding", has_answer=True)
                     try:
                         if request.validate:
                             request.validate(value, response.evidence)
-                    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                    except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                        code = error.code if isinstance(error, OutputRuleError) else "decision_validation"
                         if not request.single_review:
-                            raise
+                            raise ProviderError(route.provider, route.model, "invalid_output", code=code) from None
                         # A successful response can fail an owner decision's
                         # evidence rules without the provider being unhealthy.
-                        attempts.append(ProviderError(route.provider, route.model, "decision_rejected"))
+                        attempts.append(ProviderError(route.provider, route.model, "decision_rejected", code=code))
                         break
                     actual = ModelRoute(route.provider, response.model or route.model)
                     if request.primary and actual.underlying == request.primary.underlying:
-                        raise ValueError("same underlying confirmation model")
+                        raise ProviderError(route.provider, route.model, "invalid_output",
+                                            code="confirmation_same_model")
                     report_ok = getattr(self.health, "record_llm_ok", None)
                     if report_ok is not None:
                         report_ok(route.provider, at=self.now())
@@ -252,7 +285,7 @@ class LLMClient:
                     # Transport failures never count as an owner's one decision.
                     await self._failed(route, error, now)
                 except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                    error = ProviderError(route.provider, route.model, "invalid_output")
+                    error = ProviderError(route.provider, route.model, "invalid_output", code="response_envelope")
                     attempts.append(error)
                     await self._failed(route, error, now)
         raise ProviderUnavailable(tuple(attempts))
@@ -276,7 +309,8 @@ class LLMClient:
         report_failure = getattr(self.health, "record_llm_failure", None)
         if report_failure is not None and error.kind not in {"budget", "input_limit"}:
             report_failure(route.provider, summary=error.kind, status_code=error.status, at=now)
-        logger.warning("Research %s route failed (%s, %s)", route.provider, error.kind, error.status)
+        logger.warning("Research %s route failed (%s, %s, code=%s)", route.provider, error.kind, error.status,
+                       error.safe_code)
         if self.on_failure is not None:
             try:
                 await self.on_failure(error)
@@ -321,7 +355,8 @@ class LLMClient:
             if live and not evidence and not request.single_review:
                 raise ProviderError(route.provider, route.model, "no_grounding")
         if not text or len(text.encode()) > 22_000:
-            raise ProviderError(route.provider, route.model, "invalid_output")
+            raise ProviderError(route.provider, route.model, "invalid_output",
+                                code="answer_too_large" if text else "answer_empty")
         return _Response(text, evidence, None if added_cost is None or cost is None else added_cost + cost, data.get("model"))
 
     def _payload(self, route: ModelRoute, request: LLMRequest, blob: str, *, evidence_pass: bool = False) -> dict:
@@ -403,14 +438,17 @@ class LLMClient:
                 resp = await self._client.post(_ENDPOINTS[route.provider], json=body, headers=headers)
             try:
                 data = resp.json()
+                invalid_json = False
             except ValueError:
                 data = {}
+                invalid_json = True
             if resp.status_code >= 400:
                 if resp.status_code in {400, 401, 402, 403, 404, 429}:
                     cost = 0
                 raise self._http_error(route, resp, data)
             if not isinstance(data, dict) or not data:
-                raise ProviderError(route.provider, route.model, "invalid_output")
+                raise ProviderError(route.provider, route.model, "invalid_output",
+                                    code="response_json" if invalid_json else "response_envelope")
             cost = self._cost(route, data, search_calls)
             return data, cost
         except (httpx.TransportError, TimeoutError):

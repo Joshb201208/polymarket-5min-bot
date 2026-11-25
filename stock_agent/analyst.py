@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
-from stock_agent.llm_client import LLMClient, LLMRequest, LLMResult, ModelRoute
+from stock_agent.llm_client import LLMClient, LLMRequest, LLMResult, ModelRoute, OutputRuleError
 from stock_agent.research_schemas import (
     Direction,
     Evidence,
@@ -202,46 +202,48 @@ class Analyst:
 
         def validate(draft: ThesisDraft, web: tuple[Evidence, ...]) -> None:
             if draft.symbol != data.symbol:
-                raise ValueError("thesis security mismatch")
+                raise OutputRuleError("thesis_symbol")
             if best_ideas and draft.direction not in {
                 Direction.BUY, Direction.BEARISH, Direction.AVOID, Direction.INSUFFICIENT_EVIDENCE,
             }:
-                raise ValueError("invalid direction for scheduled unheld stock thesis")
+                raise OutputRuleError("thesis_direction")
             if draft.direction is Direction.EXIT_PROPOSED and (not held or draft.thesis_change not in {"weakened", "broken"}):
-                raise ValueError("invalid exit proposal")
+                raise OutputRuleError("thesis_exit_rule")
             if draft.target_price is not None and data.price and not data.price / 5 <= draft.target_price <= data.price * 5:
-                raise ValueError("target outside safety sanity band")
+                raise OutputRuleError("thesis_target_band")
             known = _index_evidence(data, web)
             sourced = set()
             for claim in draft.claims:
                 for key in claim.evidence_ids:
                     ref = known.get(_source_key(key))
                     if ref is None:
-                        raise ValueError("unknown evidence reference")
+                        raise OutputRuleError("thesis_unknown_evidence")
                     if ref.published_at is not None:
                         sourced.add(ref.evidence_id)
             if draft.direction in _ENTRY | {Direction.EXIT_PROPOSED}:
-                if not sourced or not (draft.thesis_break or "").strip():
-                    raise ValueError("actionable thesis needs dated evidence and an invalidation")
+                if not sourced:
+                    raise OutputRuleError("thesis_missing_dated_evidence")
+                if not (draft.thesis_break or "").strip():
+                    raise OutputRuleError("thesis_missing_invalidation")
                 if data.trigger_evidence_ids and not sourced.intersection(data.trigger_evidence_ids):
-                    raise ValueError("news reaction did not cite the triggering evidence")
+                    raise OutputRuleError("thesis_missing_trigger_evidence")
             if owner:
                 if draft.direction is Direction.BUY:
                     stop = getattr(draft, "stop_price", None)
                     if (data.price is None or stop is None or not 0 < stop < data.price
                             or draft.veto_claim_index is not None):
-                        raise ValueError("owner BUY requires priced downside protection")
+                        raise OutputRuleError("owner_stop")
                 else:
                     index = draft.veto_claim_index
                     if index is None or index >= len(draft.claims):
-                        raise ValueError("owner veto must identify the supporting claim")
+                        raise OutputRuleError("owner_veto_claim")
                     claim = draft.claims[index]
                     if not claim.text.strip() or claim.text != draft.thesis_break:
-                        raise ValueError("owner veto must identify the same claim in thesis_break")
+                        raise OutputRuleError("owner_veto_text")
                     for key in claim.evidence_ids:
                         stamp = known[_source_key(key)].published_at
                         if stamp is None or utc_datetime(stamp).date() <= owner.added:
-                            raise ValueError("owner veto claim has undated or non-post-directive evidence")
+                            raise OutputRuleError("owner_veto_date")
 
         prompt = (_OWNER + "\n\n" + _RUBRIC.split("\nIf evidence is weak", 1)[0] if owner else
                   _BEST_IDEAS if best_ideas else _THESIS + (_NEWS if task is ResearchTask.NEWS else "") + _RUBRIC)

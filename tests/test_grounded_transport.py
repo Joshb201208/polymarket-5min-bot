@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from stock_agent.analyst import Analyst, ResearchInput, _index_evidence
-from stock_agent.llm_client import LLMClient, LLMRequest, ProviderUnavailable
+from stock_agent.llm_client import LLMClient, LLMRequest, ProviderError, ProviderUnavailable
 from stock_agent.research_focus import FocusItem
 from stock_agent.research_schemas import Evidence, ResearchTask
 from tests.fakes.base import FakeInternet
@@ -90,9 +90,9 @@ def test_perplexity_raises_only_grounded_cap_and_reserves_it():
      "incomplete_output", "max_output_tokens", True),
     ((400, {"error": {"type": "invalid_request_error", "code": "invalid_type", "message": "never record this"}}),
      "request_rejected", "invalid_type", True),
-    ((200, completed('{"direction"', [])), "invalid_output", None, True),
+    ((200, completed('{"direction"', [])), "invalid_output", "answer_json", True),
     ((200, completed(ANSWER, [])), "no_grounding", None, False),
-    ((200, completed()), "decision_rejected", None, False),
+    ((200, completed()), "decision_rejected", "decision_validation", False),
 ])
 def test_owner_retries_transport_but_not_a_parsed_decision(first, kind, code, can_fallback):
     calls = []
@@ -130,9 +130,13 @@ def test_owner_retries_transport_but_not_a_parsed_decision(first, kind, code, ca
 
 
 def test_only_allowlisted_error_codes_are_kept():
+    assert ProviderError("openai", "", "invalid_output", code="key-looking-text").safe_code is None
+
     async def run():
         def endpoint(_):
-            return httpx.Response(400, json={"error": {"code": "key-looking-text", "message": "never record this"}})
+            return httpx.Response(400, json={"error": {
+                "code": "thesis_unknown_evidence", "message": "never record this",
+            }})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
             llm = LLMClient(settings(OPENAI_API_KEY=""), client=http, now=lambda: NOW)
@@ -145,10 +149,16 @@ def test_only_allowlisted_error_codes_are_kept():
     asyncio.run(run())
 
 
-def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path):
+@pytest.mark.parametrize(("failure", "code"), [
+    ("request_rejected", "invalid_type"),
+    ("invalid_output", "answer_json"),
+])
+def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path, failure, code):
     clock, ledger, _, make_pipeline = rig(tmp_path)
 
     def endpoint(_):
+        if failure == "invalid_output":
+            return httpx.Response(200, json=completed("never record this hidden malformed answer"))
         return httpx.Response(400, json={"error": {
             "code": "invalid_type", "param": "hidden", "message": "never record this"
         }})
@@ -160,9 +170,62 @@ def test_research_work_adds_safe_codes_without_replacing_failure_kinds(tmp_path)
             await pipe.run("weekly")
             work = pipe.store.work_state(f"weekly:{clock.t.date()}:ABC")
             details = json.loads(work["details_json"])
-            assert details["failures"] == ["openai:request_rejected"]
-            assert details["failure_codes"] == ["openai:invalid_type"]
+            assert details["failures"] == [f"openai:{failure}"]
+            assert details["failure_codes"] == [f"openai:{code}"]
             assert "never record" not in work["details_json"] and "hidden" not in work["details_json"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("answer", "code"), [
+    ("", "answer_empty"),
+    ("x" * 22_001, "answer_too_large"),
+    ('{"direction":"BUY","direction":"HOLD","conviction":8,"note":null}', "answer_json"),
+    ('{"direction":"BUY","conviction":NaN,"note":null}', "answer_json"),
+    ('{"direction":"hidden","conviction":8,"note":null}', "schema_direction"),
+    ('{"direction":"BUY","conviction":8}', "schema_missing_field"),
+    ('{"direction":"BUY","conviction":8,"note":null,"hidden":true}', "schema_extra_field"),
+    ('{"direction":"BUY","conviction":"hidden","note":null}', "schema_invalid"),
+])
+def test_ungrounded_invalid_answer_codes_are_safe(answer, code, caplog):
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=completed(answer, [])),
+        )) as http:
+            llm = LLMClient(settings(OPENAI_API_KEY=""), client=http, now=lambda: NOW)
+            with pytest.raises(ProviderUnavailable) as exc:
+                await llm.complete(request(grounded=False))
+            assert exc.value.attempts[0].kind == "invalid_output"
+            assert exc.value.failure_codes == {"failure_codes": [f"perplexity:{code}"]}
+
+    asyncio.run(run())
+    assert f"code={code}" in caplog.text and "hidden" not in caplog.text
+
+
+@pytest.mark.parametrize(("direction", "cite", "dated", "thesis_break", "code"), [
+    ("HOLD", "source", True, "Break", "thesis_direction"),
+    ("BUY", "bogus", True, "Break", "thesis_unknown_evidence"),
+    ("BUY", "source", False, "Break", "thesis_missing_dated_evidence"),
+    ("BUY", "source", True, None, "thesis_missing_invalidation"),
+])
+def test_best_ideas_codes_distinguish_parsed_thesis_validation(direction, cite, dated, thesis_break, code):
+    def endpoint(req):
+        wire = response(json.loads(req.content), direction=direction, cite=cite).json()
+        draft = json.loads(wire["output"][-1]["content"][0]["text"])
+        draft["thesis_break"] = thesis_break
+        source = {"url": "https://example.org/results", "id": "source"}
+        if dated:
+            source["published_at"] = (NOW - timedelta(days=1)).isoformat()
+        return httpx.Response(200, json=completed(json.dumps(draft), [source]))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            analyst = Analyst(LLMClient(settings(OPENAI_API_KEY=""), client=http, now=lambda: NOW))
+            data = ResearchInput("ABC", NOW, "ABC", "t", 20, None, {}, ())
+            with pytest.raises(ProviderUnavailable) as exc:
+                await analyst.evaluate(data, best_ideas=True)
+            assert exc.value.attempts[0].kind == "invalid_output"
+            assert exc.value.failure_codes == {"failure_codes": [f"perplexity:{code}"]}
 
     asyncio.run(run())
 
@@ -279,5 +342,6 @@ def test_owner_buy_and_veto_apply_publication_precision(direction, added_days, d
                 with pytest.raises(ProviderUnavailable) as exc:
                     await analyst.evaluate(data, owner=owner)
                 assert [a.kind for a in exc.value.attempts] == ["decision_rejected"]
+                assert exc.value.failure_codes == {"failure_codes": ["perplexity:owner_veto_date"]}
 
     asyncio.run(run())
