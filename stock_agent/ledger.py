@@ -923,7 +923,7 @@ class Ledger:
 
     def claim_intent(self, intent_id: str, *, check_thesis: bool = True,
                      top_up_session: date | None = None, top_up_baseline_grade: int | None = None,
-                     new_stock_session: date | None = None) -> OrderIntent:
+                     new_stock_session: date | None = None, new_stock_limit: int | None = None) -> OrderIntent:
         """Mark SUBMITTING before the HTTP call. Raises ``LedgerError`` when the
         intent is not QUEUED, is expired, or (buys) its thesis was superseded."""
         it = self.get_intent(intent_id)
@@ -947,10 +947,12 @@ class Ledger:
         if top_up_session is not None:
             return self._claim_top_up(it, top_up_session, top_up_baseline_grade)
         if new_stock_session is not None:
-            return self._claim_new_stock(it, new_stock_session)
+            if new_stock_limit is None or new_stock_limit < 1:
+                raise LedgerError("a new-stock reservation requires a positive session limit")
+            return self._claim_new_stock(it, new_stock_session, new_stock_limit)
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
 
-    def _claim_new_stock(self, it: OrderIntent, session: date) -> OrderIntent:
+    def _claim_new_stock(self, it: OrderIntent, session: date, limit: int) -> OrderIntent:
         from stock_agent.risk_manager import classify_symbol
 
         if it.position_id or it.side != "buy" or it.kind != "equity":
@@ -979,9 +981,9 @@ class Ledger:
             if issuer in occupied:
                 raise NewStockEntryRefused("new_stock_issuer_already_admitted",
                                            "this issuer filled today or already has an active entry reservation")
-            if len(occupied) >= 2:
+            if len(occupied) >= limit:
                 raise NewStockEntryRefused("new_stock_session_cap",
-                                           "two new stock positions already filled or reserved this NY session")
+                                           f"new-stock limit ({limit}) reached for this NY session (fills/reservations)")
             return self._transition(it.intent_id, IntentStatus.SUBMITTING, bump_attempts=True,
                                     meta={"new_stock_session": day, "new_stock_issuer": issuer})
 

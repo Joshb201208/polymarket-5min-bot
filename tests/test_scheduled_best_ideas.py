@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from stock_agent.analyst import BEST_IDEAS_PROMPT_VERSION, THESIS_PROMPT_VERSION, Analyst
+from stock_agent.config import Config
 from stock_agent.ledger import IntentStatus, NewIntent, NewStockEntryRefused
 from stock_agent.llm_client import LLMClient
 from stock_agent.market_calendar import Session
@@ -235,45 +236,56 @@ def test_scheduled_screener_drops_relative_strength_weight_without_erasing_other
 def test_session_reservations_survive_restart_and_release_on_zero_fill(tmp_path):
     ledger = make_ledger(tmp_path)
     day = START.date()
+    reserve = {"new_stock_session": day, "new_stock_limit": 2}
     issuer_a, alias, issuer_b, third, fourth = ledger.enqueue_intents([
         NewIntent(s, "buy", s, origin=origin) for s, origin in
         [("GOOGL", "prescan"), ("GOOG", "news"), ("BBB", "weekly"), ("CCC", "market_move"), ("DDD", "earnings")]
     ])
-    ledger.claim_intent(issuer_a, new_stock_session=day)
+    ledger.claim_intent(issuer_a, **reserve)
     ledger.ack_intent(issuer_a, IntentStatus.SUBMITTED)
     ledger.ack_intent(issuer_a, IntentStatus.PARTIALLY_FILLED, meta={"filled_qty": 1})
     ledger.ack_intent(issuer_a, IntentStatus.CANCELLED)
-    ledger.claim_intent(issuer_b, new_stock_session=day)
+    ledger.claim_intent(issuer_b, **reserve)
     ledger.store.close()
     ledger = make_ledger(tmp_path)
     ledger.mark_submitting_ambiguous()
     with pytest.raises(NewStockEntryRefused) as same:
-        ledger.claim_intent(alias, new_stock_session=day)
+        ledger.claim_intent(alias, **reserve)
     assert same.value.code == "new_stock_issuer_already_admitted"
     with pytest.raises(NewStockEntryRefused) as full:
-        ledger.claim_intent(third, new_stock_session=day)
+        ledger.claim_intent(third, **reserve)
     assert full.value.code == "new_stock_session_cap"
     ledger.ack_intent(issuer_b, IntentStatus.CANCELLED, meta={"filled_qty": 0})
-    assert ledger.claim_intent(third, new_stock_session=day).status is IntentStatus.SUBMITTING
-    assert ledger.claim_intent(fourth, new_stock_session=day + timedelta(days=1)).status is IntentStatus.SUBMITTING
+    assert ledger.claim_intent(third, **reserve).status is IntentStatus.SUBMITTING
+    assert ledger.claim_intent(
+        fourth, new_stock_session=day + timedelta(days=1), new_stock_limit=2,
+    ).status is IntentStatus.SUBMITTING
 
 
-def test_common_execution_cap_fills_two_and_journals_third_without_order(world, tmp_path, monkeypatch):
+@pytest.mark.parametrize(("override", "expected"), [(None, 3), (2, 2)])
+def test_common_execution_cap_journals_excess_without_order(world, tmp_path, monkeypatch, override, expected):
+    if override is not None:
+        monkeypatch.setattr(Config, "MAX_NEW_STOCK_POSITIONS_PER_SESSION", override)
     world.clock.set_et(2026, 11, 23, 10, 0)
-    for symbol in ("AAA", "BBB", "CCC"):
+    entries = [("AAA", "prescan"), ("BBB", "news"), ("CCC", "market_move"), ("DDD", "earnings")]
+    for symbol, _ in entries:
         world.price(symbol, 50, spread=0.02)
     eng = make_engine(world, tmp_path, monkeypatch)
 
     async def go():
         results = []
-        for symbol, origin in (("AAA", "prescan"), ("BBB", "news"), ("CCC", "market_move")):
+        for symbol, origin in entries:
             it = enqueue(eng, symbol, "buy", ref=50)
             results.append(await eng.execute_intent(replace(it, origin=origin)))
         return results
 
-    first, second, third = asyncio.run(go())
-    assert first.status == second.status == IntentStatus.FILLED
-    assert third.status == IntentStatus.SKIPPED and third.code == "new_stock_session_cap"
-    assert {o.symbol for o in world.alpaca.orders.values() if o.side == "buy"} == {"AAA", "BBB"}
-    row = next(r for r in eng.ledger.journal.read({"execution.buy_funnel"}) if r.get("code") == third.code)
-    assert row["stage"] == "skipped" and row["symbol"] == "CCC" and row["origin"] == "market_move"
+    results = asyncio.run(go())
+    assert all(r.status == IntentStatus.FILLED for r in results[:expected])
+    assert all(r.status == IntentStatus.SKIPPED and r.code == "new_stock_session_cap" for r in results[expected:])
+    assert {o.symbol for o in world.alpaca.orders.values() if o.side == "buy"} == {
+        symbol for symbol, _ in entries[:expected]
+    }
+    rows = [r for r in eng.ledger.journal.read({"execution.buy_funnel"}) if r.get("code") == "new_stock_session_cap"]
+    assert [(r["stage"], r["symbol"], r["origin"]) for r in rows] == [
+        ("skipped", symbol, origin) for symbol, origin in entries[expected:]
+    ]

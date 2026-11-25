@@ -109,6 +109,15 @@ def test_starts_cleanly_with_only_todays_server_env_names() -> None:
     assert summary["limits"]["drawdown_pause_max_sessions"] == 21
 
 
+def test_new_stock_session_cap_defaults_and_validates_overrides() -> None:
+    assert load_settings({}).MAX_NEW_STOCK_POSITIONS_PER_SESSION == 3
+    custom = load_settings({"MAX_NEW_STOCK_POSITIONS_PER_SESSION": "2"})
+    assert custom.MAX_NEW_STOCK_POSITIONS_PER_SESSION == 2
+    assert custom.redacted_summary()["limits"]["max_new_stock_positions_per_session"] == 2
+    with pytest.raises(SettingsError, match="MAX_NEW_STOCK_POSITIONS_PER_SESSION"):
+        load_settings({"MAX_NEW_STOCK_POSITIONS_PER_SESSION": "0"})
+
+
 def test_no_secret_defaults_exist_in_code_or_repr() -> None:
     defaults = Settings()
     secret_fields = [
@@ -621,5 +630,4 @@ def test_branch_diff_contains_no_leaked_secret_patterns() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     findings = _scan_commit_range_for_secret_patterns(repo_root, base_ref="origin/master")
     assert not findings, f"Secret pattern(s) detected in branch commits: {findings}"
-
 

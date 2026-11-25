@@ -798,6 +798,7 @@ class ExecutionEngine:
                 intent.intent_id, top_up_session=self.session_date() if add else None,
                 top_up_baseline_grade=ti.effective_conviction if initial_reaffirmation else None,
                 new_stock_session=self.session_date() if not add else None,
+                new_stock_limit=self.config.MAX_NEW_STOCK_POSITIONS_PER_SESSION if not add else None,
             )
         except TopUpAlreadyToday as e:
             return self._skip(intent, str(e), "top_up_already_today")

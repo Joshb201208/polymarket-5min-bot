@@ -495,10 +495,9 @@ def test_prebuy_refresh_rolling_minute_budget_caps_slow_provider_storm(world, tm
         assert [r.status for r in results] == [
             IntentStatus.FILLED,
             IntentStatus.FILLED,
-            IntentStatus.SKIPPED,
+            IntentStatus.FILLED,
             IntentStatus.QUEUED,
         ]
-        assert results[2].code == "new_stock_session_cap"
         assert results[3].code == "research_inputs_pending"
         # Crucially, DDD never even invoked slow_refresh once the 15s rolling-minute budget was exhausted.
         assert refresh_calls == ["AAA", "BBB", "CCC"]
