@@ -82,8 +82,11 @@ class Structure:
     expiry: str
     legs: list[Leg]
     state: str = StructState.PENDING.value
-    source: str = "scan"  # scan | news | adopted
+    source: str = "scan"  # scan | news | research | owner | adopted
     thesis_id: str | None = None
+    owner_directive_added: str | None = None  # owner-backed: the directive generation ("added" date)
+    zero_fill_confirmed: bool = False  # VOID because the broker confirmed a terminal open with no fill
+    owner_claim_released: bool = False  # owner-backed: durable one-shot claim handed back
     conviction: int | None = None
     story_id: str | None = None
     opened_at: str | None = None

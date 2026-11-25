@@ -103,6 +103,8 @@ class OptionCandidate:
     source: str = "news"
     story_id: str | None = None
     direction_hint: str | None = None  # bullish | bearish | BUY | BEARISH
+    thesis_id: str | None = None  # owner ideas: the thesis the idea was built from
+    owner_directive_added: str | None = None  # owner ideas: directive generation (ISO date)
 
 
 @dataclass(frozen=True)
@@ -544,10 +546,151 @@ class OptionsManager:
                    if s.source == "news" and s.opened_at and s.opened_at[:10] == today.isoformat()
                    and s.st is not StructState.VOID)
 
+    # ---------------------------------------------------------- owner-backed
+    def _owner_ledger(self) -> Any:
+        return getattr(self.gate, "ledger", None)
+
+    def _owner_structures(self, sym: str, added: str) -> list[Structure]:
+        return [x for x in self.structures
+                if x.source == "owner" and x.underlying == sym and x.owner_directive_added == added]
+
+    def _owner_book_used(self, sym: str, added: str) -> bool:
+        """An owner structure for this directive generation uses it up: pending (outcome
+        unknown), open, partial, closed, stopped, expired, or voided without a broker-confirmed
+        zero fill; none of them re-arms. Only a confirmed zero fill frees the shot (lead ruling 2)."""
+        return any(not (x.st is StructState.VOID and x.zero_fill_confirmed)
+                   for x in self._owner_structures(sym, added))
+
+    def _owner_release_voided(self, sym: str) -> None:
+        """Hand back the durable claim of saved, broker-confirmed zero-fill owner structures,
+        before the gate is asked (the gate denies while the claim stands). Without the ledger
+        method the shot stays spent (fail closed)."""
+        release = getattr(self._owner_ledger(), "release_owner_option", None)
+        if release is None:
+            return
+        for x in self.structures:
+            if (x.source == "owner" and x.underlying == sym and x.owner_directive_added
+                    and x.st is StructState.VOID and x.zero_fill_confirmed and not x.owner_claim_released):
+                added = date.fromisoformat(x.owner_directive_added)
+                try:
+                    if release(sym, added, x.id) is True:
+                        x.owner_claim_released = True
+                        x.note("owner option claim released: confirmed zero fill")
+                        self._j("options.owner_claim_released", structure_id=x.id, underlying=sym,
+                                owner_directive_added=x.owner_directive_added)
+                        self._save()
+                except Exception as e:
+                    logger.warning("owner claim release failed for %s: %s", x.id, type(e).__name__)
+
+    async def _owner_proof(self, c: OptionCandidate, sym: str, now: datetime) -> tuple[Any, Any, str | None]:
+        """(eligibility, proof, problem). The proof is the typed OwnerEntryProof the research
+        gate issues after re-reading the focus file and the current thesis; idea metadata is
+        only cross-checked against it, never trusted on its own."""
+        self._owner_release_voided(sym)
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(sym, now, allow_owner=True, owner_lane="option"))
+        except TypeError:
+            return None, None, "research gate has no owner option lane"
+        if not el.ok:
+            await self._owner_orphan_check(sym, c.owner_directive_added)
+            return el, None, "research gate: " + ",".join(el.reasons)
+        proof = getattr(el, "owner_entry", None)
+        if proof is None:
+            return el, None, "owner directive: no proof from the research gate"
+        added = proof.added.isoformat()
+        if (proof.symbol.upper() != sym or proof.thesis_id != el.thesis_id
+                or getattr(proof, "lane", "option") != "option"
+                or (c.thesis_id is not None and c.thesis_id != proof.thesis_id)
+                or (c.owner_directive_added is not None and c.owner_directive_added != added)):
+            return el, None, "owner directive: idea does not match the current directive or thesis"
+        # the gate returns BUY, or HOLD for an owner option-only held thesis whose current
+        # held review is unchanged/strengthened; the proof is what makes either actionable
+        raw_dir = str(getattr(el.direction, "value", el.direction) or "").upper()
+        if parse_direction(el.direction) is not Direction.BULLISH and raw_dir != "HOLD":
+            return el, None, "owner directive: only a bullish structure is allowed"
+        if c.direction_hint and parse_direction(c.direction_hint) is not Direction.BULLISH:
+            return el, None, "owner directive: only a bullish structure is allowed"
+        if self._owner_book_used(sym, added):
+            if any(x.st is StructState.VOID and not x.zero_fill_confirmed
+                   for x in self._owner_structures(sym, added)):
+                await self._owner_spent_alert(sym, added)
+            return el, None, "owner directive already used for an option structure"
+        ledger = self._owner_ledger()
+        used = getattr(ledger, "owner_directive_used", None)
+        try:
+            spent = used is None or used(sym, proof.added, lane="option") is not False
+        except Exception as e:  # unreadable claim state -> no entry
+            return el, None, f"owner directive state unavailable: {e}"
+        if spent:
+            await self._owner_orphan_check(sym, added)
+            return el, None, "owner directive already used or vetoed"
+        return el, proof, None
+
+    async def _owner_orphan_check(self, sym: str, added: str | None) -> None:
+        """Independently of the gate verdict: a ledger claim for this generation with no
+        resolved structure in the book (or only an unconfirmed void) is an orphan; alert once."""
+        if not added:
+            return
+        ledger = self._owner_ledger()
+        used = getattr(ledger, "owner_directive_used", None)
+        vetoed = getattr(ledger, "owner_directive_vetoed", None)
+        try:
+            d = date.fromisoformat(added)
+            if used is None or used(sym, d, lane="option") is not True:
+                return
+            if vetoed is not None and vetoed(sym, d):
+                return
+        except Exception:
+            return
+        mine = self._owner_structures(sym, added)
+        if not mine or all(x.st is StructState.VOID and not x.zero_fill_confirmed for x in mine):
+            await self._owner_spent_alert(sym, added)
+
+    async def _owner_spent_alert(self, sym: str, added: str) -> None:
+        """Claimed but not provably resolved (crash between claim and reservation, or a void
+        the broker never confirmed): the shot stays spent; tell the owner once (durably)."""
+        key = f"opt-owner-spent-{sym}-{added}"
+        seen = self.meta.setdefault("owner_spent_alerted", [])
+        if key in seen:
+            return
+        seen.append(key)
+        self._save()
+        await self._alert("critical", f"Owner option idea spent: {sym}",
+                          f"Directive added {added} has a claimed option shot with no confirmed outcome. "
+                          "It stays spent; change 'added' in the focus file to re-arm on purpose.", key=key)
+
+    def _owner_claim(self, sym: str, proof: Any, structure_id: str) -> bool:
+        """Durable one-shot claim (ledger CAS); idempotent for the same structure id."""
+        claim = getattr(self._owner_ledger(), "claim_owner_option", None)
+        if claim is None:
+            return False
+        try:
+            return claim(sym, proof.added, structure_id) is True
+        except Exception:
+            return False
+
+    async def _owner_still_valid(self, st: Structure) -> str | None:
+        """Re-verify an owner structure before a later rung: same directive, not vetoed,
+        claim still ours."""
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
+                                                          owner_lane="option", reservation_id=st.id))
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        proof = getattr(el, "owner_entry", None) if el is not None and el.ok else None
+        if proof is None:
+            return "owner directive no longer valid"
+        if proof.added.isoformat() != st.owner_directive_added or proof.thesis_id != st.thesis_id:
+            return "owner directive or thesis changed"
+        if not self._owner_claim(st.underlying, proof, st.id):
+            return "owner directive claim lost"
+        return None
+
     async def _try_open(self, c: OptionCandidate, now: datetime) -> ScanOutcome:
         s = self.settings
         sym = c.symbol.upper()
         today = self._today(now)
+        owner = c.source == "owner"
         if any(x.underlying == sym for x in self.live()):
             return ScanOutcome(sym, None, "already holds a structure on this underlying")
         live = self.live()
@@ -567,16 +710,27 @@ class OptionsManager:
             return ScanOutcome(sym, None, f"underlying {why}", final=False)
         # ---- research gate (at a time no earlier than the quote just fetched)
         now = max(now, self._now())
-        el = await _maybe(self.gate.is_entry_eligible(sym, now))
-        if not el.ok:
-            return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
-        direction = parse_direction(el.direction)
+        proof = None
+        if owner:
+            el, proof, problem = await self._owner_proof(c, sym, now)
+            if problem:
+                return ScanOutcome(sym, None, problem, final=False)
+        else:
+            el = await _maybe(self.gate.is_entry_eligible(sym, now))
+            if not el.ok:
+                return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
+        direction = Direction.BULLISH if owner else parse_direction(el.direction)
         if direction is None:
             return ScanOutcome(sym, None, f"thesis direction {el.direction} is not tradeable with options")
         if c.direction_hint and parse_direction(c.direction_hint) not in (None, direction):
             return ScanOutcome(sym, None, "news direction disagrees with the thesis")
-        conv = el.effective_conviction
-        if conv is None or conv < s.min_effective_conviction or (el.raw_conviction or 0) < 7:
+        # owner ideas: grades come from the typed proof (owner effective, model raw), never from an
+        # ordinary held-review thesis grade
+        conv = proof.effective_conviction if proof is not None else el.effective_conviction
+        raw_grade = proof.raw_conviction if proof is not None else el.raw_conviction
+        # the model's own raw grade may sit below 7 only under a current owner proof
+        raw_floor = 1 if proof is not None else 7
+        if conv is None or conv < s.min_effective_conviction or (raw_grade or 0) < raw_floor:
             return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}")
         account = await self.broker.get_account()
         level = account.options_trading_level
@@ -598,6 +752,10 @@ class OptionsManager:
         quotes = await self._quotes(sorted(chosen), chosen)
         # level 2 allows long calls/puts only, level 3 adds spreads (A14: fall back, don't block)
         shapes = ("single", "spread") if level is None or level >= 3 else ("single",)
+        if owner and conv < s.single_option_min_conviction:
+            shapes = tuple(x for x in shapes if x == "spread")  # owner 8: a spread only, never a lone option
+            if not shapes:
+                return ScanOutcome(sym, None, f"options level {level} allows no spread for an owner idea", final=False)
         prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
                               chain=list(quotes.values()), today=today, now=now, s=s,
                               trading_days=self._calendar_days, shapes=shapes)
@@ -633,9 +791,9 @@ class OptionsManager:
         spot, quote_at = spot2, self._spot_at[sym.upper()]
         intent = TradeIntent(
             kind=TradeKind.OPTION_OPEN, symbol=sym, qty=Decimal(sizing.qty),
-            raw_conviction=el.raw_conviction, effective_conviction=conv, minimum_conviction=s.min_effective_conviction,
+            raw_conviction=raw_grade, effective_conviction=conv, minimum_conviction=s.min_effective_conviction,
             option_max_loss=Decimal(str(sizing.max_loss)), option_cash_debit=Decimal(str(sizing.debit_cash)),
-            structure_id=sid, signal_at=el.generated_at, quote_at=quote_at, analysis_price=Decimal(str(spot)),
+            structure_id=sid, signal_at=proof.generated_at if proof is not None else el.generated_at, quote_at=quote_at, analysis_price=Decimal(str(spot)),
         )
         # final risk recheck -> write-ahead reservation under the shared capital lock, so an
         # equity lane can't size from the same free cash at the same moment
@@ -644,6 +802,7 @@ class OptionsManager:
                 pause_new_buys=getattr(controls, "pause_new_buys", False),
                 drawdown=getattr(controls, "drawdown", RiskControls().drawdown),
                 option_commitments=self.commitments(),
+                **({"owner_entry": proof} if proof is not None else {}),
             )
             try:
                 snap = await _maybe(self._snapshot())
@@ -669,7 +828,17 @@ class OptionsManager:
             ok, why = await self._gate("entry")
             if not ok:
                 return ScanOutcome(sym, None, f"market gate: {why}", final=False)
+            if proof is not None:
+                if self._owner_book_used(sym, proof.added.isoformat()):
+                    return ScanOutcome(sym, None, "owner directive already used for an option structure")
+                if not self._owner_claim(sym, proof, sid):
+                    return ScanOutcome(sym, None, "owner directive claim refused (used, vetoed or unavailable)")
             st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
+            if proof is not None:
+                st.owner_directive_added = proof.added.isoformat()
+                st.conviction = conv  # owner effective grade from the proof
+                st.note(f"owner-backed: directive added {st.owner_directive_added}, model raw "
+                        f"{raw_grade}, owner {conv}")
             st.open_client_id = _cid("open", st.id)
             self.structures.append(st)
             self._save()  # write-ahead: from here the commitment is visible to every lane
@@ -710,7 +879,8 @@ class OptionsManager:
             id=sid, underlying=prop.underlying, strategy=prop.strategy.value, direction=prop.direction.value,
             qty=qty, expiry=prop.expiry.isoformat(),
             legs=[Leg(lg.symbol, lg.side, lg.type, lg.strike, lg.expiry.isoformat(), lg.ratio) for lg in prop.legs],
-            state=StructState.PENDING.value, source=c.source if c.source in ("news", "scan", "research") else "scan",
+            state=StructState.PENDING.value,
+            source=c.source if c.source in ("news", "scan", "research", "owner") else "scan",
             thesis_id=el.thesis_id, conviction=el.effective_conviction, story_id=c.story_id,
             opened_at=now.isoformat(), width=prop.width, max_loss=max_loss, limit_debit=prop.limit_debit,
             entry_greeks={"delta": prop.delta, "iv": prop.iv, "spot": prop.spot, "mid_debit": prop.mid_debit,
@@ -748,20 +918,28 @@ class OptionsManager:
             out = sorted(set(out) | {prop.limit_debit})
         return out
 
+    @staticmethod
+    def _owner_journal(st: Structure) -> dict:
+        return {"owner_directive_added": st.owner_directive_added} if st.source == "owner" else {}
+
     async def _submit_open(self, st: Structure, prop: Proposal, now: datetime) -> ScanOutcome:
         """Send the open ladder for a structure already reserved (write-ahead) in the book."""
         self._j("options.open_submitted", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                 direction=st.direction, qty=st.qty, expiry=st.expiry, legs=[lg.symbol for lg in st.legs],
                 limit_debit=prop.limit_debit, max_loss=st.max_loss, thesis_id=st.thesis_id,
-                conviction=st.conviction, source=st.source, story_id=st.story_id, greeks=st.entry_greeks)
+                conviction=st.conviction, source=st.source, story_id=st.story_id, greeks=st.entry_greeks,
+                **self._owner_journal(st))
         order = None
         for attempt, limit in enumerate(self._open_ladder(prop)):  # same ladder as sized
             if attempt:
                 ok, why = await self._gate("entry")
                 if not ok:
                     break
+                if st.source == "owner" and await self._owner_still_valid(st):
+                    break
                 st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
+                st.zero_fill_confirmed = False
                 self._save()
             # the reservation stays at the sized ceiling (top rung) until the order is
             # terminal; _apply_open_order then sets max loss from the actual fill
@@ -774,6 +952,7 @@ class OptionsManager:
                     self._save()
                     raise
                 st.state = StructState.VOID.value
+                st.zero_fill_confirmed = True  # definitive broker rejection: nothing was placed
                 st.note(f"open rejected: {e.message}")
                 self._save()
                 await self._rejected(st, "buy", st.qty, e.message, f"Options open rejected: {st.underlying}",
@@ -790,14 +969,14 @@ class OptionsManager:
             self._j("options.opened", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                     direction=st.direction, qty=st.qty, entry_debit=st.entry_debit, max_loss=st.max_loss,
                     width=st.width, expiry=st.expiry, thesis_id=st.thesis_id, greeks=st.entry_greeks,
-                    conviction=st.conviction, source=st.source)
+                    conviction=st.conviction, source=st.source, **self._owner_journal(st))
             max_profit = (round((st.width - st.entry_debit) * MULTIPLIER * st.qty, 2)
                           if st.width is not None and st.entry_debit is not None else None)
             if not await self._notify(
                     "send_option_structure_opened", underlying=st.underlying, strategy=st.strategy,
                     legs_summary=self._legs_summary(st), debit_total=round((st.entry_debit or 0) * MULTIPLIER * st.qty, 2),
                     max_loss=st.max_loss, max_profit=max_profit, expiry=st.expiry, conviction=st.conviction,
-                    origin="NEWS" if st.source == "news" else "SCHEDULED", reason=st.thesis_id or ""):
+                    origin={"news": "NEWS", "owner": "OWNER"}.get(st.source, "SCHEDULED"), reason=st.thesis_id or ""):
                 await self._alert("info", f"Options opened: {st.underlying} {st.strategy}",
                                   f"{st.qty} x {st.expiry}, debit {st.entry_debit:.2f}, max loss {st.max_loss:.0f}",
                                   key=f"opt-open-{st.id}")
@@ -860,6 +1039,7 @@ class OptionsManager:
             st.state = StructState.OPEN.value
         elif order.is_terminal:
             st.state = StructState.VOID.value
+            st.zero_fill_confirmed = (order.filled_qty or 0) == 0
             st.note(f"open order ended {order.status} with no fill")
 
     # ============================================================== reconcile
