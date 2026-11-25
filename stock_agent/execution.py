@@ -781,7 +781,7 @@ class ExecutionEngine:
             el = await self._opening_owner_eligibility(intent, h)
             if el is None or el.owner_entry is None:
                 reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
-                if set(reasons) <= self.RESEARCH_TRANSIENT:
+                if set(reasons) <= self.OWNER_RESEARCH_TRANSIENT:
                     return await self._hold(intent, ", ".join(reasons), code="research_inputs_pending")
                 return self._skip(intent, ", ".join(reasons), "owner_directive_invalid")
             owner_entry = el.owner_entry
@@ -861,7 +861,7 @@ class ExecutionEngine:
             el = await self._opening_owner_eligibility(claimed, h)
             if el is None or el.owner_entry != owner_entry:
                 reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
-                if set(reasons) <= self.RESEARCH_TRANSIENT:
+                if set(reasons) <= self.OWNER_RESEARCH_TRANSIENT:
                     return await self._hold(claimed, ", ".join(reasons), code="research_inputs_pending")
                 return self._skip(claimed, ", ".join(reasons), "owner_directive_invalid")
             controls = replace(self._risk_controls(), owner_entry=el.owner_entry)
@@ -902,7 +902,8 @@ class ExecutionEngine:
     # and retried (it expires at the session close) instead of being skipped.
     RESEARCH_REFRESHABLE = frozenset({"quote_stale_or_unavailable", "news_stale_or_unavailable"})
     RESEARCH_TRANSIENT = RESEARCH_REFRESHABLE | frozenset({
-        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable", "owner_proof_unavailable"})
+        "broker_book_unavailable", "research_health_unavailable", "llm_unavailable"})
+    OWNER_RESEARCH_TRANSIENT = RESEARCH_TRANSIENT | frozenset({"owner_proof_unavailable"})
     RESEARCH_REFRESH_TIMEOUT_S = 10.0
     # Aggregate cap so N due buys can't stall monitor_tick by N x 10s: at most this many seconds
     # of proof refresh per rolling minute; past it, stale proofs take the transient hold path.
