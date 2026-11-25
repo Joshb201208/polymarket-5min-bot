@@ -19,7 +19,7 @@ from stock_agent.ledger import BookSnapshot, IntentStatus, JobStatus, NewIntent,
 from stock_agent.llm_client import ModelRoute, ProviderUnavailable
 from stock_agent.research_focus import FocusItem, focus_symbols, owner_backed
 from stock_agent.research_notes import load_notes, research_notes_payload
-from stock_agent.research_schemas import Direction, Evidence, ResearchTask, utc_datetime
+from stock_agent.research_schemas import Direction, Evidence, OwnerThesisDraft, ResearchTask, utc_datetime
 from stock_agent.research_store import NY, ResearchStore
 from stock_agent.screener import Candidate, Screener
 
@@ -39,6 +39,10 @@ def _edgar_filing(url: str) -> bool:
                 and parsed.path.lower().startswith("/archives/edgar/data/"))
     except ValueError:
         return False
+
+
+def _edgar_index_only(url: str) -> bool:
+    return _edgar_filing(url) and urlsplit(url).path.lower().endswith(("-index.htm", "-index.html"))
 
 
 class SourceUnavailable(RuntimeError):
@@ -79,12 +83,16 @@ class SecurityInputs:
     metrics: dict = field(default_factory=dict)
     evidence: tuple[Evidence, ...] = ()
     metric_provenance: dict = field(default_factory=dict)
+    priority_evidence: tuple[Evidence, ...] = ()
+    analysis_price: Decimal | None = None
+    analysis_quote_at: datetime | None = None
 
 
 class Sources(Protocol):
     async def universe(self, now: datetime) -> tuple[str, ...]: ...
 
-    async def securities(self, symbols: tuple[str, ...], now: datetime) -> dict[str, SecurityInputs]: ...
+    async def securities(self, symbols: tuple[str, ...], now: datetime,
+                         *, preopen: bool = False, prescan: bool = False) -> dict[str, SecurityInputs]: ...
 
     async def news(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]: ...
 
@@ -232,8 +240,8 @@ class ResearchPipeline:
             await self._confirm(pending["work_key"], held.get(pending["symbol"]))
         focus = tuple(self.focus(now=now))
         daily = tuple(dict.fromkeys(self.daily_focus(now=now)))
-        prescan = (kind == "prescan" and work_scope is None
-                   and now.astimezone(NY).date() == session.date and now < session.opens_at)
+        preopen = now.astimezone(NY).date() == session.date and now < session.opens_at
+        prescan = kind == "prescan" and work_scope is None and preopen
         directives = self.directives(now=now) if prescan else {}
         universe = await self.sources.universe(now)
         symbols = tuple(dict.fromkeys((*held, *focus, *universe)))
@@ -286,7 +294,9 @@ class ResearchPipeline:
         else:
             if prescan:
                 symbols = tuple(dict.fromkeys((*held, *directives, *focus, *daily, *symbols)))
-            securities = await self.sources.securities(symbols, now)
+            securities = await self.sources.securities(
+                symbols, now, **({"preopen": True} if preopen else {}), **({"prescan": True} if prescan else {}),
+            )
             ranked = Screener.rank([
                 Candidate(row.symbol, row.name, row.sector, row.tradable, row.metrics, row.symbol in focus)
                 for row in securities.values()
@@ -327,7 +337,9 @@ class ResearchPipeline:
             owner = None
             held_owner_option = None
             if (directive and as_of < session.opens_at
-                    and not self.ledger.owner_directive_vetoed(symbol, directive.added)):
+                    and not self.ledger.owner_directive_vetoed(symbol, directive.added)
+                    and not self.ledger.owner_directive_exited(symbol, directive.added)
+                    and not self.ledger.owner_directive_held(symbol, session.date)):
                 option_used = self.ledger.owner_directive_used(symbol, directive.added, lane="option")
                 if symbol in held:
                     held_owner_option = None if option_used else directive
@@ -492,10 +504,12 @@ class ResearchPipeline:
             if code == "handoff_promoted":
                 funnel.buy_candidates += 1
 
-    def _finish_handoff(self, key, intent, code, *, reasons=()):
+    def _finish_handoff(self, key, intent, code, *, reasons=(), hold_owner=False):
         with self.store.store.transaction():
             if self.store.pending_buy(key)["status"] != "waiting":
                 return "handoff_already_processed"
+            if hold_owner:
+                self.ledger.hold_owner_directive_for_session(intent.symbol, intent.session_date, reasons[0])
             intent_id = None
             if code != "handoff_reanchored":
                 queued = intent if code == "handoff_promoted" else replace(
@@ -551,6 +565,8 @@ class ResearchPipeline:
                 symbol, self.clock(), **({"allow_owner": True} if owner else {}),
             )
             if not gate.ok:
+                if owner and "owner_directive_session_hold" in gate.reasons:
+                    return refuse("handoff_owner_news_deferred", "owner_directive_session_hold")
                 if gate.reasons and set(gate.reasons) <= _HANDOFF_TRANSIENT:
                     return self._retry_handoff(key, intent, gate.reasons[0])
                 return refuse("handoff_gate_refused", *gate.reasons)
@@ -604,13 +620,16 @@ class ResearchPipeline:
             return rejection
         if owner:
             if material:
-                code = refuse("handoff_owner_news_deferred", "new_material_issuer_news_after_owner_review")
+                code = self._finish_handoff(
+                    key, intent, "handoff_owner_news_deferred", hold_owner=True,
+                    reasons=("new_material_issuer_news_after_owner_review",),
+                )
                 if code == "handoff_owner_news_deferred":
                     self._owner_event(owner, "handoff_deferred", evidence_ids=tuple(item.evidence_id for item in material))
-                    await self._owner_alert(
-                        owner, "handoff deferred",
-                        "New material issuer news blocked today's stock handoff. The stock lane remains unused "
-                        "and can be reviewed at the next pre-open session if the directive is still active.\n"
+                    await self._owner_session_hold_alert(
+                        symbol, intent.session_date,
+                        "New material issuer news paused both owner lanes for this session. "
+                        "A fresh pre-open review may reassess the active directive next session.\n"
                         + "\n".join(f"{item.title}: {item.url}" for item in material[:3]),
                     )
                 return code
@@ -660,6 +679,31 @@ class ResearchPipeline:
         }
         if story:
             evidence = {story.evidence.evidence_id: story.evidence, **evidence}
+        baseline_evidence = tuple(evidence.values())[:24]
+        grounding_evidence = tuple(
+            item for item in baseline_evidence if item.published_at is not None and not _edgar_index_only(item.url)
+        )
+        recent_primary = next((
+            item for item in grounding_evidence
+            if now - item.published_at <= timedelta(days=120) and _edgar_filing(item.url)
+        ), None)
+        filing_evidence = tuple({
+            item.evidence_id: item for item in security.priority_evidence
+            if item.evidence_id not in evidence and item.retrieved_at <= now
+            and (item.published_at is None or item.published_at <= now)
+        }.values())[:3]
+        # Metadata-only filings get reserved slots, but cannot suppress search.
+        # Keep both kinds of baseline grounding signals in the visible evidence.
+        anchors = {
+            item.evidence_id for item in (next(iter(grounding_evidence), None), recent_primary) if item is not None
+        }
+        kept = list(baseline_evidence)
+        for index in reversed(range(len(kept))):
+            if len(kept) + len(filing_evidence) <= 24:
+                break
+            if kept[index].evidence_id not in anchors:
+                del kept[index]
+        presented_evidence = (*kept, *filing_evidence)
         context = self.context()
         market = self.store.store.kv_get("research_market_regime") or {}
         market_at = utc_datetime(market.get("as_of"))
@@ -688,9 +732,10 @@ class ResearchPipeline:
                 price = await completed(symbol, previous.date)
                 if price is not None:
                     anchor_kind = "completed_split_adjusted_close"
-            if price is None and owner and _fresh_quote(security, now, max_age=timedelta(minutes=20)):
-                # An analysis anchor only, not the 90-second executable quote.
-                price = security.price
+        if anchor_kind is None and scheduled and now.astimezone(NY).date() == session.date:
+            brief = replace(security, price=security.analysis_price, quote_at=security.analysis_quote_at)
+            if _fresh_quote(brief, now, max_age=timedelta(minutes=20)):
+                price, quote_at = brief.price, brief.quote_at
                 anchor_kind = "recent_research_quote"
         metrics = dict(security.metrics)
         if anchor_kind:
@@ -700,7 +745,7 @@ class ResearchPipeline:
         data = ResearchInput(
             symbol, now, security.name, security.sector, float(price) if anchor_kind else None,
             quote_at if anchor_kind in {"quote", "recent_research_quote"} else None,
-            metrics, tuple(evidence.values())[:24],
+            metrics, presented_evidence,
             (story.evidence.evidence_id,) if story else (), _safe_previous(entry),
             _safe_previous(baseline or current), {"held": True, "opened_at": holding.meta.opened_at.isoformat()
                                                if holding.meta and holding.meta.opened_at else None}
@@ -709,27 +754,20 @@ class ResearchPipeline:
         task = ResearchTask.NEWS if story else ResearchTask.REVIEW if holding else ResearchTask.THESIS
         # Dated feed evidence can ground this evaluation directly; external
         # web search is useful when it fills a gap, not a second mandatory feed.
-        needs_search = not any(item.published_at is not None and item.published_at <= now for item in data.evidence)
+        needs_search = not grounding_evidence
         best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
         if owner:
             if data.price is None:
                 raise OwnerReviewUnavailable("no_quote_or_completed_close")
-            primary = any(
-                item.published_at is not None and now - item.published_at <= timedelta(days=120)
-                and _edgar_filing(item.url) for item in data.evidence
-            )
-            result = await self.analyst.evaluate(data, task=task, grounded=not primary, owner=owner)
+            result = await self.analyst.evaluate(data, task=task, grounded=True, owner=owner)
         elif best_ideas:
             # A dated market story or provider metric does not replace filing
             # research. Do not infer official issuer domains from ticker symbols.
-            needs_search = not any(
-                item.published_at is not None and now - item.published_at <= timedelta(days=120)
-                and _edgar_filing(item.url) for item in data.evidence
-            )
-            result = await self.analyst.evaluate(data, task=task, grounded=needs_search, best_ideas=True)
+            result = await self.analyst.evaluate(data, task=task, grounded=recent_primary is None, best_ideas=True)
         else:
             result = await self.analyst.evaluate(
-                data, task=task, grounded=needs_search, **({"single_review": True} if held_owner_option else {}),
+                data, task=task, grounded=bool(held_owner_option) or needs_search,
+                **({"single_review": True} if held_owner_option else {}),
             )
         record = result.record
         direction = record.draft.direction
@@ -783,6 +821,10 @@ class ResearchPipeline:
                 owner_option_conviction=held_owner_option.owner_conviction,
             )
         if owner and direction is not Direction.BUY:
+            assert isinstance(record.draft, OwnerThesisDraft) and record.draft.veto_claim_index is not None
+            claim = record.draft.claims[record.draft.veto_claim_index]
+            payload.update(owner_veto_claim_index=record.draft.veto_claim_index,
+                           owner_veto_evidence_ids=claim.evidence_ids)
             with self.store.store.transaction():
                 thesis_id = self.ledger.record_thesis(
                     symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
@@ -792,26 +834,31 @@ class ResearchPipeline:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "owner_directive_veto"})
             funnel.rejected_by_reason["owner_directive_veto"] += 1
             self._owner_event(owner, "vetoed", raw_conviction=record.raw_conviction,
-                              thesis_id=thesis_id, evidence_ids=evidence_ids)
+                              thesis_id=thesis_id, evidence_ids=claim.evidence_ids)
             if first:
                 cited = [
                     item.url for item in record.evidence
-                    if item.evidence_id in evidence_ids and item.published_at
-                    and utc_datetime(item.published_at).date() > owner.added
+                    if item.evidence_id in claim.evidence_ids
                 ]
-                await self._owner_alert(owner, "veto", f"{record.draft.summary}\n" + "\n".join(cited[:3]))
+                await self._owner_alert(owner, "veto", f"{claim.text}\n" + "\n".join(cited[:3]))
             return
         entry_blockers = ()
         confirmation_requested = False
+        new_owner_hold = False
         with self.store.store.transaction():
             exit_pending = self.store.has_unqueued_exit(symbol, now) or self.store.has_pending_confirmation(symbol, now)
-            protect_owner_handoff = (
-                not holding and owner is None and self.store.has_waiting_owner_buy(symbol, session.date.isoformat(), now)
+            waiting_owner = (
+                owner is None and self.store.has_waiting_owner_buy(symbol, session.date.isoformat(), self.clock())
             )
+            if (waiting_owner and kind in {"news", "earnings"}
+                    and direction in {Direction.AVOID, Direction.BEARISH, Direction.EXIT_PROPOSED}):
+                new_owner_hold = self.ledger.hold_owner_directive_for_session(
+                    symbol, session.date, f"{kind}:{direction.value}",
+                )
             thesis_id = self.ledger.record_thesis(
                 symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                 generated_at=record.generated_at,
-                activate=not (exit_pending or protect_owner_handoff),
+                activate=not (exit_pending or (waiting_owner and not holding)),
             )
             if option_from_held and not exit_pending and security.tradable:
                 self._qualify_owner_option(
@@ -853,6 +900,16 @@ class ResearchPipeline:
                 confirmation_requested = True
             else:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
+        if new_owner_hold:
+            self.ledger.journal.append(
+                "research.owner_directive", symbol=symbol, reason="owner_directive", outcome="session_held",
+                session_date=session.date.isoformat(), direction=direction, source=kind, thesis_id=thesis_id,
+            )
+            await self._owner_session_hold_alert(
+                symbol, session.date,
+                f"A {kind} review returned {direction.value}. Both owner lanes are paused for this session "
+                "without using either shot; the next pre-open review may reassess the directive.",
+            )
         if direction is not Direction.EXIT_PROPOSED or not position_id:
             if owner and entry_blockers:
                 await self._owner_unavailable(key, owner, ", ".join(entry_blockers), funnel)
@@ -875,15 +932,24 @@ class ResearchPipeline:
         )
 
     async def _owner_alert(self, owner: FocusItem, kind: str, body: str) -> None:
+        now = self.clock()
+        suffix = f":{now.astimezone(NY).date()}" if kind == "unavailable" else ""
+        await self._publish_owner_alert(
+            owner.symbol, kind, body, f"owner_directive:{kind}:{owner.symbol}:{owner.added}{suffix}", now,
+        )
+
+    async def _owner_session_hold_alert(self, symbol: str, session: date, body: str) -> None:
+        await self._publish_owner_alert(
+            symbol, "handoff deferred", body, f"owner_directive:session_hold:{symbol}:{session}", self.clock(),
+        )
+
+    async def _publish_owner_alert(self, symbol: str, kind: str, body: str, key: str, now: datetime) -> None:
         alert = getattr(self.alerts, "alert", None)
         if alert is None:
             return
-        now = self.clock()
-        suffix = f":{now.astimezone(NY).date()}" if kind in {"unavailable", "handoff deferred"} else ""
-        key = f"owner_directive:{kind}:{owner.symbol}:{owner.added}{suffix}"
-        if not self.store.claim_work(key, owner.symbol, now):
+        if not self.store.claim_work(key, symbol, now):
             return
-        result = alert("warning", f"Owner directive {kind}", f"{owner.symbol}: {body}", key=key)
+        result = alert("warning", f"Owner directive {kind}", f"{symbol}: {body}", key=key)
         if inspect.isawaitable(result):
             await result
         self.store.finish_work(key, "no_action")

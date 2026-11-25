@@ -318,13 +318,31 @@ class ResearchStore:
             (symbol, session_date),
         ))
 
-    def has_waiting_owner_buy(self, symbol: str, session_date: str, now: datetime) -> bool:
+    def has_waiting_owner_buy(self, symbol: str, session_date: str, now: datetime,
+                              *, generation: str | None = None) -> bool:
+        # Live reviews protect the active handoff; stock-first ordering also
+        # waits for any matching staged attempt until the handoff resolves it.
         return bool(self.store.query(
-            """SELECT 1 FROM research_pending_buys p JOIN current_thesis t
+            """SELECT 1 FROM research_pending_buys p LEFT JOIN current_thesis t
                ON t.symbol=p.symbol AND t.thesis_id=p.thesis_id
                WHERE p.symbol=? AND p.session_date=? AND p.status='waiting' AND p.expires_at_s>?
-               AND json_extract(p.details_json, '$.intent.meta.owner_directive_added') IS NOT NULL LIMIT 1""",
-            (symbol, session_date, int(now.timestamp())),
+               AND json_extract(p.details_json, '$.intent.meta.owner_directive_added') IS NOT NULL
+               AND ((? IS NULL AND t.thesis_id IS NOT NULL)
+                    OR json_extract(p.details_json, '$.intent.meta.owner_directive_added')=?) LIMIT 1""",
+            (symbol, session_date, int(now.timestamp()), generation, generation),
+        ))
+
+    def has_unqueued_owner_buy(self, symbol: str, session_date: str, generation: str, now: datetime) -> bool:
+        return bool(self.store.query(
+            """SELECT 1 FROM research_work w
+               WHERE w.symbol=? AND w.status='proposed'
+               AND json_extract(w.details_json, '$.intent.side')='buy'
+               AND json_extract(w.details_json, '$.intent.session_date')=?
+               AND json_extract(w.details_json, '$.intent.meta.owner_directive_added')=?
+               AND julianday(json_extract(w.details_json, '$.intent.expires_at'))>julianday(?)
+               AND NOT EXISTS (SELECT 1 FROM order_intents i WHERE i.dedupe_key=w.work_key)
+               LIMIT 1""",
+            (symbol, session_date, generation, now.isoformat()),
         ))
 
     def finish_pending_buy(self, key: str, status: str, *, intent_id: str | None = None,

@@ -82,6 +82,7 @@ class LLMRequest(Generic[T]):
     validate: Callable[[T, tuple[Evidence, ...]], None] | None = None
     exit_work: bool = False
     single_review: bool = False
+    local_decision_validation: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,9 +188,17 @@ class LLMClient:
                     continue
                 try:
                     response = await self._execute(route, request, blob)
-                    value = strict_json(request.value_type, response.text)
-                    if request.validate:
-                        request.validate(value, response.evidence)
+                    try:
+                        value = strict_json(request.value_type, response.text)
+                        if request.validate:
+                            request.validate(value, response.evidence)
+                    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                        if not request.local_decision_validation:
+                            raise
+                        # A successful response can fail an owner decision's
+                        # evidence rules without the provider being unhealthy.
+                        attempts.append(ProviderError(route.provider, route.model, "decision_rejected"))
+                        break
                     actual = ModelRoute(route.provider, response.model or route.model)
                     if request.primary and actual.underlying == request.primary.underlying:
                         raise ValueError("same underlying confirmation model")

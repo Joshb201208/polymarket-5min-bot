@@ -1503,9 +1503,13 @@ class StockAgentScheduler:
         if not self._entries_enabled():
             return
         ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        ideas = [idea for idea in ideas if idea.source != "owner" or self._owner_option_stock_ready(idea, now)]
         if not ideas:
             return
         if not (await self.market_gate("entry")).allowed:
+            return
+        ideas = [idea for idea in ideas if idea.source != "owner" or self._owner_option_stock_ready(idea, now)]
+        if not ideas:
             return
         candidates = [OptionCandidate(idea.symbol, source=getattr(idea, "source", "news"), story_id=idea.story_id,
                                       direction_hint=idea.direction.value,
@@ -1516,6 +1520,22 @@ class StockAgentScheduler:
         handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
         if handled:
             self.research_store.acknowledge_options(tuple(sorted(handled)))
+
+    def _owner_option_stock_ready(self, idea: OptionIdea, now: datetime) -> bool:
+        session_date = now.astimezone(ET).date()
+        symbol, generation = idea.symbol, idea.owner_directive_added
+        if not isinstance(generation, str) or self.ledger.owner_directive_held(symbol, session_date):
+            return False
+        iso_date = session_date.isoformat()
+        if self.research_store.has_waiting_owner_buy(symbol, iso_date, now, generation=generation):
+            return False
+        if self.research_store.has_unqueued_owner_buy(symbol, iso_date, generation, now):
+            return False
+        try:
+            added = date.fromisoformat(generation)
+        except ValueError:
+            return False
+        return not self.ledger.owner_stock_attempt_in_progress(symbol, added, session_date)
 
     async def _run_execution_cycle(self):
         if not self._engine_resumed:

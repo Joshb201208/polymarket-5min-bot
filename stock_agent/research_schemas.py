@@ -64,6 +64,7 @@ class ThesisDraft(StrictModel):
 class OwnerThesisDraft(ThesisDraft):
     direction: Literal[Direction.BUY, Direction.BEARISH, Direction.AVOID]
     stop_price: float | None = Field(gt=0)
+    veto_claim_index: int | None = Field(ge=0, le=7)
 
 
 class ExitConfirmation(StrictModel):

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -8,11 +9,13 @@ import pytest
 
 from stock_agent import research_focus
 from stock_agent.analyst import OWNER_IDEA_PROMPT_VERSION
-from stock_agent.ledger import ThesisRole
+from stock_agent.ledger import IntentStatus, NewIntent, ThesisRole
 from stock_agent.llm_client import ModelRoute
 from stock_agent.market_calendar import Session
 from stock_agent.research_focus import FocusItem
-from stock_agent.research_schemas import Evidence
+from stock_agent.research_pipeline import NewsEvent, OptionIdea
+from stock_agent.research_schemas import Direction, Evidence
+from stock_agent.scheduler import StockAgentScheduler
 from tests.test_review_research import START
 from tests.test_scheduled_best_ideas import FILING, response, rig
 
@@ -28,6 +31,9 @@ def _reply(body, *, direction, stop, cite="background", symbol="ABC"):
     item = raw["output"][-1]["content"][0]
     value = json.loads(item["text"])
     value["stop_price"] = stop
+    value["veto_claim_index"] = 0 if direction in {"AVOID", "BEARISH"} else None
+    if value["veto_claim_index"] is not None:
+        value["thesis_break"] = value["claims"][0]["text"]
     item["text"] = json.dumps(value)
     return httpx.Response(200, json=raw)
 
@@ -55,6 +61,7 @@ def test_owner_decision_is_priced_evidence_bound_and_never_silently_abstains(
         body = json.loads(req.content)
         calls.append(body)
         assert "Act as a risk reviewer" in body["instructions"]
+        assert body["tools"]  # An EDGAR input (even when dated) does not disable owner grounding.
         assert json.loads(body["input"].split("INPUT_JSON:\n")[1])["owner_directive"]["note"] == directive.note
         return _reply(body, direction=direction, stop=stop)
 
@@ -207,10 +214,10 @@ def test_analysis_anchors_option_only_research_while_underlying_quote_is_stale(t
         assert data["metrics"]["reference_price_kind"] == anchor_kind
         return _reply(body, direction="BUY", stop=17)
 
-    async def get_quotes(symbols, **kwargs):
+    async def get_quotes(symbols, *, purpose, **kwargs):
         return SimpleNamespace(quotes={
             sym: SimpleNamespace(price=20, as_of=clock.t - timedelta(minutes=5))
-            for sym in symbols if anchor_kind == "recent_research_quote"
+            for sym in symbols if anchor_kind == "recent_research_quote" and purpose == "brief"
         })
 
     async def prior_close(symbol, date):
@@ -221,6 +228,7 @@ def test_analysis_anchors_option_only_research_while_underlying_quote_is_stale(t
         async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
             pipe = make_pipe(http)
             pipe.directives = research_focus.owner_backed
+            pipe.sources.directives_for = research_focus.owner_backed
             pipe.sources.prices.get_quotes = get_quotes
             pipe.sources.completed_close = prior_close
             _prescan(pipe, clock)
@@ -296,6 +304,7 @@ def test_staged_owner_handoff_survives_ordinary_review_or_defers_without_spendin
             assert not ledger.owner_directive_used("ABC", directive.added)
             assert not ledger.owner_directive_used("ABC", directive.added, lane="option")
             assert not ledger.owner_directive_vetoed("ABC", directive.added)
+            assert ledger.owner_directive_held("ABC", START.date()) is has_issuer_event
             assert reviews == [True, False] and len(checks) == 1
             assert bool(alerts) == has_issuer_event and len(alerts) <= 1
             if has_issuer_event:
@@ -306,6 +315,206 @@ def test_staged_owner_handoff_survives_ordinary_review_or_defers_without_spendin
                 assert next_scan.intents and reviews == [True, False, True]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("mixed_in_one_claim", [False, True])
+def test_owner_veto_citations_bind_to_the_break_and_dont_fail_provider_health(tmp_path, monkeypatch, mixed_in_one_claim):
+    clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=FILING)
+    directive = FocusItem("ABC", None, "Check for a guidance cut.", START.date() - timedelta(days=1),
+                          START.date() + timedelta(days=5), stance="bullish", owner_conviction=8)
+    monkeypatch.setattr(research_focus, "owner_backed", lambda **_: {"ABC": directive})
+    old = Evidence(evidence_id="older", url="https://example.org/old", title="Cut",
+                   published_at=START - timedelta(days=1), retrieved_at=START, publisher="Fixture", snippet="")
+    health_failures = []
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        raw = _reply(body, direction="AVOID", stop=None).json()
+        item = raw["output"][-1]["content"][0]
+        value = json.loads(item["text"])
+        value["thesis_break"] = "Guidance was cut before acceptance."
+        value["claims"] = [
+            {"text": value["thesis_break"], "evidence_ids": ["older", "background"] if mixed_in_one_claim else ["older"]},
+            {"text": "A benign new source was published.", "evidence_ids": ["background"]},
+        ]
+        item["text"] = json.dumps(value)
+        return httpx.Response(200, json=raw)
+
+    async def run():
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            pipe = make_pipe(http)
+            pipe.directives = research_focus.owner_backed
+            pipe.analyst.llm.health = SimpleNamespace(record_llm_failure=lambda *a, **kw: health_failures.append(a))
+            original_securities = pipe.sources.securities
+
+            async def with_old(*args, **kwargs):
+                rows = await original_securities(*args, **kwargs)
+                return {sym: replace(row, evidence=(*row.evidence, old)) for sym, row in rows.items()}
+
+            pipe.sources.securities = with_old
+            _prescan(pipe, clock)
+            outcome = await pipe.run("prescan")
+            assert outcome.detail["unavailable"] == 1 and not outcome.intents and not outcome.option_candidates
+            assert pipe.analyst.llm.is_healthy()
+
+    asyncio.run(run())
+    assert not health_failures
+    assert not ledger.owner_directive_vetoed("ABC", directive.added)
+
+
+@pytest.mark.parametrize("preopen", [True, False])
+def test_metadata_only_filings_leave_ordinary_grounding_and_brief_stays_preopen(tmp_path, preopen):
+    index_url = "https://www.sec.gov/Archives/edgar/data/1/fixture-index.htm"
+    clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=index_url)
+    extra = Evidence(evidence_id="metadata", url=index_url.replace("fixture", "another"), title="EDGAR",
+                     published_at=START - timedelta(hours=2), retrieved_at=START, publisher="SEC", snippet="")
+    calls = []
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        inputs = json.loads(body["input"].split("INPUT_JSON:\n")[1])
+        assert body["tools"]
+        assert len(inputs["evidence"]) == 24
+        assert any(row["evidence_id"] == "metadata" for row in inputs["evidence"])
+        assert inputs["reference_price"] == (20 if preopen else None)
+        assert inputs["metrics"].get("reference_price_kind") == ("recent_research_quote" if preopen else None)
+        calls.append(inputs)
+        return response(body, direction="AVOID")
+
+    async def run():
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            pipe = make_pipe(http)
+            pipe.daily_focus = lambda **_: ("ABC",)
+            original_securities = pipe.sources.securities
+
+            async def with_brief(*args, **kwargs):
+                assert bool(kwargs.get("preopen")) is preopen
+                assert not kwargs.get("prescan")
+                rows = await original_securities(*args, **kwargs)
+                filler = tuple(extra.model_copy(update={"evidence_id": f"routine-{i}", "published_at": None})
+                               for i in range(24))
+                return {
+                    sym: replace(row, price=None, quote_at=None, evidence=(*row.evidence, *filler),
+                                 priority_evidence=(extra,),
+                                 analysis_price=20, analysis_quote_at=clock.t - timedelta(seconds=30))
+                    for sym, row in rows.items()
+                }
+
+            pipe.sources.securities = with_brief
+            if preopen:
+                _prescan(pipe, clock)
+            await pipe.run("weekly")
+
+    asyncio.run(run())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(("kind", "direction"), [
+    ("news", "HOLD"), ("earnings", "INSUFFICIENT_EVIDENCE"),
+    ("news", "AVOID"), ("earnings", "BEARISH"), ("news", "EXIT_PROPOSED"),
+])
+def test_live_review_preserves_owner_thesis_or_records_session_hold(tmp_path, monkeypatch, kind, direction):
+    clock, ledger, _, make_pipe = rig(tmp_path, supplied_url=FILING)
+    directive = FocusItem("ABC", None, "Check for a guidance cut.", START.date() - timedelta(days=1),
+                          START.date() + timedelta(days=5), stance="bullish", owner_conviction=8)
+    monkeypatch.setattr(research_focus, "owner_backed", lambda **_: {"ABC": directive})
+    alerts = []
+    story_count = 0
+
+    def endpoint(req):
+        body = json.loads(req.content)
+        if "Act as a risk reviewer" in body["instructions"]:
+            return _reply(body, direction="BUY", stop=17)
+        ordinary = response(body, direction=direction, cite="live-event")
+        if direction == "EXIT_PROPOSED":
+            raw = ordinary.json()
+            item = raw["output"][-1]["content"][0]
+            value = json.loads(item["text"])
+            item["text"] = json.dumps({**value, "thesis_change": "broken"})
+            return httpx.Response(200, json=raw)
+        return ordinary
+
+    async def get_quotes(*args, **kwargs):
+        return SimpleNamespace(quotes={})
+
+    async def prior_close(*_):
+        return 20
+
+    async def live_news(*_):
+        nonlocal story_count
+        story_count += 1
+        return (NewsEvent("ABC", f"live-event-{story_count}", Evidence(
+            evidence_id="live-event", url="https://example.org/event", title="Issuer event",
+            published_at=clock.t, retrieved_at=clock.t, publisher="Fixture", snippet="",
+        ), 8),)
+
+    async def run():
+        await ledger.refresh("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as http:
+            pipe = make_pipe(http)
+            pipe.directives = research_focus.owner_backed
+            pipe.alerts = SimpleNamespace(alert=lambda *args, **kwargs: alerts.append((args, kwargs)))
+            pipe.sources.prices.get_quotes = get_quotes
+            pipe.sources.completed_close = prior_close
+            pipe.sources.live_news = live_news
+            pipe.sources.releases = live_news
+            opens = _prescan(pipe, clock)
+            pipe.calendar.previous_session = lambda day: SimpleNamespace(date=day - timedelta(days=1))
+            await pipe.run("prescan")
+            old = ledger.current_thesis("ABC").thesis_id
+            clock.t = opens + timedelta(minutes=1)
+            await ledger.refresh("fixture")
+            snapshot = ledger.snapshot()
+            if direction == "EXIT_PROPOSED":
+                # A position appearing after staging permits an ordinary exit
+                # analysis; its lack of a position ID precludes a sell intent.
+                snapshot = replace(snapshot, holdings=(SimpleNamespace(symbol="ABC", qty=1, meta=None),))
+            await pipe.run(kind, snapshot=snapshot)
+            await pipe.run(kind, snapshot=snapshot)
+            if direction != "EXIT_PROPOSED":
+                assert ledger.current_thesis("ABC").thesis_id == old
+
+    asyncio.run(run())
+    expected = direction in {"AVOID", "BEARISH", "EXIT_PROPOSED"}
+    assert ledger.owner_directive_held("ABC", START.date()) is expected
+    assert not ledger.owner_directive_vetoed("ABC", directive.added)
+    assert not ledger.owner_directive_used("ABC", directive.added)
+    assert not ledger.owner_directive_used("ABC", directive.added, lane="option")
+    assert story_count == 2
+    assert len(alerts) == int(expected)
+
+
+def test_option_scheduler_waits_for_stock_proposal_queue_and_working_order(tmp_path):
+    clock, ledger, _, make_pipe = rig(tmp_path)
+    added = (clock.t.date() - timedelta(days=1)).isoformat()
+    session_day = clock.t.date()
+    pipe = make_pipe(None)
+    scheduler = SimpleNamespace(ledger=ledger, research_store=pipe.store)
+    idea = OptionIdea("ABC", Direction.BUY, "option", "thesis", 3, 8, clock.t, (), "owner", added)
+
+    def ready(now=None):
+        return StockAgentScheduler._owner_option_stock_ready(scheduler, idea, now or clock.t)
+
+    proposal = NewIntent(
+        "ABC", "buy", "stock-proposal", session_date=session_day, expires_at=clock.t + timedelta(hours=4),
+        meta={"owner_directive_added": added},
+    )
+    assert ready()
+    assert pipe.store.claim_work(proposal.dedupe_key, proposal.symbol, clock.t)
+    pipe.store.record_proposal(proposal.dedupe_key, "thesis", proposal)
+    assert not ready()
+    (intent_id,) = ledger.enqueue_intents((proposal,))
+    assert not ready()
+    assert ready(clock.t + timedelta(days=1))
+    ledger._transition(intent_id, IntentStatus.SUBMITTING)
+    ledger._transition(intent_id, IntentStatus.SUBMITTED)
+    assert not ready()
+    ledger._transition(intent_id, IntentStatus.CANCELLED)
+    assert ready()
+    assert ledger.hold_owner_directive_for_session("ABC", session_day, "risk")
+    assert not ready()
 
 
 @pytest.mark.parametrize(("change", "option_expected"), [("unchanged", True), ("weakened", False)])

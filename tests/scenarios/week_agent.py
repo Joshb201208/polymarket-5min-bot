@@ -115,7 +115,7 @@ class HttpSources:
     async def market(self, now):
         return ()
 
-    async def securities(self, symbols, now):
+    async def securities(self, symbols, now, *, preopen=False, prescan=False):
         from stock_agent.research_pipeline import SecurityInputs
 
         if not symbols:
