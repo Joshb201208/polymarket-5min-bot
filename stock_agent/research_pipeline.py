@@ -32,6 +32,8 @@ PRESCAN_MAX_RUNTIME = 2_100
 _PRESCAN_OPEN_BUFFER = timedelta(minutes=10)
 _PRESCAN_PRICE_TIMEOUT = 15
 _PRESCAN_REVIEW_BUDGET = SCHEDULED_REVIEW_TRANSPORT_SECONDS + _PRESCAN_PRICE_TIMEOUT + 10
+# At most two configured model choices per provider, all ungrounded (30s).
+_PRESCAN_CONFIRM_BUDGET = 190
 _HANDOFF_TRANSIENT = {"broker_book_unavailable",
                       "quote_stale_or_unavailable", "news_stale_or_unavailable", "llm_unavailable"}
 
@@ -51,6 +53,10 @@ def _edgar_index_only(url: str) -> bool:
 
 def prescan_runtime_seconds(now: datetime, opens_at: datetime) -> float:
     return max(0.0, min(PRESCAN_MAX_RUNTIME, (opens_at - _PRESCAN_OPEN_BUFFER - now).total_seconds()))
+
+
+class _PrescanCutoff(Exception):
+    """Prescan may not publish a decision after its time budget closes."""
 
 
 class SourceUnavailable(RuntimeError):
@@ -251,7 +257,7 @@ class ResearchPipeline:
         now = self.clock()
         held = {row.symbol: row for row in (snapshot or self.ledger.snapshot()).holdings if row.qty > 0}
         for pending in self.store.due_confirmations(now):
-            await self._confirm(pending["work_key"], held.get(pending["symbol"]))
+            await self._confirm(pending["work_key"], held.get(pending["symbol"]), deadline=deadline)
         focus = tuple(self.focus(now=now))
         daily = tuple(dict.fromkeys(self.daily_focus(now=now)))
         preopen = now.astimezone(NY).date() == session.date and now < session.opens_at
@@ -364,8 +370,7 @@ class ResearchPipeline:
             if directive and symbol not in held and owner is None:
                 funnel.rejected_by_reason["owner_directive_inactive"] += 1
                 continue
-            if deadline is not None and min(deadline[0] - asyncio.get_running_loop().time(),
-                                            (deadline[1] - as_of).total_seconds()) <= _PRESCAN_REVIEW_BUDGET:
+            if self._prescan_remaining(deadline, as_of) <= _PRESCAN_REVIEW_BUDGET:
                 # Do not claim or make a reservation for an unstarted tail.
                 # An in-flight provider can bill even when its caller cancels.
                 if self.store.ready(key, as_of):
@@ -379,12 +384,18 @@ class ResearchPipeline:
             attempted += 1
             try:
                 await self._review(kind, key, item, held.get(symbol), story, session, as_of, funnel,
-                                   owner=owner, held_owner_option=held_owner_option)
-            except OwnerReviewUnavailable as exc:
+                                   owner=owner, held_owner_option=held_owner_option, deadline=deadline)
+            except (_PrescanCutoff, OwnerReviewUnavailable, ProviderUnavailable) as exc:
+                if isinstance(exc, _PrescanCutoff) or self._prescan_remaining(deadline) <= 0:
+                    attempted -= 1
+                    time_deferred += 1
+                    self.store.finish_work(key, "retry", detail={"reason": "prescan_time_budget"},
+                                           retry_at=self.clock() + timedelta(minutes=2))
+                    continue
                 failed += 1
-                await self._owner_unavailable(key, owner, str(exc), funnel)
-            except ProviderUnavailable as exc:
-                failed += 1
+                if isinstance(exc, OwnerReviewUnavailable):
+                    await self._owner_unavailable(key, owner, str(exc), funnel)
+                    continue
                 failures = {error.kind for error in exc.attempts}
                 funnel.rejected_by_reason.update(f"llm_{reason}" for reason in failures or {"no_available_route"})
                 owner_review = owner or held_owner_option
@@ -420,6 +431,15 @@ class ResearchPipeline:
         return JobOutcome(status, collected, {
             "reviewed": attempted, "unavailable": failed, "deferred": deferred + time_deferred,
         }, ideas)
+
+    def _prescan_remaining(self, deadline, now=None) -> float:
+        if deadline is None:
+            return math.inf
+        return min(deadline[0] - asyncio.get_running_loop().time(), (deadline[1] - (now or self.clock())).total_seconds())
+
+    def _require_prescan_time(self, deadline, minimum=0) -> None:
+        if self._prescan_remaining(deadline) <= minimum:
+            raise _PrescanCutoff
 
     def _has_scheduled_entry(self, symbol: str, session_date: date) -> bool:
         if self.store.protects_scheduled_buy(symbol, session_date.isoformat()):
@@ -696,7 +716,8 @@ class ResearchPipeline:
         return refuse("handoff_reanchor_unavailable", "targeted_review_did_not_qualify")
 
     async def _review(self, kind, key, security, holding, story, session, now, funnel, *,
-                      reanchor=None, owner: FocusItem | None = None, held_owner_option: FocusItem | None = None) -> None:
+                      reanchor=None, owner: FocusItem | None = None, held_owner_option: FocusItem | None = None,
+                      deadline=None) -> None:
         symbol = security.symbol
         position_id = holding.meta.position_id if holding and holding.meta else None
         entry = self.ledger.entry_thesis(position_id) if position_id else None
@@ -794,6 +815,7 @@ class ResearchPipeline:
         best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
         search_policy = ({"long_search": True} if (reanchor is None and story is None
                          and kind in {"prescan", "weekly", "market_move"} and key.startswith(f"{kind}:")) else {})
+        self._require_prescan_time(deadline, SCHEDULED_REVIEW_TRANSPORT_SECONDS)
         if owner:
             if data.price is None:
                 raise OwnerReviewUnavailable("no_quote_or_completed_close")
@@ -809,6 +831,7 @@ class ResearchPipeline:
                 **({"single_review": True} if held_owner_option else {}),
                 **search_policy,
             )
+        self._require_prescan_time(deadline)
         record = result.record
         direction = record.draft.direction
         entry_direction = direction in {Direction.BUY, Direction.BEARISH}
@@ -866,12 +889,14 @@ class ResearchPipeline:
             payload.update(owner_veto_claim_index=record.draft.veto_claim_index,
                            owner_veto_evidence_ids=claim.evidence_ids)
             with self.store.store.transaction():
+                self._require_prescan_time(deadline)
                 thesis_id = self.ledger.record_thesis(
                     symbol, payload, role, source=f"{record.provider}/{record.model}", decision_id=key,
                     generated_at=record.generated_at,
                 )
                 first = self.ledger.latch_owner_directive_veto(symbol, owner.added)
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "owner_directive_veto"})
+                self._require_prescan_time(deadline)
             funnel.rejected_by_reason["owner_directive_veto"] += 1
             self._owner_event(owner, "vetoed", raw_conviction=record.raw_conviction,
                               thesis_id=thesis_id, evidence_ids=claim.evidence_ids)
@@ -886,6 +911,7 @@ class ResearchPipeline:
         confirmation_requested = False
         new_owner_hold = False
         with self.store.store.transaction():
+            self._require_prescan_time(deadline)
             checked_at = self.clock()
             exit_pending = self.store.has_unqueued_exit(symbol, now) or self.store.has_pending_confirmation(symbol, now)
             waiting_owner = (
@@ -916,6 +942,7 @@ class ResearchPipeline:
                     thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel,
                     scheduled=scheduled and not exit_pending, anchor_kind=anchor_kind, reanchor=reanchor,
                     owner=owner, owner_stop=result.owner_stop_price if owner else None,
+                    deadline=deadline,
                 )
                 if entry_direction or not holding:
                     funnel.rejected_by_reason.update(rejected)
@@ -946,6 +973,7 @@ class ResearchPipeline:
                 confirmation_requested = True
             else:
                 self.store.finish_work(key, "no_action", thesis_id=thesis_id, detail={"reason": "exit_already_pending"})
+            self._require_prescan_time(deadline)
         if new_owner_hold:
             self.ledger.journal.append(
                 "research.owner_directive", symbol=symbol, reason="owner_directive", outcome="session_held",
@@ -969,7 +997,7 @@ class ResearchPipeline:
                     await alert
             return
         if confirmation_requested:
-            await self._confirm(key, holding)
+            await self._confirm(key, holding, deadline=deadline)
 
     def _owner_event(self, owner: FocusItem, outcome: str, **detail) -> None:
         self.ledger.journal.append(
@@ -1008,7 +1036,18 @@ class ResearchPipeline:
         self._owner_event(owner, "unavailable", input=reason)
         await self._owner_alert(owner, "unavailable", reason)
 
-    async def _confirm(self, key: str, holding) -> None:
+    def _defer_prescan_confirmation(self, key, thesis_id, attempts) -> None:
+        with self.store.store.transaction():
+            if attempts < 3:
+                self.store.finish_confirmation(key, "waiting", retry_at=self.clock() + timedelta(minutes=2))
+            else:
+                self.store.finish_confirmation(key, "unavailable")
+                self.store.finish_work(key, "confirmation_unavailable", thesis_id=thesis_id,
+                                       detail={"reason": "prescan_time_budget"})
+
+    async def _confirm(self, key: str, holding, *, deadline=None) -> None:
+        if self._prescan_remaining(deadline) <= _PRESCAN_CONFIRM_BUDGET:
+            return  # Leave for a later lane without claiming or starting a POST.
         row = self.store.claim_confirmation(key, self.clock())
         if row is None:
             return
@@ -1021,11 +1060,16 @@ class ResearchPipeline:
             return
         data = ResearchInput.from_payload(request["inputs"])
         primary = ModelRoute(request["provider"], request["model"])
+        if self._prescan_remaining(deadline) <= 0:
+            self._defer_prescan_confirmation(key, thesis_id, row["attempts"])
+            return
         try:
             confirmation = await self.analyst.confirm_exit(data, primary)
         except ProviderUnavailable as exc:
             with self.store.store.transaction():
-                if row["attempts"] < 3 and _can_retry(exc):
+                if self._prescan_remaining(deadline) <= 0:
+                    self._defer_prescan_confirmation(key, thesis_id, row["attempts"])
+                elif row["attempts"] < 3 and _can_retry(exc):
                     self.store.finish_confirmation(key, "waiting", retry_at=self.clock() + timedelta(minutes=2))
                 else:
                     self.store.finish_confirmation(key, "unavailable")
@@ -1035,29 +1079,36 @@ class ResearchPipeline:
                     })
             return
 
-        with self.store.store.transaction():
-            conf_id = self.ledger.record_thesis(
-                symbol, confirmation.result.value.model_dump(mode="json") | {
-                    "inputs": confirmation.inputs,
-                    "degraded": confirmation.result.degraded_confirmation,
-                    "prompt_version": EXIT_PROMPT_VERSION,
-                    "input_hash": confirmation.result.input_hash,
-                },
-                ThesisRole.EXIT_CONFIRMATION,
-                source=f"{confirmation.result.route.provider}/{confirmation.result.route.model}",
-                decision_id=key, generated_at=confirmation.result.completed_at,
-            )
-            execution_session = self._session(self.clock())
-            if (confirmation.approved and execution_session
-                    and self.store.reserve_exit(execution_session.date.isoformat(), position_id)):
-                ids = tuple(dict.fromkeys((*request["evidence_ids"], *confirmation.result.value.evidence_ids)))
-                price = Decimal(str(data.price)) if data.price is not None else None
-                intent = self._intent(key, symbol, "sell", position_id, (thesis_id, conf_id),
-                                      price, ids, request["kind"], execution_session)
-                self.store.record_proposal(key, thesis_id, intent)
-            else:
-                self.store.finish_work(key, "no_action", thesis_id=thesis_id)
-            self.store.finish_confirmation(key, "complete")
+        try:
+            with self.store.store.transaction():
+                self._require_prescan_time(deadline)
+                conf_id = self.ledger.record_thesis(
+                    symbol, confirmation.result.value.model_dump(mode="json") | {
+                        "inputs": confirmation.inputs,
+                        "degraded": confirmation.result.degraded_confirmation,
+                        "prompt_version": EXIT_PROMPT_VERSION,
+                        "input_hash": confirmation.result.input_hash,
+                    },
+                    ThesisRole.EXIT_CONFIRMATION,
+                    source=f"{confirmation.result.route.provider}/{confirmation.result.route.model}",
+                    decision_id=key, generated_at=confirmation.result.completed_at,
+                )
+                execution_session = self._session(self.clock())
+                self._require_prescan_time(deadline)
+                if (confirmation.approved and execution_session
+                        and self.store.reserve_exit(execution_session.date.isoformat(), position_id)):
+                    ids = tuple(dict.fromkeys((*request["evidence_ids"], *confirmation.result.value.evidence_ids)))
+                    price = Decimal(str(data.price)) if data.price is not None else None
+                    intent = self._intent(key, symbol, "sell", position_id, (thesis_id, conf_id),
+                                          price, ids, request["kind"], execution_session)
+                    self.store.record_proposal(key, thesis_id, intent)
+                else:
+                    self.store.finish_work(key, "no_action", thesis_id=thesis_id)
+                self.store.finish_confirmation(key, "complete")
+                self._require_prescan_time(deadline)
+        except _PrescanCutoff:
+            self._defer_prescan_confirmation(key, thesis_id, row["attempts"])
+            return
         if request["story_id"]:
             self.ledger.journal.append(
                 "news_reaction", story_id=request["story_id"], symbol=symbol,
@@ -1067,7 +1118,7 @@ class ResearchPipeline:
 
     def _record_entry(self, key, symbol, kind, security, holding, position_id, baseline, story, session,
                       thesis_id, record, fresh_quote, price, evidence_ids, floor, conviction_ok, funnel, *,
-                      scheduled=False, anchor_kind=None, reanchor=None, owner=None, owner_stop=None):
+                      scheduled=False, anchor_kind=None, reanchor=None, owner=None, owner_stop=None, deadline=None):
         direction = record.draft.direction
         rejected = []
         now = self.clock()
@@ -1095,6 +1146,7 @@ class ResearchPipeline:
         qualifies = not rejected
         defer = scheduled and set(rejected) == {"quote_stale_or_unavailable"}
         stock_used = bool(owner and self.ledger.owner_directive_used(symbol, owner.added))
+        self._require_prescan_time(deadline)
         # Options own their underlying/chain quote and execution checks. They
         # can use this priced research anchor even while stock awaits a quote.
         if owner and conviction_ok and security.tradable and price is not None:
