@@ -28,6 +28,15 @@ FILING = "https://www.sec.gov/Archives/edgar/data/1/fixture.htm"
 SECONDARY = "https://example.com/secondary"
 
 
+def openai_search_pass(body):
+    return bool(body.get("tools")) and "text" not in body
+
+
+def original_input(body):
+    data = json.loads(body["input"].split("INPUT_JSON:\n")[1])
+    return data.get("original_input", data)
+
+
 def response(body, *, direction="BUY", cite=FILING, conviction=7, symbol="ABC"):
     thesis = {
         "symbol": symbol, "direction": direction, "conviction": conviction,
@@ -106,7 +115,10 @@ def test_dated_secondary_does_not_disable_grounding_and_healthy_empty_news_can_b
 
     def endpoint(request):
         body = json.loads(request.content)
-        assert bool(body.get("tools")) == grounded
+        if openai_search_pass(body):
+            assert grounded
+            return response(body)
+        assert ("web_evidence" in body["input"]) == grounded
         assert "No discrete catalyst is required" in body["instructions"]
         assert "latest valid" in body["instructions"]
         return response(body)
@@ -133,6 +145,8 @@ def test_best_ideas_rejects_hold_and_preserves_cautious_floor(tmp_path):
 
     def endpoint(request):
         body = json.loads(request.content)
+        if openai_search_pass(body):
+            return response(body)
         calls.append(body)
         return response(body, direction="HOLD" if len(calls) == 1 else "BUY")
 

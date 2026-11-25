@@ -419,6 +419,60 @@ def close_limit(value_bid: float, value_mid: float, frac: float) -> float:
     return max(math.floor(round(px * 100, 6)) / 100, 0.0)
 
 
+def _floor_cent(px: float) -> float:
+    return math.floor(round(px * 100, 6)) / 100
+
+
+def leg_intrinsic(type_: str, strike: float, spot: float) -> float:
+    return max(spot - strike, 0.0) if type_ == "call" else max(strike - spot, 0.0)
+
+
+@dataclass(frozen=True)
+class NoQuoteClose:
+    """Fallback limit for closing without usable option quotes. `credit` is per share,
+    signed like a closing value: + we receive, - we pay (only ever when a short leg makes
+    the close cost money)."""
+    credit: float
+    intrinsic: float
+    deep_otm: bool
+
+
+def fallback_close_limit(legs: Sequence[object], spot: float, *, haircut: float, cushion_pct: float,
+                         cushion_min: float, deep_otm_pct: float, debit_vertical: bool) -> NoQuoteClose:
+    """A defensible marketable limit from the underlying alone.
+
+    - net intrinsic = sum(sign * ratio * intrinsic) per share;
+    - no short legs, or a debit vertical (whose value is never below 0): receive at least
+      intrinsic less the haircut; a lone long never below 0.01, a spread never below 0.00,
+      so the close can only improve on zero and never pays;
+    - otherwise (a short leg can make the close cost money): pay at most net intrinsic
+      plus a cushion of max(cushion_min, cushion_pct * spot) per short contract.
+    deep_otm: every leg has 0 intrinsic and every short is at least deep_otm_pct out of the money.
+    """
+    net = 0.0
+    shorts = 0
+    deep = True
+    for lg in legs:
+        intr = leg_intrinsic(lg.type, lg.strike, spot)
+        net += lg.sign * lg.ratio * intr
+        if intr > 0:
+            deep = False
+        if lg.side == "sell":
+            shorts += lg.ratio
+            gap = (lg.strike - spot) if lg.type == "call" else (spot - lg.strike)
+            if gap < deep_otm_pct * spot:
+                deep = False
+    if shorts == 0 or debit_vertical:
+        floor_px = 0.01 if len(legs) == 1 else 0.0
+        credit = max(_floor_cent(max(net, 0.0) * (1 - haircut)), floor_px)
+    else:
+        cushion = max(cushion_min, cushion_pct * spot) * shorts
+        credit = _floor_cent(net - cushion)
+        if credit > 0:  # the longs out-weigh the shorts: still haircut, never ask for more
+            credit = _floor_cent(max(net, 0.0) * (1 - haircut))
+    return NoQuoteClose(round(credit, 2), round(net, 4), deep)
+
+
 # ---------------------------------------------------------------- calendar fallback
 # Used only beyond the broker calendar's window. Rule-based NYSE full-day closures
 # (https://www.nyse.com/markets/hours-calendars); special closures are not known here,

@@ -29,12 +29,13 @@ def test_half_day_pin_wont_deliver_shares_during_quote_outage(world, tmp_path):
     exp = date(2026, 11, 27)
     a, _, _ = legs(world, exp)
     a.behaviour.expiry_day_liquidation_time = None
-    world.price("AAA", 102, spread=0.02)
+    seed_chain(world, spot=102, exp=exp)  # option quotes consistent with the new spot
     m = make_manager(world, tmp_path, universe=())
     run(m.reconcile())
     a.fail("/v1beta1/options/snapshots", "status", method="GET", status=503, times=None)
     for day in (24, 25, 27):
         world.clock.set_et(2026, 11, day, 10, 0)
+        world.price("AAA", 102, spread=0.02)  # only the option quotes are out
         run(m.monitor())
     world.clock.set_et(2026, 11, 27, 13, 1)
     assert a.position("AAA") is None

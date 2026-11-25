@@ -1,0 +1,391 @@
+import asyncio
+from dataclasses import replace
+from datetime import date, timedelta
+from decimal import Decimal as D
+from types import SimpleNamespace
+
+import pytest
+
+from stock_agent.execution import ExecutionEngine
+from stock_agent.ledger import IntentStatus, NewIntent, NewStockEntryRefused, ThesisRole
+from stock_agent.options_book import Leg, Structure
+from stock_agent.research_focus import FocusItem
+from stock_agent.research_gate import ResearchGate
+from stock_agent.risk_manager import RiskControls
+from stock_agent.scheduler import StockAgentScheduler
+from tests.exec_helpers import enqueue as enqueue_trade
+from tests.exec_helpers import make_engine
+from tests.ledger_helpers import StubBroker, make_ledger
+from tests.test_risk_projection import NOW, buy, leg, margin_book, order, snapshot, stock
+
+
+@pytest.fixture
+def setup(world, tmp_path, monkeypatch, request):
+    world.clock.set_et(*getattr(request, "param", (2026, 11, 23, 10, 0)))
+    world.price("NVDA", 50, spread=0.02)
+    eng = make_engine(world, tmp_path, monkeypatch)
+    now = eng.now()
+    added = now.date() - timedelta(days=1)
+    directive = FocusItem("NVDA", None, "synthetic", added, added + timedelta(days=3), stance="bullish",
+                          owner_conviction=8)
+    focus = {"NVDA": directive}
+    monkeypatch.setattr("stock_agent.research_gate.research_focus.owner_backed", lambda **_: focus)
+    health = SimpleNamespace(research_entry_blockers=lambda *_: ())
+    eng._research_gate = ResearchGate(eng.ledger, health, eng.config)
+    fields = {
+        "adjustment_reason": "owner_directive", "owner_directive_added": added.isoformat(),
+        "owner_conviction": 8, "raw_conviction": 3, "effective_conviction": 8,
+        "signal_at": now.isoformat(),
+    }
+    thesis_id = eng.ledger.record_thesis(
+        "NVDA", dict(fields, draft={"symbol": "NVDA", "direction": "BUY"}, generated_at=now.isoformat(),
+                     inputs_as_of=now.isoformat(), job="prescan"), ThesisRole.ENTRY_CANDIDATE,
+        source="synthetic/model", decision_id="owner-thesis", generated_at=now, activate=True,
+    )
+
+    def enqueue(key, **meta):
+        [intent_id] = eng.ledger.enqueue_intents([
+            NewIntent("NVDA", "buy", key, thesis_ids=(thesis_id,), reference_price=D(50), origin="prescan",
+                      meta=fields | meta),
+        ])
+        return eng.ledger.get_intent(intent_id)
+
+    return eng, added, focus, enqueue
+
+
+def test_owner_stock_fill_spends_only_stock_and_stop_out_does_not_rearm(setup, world):
+    eng, added, _, enqueue = setup
+    assert not eng._research_gate.is_entry_eligible("NVDA", eng.now()).ok
+    intent = enqueue("first")
+    result = asyncio.run(eng.execute_intent(intent))
+    assert result.status == IntentStatus.FILLED, result
+    assert eng.ledger.owner_directive_used("NVDA", added)
+    assert eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True,
+                                                owner_lane="option").ok
+    world.clock.advance(seconds=1)
+    world.price("NVDA", 40, spread=0.02)
+    assert world.alpaca.position("NVDA") is None
+    world.price("NVDA", 50, spread=0.02)
+    second = asyncio.run(eng.execute_intent(enqueue("next", signal_at=eng.now().isoformat())))
+    assert second.status == IntentStatus.SKIPPED
+    assert "owner_directive_exited" in second.reason
+    assert eng.ledger.owner_directive_used("NVDA", added)
+    assert not eng.ledger.claim_owner_option("NVDA", added, "after-stop")
+    denied = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option")
+    assert denied.reasons == ("owner_directive_exited",)
+
+
+def test_stock_exit_to_zero_latches_unspent_lanes_across_restart(setup, world, tmp_path, monkeypatch):
+    eng, added, _, _ = setup
+    world.alpaca.seed_position("NVDA", 10, 50)
+    asyncio.run(eng.ledger.refresh("position before owner review"))
+    part = enqueue_trade(eng, "NVDA", "sell", qty=4, rule="hard_stop")
+    assert asyncio.run(eng.execute_intent(part)).filled_qty == 4
+    asyncio.run(eng.ledger.refresh("partial reduction"))
+    assert not eng.ledger.owner_directive_exited("NVDA", added)
+    assert world.alpaca.position("NVDA").qty == 6
+
+    observed = []
+    original = type(eng.broker).get_position
+
+    async def during_verify(self, symbol):
+        position = await original(self, symbol)
+        if position is None and not observed:
+            proof = eng._research_gate.is_entry_eligible(symbol, eng.now(), allow_owner=True, owner_lane="option")
+            observed.append(proof.reasons)
+        return position
+
+    monkeypatch.setattr(type(eng.broker), "get_position", during_verify)
+    flat = enqueue_trade(eng, "NVDA", "sell", rule="hard_stop")
+    assert asyncio.run(eng.execute_intent(flat)).filled_qty == 6
+    assert world.alpaca.position("NVDA") is None
+    assert observed and "pending_exit" in observed[0]
+    assert eng.ledger.open_position_meta("NVDA") is not None  # reconcile has not run
+    assert eng.ledger.owner_directive_exited("NVDA", added)
+    assert not eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option").ok
+    reopened = make_engine(world, tmp_path, monkeypatch)
+    assert reopened.ledger.owner_directive_exited("NVDA", added)
+    for lane in ("stock", "option"):
+        assert not reopened.ledger.owner_directive_used("NVDA", added, lane=lane)
+    assert not reopened.ledger.claim_owner_option("NVDA", added, "old-generation")
+    assert not reopened.ledger.owner_directive_exited("NVDA", eng.session_date() + timedelta(days=1))
+
+
+def test_evening_sell_does_not_latch_next_ny_session_generation(tmp_path):
+    broker = StubBroker()
+    broker.pos("NVDA", 10, 100)
+    ledger = make_ledger(tmp_path, broker=broker)
+    asyncio.run(ledger.refresh("existing position"))
+    broker.fill("NVDA", "sell", 10, 99, ts="2026-11-26T00:15:00Z")  # Nov 25, 19:15 New York
+    del broker.positions["NVDA"]
+    asyncio.run(ledger.refresh("confirmed close with evening fill"))
+    assert ledger.owner_directive_exited("NVDA", date(2026, 11, 25))
+    assert not ledger.owner_directive_exited("NVDA", date(2026, 11, 26))
+
+
+@pytest.mark.parametrize("change", ["removed", "score", "veto", "throw", "intent_score", "health"])
+def test_owner_metadata_never_substitutes_for_binding_proof(setup, world, monkeypatch, change):
+    eng, added, focus, enqueue = setup
+    intent = enqueue("owner", **({"effective_conviction": 9} if change == "intent_score" else {}))
+    if change == "removed":
+        focus.clear()
+    elif change == "score":
+        focus["NVDA"] = replace(focus["NVDA"], owner_conviction=9)
+    elif change == "veto":
+        assert eng.ledger.latch_owner_directive_veto("NVDA", added)
+        assert not eng.ledger.latch_owner_directive_veto("NVDA", added)
+        assert not eng.ledger.claim_owner_option("NVDA", added, "struct")
+    elif change == "throw":
+        def raising(*args, **kwargs):
+            raise OSError("test")
+        monkeypatch.setattr(eng._research_gate, "is_entry_eligible", raising)
+    elif change == "health":
+        eng._research_gate.health.research_entry_blockers = lambda *_: ("llm_unavailable",)
+    result = asyncio.run(eng.execute_intent(intent))
+    assert result.status == (IntentStatus.QUEUED if change in {"health", "throw"} else IntentStatus.SKIPPED)
+    world.assert_no_orders()
+    assert not eng.ledger.owner_directive_used("NVDA", added)
+
+
+def test_atomic_owner_claim_persists_pending_and_excludes_a_second_intent(setup):
+    eng, added, _, enqueue = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    first, second = enqueue("a"), enqueue("b")
+    session = eng.session_date()
+
+    def claim(intent):
+        return eng.ledger.claim_intent(intent.intent_id, new_stock_session=session, new_stock_limit=3,
+                                       owner_entry=proof)
+
+    with pytest.raises(NewStockEntryRefused, match="no longer matches"):
+        eng.ledger.claim_intent(first.intent_id, new_stock_session=session, new_stock_limit=3,
+                                owner_entry=replace(proof, raw_conviction=4))
+    assert claim(first).meta["owner_stock_claim"] == added.isoformat()
+    with pytest.raises(NewStockEntryRefused, match="already reserved or filled"):
+        claim(second)
+    eng.ledger.ack_intent(first.intent_id, IntentStatus.AMBIGUOUS)
+    assert eng.ledger.owner_directive_used("NVDA", added)
+    eng.ledger.ack_intent(first.intent_id, IntentStatus.QUEUED)
+    assert eng.ledger.owner_directive_used("NVDA", added)
+    assert not eng.ledger.owner_directive_used("NVDA", added, reservation_id=first.intent_id)
+    assert claim(first).status == IntentStatus.SUBMITTING
+
+
+def test_option_reservation_is_independent_and_veto_blocks_its_own_later_rung(setup):
+    eng, added, _, _ = setup
+    ledger = eng.ledger
+    assert ledger.claim_owner_option("NVDA", added, "one")
+    assert not ledger.owner_directive_used("NVDA", added)
+    assert ledger.owner_directive_used("NVDA", added, lane="option")
+    assert ledger.claim_owner_option("NVDA", added, "one")
+    assert not ledger.claim_owner_option("NVDA", added, "two")
+    assert eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option",
+                                                reservation_id="one").ok
+    ledger.latch_owner_directive_veto("NVDA", added)
+    assert not ledger.claim_owner_option("NVDA", added, "one")
+    assert not eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option",
+                                                    reservation_id="one").ok
+
+
+def test_option_claim_waits_for_current_session_stock_attempt_to_finish(setup):
+    eng, added, _, enqueue = setup
+    ledger = eng.ledger
+    attempt = enqueue("stock-first")
+    assert ledger.owner_stock_attempt_in_progress("NVDA", added, eng.session_date())
+    assert not ledger.claim_owner_option("NVDA", added, "option-while-queued")
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    ledger.claim_intent(attempt.intent_id, new_stock_session=eng.session_date(), new_stock_limit=3, owner_entry=proof)
+    assert not ledger.claim_owner_option("NVDA", added, "option-while-working")
+    ledger.ack_intent(attempt.intent_id, IntentStatus.REJECTED)
+    assert not ledger.owner_stock_attempt_in_progress("NVDA", added, eng.session_date())
+    assert ledger.claim_owner_option("NVDA", added, "option-after-stock")
+
+
+def test_stock_scope_exempts_only_exact_owner_option_structure(setup):
+    eng, added, _, _ = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    proof = replace(proof, generated_at=NOW)
+    long, short = "NVDA261218C00100000", "NVDA261218C00110000"
+    structure = Structure("opt-test", "NVDA", "bull_call_spread", "bullish", 1, "2026-12-18",
+                          [Leg(long, "buy", "call", 100, "2026-12-18"),
+                           Leg(short, "sell", "call", 110, "2026-12-18")],
+                          state="open", source="owner", owner_directive_added=added.isoformat(),
+                          close_client_id="owned-close")
+    eng.options = SimpleNamespace(get=lambda sid: structure if sid == structure.id else None)
+    assert eng._owner_option_scope(proof) is None  # book metadata alone never authorizes
+    assert eng.ledger.claim_owner_option("NVDA", added, structure.id)
+    scope = eng._owner_option_scope(proof)
+    assert scope is not None
+    intent = buy("NVDA", qty="1", signal_at=NOW, raw_conviction=3, effective_conviction=8)
+    opt_legs = (replace(leg("NVDA", 1), occ_symbol=long), replace(leg("NVDA", -1), occ_symbol=short))
+    orders = tuple(replace(order(symbol, qty="1", done="0"), asset_class="us_option") for symbol in (long, short))
+    parent = replace(order("", qty="1", done="0"), order_class="mleg", asset_class="us_option",
+                     client_order_id="owned-close", legs=orders)
+    controls = RiskControls(owner_entry=proof, owner_option_scope=scope)
+    for book in (snapshot(legs=opt_legs), snapshot(orders=(parent,)), snapshot(legs=opt_legs, orders=(parent,))):
+        assert eng.risk.evaluate_trade(book, intent, controls=controls).ok
+        assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(
+            book, intent, controls=replace(controls, owner_option_scope=None),
+        ).reasons
+    extra_leg = replace(opt_legs[0], qty=D(2))
+    for book in (
+        snapshot(legs=(extra_leg, opt_legs[1])),
+        snapshot(orders=(parent, order("NVDA", qty="1", done="0"))),
+        snapshot(orders=(replace(parent, client_order_id="unrelated-close"),)),
+        snapshot(orders=(replace(orders[0], asset_class=""),)),
+        snapshot(orders=(replace(parent, legs=(orders[0], replace(orders[1], symbol="NVDA261218C00120000"))),)),
+    ):
+        assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(book, intent, controls=controls).reasons
+    structure.owner_directive_added = NOW.date().isoformat()
+    assert eng._owner_option_scope(proof) is None
+
+
+def test_option_zero_fill_release_is_compare_and_delete_and_never_undoes_veto(setup):
+    eng, added, _, _ = setup
+    ledger = eng.ledger
+    assert ledger.claim_owner_option("NVDA", added, "one")
+    assert not ledger.release_owner_option("NVDA", added, "other")
+    assert ledger.release_owner_option("NVDA", added, "one")
+    assert not ledger.owner_directive_used("NVDA", added, lane="option")
+    assert ledger.claim_owner_option("NVDA", added, "two")
+    assert not ledger.release_owner_option("NVDA", added, "one")
+    ledger.latch_owner_directive_veto("NVDA", added)
+    assert not ledger.release_owner_option("NVDA", added, "two")
+    assert ledger.owner_directive_used("NVDA", added, lane="option")
+
+
+def test_session_hold_blocks_both_proofs_and_stale_claims_without_consuming(setup, world):
+    eng, added, _, enqueue = setup
+    ledger, gate = eng.ledger, eng._research_gate
+    now, session = eng.now(), eng.session_date()
+    proof = gate.is_entry_eligible("NVDA", now, allow_owner=True).owner_entry
+    assert gate.is_entry_eligible("NVDA", now, allow_owner=True, owner_lane="option").ok
+    assert ledger.hold_owner_directive_for_session("NVDA", session, "issuer guidance cut")
+    assert not ledger.hold_owner_directive_for_session("NVDA", session, "live AVOID")
+    for lane in ("stock", "option"):
+        result = gate.is_entry_eligible("NVDA", now, allow_owner=True, owner_lane=lane)
+        assert not result.ok and "owner_directive_session_hold" in result.reasons
+        assert not ledger.owner_directive_used("NVDA", added, lane=lane)
+    assert not ledger.owner_directive_vetoed("NVDA", added)
+    assert not ledger.claim_owner_option("NVDA", added, "reserved")
+    assert not ledger.claim_owner_option("NVDA", session, "new-generation")
+    with pytest.raises(NewStockEntryRefused, match="deferred this session"):
+        ledger.claim_intent(enqueue("after-hold").intent_id, new_stock_session=session, new_stock_limit=3,
+                            owner_entry=proof)
+    world.clock.advance(days=1)
+    assert not ledger.owner_directive_held("NVDA", eng.session_date())
+    assert ledger.claim_owner_option("NVDA", added, "next-session")
+
+
+def test_hold_after_stock_claim_stops_submission_without_consuming(setup, world, monkeypatch):
+    eng, added, _, enqueue = setup
+    original = ExecutionEngine._gate
+
+    async def concurrent_hold(self, purpose, *args, **kwargs):
+        result = await original(self, purpose, *args, **kwargs)
+        if purpose == "entry" and self.ledger.owner_directive_used("NVDA", added):
+            self.ledger.hold_owner_directive_for_session("NVDA", self.session_date(), "live AVOID")
+        return result
+
+    monkeypatch.setattr(ExecutionEngine, "_gate", concurrent_hold)
+    result = asyncio.run(eng.execute_intent(enqueue("concurrent-hold")))
+    assert result.code == "owner_directive_session_hold"
+    assert not eng.ledger.owner_directive_used("NVDA", added)
+    world.assert_no_orders()
+
+
+@pytest.mark.parametrize("setup", [(2026, 11, 27, 12, 49, 59)], indirect=True)
+def test_owner_submit_time_rechecks_half_day_cutoff(setup, world, monkeypatch):
+    eng, added, _, enqueue = setup
+    original = ExecutionEngine._stop_distance
+
+    async def cross_cutoff(self, *args):
+        result = await original(self, *args)
+        world.clock.advance(1)
+        return result
+
+    monkeypatch.setattr(ExecutionEngine, "_stop_distance", cross_cutoff)
+    assert asyncio.run(eng.calendar.market_gate("entry")).allowed
+    intent = enqueue("early-close")
+    result = asyncio.run(eng.execute_intent(intent))
+    assert result.status == IntentStatus.QUEUED
+    assert result.code == "market_closed"
+    assert "entry closing buffer" in result.reason
+    assert eng.ledger.get_intent(intent.intent_id).meta["owner_stock_claim"] == added.isoformat()
+    world.assert_no_orders()
+
+
+def test_owner_stock_missing_after_restart_stays_ambiguous_and_alerts_once(setup, world):
+    eng, added, _, enqueue = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    first = enqueue("crash")
+    eng.ledger.claim_intent(first.intent_id, new_stock_session=eng.session_date(), new_stock_limit=3, owner_entry=proof)
+    asyncio.run(eng.resume())
+    asyncio.run(eng.resolve_pending())
+    assert eng.ledger.get_intent(first.intent_id).status == IntentStatus.AMBIGUOUS
+    assert eng.ledger.owner_directive_used("NVDA", added)
+    notices = [body for _, title, body in eng.alerts if "owner stock order outcome unknown" in title]
+    assert len(notices) == 1 and "changing 'added'" in notices[0]
+    second = asyncio.run(eng.execute_intent(enqueue("duplicate")))
+    assert second.status == IntentStatus.SKIPPED and "owner_directive_used" in second.reason
+    world.assert_no_orders()
+
+
+@pytest.mark.parametrize("filled_qty,remains_used", [(0, False), (1, True)])
+def test_owner_stock_only_confirmed_zero_fill_frees_claim(setup, filled_qty, remains_used):
+    eng, added, _, enqueue = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    first = enqueue("fill-check")
+    eng.ledger.claim_intent(first.intent_id, new_stock_session=eng.session_date(), new_stock_limit=3, owner_entry=proof)
+    eng.ledger.ack_intent(first.intent_id, IntentStatus.SUBMITTED)
+    eng.ledger.ack_intent(first.intent_id, IntentStatus.CANCELLED, meta={"filled_qty": filled_qty})
+    assert eng.ledger.owner_directive_used("NVDA", added) is remains_used
+
+
+@pytest.mark.parametrize("direction, change, eligible", [("HOLD", "unchanged", True), ("HOLD", "weakened", False),
+                                                         ("EXIT_PROPOSED", "unchanged", False)])
+def test_held_review_authorizes_only_explicit_option_lane_without_grade_leakage(setup, direction, change, eligible):
+    eng, added, _, _ = setup
+    now = eng.now()
+    eng.ledger.record_thesis("NVDA", {
+        "owner_option_directive_added": added.isoformat(), "owner_option_conviction": 8,
+        "raw_conviction": 3, "effective_conviction": 3, "generated_at": now.isoformat(),
+        "inputs_as_of": now.isoformat(), "job": "prescan",
+        "draft": {"symbol": "NVDA", "direction": direction, "thesis_change": change},
+    }, ThesisRole.HELD_REVIEW, activate=True)
+    gate = eng._research_gate
+    ordinary = gate.is_entry_eligible("NVDA", now, allow_owner=True)
+    assert not ordinary.ok and ordinary.owner_entry is None and ordinary.effective_conviction == 3
+    option = gate.is_entry_eligible("NVDA", now, allow_owner=True, owner_lane="option")
+    assert option.ok is eligible
+    if eligible:
+        assert option.owner_entry.lane == "option" and option.raw_conviction == 3 and option.effective_conviction == 8
+        prior_session = gate.is_entry_eligible("NVDA", now + timedelta(days=1), allow_owner=True, owner_lane="option")
+        assert not prior_session.ok and "owner_directive_requires_same_session_review" in prior_session.reasons
+
+
+def test_owner_risk_scope_and_protective_trim_uses_raw_model_grade(setup):
+    eng, _, _, _ = setup
+    proof = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True).owner_entry
+    proof = replace(proof, generated_at=NOW, added=NOW.date(), expires=NOW.date())
+    intent = buy("NVDA", qty="1", signal_at=NOW, quote_at=NOW, raw_conviction=3, effective_conviction=8)
+    controls = RiskControls(owner_entry=proof)
+    empty = snapshot()
+    assert eng.risk.evaluate_trade(empty, intent, controls=controls).ok
+    assert eng.risk.evaluate_trade(empty, intent).reasons == ("conviction_floor",)
+    assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(
+        replace(empty, open_orders=(order("NVDA", qty="1", done="0"),)), intent, controls=controls,
+    ).reasons
+    assert "owner_directive_scope_mismatch" in eng.risk.evaluate_trade(
+        replace(empty, holdings=(stock("NVDA", 1, "Technology"),)), intent, controls=controls,
+    ).reasons
+    owner = stock("NVDA", 100, "Technology")
+    peer = stock("PEER", 100, "Energy")
+    trim_book = margin_book(owner, peer, maintenance="85001", regt="5000")
+    now = eng.now()
+    eng.ledger.record_thesis("PEER", {"effective_conviction": 7}, ThesisRole.HELD_REVIEW, source="synthetic/model",
+                             decision_id="peer", generated_at=now, activate=True)
+    scheduler_context = SimpleNamespace(ledger=eng.ledger, config=eng.config, options=None)
+    trim_controls = StockAgentScheduler._margin_controls(scheduler_context, trim_book)
+    assert trim_controls.holding_convictions == {"NVDA": 3, "PEER": 7}
+    assert eng.risk.plan_margin_trim(trim_book, controls=trim_controls)[0].symbol == "NVDA"

@@ -306,6 +306,14 @@ def test_only_the_stock_buy_step_takes_the_shared_capital_lock():
 
     from stock_agent.execution import ExecutionEngine
 
-    users = sorted(name for name, fn in inspect.getmembers(ExecutionEngine, inspect.isfunction)
-                   if "_capital_lock" in inspect.getsource(fn) and name != "__init__")
-    assert users == ["buy"]
+    import re
+
+    takers = sorted(name for name, fn in inspect.getmembers(ExecutionEngine, inspect.isfunction)
+                    if re.search(r"async with \(?self\._capital_lock", inspect.getsource(fn)))
+    assert takers == ["buy"]
+    # the locked section may be factored into a helper, but only buy() may call it
+    src = inspect.getsource(ExecutionEngine)
+    if "_authorise_and_submit_buy" in src:
+        callers = sorted(name for name, fn in inspect.getmembers(ExecutionEngine, inspect.isfunction)
+                         if "self._authorise_and_submit_buy(" in inspect.getsource(fn))
+        assert callers == ["buy"]

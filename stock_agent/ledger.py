@@ -33,17 +33,22 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from stock_agent.journal import Journal
 from stock_agent.state_store import StateStore, StateUnavailable
 
+if TYPE_CHECKING:
+    from stock_agent.research_gate import OwnerEntryProof
+
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
+_MARKET_TZ = ZoneInfo("America/New_York")
 
 
 # =========================================================================
@@ -305,7 +310,11 @@ def filled_thesis_grade(thesis: ThesisRecord | None) -> int | None:
             return None
         grade = thesis.payload.get("conviction")
     else:
-        grade = thesis.payload.get("effective_conviction")
+        grade = thesis.payload.get(
+            "raw_conviction" if (thesis.payload.get("adjustment_reason") == "owner_directive"
+                                 or "owner_directive_added" in thesis.payload)
+            else "effective_conviction",
+        )
     return grade if type(grade) is int and 1 <= grade <= 10 else None
 
 
@@ -921,9 +930,174 @@ class Ledger:
                             error=last_error, attempts=it.attempts)
         return it
 
+    @staticmethod
+    def _owner_key(symbol: str, added: date, lane: str) -> str:
+        return f"owner_directive.{lane}.{symbol.strip().upper()}.{added.isoformat()}"
+
+    def owner_directive_vetoed(self, symbol: str, added: date) -> bool:
+        return bool(self.store.query("SELECT 1 FROM kv WHERE key=?", (self._owner_key(symbol, added, "veto"),)))
+
+    def _owner_vetoed_in(self, c, symbol: str, added: date) -> bool:
+        return c.execute("SELECT 1 FROM kv WHERE key=?",
+                         (self._owner_key(symbol, added, "veto"),)).fetchone() is not None
+
+    def latch_owner_directive_veto(self, symbol: str, added: date) -> bool:
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,'true',?)",
+                (self._owner_key(symbol, added, "veto"), _iso(self.now())),
+            ).rowcount == 1
+
+    def hold_owner_directive_for_session(self, symbol: str, session: date, reason: str) -> bool:
+        """Defer both owner lanes for this NY session, without using either shot."""
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                (self._owner_key(symbol, session, "session_hold"), json.dumps(reason), _iso(self.now())),
+            ).rowcount == 1
+
+    def _owner_held_in(self, c, symbol: str, session: date) -> bool:
+        return c.execute("SELECT 1 FROM kv WHERE key=?",
+                         (self._owner_key(symbol, session, "session_hold"),)).fetchone() is not None
+
+    def owner_directive_held(self, symbol: str, session: date) -> bool:
+        return bool(self.store.query("SELECT 1 FROM kv WHERE key=?",
+                                     (self._owner_key(symbol, session, "session_hold"),)))
+
+    def _owner_exited_in(self, c, symbol: str, added: date) -> bool:
+        """Read a confirmed equity flatten, including one reconciled before a restart."""
+        key = self._owner_key(symbol, added, "stock_exit")
+        if c.execute("SELECT 1 FROM kv WHERE key=?", (key,)).fetchone() is not None:
+            return True
+        # Reconcile only records a normal sell close when the live broker position
+        # is flat and its latest relevant activity explains the close. It separately
+        # records a proven flat-then-reopen from replayed fills. Require an actual sell
+        # fill in that position's lifetime and use its timestamp (not observation time)
+        # to distinguish a new owner generation from a late reconcile of an old exit.
+        row = c.execute(
+            """SELECT a.ts, a.order_id FROM positions_meta p
+                 JOIN broker_activities a ON a.symbol=p.symbol
+               WHERE p.symbol=? AND p.asset_class='us_equity' AND p.closed_at IS NOT NULL
+                 AND a.activity_type='FILL' AND a.side LIKE 'sell%' AND a.qty>0
+                 AND julianday(a.ts)>=julianday(?) AND julianday(a.ts)>=julianday(COALESCE(p.opened_at, a.ts))
+                 AND ((p.close_cause LIKE 'sell fill %' AND substr(a.ts,1,10)=substr(p.close_cause,-10))
+                      OR (p.close_cause='flat_then_reopened' AND julianday(a.ts)<=julianday(p.closed_at)))
+               ORDER BY julianday(a.ts) DESC LIMIT 1""",
+            (symbol.strip().upper(), _iso(datetime.combine(added, time.min, _MARKET_TZ))),
+        ).fetchone()
+        if row is None:
+            return False
+        c.execute("INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                  (key, json.dumps({"filled_at": row[0], "order_id": row[1]}), _iso(self.now())))
+        return True
+
+    def record_confirmed_stock_flatten(self, symbol: str, *, filled_at: datetime, order_id: str) -> bool:
+        """Latch an active generation when execution verifies a sell fill and broker flat."""
+        from stock_agent import research_focus
+
+        if filled_at.utcoffset() is None:
+            return False
+        fill_session = filled_at.astimezone(_MARKET_TZ)
+        directive = research_focus.owner_backed(now=fill_session).get(symbol)
+        if directive is None or not directive.added <= fill_session.date() <= directive.expires:
+            return False
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                (self._owner_key(symbol, directive.added, "stock_exit"),
+                 json.dumps({"filled_at": filled_at.isoformat(), "order_id": order_id}), _iso(self.now())),
+            ).rowcount == 1
+
+    def owner_directive_exited(self, symbol: str, added: date) -> bool:
+        """Whether a reconciled stock flatten closed both lanes for this generation."""
+        with self.store.transaction() as c:
+            return self._owner_exited_in(c, symbol, added)
+
+    def mark_owner_stock_uncertainty_notified(self, symbol: str, added: date) -> bool:
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,'true',?)",
+                (self._owner_key(symbol, added, "stock_uncertainty_notified"), _iso(self.now())),
+            ).rowcount == 1
+
+    @staticmethod
+    def _owner_stock_used(c, symbol: str, added: date, reservation_id: str | None) -> bool:
+        return c.execute(
+            """SELECT 1 FROM order_intents WHERE symbol=? AND kind='equity' AND side='buy'
+               AND json_extract(meta_json, '$.owner_stock_claim')=?
+               AND (status='filled' OR CAST(json_extract(meta_json, '$.filled_qty') AS REAL)>0
+                    OR status IN ('submitted','ambiguous','partially_filled')
+                    OR (status IN ('queued','submitting') AND intent_id<>COALESCE(?,''))) LIMIT 1""",
+            (symbol, added.isoformat(), reservation_id),
+        ).fetchone() is not None
+
+    def owner_directive_used(self, symbol: str, added: date, *, lane: str = "stock",
+                             reservation_id: str | None = None) -> bool:
+        with self.store.transaction() as c:
+            if lane == "stock":
+                return self._owner_stock_used(c, symbol.strip().upper(), added, reservation_id)
+            if lane != "option":
+                return True
+            row = c.execute("SELECT value_json FROM kv WHERE key=?",
+                            (self._owner_key(symbol, added, lane),)).fetchone()
+            return row is not None and (reservation_id is None or row[0] != json.dumps(reservation_id))
+
+    @staticmethod
+    def _owner_stock_attempt_in(c, symbol: str, added: date, session: date) -> bool:
+        start = datetime.combine(session, time.min, _MARKET_TZ)
+        end = datetime.combine(session + timedelta(days=1), time.min, _MARKET_TZ)
+        return c.execute(
+            """SELECT 1 FROM order_intents
+               WHERE symbol=? AND kind='equity' AND side='buy'
+                 AND json_extract(meta_json,'$.owner_directive_added')=?
+                 AND status IN ('queued','submitting','submitted','ambiguous','partially_filled')
+                 AND (COALESCE(json_extract(meta_json,'$.new_stock_session'),session_date)=?
+                      OR (session_date IS NULL AND json_extract(meta_json,'$.new_stock_session') IS NULL
+                          AND julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?)))
+               LIMIT 1""", (symbol.strip().upper(), added.isoformat(), session.isoformat(), _iso(start), _iso(end)),
+        ).fetchone() is not None
+
+    def owner_stock_attempt_in_progress(self, symbol: str, added: date, session: date) -> bool:
+        with self.store.transaction() as c:
+            return self._owner_stock_attempt_in(c, symbol, added, session)
+
+    def owner_option_claim_id(self, symbol: str, added: date) -> str | None:
+        value = self.store.kv_get(self._owner_key(symbol, added, "option"))
+        return value if isinstance(value, str) and value else None
+
+    def claim_owner_option(self, symbol: str, added: date, structure_id: str) -> bool:
+        if not structure_id:
+            return False
+        with self.store.transaction() as c:
+            session = self.now().astimezone(_MARKET_TZ).date()
+            if (self._owner_vetoed_in(c, symbol, added)
+                    or self._owner_held_in(c, symbol, session)
+                    or self._owner_exited_in(c, symbol, added)):
+                return False
+            key = self._owner_key(symbol, added, "option")
+            value = json.dumps(structure_id)
+            row = c.execute("SELECT value_json FROM kv WHERE key=?", (key,)).fetchone()
+            if row is not None:
+                return row[0] == value
+            if self._owner_stock_attempt_in(c, symbol, added, session):
+                return False
+            c.execute("INSERT INTO kv(key,value_json,updated_at) VALUES (?,?,?)", (key, value, _iso(self.now())))
+            return True
+
+    def release_owner_option(self, symbol: str, added: date, structure_id: str) -> bool:
+        """Release the exact claim after the caller proves a terminal zero-fill."""
+        if not structure_id:
+            return False
+        with self.store.transaction() as c:
+            if self._owner_vetoed_in(c, symbol, added):
+                return False
+            return c.execute("DELETE FROM kv WHERE key=? AND value_json=?",
+                             (self._owner_key(symbol, added, "option"), json.dumps(structure_id))).rowcount == 1
+
     def claim_intent(self, intent_id: str, *, check_thesis: bool = True,
                      top_up_session: date | None = None, top_up_baseline_grade: int | None = None,
-                     new_stock_session: date | None = None, new_stock_limit: int | None = None) -> OrderIntent:
+                     new_stock_session: date | None = None, new_stock_limit: int | None = None,
+                     owner_entry: OwnerEntryProof | None = None) -> OrderIntent:
         """Mark SUBMITTING before the HTTP call. Raises ``LedgerError`` when the
         intent is not QUEUED, is expired, or (buys) its thesis was superseded."""
         it = self.get_intent(intent_id)
@@ -931,6 +1105,12 @@ class Ledger:
             raise LedgerError(f"unknown intent {intent_id}")
         if it.status != IntentStatus.QUEUED:
             raise LedgerError(f"intent {intent_id} is {it.status.value}, not queued")
+        owner_marked = (it.meta or {}).get("adjustment_reason") == "owner_directive" or (
+            "owner_directive_added" in (it.meta or {}) or "owner_stock_claim" in (it.meta or {})
+        )
+        if (owner_marked or owner_entry is not None) and (not owner_marked or owner_entry is None
+                or new_stock_session is None or top_up_session is not None or not check_thesis):
+            raise NewStockEntryRefused("owner_directive_invalid", "owner directive requires a verified opening buy")
         if it.expires_at is not None and it.expires_at <= self.now():
             self._transition(intent_id, IntentStatus.EXPIRED, last_error="expired before submission")
             raise LedgerError(f"intent {intent_id} expired")
@@ -939,6 +1119,9 @@ class Ledger:
             if cur is None or cur.thesis_id not in it.thesis_ids:
                 self._transition(intent_id, IntentStatus.CANCELLED, last_error="thesis superseded")
                 raise LedgerError(f"intent {intent_id}: thesis superseded")
+            if owner_entry is None and (cur.payload.get("adjustment_reason") == "owner_directive"
+                                        or "owner_directive_added" in cur.payload):
+                raise NewStockEntryRefused("owner_directive_invalid", "owner thesis requires verified owner proof")
         if it.position_id:
             row = self.store.query("SELECT closed_at FROM positions_meta WHERE position_id=?", (it.position_id,))
             if not row or row[0][0] is not None:
@@ -949,10 +1132,12 @@ class Ledger:
         if new_stock_session is not None:
             if new_stock_limit is None or new_stock_limit < 1:
                 raise LedgerError("a new-stock reservation requires a positive session limit")
-            return self._claim_new_stock(it, new_stock_session, new_stock_limit)
+            return self._claim_new_stock(it, new_stock_session, new_stock_limit, owner_entry=owner_entry)
         return self._transition(intent_id, IntentStatus.SUBMITTING, bump_attempts=True)
 
-    def _claim_new_stock(self, it: OrderIntent, session: date, limit: int) -> OrderIntent:
+    def _claim_new_stock(self, it: OrderIntent, session: date, limit: int, *,
+                         owner_entry: OwnerEntryProof | None = None) -> OrderIntent:
+        from stock_agent.research_gate import OwnerEntryProof
         from stock_agent.risk_manager import classify_symbol
 
         if it.position_id or it.side != "buy" or it.kind != "equity":
@@ -960,6 +1145,28 @@ class Ledger:
         day = session.isoformat()
         issuer = classify_symbol(it.symbol).issuer
         with self.store.transaction() as c:
+            owner_meta = {}
+            if owner_entry is not None:
+                cur = self.current_thesis(it.symbol)
+                if (not isinstance(owner_entry, OwnerEntryProof) or owner_entry.lane != "stock"
+                        or owner_entry.symbol != it.symbol or cur is None or owner_entry.thesis_id != cur.thesis_id
+                        or cur.thesis_id not in it.thesis_ids or it.origin != "prescan"
+                        or cur.payload.get("adjustment_reason") != "owner_directive"
+                        or cur.payload.get("owner_directive_added") != owner_entry.added.isoformat()
+                        or (it.meta or {}).get("owner_directive_added") != owner_entry.added.isoformat()
+                        or cur.payload.get("raw_conviction") != owner_entry.raw_conviction
+                        or cur.payload.get("effective_conviction") != owner_entry.effective_conviction
+                        or cur.generated_at != owner_entry.generated_at):
+                    raise NewStockEntryRefused("owner_directive_invalid", "owner proof no longer matches the buy")
+                if self._owner_vetoed_in(c, it.symbol, owner_entry.added):
+                    raise NewStockEntryRefused("owner_directive_vetoed", "owner directive received a model veto")
+                if self._owner_held_in(c, it.symbol, session):
+                    raise NewStockEntryRefused("owner_directive_session_hold", "owner directive deferred this session")
+                if self._owner_exited_in(c, it.symbol, owner_entry.added):
+                    raise NewStockEntryRefused("owner_directive_exited", "owner directive closed by a confirmed stock exit")
+                if self._owner_stock_used(c, it.symbol, owner_entry.added, it.intent_id):
+                    raise NewStockEntryRefused("owner_directive_used", "owner directive already reserved or filled")
+                owner_meta["owner_stock_claim"] = owner_entry.added.isoformat()
             rows = c.execute(
                 """SELECT symbol, session_date, status, meta_json FROM order_intents
                    WHERE kind='equity' AND side='buy' AND position_id IS NULL AND intent_id<>?
@@ -985,7 +1192,7 @@ class Ledger:
                 raise NewStockEntryRefused("new_stock_session_cap",
                                            f"new-stock limit ({limit}) reached for this NY session (fills/reservations)")
             return self._transition(it.intent_id, IntentStatus.SUBMITTING, bump_attempts=True,
-                                    meta={"new_stock_session": day, "new_stock_issuer": issuer})
+                                    meta={"new_stock_session": day, "new_stock_issuer": issuer, **owner_meta})
 
     def _claim_top_up(self, it: OrderIntent, session: date, baseline_grade: int | None) -> OrderIntent:
         if not it.position_id or it.side != "buy" or it.kind != "equity":

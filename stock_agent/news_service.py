@@ -55,9 +55,13 @@ _KV_EVALUATED_KEY = "news:evaluated_stories:v1"
 _KV_CURSOR_PREFIX = "news:cursor:v1:"
 _MAX_PERSISTED_STORIES = 2000
 _CURSOR_OVERLAP = timedelta(minutes=2)
+_RECENT_FILINGS_TTL = timedelta(minutes=30)
+_SEC_FILING_FORMS: frozenset[str] = frozenset(
+    {"8-K", "8-K/A", "10-Q", "10-Q/A", "10-K", "10-K/A", "6-K", "20-F"}
+)
 _PUNCT_RE = re.compile(r"[^a-z0-9\s]+")
 
-# Built-in CIK fallback for major US equities when AssetRegistry has not yet populated CIKs
+# Built-in CIK fallback for major US equities and ADR focus issuers when AssetRegistry lacks CIKs
 DEFAULT_CIK_MAP: dict[str, str] = {
     "AAPL": "0000320193",
     "MSFT": "0000789019",
@@ -66,6 +70,13 @@ DEFAULT_CIK_MAP: dict[str, str] = {
     "AVGO": "0001730168",
     "MU": "0000723125",
     "ANET": "0001596532",
+    "ORCL": "0001341439",
+    "PANW": "0001327567",
+    "TSM": "0001046179",
+    "ASML": "0000937966",
+    "FIX": "0001035983",
+    "NVT": "0001720635",
+    "VST": "0001692819",
     "GOOGL": "0001652044",
     "GOOG": "0001652044",
     "META": "0001326801",
@@ -245,6 +256,7 @@ class NewsService:
         self._seen: dict[str, dict[str, Any]] = {}
         self._evaluated: dict[str, str] = {}
         self._cursors: dict[str, datetime] = {}
+        self._recent_filings_cache: dict[tuple[str, int, int], tuple[datetime, tuple[NewsItem, ...]]] = {}
         self._latest_batch: NewsFeedBatch | None = None
         self._state_loaded: bool = store is None
         if not defer_load:
@@ -408,7 +420,9 @@ class NewsService:
             owner_focus = tuple(self._resolve_symbol(str(s)) for s in focus if s and str(s).strip())
         elif include_focus:
             try:
-                owner_focus = tuple(self._resolve_symbol(s) for s in focus_symbols(now=now_utc))
+                owner_focus = tuple(
+                    self._resolve_symbol(s) for s in focus_symbols(now=now_utc, cadence="live")
+                )
             except Exception:
                 owner_focus = ()
 
@@ -817,6 +831,200 @@ class NewsService:
 
         return items, tuple(covered), last_err
 
+    def _parse_sec_submissions(
+        self,
+        sym: str,
+        cik_padded: str,
+        payload: Any,
+        *,
+        since_day_iso: str,
+        now_utc: datetime,
+        target_set: set[str],
+        focus_set: set[str],
+        threshold: int,
+        max_scan_rows: int = 80,
+        per_symbol_limit: int | None = None,
+    ) -> list[NewsItem]:
+        recent = (
+            payload.get("filings", {}).get("recent", {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        forms = recent.get("form") or []
+        dates = recent.get("filingDate") or []
+        accessions = recent.get("accessionNumber") or []
+        items_col = recent.get("items") or []
+        acceptance_col = recent.get("acceptanceDateTime") or []
+        report_col = recent.get("reportDate") or []
+        desc_col = recent.get("primaryDocDescription") or []
+        today_iso = now_utc.date().isoformat()
+        parsed_items: list[NewsItem] = []
+
+        for idx, form in enumerate(forms[:max_scan_rows]):
+            form_str = str(form or "").strip().upper()
+            if form_str not in _SEC_FILING_FORMS:
+                continue
+            filing_date_str = str(dates[idx]) if idx < len(dates) else ""
+            if not filing_date_str or filing_date_str < since_day_iso or filing_date_str > today_iso:
+                continue
+            acc_raw = str(accessions[idx]) if idx < len(accessions) else f"{sym}-{idx}"
+            acc_nodash = acc_raw.replace("-", "")
+            raw_items_entry = items_col[idx] if idx < len(items_col) else ""
+            if isinstance(raw_items_entry, list):
+                sec_item_codes = tuple(str(x).strip() for x in raw_items_entry if str(x).strip())
+            else:
+                sec_item_codes = tuple(
+                    x.strip() for x in str(raw_items_entry or "").split(",") if x.strip()
+                )
+            has_explicit_acceptance = False
+            published_at = datetime.fromisoformat(f"{filing_date_str}T12:00:00+00:00")
+            if idx < len(acceptance_col) and acceptance_col[idx]:
+                try:
+                    published_at = utc_datetime(str(acceptance_col[idx]))
+                    has_explicit_acceptance = True
+                except ValueError:
+                    pass
+            if published_at > now_utc:
+                if has_explicit_acceptance:
+                    continue
+                published_at = now_utc
+
+            items_desc = f" (Items {', '.join(sec_item_codes)})" if sec_item_codes else ""
+            report_str = str(report_col[idx] or "").strip() if idx < len(report_col) else ""
+            raw_desc = sanitize_news_text(
+                str(desc_col[idx] or "") if idx < len(desc_col) else "",
+                max_chars=160,
+            )
+            period_note = f", period {report_str}" if report_str else ""
+            doc_note = (
+                f" — {raw_desc}"
+                if raw_desc and raw_desc.upper() not in {form_str, f"FORM {form_str}"}
+                else ""
+            )
+            headline = f"{sym} filed SEC Form {form_str}{items_desc}"
+            summary = f"SEC EDGAR Form {form_str} filed on {filing_date_str}{items_desc}{period_note}{doc_note}."
+            url = f"https://www.sec.gov/Archives/edgar/data/{int(cik_padded)}/{acc_nodash}/{acc_raw}-index.htm"
+            verdict = score_materiality(
+                headline,
+                summary,
+                symbols=(sym,),
+                held_or_target=target_set,
+                focus_set=focus_set,
+                sec_form=form_str,
+                sec_items=sec_item_codes,
+                threshold=threshold,
+            )
+            parsed_items.append(
+                NewsItem(
+                    id=f"sec-{sym.lower()}-{acc_nodash}",
+                    symbols=(sym,),
+                    headline=headline,
+                    summary=summary,
+                    source="SEC EDGAR",
+                    published_at=published_at,
+                    url=url,
+                    retrieved_at=now_utc,
+                    provider="sec",
+                    provider_id=acc_raw,
+                    kind="sec_filing",
+                    sec_form=form_str,
+                    sec_items=sec_item_codes,
+                    materiality=verdict.score,
+                    materiality_reasons=verdict.reasons,
+                )
+            )
+            if per_symbol_limit is not None and len(parsed_items) >= per_symbol_limit:
+                break
+        return parsed_items
+
+    async def fetch_recent_filings(
+        self,
+        symbols: Sequence[str],
+        *,
+        now: datetime | None = None,
+        lookback_days: int = 120,
+        per_symbol_limit: int = 4,
+        max_symbols: int = 30,
+    ) -> dict[str, tuple[NewsItem, ...]]:
+        """Return recent issuer EDGAR filings (8-K/10-Q/10-K/6-K/20-F) cached per symbol."""
+        if not self.enable_sec_filings or not symbols or lookback_days <= 0 or per_symbol_limit <= 0:
+            return {}
+        now_utc = utc_datetime(now or self._now())
+        if self.health.is_blocked("sec", "edgar", now=now_utc):
+            return {}
+        since_day_iso = (now_utc.astimezone(ET).date() - timedelta(days=lookback_days)).isoformat()
+        all_resolved = list(
+            dict.fromkeys(self._resolve_symbol(str(s)) for s in symbols if s and str(s).strip())
+        )
+        cap = max(1, int(max_symbols))
+        if len(all_resolved) > cap:
+            dropped = tuple(all_resolved[cap:])
+            logger.warning(
+                "fetch_recent_filings capped at %d symbols; dropped=%s",
+                cap,
+                ",".join(dropped),
+            )
+            resolved_syms = all_resolved[:cap]
+        else:
+            resolved_syms = all_resolved
+        focus_live = set()
+        try:
+            focus_live = {self._resolve_symbol(s) for s in focus_symbols(now=now_utc, cadence="live")}
+        except Exception:
+            focus_live = set()
+
+        result: dict[str, tuple[NewsItem, ...]] = {}
+        for sym in resolved_syms:
+            cache_key = (sym, lookback_days, per_symbol_limit)
+            cached = self._recent_filings_cache.get(cache_key)
+            if cached is not None and timedelta() <= now_utc - cached[0] < _RECENT_FILINGS_TTL:
+                if cached[1]:
+                    result[sym] = cached[1]
+                continue
+            cik = self._lookup_cik(sym)
+            if not cik:
+                continue
+            cik_padded = str(cik).zfill(10)
+            try:
+                resp = await self.http.get(
+                    f"{self.sec_submissions_base}/CIK{cik_padded}.json"
+                )
+            except httpx.HTTPError as exc:
+                self.health.record_failure("sec", "edgar", summary=scrub_secrets(str(exc)), at=now_utc)
+                break
+            if resp.status_code != 200:
+                self.health.record_failure(
+                    "sec",
+                    "edgar",
+                    status_code=resp.status_code,
+                    summary=f"SEC submissions HTTP {resp.status_code}",
+                    at=now_utc,
+                )
+                continue
+            self.health.record_ok("sec", "edgar", required=False, at=now_utc)
+            items = tuple(
+                sorted(
+                    self._parse_sec_submissions(
+                        sym,
+                        cik_padded,
+                        resp.json(),
+                        since_day_iso=since_day_iso,
+                        now_utc=now_utc,
+                        target_set={sym},
+                        focus_set=focus_live,
+                        threshold=MATERIALITY_THRESHOLD,
+                        max_scan_rows=80,
+                        per_symbol_limit=per_symbol_limit,
+                    ),
+                    key=lambda item: item.published_at,
+                    reverse=True,
+                )
+            )
+            self._recent_filings_cache[cache_key] = (now_utc, items)
+            if items:
+                result[sym] = items
+        return result
+
     async def _fetch_sec_filings(
         self,
         symbols: Sequence[str],
@@ -828,7 +1036,7 @@ class NewsService:
         threshold: int,
     ) -> list[NewsItem]:
         out: list[NewsItem] = []
-        since_day = since_utc.astimezone(ET).date()
+        since_day_iso = since_utc.astimezone(ET).date().isoformat()
 
         for sym in symbols:
             cik = self._lookup_cik(sym)
@@ -852,72 +1060,19 @@ class NewsService:
                 )
                 continue
             self.health.record_ok("sec", "edgar", required=False, at=now_utc)
-            payload = resp.json()
-            recent = (
-                payload.get("filings", {}).get("recent", {})
-                if isinstance(payload, dict)
-                else {}
-            )
-            forms = recent.get("form") or []
-            dates = recent.get("filingDate") or []
-            accessions = recent.get("accessionNumber") or []
-            items_col = recent.get("items") or []
-            acceptance_col = recent.get("acceptanceDateTime") or []
-
-            for idx, form in enumerate(forms[:20]):
-                form_str = str(form or "").strip().upper()
-                if form_str not in {"8-K", "8-K/A", "10-Q", "10-K", "6-K"}:
-                    continue
-                filing_date_str = str(dates[idx]) if idx < len(dates) else ""
-                if not filing_date_str or filing_date_str < since_day.isoformat():
-                    continue
-                acc_raw = str(accessions[idx]) if idx < len(accessions) else f"{sym}-{idx}"
-                acc_nodash = acc_raw.replace("-", "")
-                raw_items_entry = items_col[idx] if idx < len(items_col) else ""
-                if isinstance(raw_items_entry, list):
-                    sec_item_codes = tuple(str(x).strip() for x in raw_items_entry if str(x).strip())
-                else:
-                    sec_item_codes = tuple(
-                        x.strip() for x in str(raw_items_entry or "").split(",") if x.strip()
-                    )
-                published_at = datetime.fromisoformat(f"{filing_date_str}T12:00:00+00:00")
-                if idx < len(acceptance_col) and acceptance_col[idx]:
-                    try:
-                        published_at = utc_datetime(str(acceptance_col[idx]))
-                    except ValueError:
-                        pass
-                items_desc = f" (Items {', '.join(sec_item_codes)})" if sec_item_codes else ""
-                headline = f"{sym} filed SEC Form {form_str}{items_desc}"
-                url = f"https://www.sec.gov/Archives/edgar/data/{int(cik_padded)}/{acc_nodash}/{acc_raw}-index.htm"
-                verdict = score_materiality(
-                    headline,
-                    "",
-                    symbols=(sym,),
-                    held_or_target=target_set,
+            out.extend(
+                self._parse_sec_submissions(
+                    sym,
+                    cik_padded,
+                    resp.json(),
+                    since_day_iso=since_day_iso,
+                    now_utc=now_utc,
+                    target_set=target_set,
                     focus_set=focus_set,
-                    sec_form=form_str,
-                    sec_items=sec_item_codes,
                     threshold=threshold,
+                    max_scan_rows=80,
                 )
-                out.append(
-                    NewsItem(
-                        id=f"sec-{sym.lower()}-{acc_nodash}",
-                        symbols=(sym,),
-                        headline=headline,
-                        summary=f"SEC EDGAR Form {form_str} filed on {filing_date_str}{items_desc}.",
-                        source="SEC EDGAR",
-                        published_at=published_at,
-                        url=url,
-                        retrieved_at=now_utc,
-                        provider="sec",
-                        provider_id=acc_raw,
-                        kind="sec_filing",
-                        sec_form=form_str,
-                        sec_items=sec_item_codes,
-                        materiality=verdict.score,
-                        materiality_reasons=verdict.reasons,
-                    )
-                )
+            )
         return out
 
     def _dedupe_and_apply_seen(

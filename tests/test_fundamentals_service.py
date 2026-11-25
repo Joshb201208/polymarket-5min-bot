@@ -347,3 +347,104 @@ def test_cached_company_makes_no_requests(world):
         assert snap is not None and len(world.net.recorded) == before
         return snap
     run_svc(go, assets=assets)
+
+
+def test_focus_defaults_to_live_cadence_and_preserves_explicit_empty_callable(tmp_path, monkeypatch):
+    import json
+    import stock_agent.research_focus as rf
+
+    focus_file = tmp_path / "owner_focus.json"
+    focus_file.write_text(
+        json.dumps(
+            [
+                {
+                    "symbol": "NVDA",
+                    "cadence": "live",
+                    "stance": "bullish",
+                    "owner_conviction": 8,
+                    "note": "AI compute.",
+                    "added": "2026-11-01",
+                    "expires": "2026-12-31",
+                },
+                {
+                    "symbol": "VST",
+                    "cadence": "daily",
+                    "note": "Power generation.",
+                    "added": "2026-11-01",
+                    "expires": "2026-12-31",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    orig_load = rf.load_focus
+    monkeypatch.setattr(rf, "load_focus", lambda *, now=None, path=focus_file: orig_load(now=now, path=path))
+
+    async def check():
+        http = DataHttpClient(Config)
+        try:
+            default_svc = FundamentalsService(http, now=lambda: NOW)
+            empty_callable_svc = FundamentalsService(http, now=lambda: NOW, focus_symbols=lambda: ())
+            assert default_svc.focus() == ("NVDA",)
+            assert empty_callable_svc.focus() == ()
+        finally:
+            await http.aclose()
+
+    asyncio.run(check())
+
+
+def test_fetch_company_uses_default_cik_map_only_when_sec_user_agent_set(world):
+    from types import SimpleNamespace
+
+    world.finnhub.on(
+        "GET",
+        "/api/v1/stock/metric",
+        {"metric": {"peTTM": 35.0, "grossMarginTTM": 74.0, "marketCapitalization": 3_400_000}},
+    )
+    world.finnhub.on("GET", "/api/v1/stock/profile2", {"name": "NVIDIA Corp", "finnhubIndustry": "Semiconductors"})
+    world.finnhub.on("GET", "/api/v1/stock/insider-transactions", {"data": []})
+    world.finnhub.on("GET", "/api/v1/stock/recommendation", [])
+    world.fmp.on("GET", "/stable/profile", [])
+    rev = {
+        "units": {
+            "USD": [
+                _f("2025-10-01", "2025-12-31", 30e9),
+                _f("2026-01-01", "2026-03-31", 32e9),
+                _f("2026-04-01", "2026-06-30", 33e9),
+                _f("2026-07-01", "2026-09-30", 35e9),
+            ]
+        }
+    }
+    world.sec.on("GET", "/api/xbrl/companyconcept/CIK0001045810/us-gaap/Revenues.json", rev)
+    world.sec.on(
+        "GET",
+        "/api/xbrl/companyconcept/*/NetIncomeLoss.json",
+        lambda r: json_response({"message": "not found"}, 404),
+    )
+    assets = Assets([Meta("NVDA", cik=None)])  # Simulates AssetRegistry before SEC CIK sync
+
+    cfg_no_sec = SimpleNamespace(
+        FINNHUB_API_KEY="k", FMP_API_KEY="k", ALPACA_DATA_URL="https://data.alpaca.markets", SEC_USER_AGENT=""
+    )
+    snap_no_sec = run_svc(lambda s: s.fetch_company("NVDA"), assets=assets, config=cfg_no_sec)
+    assert "revenue_ttm_usd" not in snap_no_sec.metrics
+    assert len(world.net.requests(service="sec")) == 0
+
+    cfg_with_sec = SimpleNamespace(
+        FINNHUB_API_KEY="k",
+        FMP_API_KEY="k",
+        ALPACA_DATA_URL="https://data.alpaca.markets",
+        SEC_USER_AGENT="TestAgent/1.0 (ops@example.invalid)",
+    )
+    snap_with_sec = run_svc(lambda s: s.fetch_company("NVDA"), assets=assets, config=cfg_with_sec)
+    assert snap_with_sec.metrics["revenue_ttm_usd"].value == 130e9
+    assert (
+        len(
+            world.net.requests(
+                service="sec",
+                path="/api/xbrl/companyconcept/CIK0001045810/us-gaap/Revenues.json",
+            )
+        )
+        == 1
+    )
+

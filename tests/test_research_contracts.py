@@ -89,9 +89,10 @@ def test_perplexity_quota_falls_back_and_same_provider_confirmation_is_distinct(
             assert followup.route.model == "gpt-5.6-luna" and followup.degraded_confirmation
 
     asyncio.run(run())
-    assert [host for host, _ in calls] == ["api.perplexity.ai", "api.openai.com", "api.openai.com"]
+    assert [host for host, _ in calls] == ["api.perplexity.ai"] + ["api.openai.com"] * 3
     assert calls[1][1]["tools"][0]["type"] == "web_search"
-    assert calls[1][1]["text"]["format"]["strict"] is True
+    assert "text" not in calls[1][1]
+    assert calls[2][1]["text"]["format"]["strict"] is True and "tools" not in calls[2][1]
     assert incidents == ["quota"]
 
 

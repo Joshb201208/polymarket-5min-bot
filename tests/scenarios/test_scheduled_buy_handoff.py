@@ -38,6 +38,9 @@ def test_scheduled_buy_can_reach_open_with_fresh_quote(
     def draft(body):
         text = body.get("input") or body["messages"][0]["content"]
         data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
+        if body.get("tools") and (body.get("instructions") or "").startswith("Search for primary evidence"):
+            return with_grounding(body, {})  # search-only first pass of a two-pass review: sources only
+        data = data.get("original_input", data)  # the structured second pass wraps the input
         # Catch-up can stamp a healthy all-HOLD set; it never supplies the BUY.
         regular = world.clock.now_et().hour == 9
         direction = "HOLD" if regular else "BUY"

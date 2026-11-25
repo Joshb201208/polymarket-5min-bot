@@ -9,7 +9,10 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlsplit
 
+from stock_agent.materiality import score_materiality
+from stock_agent.research_focus import focus_symbols, owner_backed
 from stock_agent.research_pipeline import NewsEvent, SecurityInputs, SourceUnavailable
 from stock_agent.research_schemas import Evidence, utc_datetime
 
@@ -18,20 +21,219 @@ _QUOTE_TTL = timedelta(seconds=90)
 _COMPANY_TTL = timedelta(hours=6)
 _MARKET = ("SPY", "QQQ")
 _NEWS_LIMIT = 5
+_OWNER_HANDOFF_MIN_SCORE = 5
+_REGULATORS = ("sec.gov", "bis.gov", "commerce.gov", "federalregister.gov", "justice.gov", "ftc.gov", "fda.gov")
+_OWNER_CATALYST_REASONS = frozenset(
+    {
+        "trading_halt_or_distress",
+        "earnings_or_guidance",
+        "mna_or_strategic",
+        "regulatory_or_legal",
+        "ai_semis_or_contract",
+        "capital_or_exec",
+    }
+)
+_OWNER_DELIVERY_CATALYST_RE = re.compile(
+    r"\b(?:(?:delays?|delayed|postpones?|postponed|halts?|halted|pauses?|paused|suspends?|suspended|"
+    r"cancels?|canceled|cancelled|cuts?)\b[^.;]{0,50}\b(?:shipments?|deliver(?:y|ies)|rollout|launch|ramp|"
+    r"production|orders?|supply)\b|"
+    r"(?:shipments?|deliver(?:y|ies)|rollout|launch|ramp|production)\b[^.;]{0,40}\b(?:delays?|delayed|"
+    r"pushout|pull[- ]in|halts?|halted|pauses?|paused|suspends?|suspended)\b)",
+    re.I,
+)
+_OWNER_EXEC_CAPITAL_ACTION_RE = re.compile(
+    r"\b(?:resigns?|steps?\s+down|retires?|ousted?|fires?|fired|terminat\w+|removes?|removed|"
+    r"departs?|departing|departure|leaves?|leaving|appoint\w+|names?|named|replaces?|replaced|"
+    r"succeeds?|buyback|share\s+repurchase|dividend\s+(?:hike|increase|cut|suspension|initiation)|"
+    r"secondary\s+offering|convertible\s+notes|restructuring|layoffs?)\b",
+    re.I,
+)
+_OWNER_WRAP = re.compile(
+    r"(?:\?\s*$|"
+    r"^\s*(?:why|how|what|is|are|can|could|should|will)\b|"
+    r"\b(?:euphoria|roundup|commentary|opinion|editorial|column|market\s+(?:wrap|recap)|"
+    r"earnings\s+call\s+summary|price[- ]move|price\s+target|"
+    r"here(?:'s|\s+is)\s+(?:why|how|what|which)|"
+    r"(?:shares|stock|stocks)\s+(?:are\s+|is\s+)?(?:mov(?:e|es|ing)|jump\w*|fall\w*|ris(?:e|es|ing)|"
+    r"drop\w*|slump\w*|slid\w*|rall(?:y|ies|ying)|sink\w*|plung\w*|surg\w*|gain\w*|dip\w*|tumbl\w*|soar\w*)|"
+    r"(?:fell|rose|jumped|dropped|slumped|gained|sank|plunged|surged|dipped)\s+\d+(?:\.\d+)?%|"
+    r"give\s+back\s+(?:some\s+)?gains|"
+    r"top\s+\d+\s+stocks|\d+\s+(?:ai\s+|chip\s+|tech\s+|magnificent\s+)?stocks\s+to\s+(?:buy|watch|avoid)|"
+    r"stocks\s+to\s+(?:watch|buy)|if\s+you\s+invested|motley\s+fool|zacks|"
+    r"left\s+in\s+the\s+dark|under\s+scrutiny\s+after)(?=\W|$))",
+    re.I,
+)
+_MULTI_ISSUER_LEAD_RE = re.compile(
+    r"^\s*(?:(?:exclusive|breaking|update)\s*:\s*)?(?:\$?[A-Za-z0-9.\-]+(?:\s+[A-Za-z0-9.\-]+){0,2})"
+    r"\s*,\s*[A-Z][A-Za-z0-9.\-]+(?:\s*,\s*[A-Z][A-Za-z0-9.\-]+|\s+(?:and|&)\b)",
+)
+_FALLBACK_ISSUER_NAMES: dict[str, str] = {
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "AMD": "Advanced Micro Devices",
+    "AVGO": "Broadcom",
+    "MU": "Micron",
+    "ANET": "Arista Networks",
+    "ORCL": "Oracle",
+    "PANW": "Palo Alto Networks",
+    "TSM": "TSMC",
+    "ASML": "ASML",
+    "FIX": "Comfort Systems",
+    "NVT": "nVent",
+    "VST": "Vistra",
+    "GOOGL": "Alphabet",
+    "GOOG": "Alphabet",
+    "META": "Meta",
+    "AMZN": "Amazon",
+    "TSLA": "Tesla",
+    "LLY": "Eli Lilly",
+    "UNH": "UnitedHealth",
+    "ABBV": "AbbVie",
+}
 
 
-def _issuer_headline(symbol: str, company: str | None, headline: str) -> bool:
+_COMPANY_TRAIL_RE = re.compile(r"(?:\([^)]*\)|\beach\s+representing\b.*$)", re.I)
+_SHARE_CLASS_SUFFIXES: tuple[tuple[str, ...], ...] = (
+    ("shares", "of", "beneficial", "interest"),
+    ("new", "york", "registry", "shares"),
+    ("american", "depositary", "shares"),
+    ("american", "depositary", "receipts"),
+    ("global", "depositary", "shares"),
+    ("global", "depositary", "receipts"),
+    ("subordinate", "voting", "shares"),
+    ("non", "voting", "shares"),
+    ("limited", "partnership", "units"),
+    ("depositary", "shares"),
+    ("depositary", "receipts"),
+    ("registry", "shares"),
+    ("beneficial", "interest"),
+    ("sponsored", "adr"),
+    ("unsponsored", "adr"),
+    ("common", "stock"),
+    ("common", "shares"),
+    ("common", "units"),
+    ("ordinary", "shares"),
+    ("capital", "stock"),
+    ("preferred", "stock"),
+    ("preference", "shares"),
+    ("voting", "shares"),
+    ("class", "a"),
+    ("class", "b"),
+    ("class", "c"),
+    ("cl", "a"),
+    ("cl", "b"),
+    ("cl", "c"),
+    ("series", "a"),
+    ("series", "b"),
+    ("series", "c"),
+    ("n", "v"),
+    ("s", "a"),
+    ("a", "s"),
+    ("and", "company"),
+    ("and", "co"),
+)
+_LEGAL_ENTITY_SUFFIXES = frozenset(
+    {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "plc",
+        "ltd",
+        "limited",
+        "llc",
+        "lp",
+        "nv",
+        "sa",
+        "ag",
+        "se",
+        "adr",
+        "ads",
+        "gdr",
+        "com",
+    }
+)
+
+
+def _issuer_words(company: str | None) -> list[str]:
+    cleaned = _COMPANY_TRAIL_RE.sub(" ", company or "")
+    words = re.findall(r"[a-z0-9]+", cleaned.lower())
+    changed = True
+    while changed and len(words) > 1:
+        changed = False
+        for phrase in _SHARE_CLASS_SUFFIXES:
+            n = len(phrase)
+            if len(words) > n and tuple(words[-n:]) == phrase:
+                del words[-n:]
+                changed = True
+                break
+        if not changed and len(words) > 1 and words[-1] in _LEGAL_ENTITY_SUFFIXES:
+            words.pop()
+            changed = True
+    return words
+
+
+def _issuer_headline(
+    symbol: str,
+    company: str | Sequence[str] | None,
+    headline: str,
+    *,
+    leading: bool = False,
+) -> bool:
     # Provider tags alone do not make a market wrap issuer-specific. A title
     # hit is an exemption from the indirect-work quota, not proof of materiality.
-    if re.search(rf"(?<!\w)\${re.escape(symbol)}(?!\w)", headline, re.IGNORECASE):
+    if leading:
+        headline = re.sub(r"^\s*(?:(?:exclusive|breaking|update)\s*:\s*)?", "", headline, flags=re.I)
+    start = "^" if leading else r"(?<!\w)"
+    if re.search(rf"{start}\${re.escape(symbol)}(?!\w)", headline, re.IGNORECASE):
         return True
-    if len(symbol) >= 2 and re.search(rf"(?<!\w){re.escape(symbol)}(?!\w)", headline):
+    if len(symbol) >= 2 and re.search(rf"{start}{re.escape(symbol)}(?!\w)", headline):
         return True
-    words = re.findall(r"[a-z0-9]+", (company or "").lower())
-    while words and words[-1] in {"inc", "incorporated", "corp", "corporation", "plc", "ltd", "limited", "com"}:
-        words.pop()
+    names = (company,) if isinstance(company, str) else tuple(company or ())
+    if not names:
+        return False
     title = " " + " ".join(re.findall(r"[a-z0-9]+", headline.lower())) + " "
-    return bool(words and " " + " ".join(words) + " " in title)
+    for candidate in names:
+        words = _issuer_words(candidate)
+        if not words:
+            continue
+        company_match = " " + " ".join(words) + " "
+        if title.startswith(company_match) if leading else company_match in title:
+            return True
+    return False
+
+
+def _owner_handoff_event(
+    item, evidence: Evidence, symbol: str, company: str | Sequence[str] | None,
+) -> bool:
+    if getattr(item, "kind", None) == "sec_filing":
+        return True  # The caller already checked the filing's issuer tag.
+    try:
+        host = (urlsplit(evidence.url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host.endswith(".gov") or any(host == domain or host.endswith("." + domain) for domain in _REGULATORS):
+        return _issuer_headline(symbol, company, evidence.title)
+    if (
+        _OWNER_WRAP.search(evidence.title)
+        or _MULTI_ISSUER_LEAD_RE.search(evidence.title)
+        or not _issuer_headline(symbol, company, evidence.title, leading=True)
+    ):
+        return False
+    combined_text = f"{evidence.title} {evidence.snippet or ''}".strip()
+    if _OWNER_DELIVERY_CATALYST_RE.search(combined_text):
+        return True
+    # Re-score unboosted (no focus/target boost and no multi-tag roundup penalty) so a single real catalyst reaches >= 5.
+    verdict = score_materiality(evidence.title, evidence.snippet or "")
+    matched = set(verdict.reasons) & _OWNER_CATALYST_REASONS
+    if verdict.score < _OWNER_HANDOFF_MIN_SCORE or not matched:
+        return False
+    if matched == {"capital_or_exec"} and not _OWNER_EXEC_CAPITAL_ACTION_RE.search(combined_text):
+        return False
+    return True
 
 
 class ResearchSources:
@@ -46,6 +248,8 @@ class ResearchSources:
         tipranks=None,
         baseline_due: Callable[[datetime], bool] | None = None,
         fundamental_limit: int = 10,
+        focus_for: Callable[..., Sequence[str]] | None = None,
+        directives_for: Callable[..., Mapping[str, Any]] | None = None,
     ):
         self.prices = prices
         self.news_service = news
@@ -58,6 +262,8 @@ class ResearchSources:
         self.tipranks = tipranks
         self.baseline_due = baseline_due
         self.fundamental_limit = max(0, fundamental_limit)
+        self.focus_for = focus_for or focus_symbols
+        self.directives_for = directives_for or owner_backed
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._universe_tipranks_key: tuple[Any, ...] | None = None
@@ -238,15 +444,58 @@ class ResearchSources:
         if not self.news_ok(symbol, now):
             await self.background((symbol,))
 
-    async def handoff_material_news(self, symbol: str, after: datetime, now: datetime) -> tuple[Evidence, ...]:
-        """Use the live-news materiality threshold on the opening symbol's newest stories."""
+    def _company_names(self, symbol: str) -> tuple[str, ...]:
+        candidates: list[str] = []
+        stamp = self._companies.get(symbol)
+        if stamp is not None:
+            snap_name = getattr(stamp[1], "company_name", None) or getattr(stamp[1], "name", None)
+            if snap_name:
+                candidates.append(str(snap_name))
+        if self.cached_company is not None:
+            cached = self.cached_company(symbol)
+            cached_name = getattr(cached, "company_name", None) or getattr(cached, "name", None)
+            if cached_name:
+                candidates.append(str(cached_name))
+        fallback = _FALLBACK_ISSUER_NAMES.get(symbol)
+        if fallback:
+            candidates.append(fallback)
+        asset_name = getattr(self.asset_for(symbol), "company_name", None)
+        if asset_name:
+            candidates.append(str(asset_name))
+        scored: list[tuple[int, int, int, str]] = []
+        seen_norm: set[str] = set()
+        for idx, raw in enumerate(candidates):
+            words = _issuer_words(raw)
+            if not words:
+                continue
+            norm = " ".join(words)
+            if norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            scored.append((len(words), len(norm), idx, raw))
+        scored.sort()
+        return tuple(item[3] for item in scored)
+
+    def _company_name(self, symbol: str) -> str | None:
+        names = self._company_names(symbol)
+        return names[0] if names else None
+
+    async def handoff_material_news(
+        self, symbol: str, after: datetime, now: datetime, *, owner: bool = False,
+    ) -> tuple[Evidence, ...]:
+        """Ordinary handoffs retain the live threshold; owner handoffs require issuer events."""
         items = await self._poll((symbol,), scope="scheduled_research", include_market=False, lookback_hours=24)
         evidence = []
+        companies = self._company_names(symbol) if owner else ()
         for item in items:
-            score = _finite(item.materiality_score)
             parsed = _news_evidence(item)
-            if (symbol in item.symbols and score is not None and score >= _NEWS_LIMIT and parsed is not None
-                    and parsed.published_at is not None and after < parsed.published_at <= now):
+            if (symbol not in item.symbols or parsed is None or parsed.published_at is None
+                    or not after < parsed.published_at <= now):
+                continue
+            if owner:
+                if _owner_handoff_event(item, parsed, symbol, companies):
+                    evidence.append(parsed)
+            elif (_finite(item.materiality_score) or 0) >= _NEWS_LIMIT:
                 evidence.append(parsed)
         return tuple(sorted(evidence, key=lambda row: row.published_at, reverse=True)[:6])
 
@@ -255,7 +504,10 @@ class ResearchSources:
         getter = getattr(self.prices, "get_daily_bars", None)
         if getter is None:
             return None
-        bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        try:
+            bars = (await getter([symbol], sessions=1, end_date=session_date)).get(symbol, ())
+        except Exception:
+            return None
         return _price(bars[-1].close) if bars and bars[-1].session_date == session_date else None
 
     async def releases(self, symbols: tuple[str, ...], now: datetime) -> tuple[NewsEvent, ...]:
@@ -302,7 +554,87 @@ class ResearchSources:
                 self._quote_at[symbol] = stamp
         return quotes
 
-    async def securities(self, symbols: tuple[str, ...], now: datetime) -> dict[str, SecurityInputs]:
+    def _normalize_with_alias(self, raw_symbols: Sequence[Any]) -> list[str]:
+        out: list[str] = []
+        resolve = getattr(self.news_service, "_resolve_symbol", None)
+        for item in raw_symbols:
+            sym = str(item or "").strip().upper()
+            if not sym:
+                continue
+            out.append(sym)
+            if callable(resolve):
+                try:
+                    resolved = str(resolve(sym) or "").strip().upper()
+                    if resolved and resolved != sym:
+                        out.append(resolved)
+                except Exception:
+                    pass
+        return out
+
+    def _focus_by_cadence(self, now: datetime, cadence: str) -> list[str]:
+        try:
+            raw = self.focus_for(now=now, cadence=cadence)
+        except TypeError:
+            if cadence != "live":
+                return []
+            try:
+                raw = self.focus_for(now=now)
+            except Exception:
+                return []
+        except Exception:
+            return []
+        return self._normalize_with_alias(tuple(raw))
+
+    def _ordered_priority_symbols(self, now: datetime, *, include_daily: bool) -> tuple[str, ...]:
+        """Deterministic order: owner-backed first, then live focus, then daily focus (prescan only)."""
+        owner_raw: Sequence[Any] = ()
+        try:
+            directives = self.directives_for(now=now)
+            owner_raw = tuple(directives.keys() if isinstance(directives, Mapping) else directives)
+        except Exception:
+            owner_raw = ()
+        owner_syms = self._normalize_with_alias(owner_raw)
+        live_syms = self._focus_by_cadence(now, "live")
+        daily_syms = self._focus_by_cadence(now, "daily") if include_daily else []
+        return tuple(dict.fromkeys([*owner_syms, *live_syms, *daily_syms]))
+
+    async def _brief_quotes(self, symbols: Sequence[str]):
+        """Pre-open analysis-only 20m quote fallback; never updates _quote_at or regular-hours price."""
+        if not symbols or self.prices is None:
+            return {}
+        try:
+            batch = await self.prices.get_quotes(
+                list(symbols), purpose="brief", max_age_s=int(_NEWS_TTL.total_seconds())
+            )
+        except Exception:
+            return {}
+        return getattr(batch, "quotes", None) or {}
+
+    async def _recent_filings_evidence(
+        self, symbols: Sequence[str], now: datetime
+    ) -> dict[str, tuple[Evidence, ...]]:
+        fetch_recent = getattr(self.news_service, "fetch_recent_filings", None)
+        if not symbols or not callable(fetch_recent):
+            return {}
+        try:
+            batches = await fetch_recent(tuple(symbols), now=now)
+        except Exception:
+            return {}
+        out: dict[str, tuple[Evidence, ...]] = {}
+        for symbol, items in (batches or {}).items():
+            parsed = tuple(ev for item in items if (ev := _news_evidence(item)) is not None)
+            if parsed:
+                out[symbol] = parsed
+        return out
+
+    async def securities(
+        self,
+        symbols: tuple[str, ...],
+        now: datetime,
+        *,
+        preopen: bool = False,
+        prescan: bool = False,
+    ) -> dict[str, SecurityInputs]:
         limiter = asyncio.Semaphore(5)
         cached = {
             symbol: stamp[1] for symbol in symbols if (stamp := self._companies.get(symbol)) is not None
@@ -332,8 +664,23 @@ class ResearchSources:
                 self._companies[symbol] = (now, snapshot)
             return snapshot
 
-        fundamentals = await asyncio.gather(*(company(symbol) for symbol in symbols))
-        quotes = await self._quotes(symbols, purpose="order_sizing")
+        is_preopen = bool(preopen or prescan)
+        ordered_priority = self._ordered_priority_symbols(now, include_daily=bool(prescan))
+        requested_set = set(symbols)
+        filing_targets = tuple(sym for sym in ordered_priority if sym in requested_set)
+        fundamentals, quotes, recent_filings = await asyncio.gather(
+            asyncio.gather(*(company(symbol) for symbol in symbols)),
+            self._quotes(symbols, purpose="order_sizing"),
+            self._recent_filings_evidence(filing_targets, now),
+        )
+        missing_priority_quotes = (
+            [symbol for symbol in filing_targets if quotes.get(symbol) is None]
+            if is_preopen
+            else []
+        )
+        fallback_quotes = (
+            await self._brief_quotes(missing_priority_quotes) if missing_priority_quotes else {}
+        )
         out = {}
         for symbol, snapshot in zip(symbols, fundamentals, strict=True):
             asset = self.asset_for(symbol)
@@ -352,14 +699,24 @@ class ResearchSources:
             raw_metrics = getattr(snapshot, "metrics", {})
             metrics = _metrics(raw_metrics)
             quote = quotes.get(symbol)
+            bquote = fallback_quotes.get(symbol) if is_preopen else None
             ev_fn = getattr(self.tipranks, "evidence_for", None)
             tr_evidence = tuple(ev_fn(symbol, now)) if ev_fn is not None else ()
+            filing_evidence = recent_filings.get(symbol, ())
             snap_evidence = tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))
             out[symbol] = SecurityInputs(
-                symbol, str(display_name), str(sector), _price(quote.price) if quote else None,
-                utc_datetime(quote.as_of) if quote else None, tradable, metrics,
+                symbol,
+                str(display_name),
+                str(sector),
+                _price(quote.price) if quote else None,
+                utc_datetime(quote.as_of) if quote else None,
+                tradable,
+                metrics,
                 (*tr_evidence, *snap_evidence)[:12],
                 _provenance(raw_metrics),
+                priority_evidence=filing_evidence,
+                analysis_price=_price(bquote.price) if bquote else None,
+                analysis_quote_at=utc_datetime(bquote.as_of) if bquote else None,
             )
         return out
 

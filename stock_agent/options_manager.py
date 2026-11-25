@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import inspect
 import logging
+import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -59,8 +60,8 @@ from stock_agent.options_policy import (
     apply_result,
     breaks_thesis,
     build_proposal,
-    close_limit,
     exit_reason,
+    fallback_close_limit,
     in_cooldown,
     parse_direction,
     parse_occ,
@@ -103,6 +104,8 @@ class OptionCandidate:
     source: str = "news"
     story_id: str | None = None
     direction_hint: str | None = None  # bullish | bearish | BUY | BEARISH
+    thesis_id: str | None = None  # owner ideas: the thesis the idea was built from
+    owner_directive_added: str | None = None  # owner ideas: directive generation (ISO date)
 
 
 @dataclass(frozen=True)
@@ -198,8 +201,12 @@ class OptionsManager:
         config: Any = None,
         settings: OptionsSettings | None = None,
         now: Callable[[], datetime] | None = None,
+        research_refresh: Callable[[str, datetime], Any] | None = None,
     ) -> None:
         self.broker = broker
+        # ResearchSources.refresh_entry_inputs(symbol, now): re-reads a stale quote/news proof
+        # before an owner re-verify (a no-op while fresh); same hook ExecutionEngine uses
+        self._research_refresh = research_refresh
         self.store = store
         self.gate = gate
         self.risk = risk
@@ -346,8 +353,14 @@ class OptionsManager:
 
     async def _rejected(self, st_or_symbol: Any, side: str, qty: int, reason: str, title: str, key: str) -> None:
         sym = st_or_symbol if isinstance(st_or_symbol, str) else st_or_symbol.underlying
-        if not await self._notify("alert_order_rejected", symbol=sym, side=side, qty=qty, reason=reason,
-                                  asset_class="option"):
+        fn = getattr(self.alerts, "alert_order_rejected", None) if self.alerts is not None else None
+        kw: dict[str, Any] = {"symbol": sym, "side": side, "qty": qty, "reason": reason}
+        try:  # older AlertService hooks take no asset_class
+            if fn is not None and "asset_class" in inspect.signature(fn).parameters:
+                kw["asset_class"] = "option"
+        except (TypeError, ValueError):
+            pass
+        if not await self._notify("alert_order_rejected", **kw):
             await self._alert("critical", title, reason, key=key)
 
     async def _flush_closed(self, now: datetime) -> None:
@@ -544,10 +557,201 @@ class OptionsManager:
                    if s.source == "news" and s.opened_at and s.opened_at[:10] == today.isoformat()
                    and s.st is not StructState.VOID)
 
+    # ---------------------------------------------------------- owner-backed
+    def _owner_ledger(self) -> Any:
+        return getattr(self.gate, "ledger", None)
+
+    def _owner_structures(self, sym: str, added: str) -> list[Structure]:
+        return [x for x in self.structures
+                if x.source == "owner" and x.underlying == sym and x.owner_directive_added == added]
+
+    def _owner_book_used(self, sym: str, added: str) -> bool:
+        """An owner structure for this directive generation uses it up: pending (outcome
+        unknown), open, partial, closed, stopped, expired, or voided without a broker-confirmed
+        zero fill; none of them re-arms. Only a confirmed zero fill frees the shot (lead ruling 2)."""
+        return any(not (x.st is StructState.VOID and x.zero_fill_confirmed)
+                   for x in self._owner_structures(sym, added))
+
+    def _owner_release(self, x: Structure) -> bool:
+        """Hand back the durable claim of one saved, broker-confirmed zero-fill owner structure.
+        Without the ledger method (or on any error) the shot stays spent (fail closed)."""
+        if not (x.source == "owner" and x.owner_directive_added and x.st is StructState.VOID
+                and x.zero_fill_confirmed and not x.owner_claim_released):
+            return False
+        release = getattr(self._owner_ledger(), "release_owner_option", None)
+        if release is None:
+            return False
+        try:
+            if release(x.underlying, date.fromisoformat(x.owner_directive_added), x.id) is not True:
+                return False
+        except Exception as e:
+            logger.warning("owner claim release failed for %s: %s", x.id, type(e).__name__)
+            return False
+        x.owner_claim_released = True
+        x.note("owner option claim released: confirmed zero fill")
+        self._j("options.owner_claim_released", structure_id=x.id, underlying=x.underlying,
+                owner_directive_added=x.owner_directive_added)
+        self._save()
+        return True
+
+    def _owner_release_voided(self, sym: str) -> None:
+        """Backstop before the gate is asked (the gate denies while the claim stands): release
+        any saved confirmed zero fill a crash left unreleased."""
+        for x in self.structures:
+            if x.source == "owner" and x.underlying == sym:
+                self._owner_release(x)
+
+    async def _owner_settle(self, st: Structure) -> None:
+        """Eagerly, when an owner open ends VOID: a confirmed zero fill frees the shot now; a
+        void the broker never confirmed keeps it spent and tells the owner once (F2)."""
+        if st.source != "owner" or st.st is not StructState.VOID or not st.owner_directive_added:
+            return
+        if st.zero_fill_confirmed:
+            self._owner_release(st)
+        else:
+            await self._owner_spent_alert(st.underlying, st.owner_directive_added)
+
+    async def _owner_proof(self, c: OptionCandidate, sym: str, now: datetime) -> tuple[Any, Any, str | None]:
+        """(eligibility, proof, problem). The proof is the typed OwnerEntryProof the research
+        gate issues after re-reading the focus file and the current thesis; idea metadata is
+        only cross-checked against it, never trusted on its own."""
+        self._owner_release_voided(sym)
+        await self._owner_refresh(sym)
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(sym, now, allow_owner=True, owner_lane="option"))
+        except TypeError:
+            return None, None, "research gate has no owner option lane"
+        if not el.ok:
+            await self._owner_orphan_check(sym, c.owner_directive_added)
+            return el, None, "research gate: " + ",".join(el.reasons)
+        proof = getattr(el, "owner_entry", None)
+        if proof is None:
+            return el, None, "owner directive: no proof from the research gate"
+        added = proof.added.isoformat()
+        if (proof.symbol.upper() != sym or proof.thesis_id != el.thesis_id
+                or getattr(proof, "lane", "option") != "option"
+                or (c.thesis_id is not None and c.thesis_id != proof.thesis_id)
+                or (c.owner_directive_added is not None and c.owner_directive_added != added)):
+            return el, None, "owner directive: idea does not match the current directive or thesis"
+        # the gate returns BUY, or HOLD for an owner option-only held thesis whose current
+        # held review is unchanged/strengthened; the proof is what makes either actionable
+        raw_dir = str(getattr(el.direction, "value", el.direction) or "").upper()
+        if parse_direction(el.direction) is not Direction.BULLISH and raw_dir != "HOLD":
+            return el, None, "owner directive: only a bullish structure is allowed"
+        if c.direction_hint and parse_direction(c.direction_hint) is not Direction.BULLISH:
+            return el, None, "owner directive: only a bullish structure is allowed"
+        if self._owner_book_used(sym, added):
+            if any(x.st is StructState.VOID and not x.zero_fill_confirmed
+                   for x in self._owner_structures(sym, added)):
+                await self._owner_spent_alert(sym, added)
+            return el, None, "owner directive already used for an option structure"
+        ledger = self._owner_ledger()
+        used = getattr(ledger, "owner_directive_used", None)
+        try:
+            spent = used is None or used(sym, proof.added, lane="option") is not False
+        except Exception as e:  # unreadable claim state -> no entry
+            return el, None, f"owner directive state unavailable: {e}"
+        if spent:
+            await self._owner_orphan_check(sym, added)
+            return el, None, "owner directive already used or vetoed"
+        return el, proof, None
+
+    async def _owner_orphan_check(self, sym: str, added: str | None) -> None:
+        """Independently of the gate verdict: a ledger claim for this generation with no
+        resolved structure in the book (or only an unconfirmed void) is an orphan; alert once."""
+        if not added:
+            return
+        ledger = self._owner_ledger()
+        used = getattr(ledger, "owner_directive_used", None)
+        vetoed = getattr(ledger, "owner_directive_vetoed", None)
+        try:
+            d = date.fromisoformat(added)
+            if used is None or used(sym, d, lane="option") is not True:
+                return
+            if vetoed is not None and vetoed(sym, d):
+                return
+        except Exception:
+            return
+        mine = self._owner_structures(sym, added)
+        if not mine or all(x.st is StructState.VOID and not x.zero_fill_confirmed for x in mine):
+            await self._owner_spent_alert(sym, added)
+
+    async def _owner_spent_alert(self, sym: str, added: str) -> None:
+        """Claimed but not provably resolved (crash between claim and reservation, or a void
+        the broker never confirmed): the shot stays spent; tell the owner once (durably)."""
+        key = f"opt-owner-spent-{sym}-{added}"
+        seen = self.meta.setdefault("owner_spent_alerted", [])
+        if key in seen:
+            return
+        seen.append(key)
+        self._save()
+        await self._alert("critical", f"Owner option idea spent: {sym}",
+                          f"Directive added {added} has a claimed option shot with no confirmed outcome. "
+                          "It stays spent; change 'added' in the focus file to re-arm on purpose.", key=key)
+
+    def _owner_claim(self, sym: str, proof: Any, structure_id: str) -> bool:
+        """Durable one-shot claim (ledger CAS); idempotent for the same structure id."""
+        claim = getattr(self._owner_ledger(), "claim_owner_option", None)
+        if claim is None:
+            return False
+        try:
+            return claim(sym, proof.added, structure_id) is True
+        except Exception:
+            return False
+
+    async def _owner_refresh(self, sym: str) -> None:
+        """Refresh the research gate's quote/news inputs before an owner re-verify, so a ladder
+        that outlives the quote TTL is judged on a fresh quote, never on a relaxed gate.
+        Never raises; a failed refresh only means the gate sees the old input and refuses."""
+        if self._research_refresh is None:
+            return
+        try:
+            async with asyncio.timeout(10):
+                await _maybe(self._research_refresh(sym, self._now()))
+        except (Exception, TimeoutError) as e:
+            logger.warning("owner research refresh for %s failed: %s", sym, type(e).__name__)
+
+    async def _owner_reverify(self, sym: str, proof: Any, reservation_id: str | None) -> str | None:
+        """Fresh proof from the gate, which re-reads the focus file and thesis and applies the
+        veto latch and any session hold; it must match the proof the structure was sized on."""
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(sym, self._now(), allow_owner=True,
+                                                          owner_lane="option", reservation_id=reservation_id))
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        fresh = getattr(el, "owner_entry", None) if el is not None and el.ok else None
+        if fresh is None:
+            reasons = ",".join(getattr(el, "reasons", ()) or ()) if el is not None else ""
+            return "owner directive no longer valid" + (f": {reasons}" if reasons else "")
+        if (fresh.symbol.upper() != sym or fresh.added != proof.added or fresh.thesis_id != proof.thesis_id
+                or fresh.effective_conviction != proof.effective_conviction
+                or getattr(fresh, "lane", "option") != "option"):
+            return "owner directive or thesis changed"
+        return None
+
+    async def _owner_still_valid(self, st: Structure) -> str | None:
+        """Re-verify an owner structure before every rung (rung 0 included): same directive,
+        not vetoed or held, claim still ours."""
+        await self._owner_refresh(st.underlying)
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
+                                                          owner_lane="option", reservation_id=st.id))
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        proof = getattr(el, "owner_entry", None) if el is not None and el.ok else None
+        if proof is None:
+            return "owner directive no longer valid"
+        if proof.added.isoformat() != st.owner_directive_added or proof.thesis_id != st.thesis_id:
+            return "owner directive or thesis changed"
+        if not self._owner_claim(st.underlying, proof, st.id):
+            return "owner directive claim lost"
+        return None
+
     async def _try_open(self, c: OptionCandidate, now: datetime) -> ScanOutcome:
         s = self.settings
         sym = c.symbol.upper()
         today = self._today(now)
+        owner = c.source == "owner"
         if any(x.underlying == sym for x in self.live()):
             return ScanOutcome(sym, None, "already holds a structure on this underlying")
         live = self.live()
@@ -567,16 +771,27 @@ class OptionsManager:
             return ScanOutcome(sym, None, f"underlying {why}", final=False)
         # ---- research gate (at a time no earlier than the quote just fetched)
         now = max(now, self._now())
-        el = await _maybe(self.gate.is_entry_eligible(sym, now))
-        if not el.ok:
-            return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
-        direction = parse_direction(el.direction)
+        proof = None
+        if owner:
+            el, proof, problem = await self._owner_proof(c, sym, now)
+            if problem:
+                return ScanOutcome(sym, None, problem, final=False)
+        else:
+            el = await _maybe(self.gate.is_entry_eligible(sym, now))
+            if not el.ok:
+                return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
+        direction = Direction.BULLISH if owner else parse_direction(el.direction)
         if direction is None:
             return ScanOutcome(sym, None, f"thesis direction {el.direction} is not tradeable with options")
         if c.direction_hint and parse_direction(c.direction_hint) not in (None, direction):
             return ScanOutcome(sym, None, "news direction disagrees with the thesis")
-        conv = el.effective_conviction
-        if conv is None or conv < s.min_effective_conviction or (el.raw_conviction or 0) < 7:
+        # owner ideas: grades come from the typed proof (owner effective, model raw), never from an
+        # ordinary held-review thesis grade
+        conv = proof.effective_conviction if proof is not None else el.effective_conviction
+        raw_grade = proof.raw_conviction if proof is not None else el.raw_conviction
+        # the model's own raw grade may sit below 7 only under a current owner proof
+        raw_floor = 1 if proof is not None else 7
+        if conv is None or conv < s.min_effective_conviction or (raw_grade or 0) < raw_floor:
             return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}")
         account = await self.broker.get_account()
         level = account.options_trading_level
@@ -598,6 +813,10 @@ class OptionsManager:
         quotes = await self._quotes(sorted(chosen), chosen)
         # level 2 allows long calls/puts only, level 3 adds spreads (A14: fall back, don't block)
         shapes = ("single", "spread") if level is None or level >= 3 else ("single",)
+        if owner and conv < s.single_option_min_conviction:
+            shapes = tuple(x for x in shapes if x == "spread")  # owner 8: a spread only, never a lone option
+            if not shapes:
+                return ScanOutcome(sym, None, f"options level {level} allows no spread for an owner idea", final=False)
         prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
                               chain=list(quotes.values()), today=today, now=now, s=s,
                               trading_days=self._calendar_days, shapes=shapes)
@@ -633,17 +852,20 @@ class OptionsManager:
         spot, quote_at = spot2, self._spot_at[sym.upper()]
         intent = TradeIntent(
             kind=TradeKind.OPTION_OPEN, symbol=sym, qty=Decimal(sizing.qty),
-            raw_conviction=el.raw_conviction, effective_conviction=conv, minimum_conviction=s.min_effective_conviction,
+            raw_conviction=raw_grade, effective_conviction=conv, minimum_conviction=s.min_effective_conviction,
             option_max_loss=Decimal(str(sizing.max_loss)), option_cash_debit=Decimal(str(sizing.debit_cash)),
-            structure_id=sid, signal_at=el.generated_at, quote_at=quote_at, analysis_price=Decimal(str(spot)),
+            structure_id=sid, signal_at=proof.generated_at if proof is not None else el.generated_at, quote_at=quote_at, analysis_price=Decimal(str(spot)),
         )
         # final risk recheck -> write-ahead reservation under the shared capital lock, so an
         # equity lane can't size from the same free cash at the same moment
+        if proof is not None:
+            await self._owner_refresh(sym)  # network outside the lock; the in-lock re-verify is local
         async with self._capital_lock_cm():
             full_controls = RiskControls(
                 pause_new_buys=getattr(controls, "pause_new_buys", False),
                 drawdown=getattr(controls, "drawdown", RiskControls().drawdown),
                 option_commitments=self.commitments(),
+                **({"owner_entry": proof} if proof is not None else {}),
             )
             try:
                 snap = await _maybe(self._snapshot())
@@ -669,7 +891,22 @@ class OptionsManager:
             ok, why = await self._gate("entry")
             if not ok:
                 return ScanOutcome(sym, None, f"market gate: {why}", final=False)
+            if proof is not None:
+                if self._owner_book_used(sym, proof.added.isoformat()):
+                    return ScanOutcome(sym, None, "owner directive already used for an option structure")
+                # re-verify from the gate (focus file, thesis, veto latch, session hold) under the
+                # capital lock, immediately before the claim (F1c/F3)
+                why = await self._owner_reverify(sym, proof, None)
+                if why:
+                    return ScanOutcome(sym, None, why, final=False)
+                if not self._owner_claim(sym, proof, sid):
+                    return ScanOutcome(sym, None, "owner directive claim refused (used, vetoed or unavailable)")
             st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
+            if proof is not None:
+                st.owner_directive_added = proof.added.isoformat()
+                st.conviction = conv  # owner effective grade from the proof
+                st.note(f"owner-backed: directive added {st.owner_directive_added}, model raw "
+                        f"{raw_grade}, owner {conv}")
             st.open_client_id = _cid("open", st.id)
             self.structures.append(st)
             self._save()  # write-ahead: from here the commitment is visible to every lane
@@ -710,7 +947,8 @@ class OptionsManager:
             id=sid, underlying=prop.underlying, strategy=prop.strategy.value, direction=prop.direction.value,
             qty=qty, expiry=prop.expiry.isoformat(),
             legs=[Leg(lg.symbol, lg.side, lg.type, lg.strike, lg.expiry.isoformat(), lg.ratio) for lg in prop.legs],
-            state=StructState.PENDING.value, source=c.source if c.source in ("news", "scan", "research") else "scan",
+            state=StructState.PENDING.value,
+            source=c.source if c.source in ("news", "scan", "research", "owner") else "scan",
             thesis_id=el.thesis_id, conviction=el.effective_conviction, story_id=c.story_id,
             opened_at=now.isoformat(), width=prop.width, max_loss=max_loss, limit_debit=prop.limit_debit,
             entry_greeks={"delta": prop.delta, "iv": prop.iv, "spot": prop.spot, "mid_debit": prop.mid_debit,
@@ -748,20 +986,35 @@ class OptionsManager:
             out = sorted(set(out) | {prop.limit_debit})
         return out
 
+    @staticmethod
+    def _owner_journal(st: Structure) -> dict:
+        return {"owner_directive_added": st.owner_directive_added} if st.source == "owner" else {}
+
     async def _submit_open(self, st: Structure, prop: Proposal, now: datetime) -> ScanOutcome:
         """Send the open ladder for a structure already reserved (write-ahead) in the book."""
         self._j("options.open_submitted", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                 direction=st.direction, qty=st.qty, expiry=st.expiry, legs=[lg.symbol for lg in st.legs],
                 limit_debit=prop.limit_debit, max_loss=st.max_loss, thesis_id=st.thesis_id,
-                conviction=st.conviction, source=st.source, story_id=st.story_id, greeks=st.entry_greeks)
+                conviction=st.conviction, source=st.source, story_id=st.story_id, greeks=st.entry_greeks,
+                **self._owner_journal(st))
         order = None
         for attempt, limit in enumerate(self._open_ladder(prop)):  # same ladder as sized
+            if st.source == "owner":
+                why = await self._owner_still_valid(st)
+                if why:
+                    st.note(f"owner open stopped before rung {attempt}: {why}")
+                    if attempt == 0:  # nothing was sent: a confirmed zero fill
+                        st.state = StructState.VOID.value
+                        st.zero_fill_confirmed = True
+                    self._save()
+                    break
             if attempt:
                 ok, why = await self._gate("entry")
                 if not ok:
                     break
                 st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
+                st.zero_fill_confirmed = False
                 self._save()
             # the reservation stays at the sized ceiling (top rung) until the order is
             # terminal; _apply_open_order then sets max loss from the actual fill
@@ -774,8 +1027,10 @@ class OptionsManager:
                     self._save()
                     raise
                 st.state = StructState.VOID.value
+                st.zero_fill_confirmed = True  # definitive broker rejection: nothing was placed
                 st.note(f"open rejected: {e.message}")
                 self._save()
+                await self._owner_settle(st)  # F2: a definitive rejection frees the owner shot now
                 await self._rejected(st, "buy", st.qty, e.message, f"Options open rejected: {st.underlying}",
                                      key=f"opt-open-{st.id}")
                 return ScanOutcome(st.underlying, None, f"order rejected: {e.message}")
@@ -786,18 +1041,19 @@ class OptionsManager:
             self._save()
             if st.st is not StructState.VOID:
                 break
+        await self._owner_settle(st)
         if st.st is StructState.OPEN:
             self._j("options.opened", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                     direction=st.direction, qty=st.qty, entry_debit=st.entry_debit, max_loss=st.max_loss,
                     width=st.width, expiry=st.expiry, thesis_id=st.thesis_id, greeks=st.entry_greeks,
-                    conviction=st.conviction, source=st.source)
+                    conviction=st.conviction, source=st.source, **self._owner_journal(st))
             max_profit = (round((st.width - st.entry_debit) * MULTIPLIER * st.qty, 2)
                           if st.width is not None and st.entry_debit is not None else None)
             if not await self._notify(
                     "send_option_structure_opened", underlying=st.underlying, strategy=st.strategy,
                     legs_summary=self._legs_summary(st), debit_total=round((st.entry_debit or 0) * MULTIPLIER * st.qty, 2),
                     max_loss=st.max_loss, max_profit=max_profit, expiry=st.expiry, conviction=st.conviction,
-                    origin="NEWS" if st.source == "news" else "SCHEDULED", reason=st.thesis_id or ""):
+                    origin={"news": "NEWS", "owner": "OWNER"}.get(st.source, "SCHEDULED"), reason=st.thesis_id or ""):
                 await self._alert("info", f"Options opened: {st.underlying} {st.strategy}",
                                   f"{st.qty} x {st.expiry}, debit {st.entry_debit:.2f}, max loss {st.max_loss:.0f}",
                                   key=f"opt-open-{st.id}")
@@ -860,6 +1116,7 @@ class OptionsManager:
             st.state = StructState.OPEN.value
         elif order.is_terminal:
             st.state = StructState.VOID.value
+            st.zero_fill_confirmed = (order.filled_qty or 0) == 0
             st.note(f"open order ended {order.status} with no fill")
 
     # ============================================================== reconcile
@@ -897,6 +1154,8 @@ class OptionsManager:
                     st.note("no broker order under the client id; voided")
                 else:
                     self._apply_open_order(st, o)
+                if st.st is StructState.VOID:
+                    await self._owner_settle(st)  # F2: release a confirmed zero fill, alert otherwise
             elif st.st is StructState.CLOSING:
                 if o is None:
                     st.state = StructState.OPEN.value
@@ -1193,107 +1452,225 @@ class OptionsManager:
             total += lg.sign * lg.ratio * px
         return round(total, 4)
 
-    def _close_body(self, st: Structure, limit: float | None) -> dict:
+    def _close_body(self, st: Structure, limit: float) -> dict:
+        """Always a limit order: Alpaca rejects option market orders when there is no quote
+        ("please reenter with a limit order", live 25 Nov 2026). `limit` is the closing
+        value per share: + we receive, - we pay."""
         cid = st.close_client_id
         if len(st.legs) == 1:
             lg = st.legs[0]
             side = "sell" if lg.side == "buy" else "buy"
-            body = {"symbol": lg.symbol, "side": side, "qty": str(st.qty * lg.ratio),
-                    "time_in_force": "day", "position_intent": lg.close_intent, "client_order_id": cid}
-            if limit is None:
-                body["type"] = "market"
-            else:
-                body.update(type="limit", limit_price=f"{max(limit, 0.01):.2f}")
-            return body
-        body = {
+            px = limit if lg.side == "buy" else -limit  # sell at >= px / buy back at <= px
+            return {"symbol": lg.symbol, "side": side, "qty": str(st.qty * lg.ratio), "type": "limit",
+                    "limit_price": f"{max(px, 0.01):.2f}", "time_in_force": "day",
+                    "position_intent": lg.close_intent, "client_order_id": cid}
+        # mleg: positive = debit, negative = credit. A closing credit is sent negative.
+        return {
             "order_class": "mleg", "qty": str(st.qty), "time_in_force": "day", "client_order_id": cid,
+            "type": "limit", "limit_price": f"{(-limit) + 0.0:.2f}",
             "legs": [{"symbol": lg.symbol, "side": "sell" if lg.side == "buy" else "buy",
                       "ratio_qty": str(lg.ratio), "position_intent": lg.close_intent} for lg in st.legs],
         }
-        if limit is None:
-            body["type"] = "market"
+
+    @staticmethod
+    def _never_pays(st: Structure) -> bool:
+        """Closing a long-only structure or a debit vertical can never require paying."""
+        if all(lg.side == "buy" for lg in st.legs):
+            return True
+        # a debit vertical only while both legs are still there (a repair leaves a lone short)
+        return (st.strat.value in ("bull_call_spread", "bear_put_spread") and len(st.legs) == 2
+                and {lg.side for lg in st.legs} == {"buy", "sell"})
+
+    def _quote_limit(self, st: Structure, quotes: dict, frac: float) -> tuple[float | None, Any, Any]:
+        """(limit, natural, mid) from option quotes; None if they can't price the close."""
+        natural = self._value(st, quotes, "natural")
+        mid = self._value(st, quotes, "mid")
+        if natural is None or mid is None:
+            return None, natural, mid
+        px = mid - max(mid - natural, 0.0) * frac
+        limit = math.floor(round(px * 100, 6)) / 100
+        if self._never_pays(st):
+            floor_px = 0.01 if len(st.legs) == 1 else 0.0
+            if limit <= floor_px:
+                return None, natural, mid  # no real bid: price from intrinsic instead
+        return limit, natural, mid
+
+    def _close_quote_bad(self, q: ContractQuote | None, now: datetime) -> bool:
+        """Missing, crossed or stale quotes can't price a close (a zero bid on a long can)."""
+        if q is None or q.ask is None or q.ask <= 0:
+            return True
+        if q.bid is not None and q.ask < q.bid:
+            return True
+        return q.quote_at is not None and (now - q.quote_at).total_seconds() > self.settings.max_quote_age_s
+
+    def _close_session_reset(self, st: Structure, today: date) -> None:
+        if st.close_session != today.isoformat():
+            st.close_session = today.isoformat()
+            st.close_tries_session = 0
+            st.close_retry_after = None
+            st.close_zero_form = None
+
+    async def _close_alert_once(self, st: Structure, severity: str, title: str, body: str) -> None:
+        """One alert per structure per session, durable across restarts."""
+        key = f"opt-close-{st.id}-{st.close_session}"
+        seen = self.meta.setdefault("close_alerted", [])
+        if key in seen:
+            return
+        seen.append(key)
+        del seen[:-200]
+        self._save()
+        await self._alert(severity, title, body, key=key)
+
+    async def _close_try_failed(self, st: Structure, now: datetime, why: str, info: dict[str, Any],
+                                loud: bool = True) -> None:
+        """Count an unfilled or rejected close try: back off, and stop after the session cap.
+        Alerts once per session: at the first failure when `loud`, else when the cap is hit."""
+        s = self.settings
+        st.close_tries_session += 1
+        n = st.close_tries_session
+        steps = s.close_backoff_minutes or (15,)
+        st.close_retry_after = (now + timedelta(minutes=steps[min(n - 1, len(steps) - 1)])).isoformat()
+        deep = bool(info.get("deep_otm"))
+        done = n >= s.close_max_tries_per_session or st.close_zero_form == "stopped"
+        detail = (f"{why}. Legs {self._legs_summary(st)}, qty {st.qty}, spot {info.get('spot')}, "
+                  f"net intrinsic {info.get('intrinsic')}, limit tried {info.get('limit')}. ")
+        if done:
+            st.close_retry_after = None
+            st.note(f"close tries used up this session ({n}): "
+                    + ("deep out of the money, left to expire" if deep else "manual close needed"))
+            self._j("options.close_stopped", structure_id=st.id, underlying=st.underlying, tries=n,
+                    deep_otm=deep, **{k: v for k, v in info.items() if k != "deep_otm"})
+        self._save()
+        if not (done or loud):
+            return
+        if deep:
+            await self._close_alert_once(
+                st, "info", f"Options left to expire: {st.underlying}",
+                detail + f"Deep out of the money: at most {s.close_max_tries_per_session} limit tries this "
+                "session, never at market and never paying; otherwise it expires worthless.")
         else:
-            # mleg: positive = debit, negative = credit. A closing credit is sent negative.
-            body.update(type="limit", limit_price=f"{-limit:.2f}")
-        return body
+            await self._close_alert_once(
+                st, "critical", f"Options close not filled: {st.underlying}",
+                detail + f"Retrying with back-off, at most {s.close_max_tries_per_session} tries this "
+                "session, never at market. Close manually if it must not reach expiry.")
 
     async def _close(self, st: Structure, reason: ExitReason, now: datetime) -> str:
-        """Close a structure: limit rungs from mid towards the natural price, then
-        market on later attempts or when getting out is urgent."""
+        """Close a structure with limit orders only: rungs from mid towards the natural
+        price, the natural price when urgent, and, when the option quotes are unusable on an
+        expiry-driven or repair exit, a limit from the underlying's intrinsic value. Unfilled
+        or rejected tries back off (1, 2, 4, 8, 15 min) up to a per-session cap, with one alert."""
+        s = self.settings
         today = self._today(now)
+        self._close_session_reset(st, today)
+        if st.close_zero_form == "stopped" or st.close_tries_session >= s.close_max_tries_per_session:
+            return "close tries used up this session"
+        if st.close_retry_after and now < (_parse_ts(st.close_retry_after) or now):
+            return "backing off"
         days_left = self._trading_days(today, st.expiry_date)
-        # a lone short leg is closed at market straight away; time and ex-dividend exits
-        # escalate to market close to expiry or after two unfilled attempts
         urgent = reason is ExitReason.REPAIR or (
-            reason in (ExitReason.TIME_EXIT, ExitReason.ADOPTED_EXPIRY, ExitReason.EX_DIVIDEND)
-            and (days_left is None or days_left <= 1 or st.close_attempts >= 2))
+            reason in _EXPIRY_DRIVEN and (days_left is None or days_left <= 1 or st.close_attempts >= 2))
         if urgent or st.close_attempts >= 3:
-            fracs: list[float | None] = [None]
+            fracs = [1.0]
         elif st.close_attempts == 0:
-            fracs = [self.settings.limit_slippage_frac, 0.6, 1.0]
+            fracs = [s.limit_slippage_frac, 0.6, 1.0]
         else:
             fracs = [1.0]
         fallback = StructState.REPAIR if reason is ExitReason.REPAIR else StructState.OPEN
+        may_fallback = reason in _EXPIRY_DRIVEN or reason is ExitReason.REPAIR
         status = "not sent"
-        for i, frac in enumerate(fracs):
-            if i:
+        info: dict[str, Any] = {}
+        rung = 0
+        qty0 = st.qty
+        for frac in fracs:
+            if rung:
                 ok, _ = await self._gate("exit")
                 if not ok:
                     break
-            limit: float | None = None
-            natural = mid = None
-            if frac is not None:
-                try:
-                    quotes = await self._quotes([lg.symbol for lg in st.legs])
-                except BrokerError as e:
-                    if e.uncertain or e.kind == "auth":
-                        raise
-                    quotes = {}
-                natural = self._value(st, quotes, "natural")
-                mid = self._value(st, quotes, "mid")
-                if natural is not None and mid is not None:
-                    limit = close_limit(natural, mid, frac)
-                if limit is None or limit <= 0:
-                    if reason in _EXPIRY_DRIVEN:
-                        # nothing may be carried into expiry: without a usable quote, go market
-                        st.note("no usable quote for an expiry-driven exit; closing at market")
-                        limit = None
-                    else:
-                        # no usable quote: don't send a market order on a bad mark
-                        st.note("close skipped: no usable quote")
-                        self._save()
-                        return "no usable quote"
-            st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + i)
-            st.exit_reason = reason.value
-            st.state = StructState.CLOSING.value
-            self._save()  # write-ahead
-            self._j("options.exit_submitted", structure_id=st.id, underlying=st.underlying, reason=reason.value,
-                    attempt=st.close_attempts, rung=i, limit_credit=limit, natural=natural, mid=mid)
             try:
-                order = await self.broker.submit_raw_order(self._close_body(st, limit))
+                quotes = await self._quotes([lg.symbol for lg in st.legs])
             except BrokerError as e:
-                if e.uncertain:
-                    self._save()
+                if e.uncertain or e.kind == "auth":
                     raise
-                st.state = fallback.value
-                st.close_attempts += 1
-                st.note(f"close rejected: {e.message}")
-                self._save()
-                await self._rejected(st, "close", st.qty, e.message, f"Options close rejected: {st.underlying}",
-                                     key=f"opt-close-{st.id}")
-                return f"rejected: {e.message}"
-            st.close_order_id = order.id
-            self._save()
-            order = await self._wait_or_cancel(order)
-            self._apply_close_order(st, order, now, fallback_state=fallback, count_attempt=False)
-            self._save()
-            await self._flush_closed(now)
-            status = order.status
+                quotes = {}
+            stale = any(self._close_quote_bad(quotes.get(lg.symbol), now) for lg in st.legs)
+            limit, natural, mid = (None, None, None) if stale else self._quote_limit(st, quotes, frac)
+            info = {"limit": limit, "natural": natural, "mid": mid, "source": "quotes"}
+            if limit is None:
+                if not may_fallback:
+                    st.note("close skipped: no usable quote")
+                    self._save()
+                    return "no usable quote"
+                spot, why = await self._spot_now(st.underlying, now)
+                if spot is None:
+                    info = {"limit": None, "spot": None, "source": "none"}
+                    st.note(f"close not sent: no usable option quote and no underlying quote ({why})")
+                    await self._close_try_failed(st, now, f"No usable quote for {st.underlying} ({why})", info)
+                    return "no usable quote"
+                fb = fallback_close_limit(
+                    st.legs, spot, haircut=s.close_noquote_haircut, cushion_pct=s.close_short_cushion_pct,
+                    cushion_min=s.close_short_cushion_min, deep_otm_pct=s.close_deep_otm_pct,
+                    debit_vertical=self._never_pays(st) and len(st.legs) > 1)
+                limit = fb.credit
+                info = {"limit": limit, "spot": spot, "intrinsic": fb.intrinsic, "deep_otm": fb.deep_otm,
+                        "source": "intrinsic"}
+                if limit == 0 and len(st.legs) > 1 and st.close_zero_form == "credit_0.01":
+                    limit = 0.01  # a 0.00 net limit was rejected once: the 0.01-credit form, once
+                    info["limit"] = limit
+            res = await self._send_close(st, reason, now, limit, rung, info, fallback)
+            rung += 1
+            if res[0] == "rejected":
+                # a 0.00 net limit may not be accepted (UNVERIFIED): try a 0.01 credit once, then stop
+                if info.get("source") == "intrinsic" and len(st.legs) > 1 and limit == 0 \
+                        and st.close_zero_form is None:
+                    st.close_zero_form = "credit_0.01"
+                    info = {**info, "limit": 0.01}
+                    res = await self._send_close(st, reason, now, 0.01, rung, info, fallback)
+                    rung += 1
+                    if res[0] == "rejected":
+                        st.close_zero_form = "stopped"
+                if res[0] == "rejected":
+                    st.close_attempts += 1
+                    await self._close_try_failed(st, now, f"Options close rejected: {res[1]}", info)
+                    return f"rejected: {res[1]}"
+            status = res[1]
             if st.st is StructState.CLOSED:
                 return status
+            if info.get("source") == "intrinsic":
+                break  # no quotes to walk a ladder on: one intrinsic try per pass
         st.close_attempts += 1
+        if st.st is not StructState.CLOSED and status != "not sent" and st.qty >= qty0:
+            # a partial fill is progress, not a failed try
+            await self._close_try_failed(st, now, f"Options close not filled ({status})", info, loud=may_fallback)
         self._save()
         return status
+
+    async def _send_close(self, st: Structure, reason: ExitReason, now: datetime, limit: float, rung: int,
+                          info: dict[str, Any], fallback: StructState) -> tuple[str, str]:
+        """One limit close order: ('rejected', message) or ('done', order status)."""
+        st.close_client_id = _cid("close", st.id, st.close_attempts * 10 + rung)
+        st.exit_reason = reason.value
+        st.state = StructState.CLOSING.value
+        self._save()  # write-ahead
+        self._j("options.exit_submitted", structure_id=st.id, underlying=st.underlying, reason=reason.value,
+                attempt=st.close_attempts, rung=rung, limit_credit=limit, natural=info.get("natural"),
+                mid=info.get("mid"), price_source=info.get("source"), spot=info.get("spot"))
+        try:
+            order = await self.broker.submit_raw_order(self._close_body(st, limit))
+        except BrokerError as e:
+            if e.uncertain:
+                self._save()
+                raise
+            st.state = fallback.value
+            st.note(f"close rejected: {e.message}")
+            self._save()
+            return "rejected", e.message
+        st.close_order_id = order.id
+        self._save()
+        order = await self._wait_or_cancel(order)
+        self._apply_close_order(st, order, now, fallback_state=fallback, count_attempt=False)
+        self._save()
+        await self._flush_closed(now)
+        return "done", order.status
 
     def _apply_close_order(self, st: Structure, order: BrokerOrder, now: datetime,
                            fallback_state: StructState | None = None, count_attempt: bool = True) -> None:
@@ -1342,16 +1719,23 @@ class OptionsManager:
                 return CloseResult(False, 0, None, None, "market_closed", why)
             quotes = await self._quotes([contract])
             q = quotes.get(contract)
-            limit = q.ask if q is not None and q.ask else None
+            limit = q.ask if q is not None and q.ask and not self._close_quote_bad(q, now) else None
+            if limit is None:
+                # never at market (Alpaca rejects it without a quote): intrinsic plus a cushion
+                spot, why = await self._spot_now(occ.underlying, now)
+                if spot is None:
+                    return CloseResult(False, 0, None, None, "refused",
+                                       f"no usable option quote and no underlying quote ({why})")
+                s = self.settings
+                limit = max(math.ceil(round((max(spot - occ.strike, 0.0)
+                                             + max(s.close_short_cushion_min, s.close_short_cushion_pct * spot))
+                                            * 100, 6)) / 100, 0.01)
             cid = _cid("bsc", f"{contract}-{self._today(now).isoformat()}", int(self.meta.get("bsc_attempts", 0)))
             self.meta["bsc_attempts"] = int(self.meta.get("bsc_attempts", 0)) + 1
             self._save()
             body = {"symbol": contract, "side": "buy", "qty": str(qty), "time_in_force": "day",
                     "position_intent": "buy_to_close", "client_order_id": cid}
-            if limit is None:
-                body["type"] = "market"
-            else:
-                body.update(type="limit", limit_price=f"{limit:.2f}")
+            body.update(type="limit", limit_price=f"{limit:.2f}")
             self._j("options.exit_submitted", contract=contract, reason="normalise_short_call", qty=qty, limit=limit)
             try:
                 order = await self.broker.submit_raw_order(body)

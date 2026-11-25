@@ -4,8 +4,10 @@ import logging
 import math
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -21,9 +23,9 @@ from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsSer
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
 from stock_agent.http_safety import DataHttpClient
-from stock_agent.ledger import JobStatus, NewIntent
+from stock_agent.ledger import JobStatus, NewIntent, filled_thesis_grade
 from stock_agent.llm_client import LLMClient
-from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus
+from stock_agent.market_calendar import GateDecision, MarketCalendar, MarketSource, MarketStatus, Session
 from stock_agent.news_service import NewsService
 from stock_agent.options_book import KvOptionsStore, import_legacy_options
 from stock_agent.options_manager import OptionCandidate, OptionsError, OptionsManager
@@ -32,7 +34,7 @@ from stock_agent.price_service import PriceService
 from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_health import ResearchInputHealth
-from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline
+from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline, prescan_runtime_seconds
 from stock_agent.research_sources import ResearchSources
 from stock_agent.research_store import ResearchStore
 from stock_agent.risk_manager import (
@@ -70,6 +72,13 @@ OPTIONS_RESCAN_OUTSIDE_WINDOW = "outside_options_window"
 OPTIONS_RESCAN_NO_MANAGER = "no_options_manager"
 EXECUTION_DRAIN_SECONDS = 70
 SHUTDOWN_DRAIN_SECONDS = 75
+
+
+@dataclass(frozen=True)
+class _PrescanLaunch:
+    session: Session
+    deadline: tuple[float, datetime]
+
 
 DRAWDOWN_CLOSE_CAUSES = {
     "close_clock_unverified": "The broker clock did not confirm the scheduled session had closed",
@@ -187,7 +196,8 @@ class StockAgentScheduler:
         ))
         self.research = service("research", lambda: ResearchPipeline(
             self.config, self.ledger, self.calendar, self.analyst, self.research_store,
-            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus, alerts=self.alerts,
+            self.research_sources, self.research_gate, clock=_now_utc, focus=self._pollable_focus,
+            daily_focus=self._daily_focus, alerts=self.alerts,
         ))
         self.capital_lock = asyncio.Lock()
         self._asset_lock = asyncio.Lock()
@@ -206,6 +216,7 @@ class StockAgentScheduler:
             universe=self._option_universe, risk_controls=self._risk_controls, journal=self.journal,
             alerts=self.alerts, config=self.config, now=_now_utc,
             capital_lock=self.capital_lock, defer_load=True,
+            research_refresh=getattr(self.research_sources, "refresh_entry_inputs", None),
         ))
         if isinstance(self.engine, ExecutionEngine):
             self.engine.options = self.options
@@ -417,7 +428,9 @@ class StockAgentScheduler:
             if (thesis is None or not thesis.actionable) and holding.meta is not None:
                 thesis = self.ledger.last_filled_thesis(holding.meta.position_id)
             if thesis is not None and thesis.actionable:
-                grade = thesis.payload.get("effective_conviction")
+                owner_grade = (thesis.payload.get("adjustment_reason") == "owner_directive"
+                               or "owner_directive_added" in thesis.payload)
+                grade = filled_thesis_grade(thesis) if owner_grade else thesis.payload.get("effective_conviction")
                 if type(grade) is int and 1 <= grade <= 10:
                     convictions[holding.symbol] = grade
         commitments = getattr(self.options, "risk_commitments", None)
@@ -543,7 +556,7 @@ class StockAgentScheduler:
         catalogue = tuple(s for symbols in UNIVERSE_CATALOGUE.values() for s in symbols)
         # Only the selected TipRanks slice (already inside _universe_symbols) is tracked; never raw CSV rows.
         return tuple(dict.fromkeys([
-            *held, *focus_symbols(now=_now_utc()), *self.config.PRIORITY_SYMBOLS,
+            *held, *self._pollable_focus(), *self.config.PRIORITY_SYMBOLS,
             *self._universe_symbols, *self._baseline_universe_symbols, *catalogue,
         ]))
 
@@ -553,7 +566,10 @@ class StockAgentScheduler:
         ))
 
     def _pollable_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
-        return self._resolve_symbols(focus_symbols(now=now or _now_utc()))
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc(), cadence="live"))
+
+    def _daily_focus(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        return self._resolve_symbols(focus_symbols(now=now or _now_utc(), cadence="daily"))
 
     def _build_news_service(self) -> NewsService:
         return NewsService(
@@ -945,7 +961,7 @@ class StockAgentScheduler:
             ("assets", self._should_refresh_assets, self._refresh_session_assets, 90),
             ("macro", self._should_run_macro_check, self._run_macro_check, 120),
             ("earnings", self._should_run_earnings_check, self._run_earnings_reactive, 900),
-            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, 900),
+            ("prescan", self._should_run_daily_prescan, self._run_daily_prescan, None),
             ("morning_brief", self._should_send_morning_brief, self._send_morning_brief, 90),
             ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 55),
             ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
@@ -958,7 +974,16 @@ class StockAgentScheduler:
                 continue
             if name in {"weekly", "prescan", "midweek"} and "catchup" in self._job_tasks:
                 continue
+            if name in {"weekly", "midweek"} and "prescan" in self._job_tasks:
+                continue
+            if name == "prescan" and any(other in self._job_tasks for other in ("earnings", "weekly", "midweek")):
+                continue
             if not self._shutdown and due(now_et):
+                if name == "prescan":
+                    launch, timeout = self._prescan_launch()
+                    if launch is None or launch.session.date.isoformat() != day_key:
+                        continue
+                    callback = partial(callback, launch)
                 key = self._research_week_key(now_et, name) if name in {"weekly", "midweek"} else day_key
                 self._schedule_job(name, key, callback, timeout=timeout, replay=name not in {
                     "morning_brief", "daily_summary",
@@ -1497,16 +1522,39 @@ class StockAgentScheduler:
         if not self._entries_enabled():
             return
         ideas = [OptionIdea.from_payload(row) for row in self.research_store.pending_option_ideas(now)]
+        ideas = [idea for idea in ideas if idea.source != "owner" or self._owner_option_stock_ready(idea, now)]
         if not ideas:
             return
         if not (await self.market_gate("entry")).allowed:
             return
+        ideas = [idea for idea in ideas if idea.source != "owner" or self._owner_option_stock_ready(idea, now)]
+        if not ideas:
+            return
         candidates = [OptionCandidate(idea.symbol, source=getattr(idea, "source", "news"), story_id=idea.story_id,
-                                      direction_hint=idea.direction.value) for idea in ideas]
+                                      direction_hint=idea.direction.value,
+                                      **({"thesis_id": idea.thesis_id,
+                                          "owner_directive_added": idea.owner_directive_added}
+                                         if idea.source == "owner" else {})) for idea in ideas]
         await self.options.scan(_now_utc(), candidates=candidates)
         handled = self.options.handled_story_ids(idea.story_id for idea in ideas)
         if handled:
             self.research_store.acknowledge_options(tuple(sorted(handled)))
+
+    def _owner_option_stock_ready(self, idea: OptionIdea, now: datetime) -> bool:
+        session_date = now.astimezone(ET).date()
+        symbol, generation = idea.symbol, idea.owner_directive_added
+        if not isinstance(generation, str) or self.ledger.owner_directive_held(symbol, session_date):
+            return False
+        iso_date = session_date.isoformat()
+        if self.research_store.has_waiting_owner_buy(symbol, iso_date, now, generation=generation):
+            return False
+        if self.research_store.has_unqueued_owner_buy(symbol, iso_date, generation, now):
+            return False
+        try:
+            added = date.fromisoformat(generation)
+        except ValueError:
+            return False
+        return not self.ledger.owner_stock_attempt_in_progress(symbol, added, session_date)
 
     async def _run_execution_cycle(self):
         if not self._engine_resumed:
@@ -1680,8 +1728,27 @@ class StockAgentScheduler:
     async def _run_midweek_analysis(self):
         return await self._run_research("midweek")
 
-    async def _run_daily_prescan(self):
-        return await self._run_research("prescan")
+    def _prescan_launch(self) -> tuple[_PrescanLaunch | None, float]:
+        started = asyncio.get_running_loop().time()
+        now = _now_et()
+        session = self.calendar.session_on(now.date())
+        runtime = prescan_runtime_seconds(now, session.opens_at) if session is not None else 0.0
+        if session is None or runtime <= 0:
+            return None, 0.0
+        return _PrescanLaunch(session, (started + runtime, now + timedelta(seconds=runtime))), runtime
+
+    async def _run_daily_prescan(self, launch: _PrescanLaunch | None = None):
+        if launch is None:
+            launch, _ = self._prescan_launch()
+        now = _now_et()
+        session = self.calendar.session_on(now.date())
+        if (launch is None or session is None or session != launch.session or now >= session.opens_at
+                or now >= launch.deadline[1] or asyncio.get_running_loop().time() >= launch.deadline[0]):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "prescan_dispatch_cutoff", "deferred": 1})
+        if self.research is None:
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "research_not_configured"})
+        async with asyncio.timeout_at(launch.deadline[0]):
+            return await self.research.run("prescan", prescan_deadline=launch.deadline)
 
     async def _run_earnings_reactive(self):
         return await self._run_research("earnings")

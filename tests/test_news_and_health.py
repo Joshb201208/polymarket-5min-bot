@@ -375,3 +375,208 @@ def test_partial_finnhub_fallback_preserves_only_valid_symbol_coverage(world):
         assert "news_missing_or_stale" in health.research_entry_blockers(symbol)
     for symbol in ("AAA", "DDD", "OTHER"):
         assert "news_missing_or_stale" not in health.research_entry_blockers(symbol)
+
+
+def test_poll_news_default_focus_uses_only_live_cadence_not_daily(world, tmp_path, monkeypatch):
+    import json
+    import stock_agent.research_focus as rf
+
+    focus_file = tmp_path / "owner_focus.json"
+    focus_file.write_text(
+        json.dumps(
+            [
+                {
+                    "symbol": "NVDA",
+                    "cadence": "live",
+                    "stance": "bullish",
+                    "owner_conviction": 8,
+                    "note": "Blackwell rack ramp.",
+                    "added": "2026-11-01",
+                    "expires": "2026-12-31",
+                },
+                {
+                    "symbol": "ORCL",
+                    "cadence": "daily",
+                    "note": "OCI backlog.",
+                    "added": "2026-11-01",
+                    "expires": "2026-12-31",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    orig_load = rf.load_focus
+    monkeypatch.setattr(rf, "load_focus", lambda *, now=None, path=focus_file: orig_load(now=now, path=path))
+
+    cfg = make_cfg(ALPACA_API_KEY="")  # Force Finnhub fallback to inspect default focus polling
+    queried_finnhub: list[str] = []
+
+    def company_news(request):
+        sym = request.url.params["symbol"]
+        queried_finnhub.append(sym)
+        return [
+            {
+                "id": f"fh-{sym}",
+                "headline": f"{sym} general commentary",
+                "summary": "Routine wrap.",
+                "source": "Yahoo",
+                "datetime": int(world.clock.now().timestamp()),
+                "url": f"https://finance.yahoo.com/news/{sym.lower()}-wrap",
+            }
+        ]
+
+    world.finnhub.on("GET", "/api/v1/company-news", company_news)
+    svc = NewsService(config=cfg, now=world.clock.now)
+
+    async def poll():
+        try:
+            # Default focus polling must poll only live ("NVDA") and NOT daily ("ORCL").
+            return await svc.poll_news([], universe=[], include_market=False)
+        finally:
+            await svc.aclose()
+
+    batch = run(poll())
+    assert queried_finnhub == ["NVDA"]
+    nvda_items = [it for it in batch.items if "NVDA" in it.symbols]
+    assert len(nvda_items) == 1
+    assert "owner_focus" in nvda_items[0].materiality_reasons
+
+    # Even when Alpaca returns an ORCL story from normal universe polling, daily gets no +2 owner_focus boost.
+    cfg_alpaca = make_cfg()
+    world.news(["ORCL"], "ORCL routine market note", summary="Minor mention.", at=world.clock.now())
+    svc2 = NewsService(config=cfg_alpaca, now=world.clock.now)
+
+    async def poll_alpaca():
+        try:
+            return await svc2.poll_news([], universe=["ORCL"], include_market=False)
+        finally:
+            await svc2.aclose()
+
+    batch2 = run(poll_alpaca())
+    orcl_items = [it for it in batch2.items if "ORCL" in it.symbols]
+    assert len(orcl_items) == 1
+    assert "owner_focus" not in orcl_items[0].materiality_reasons
+
+
+def test_sec_recent_filings_scans_past_form4s_clamps_preopen_and_caches(world):
+    import json
+    from datetime import UTC, datetime
+
+    from stock_agent.news_service import DEFAULT_CIK_MAP
+    from stock_agent.research_focus import FOCUS_PATH
+
+    # Every symbol in bundled owner_focus.json must have a built-in fallback CIK.
+    bundled = json.loads(FOCUS_PATH.read_text(encoding="utf-8"))
+    for entry in bundled:
+        if entry.get("symbol"):
+            assert entry["symbol"] in DEFAULT_CIK_MAP
+
+    # F6: Items 1.05 and 7.01 remain non-material 8-K items on ordinary universe symbols (identical to master).
+    for code in ("9.01", "1.05", "7.01"):
+        verdict = score_materiality(
+            f"XYZ filed SEC Form 8-K (Items {code})",
+            "",
+            symbols=("XYZ",),
+            sec_form="8-K",
+            sec_items=(code,),
+        )
+        assert "sec_8k_other" in verdict.reasons and verdict.score == 4 and not verdict.is_material
+
+    preopen_now = datetime(2026, 11, 25, 11, 31, tzinfo=UTC)
+    forms = ["4"] * 25 + ["8-K", "10-Q"]
+    dates = ["2026-11-24"] * 25 + ["2026-11-25", "2026-11-19"]
+    accessions = [f"0001045810-26-{i:06d}" for i in range(1, 26)] + [
+        "0001045810-26-000090",
+        "0001045810-26-000085",
+    ]
+    items_col = [""] * 25 + ["5.02,7.01", ""]
+    acceptance_col = [""] * 25 + ["", "2026-11-19T21:35:00Z"]
+    desc_col = [""] * 25 + ["Current report on CEO transition", "Q3 FY27 Form 10-Q"]
+
+    sec_calls = 0
+
+    def handle_sec(request):
+        nonlocal sec_calls
+        sec_calls += 1
+        return {
+            "cik": "1045810",
+            "filings": {
+                "recent": {
+                    "form": forms,
+                    "filingDate": dates,
+                    "accessionNumber": accessions,
+                    "items": items_col,
+                    "acceptanceDateTime": acceptance_col,
+                    "primaryDocDescription": desc_col,
+                }
+            },
+        }
+
+    world.sec.on("GET", "/submissions/CIK0001045810.json", handle_sec)
+    cfg = make_cfg()
+    svc = NewsService(config=cfg, enable_sec_filings=True, now=lambda: preopen_now)
+
+    async def fetch_twice():
+        try:
+            first = await svc.fetch_recent_filings(["NVDA"], now=preopen_now)
+            second = await svc.fetch_recent_filings(
+                ["NVDA"], now=preopen_now + timedelta(minutes=10)
+            )
+            return first, second
+        finally:
+            await svc.aclose()
+
+    first, second = run(fetch_twice())
+    assert sec_calls == 1
+    assert first == second
+    nvda_filings = first["NVDA"]
+    assert [f.sec_form for f in nvda_filings] == ["8-K", "10-Q"]
+    assert nvda_filings[0].published_at == preopen_now  # Clamped <= preopen_now when acceptance time missing
+    assert "CEO transition" in nvda_filings[0].summary
+    assert nvda_filings[0].url == (
+        "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000090/0001045810-26-000090-index.htm"
+    )
+
+
+def test_fetch_recent_filings_preserves_order_up_to_25_plus_and_logs_overflow(world, caplog):
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 11, 25, 11, 31, tzinfo=UTC)
+    requested = [f"SYM{i:02d}" for i in range(28)]
+    queried: list[str] = []
+
+    def lookup_cik(sym: str) -> str:
+        idx = int(sym[3:]) + 1
+        return f"{idx:010d}"
+
+    def handle_any_sec(request):
+        cik = request.url.path.split("CIK")[1].split(".")[0]
+        queried.append(cik)
+        return {"cik": cik, "filings": {"recent": {"form": [], "filingDate": [], "accessionNumber": []}}}
+
+    world.sec.on("GET", "/submissions/*.json", handle_any_sec)
+    svc = NewsService(
+        config=make_cfg(),
+        cik_lookup=lookup_cik,
+        enable_sec_filings=True,
+        now=lambda: now,
+    )
+
+    async def run_test():
+        try:
+            with caplog.at_level(logging.WARNING, logger="stock_agent.news_service"):
+                # Default max_symbols=30 handles all 28 (>= 25 focus cap) in exact caller order without dropping.
+                await svc.fetch_recent_filings(requested[:25], now=now)
+                assert queried == [f"{i + 1:010d}" for i in range(25)]
+
+                queried.clear()
+                svc._recent_filings_cache.clear()
+                await svc.fetch_recent_filings(requested, now=now, max_symbols=25)
+                assert queried == [f"{i + 1:010d}" for i in range(25)]
+        finally:
+            await svc.aclose()
+
+    run(run_test())
+    assert any("SYM25,SYM26,SYM27" in rec.message for rec in caplog.records)
+
+

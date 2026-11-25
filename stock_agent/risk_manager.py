@@ -1,12 +1,13 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import StrEnum
 from typing import Protocol
 
 from stock_agent.config import Config
-from stock_agent.ledger import BookSnapshot
+from stock_agent.ledger import BookSnapshot, OpenOrder
+from stock_agent.research_gate import OwnerEntryProof
 
 DRAWDOWN_STATE_KEY = "drawdown"
 _ZERO = Decimal(0)
@@ -297,12 +298,32 @@ class DrawdownState:
 
 
 @dataclass(frozen=True)
+class OwnerOptionScope:
+    """Exact owner option-book structure already matched to the ledger claim."""
+
+    symbol: str
+    added: date
+    positions: tuple[tuple[str, int], ...]
+    order_ids: frozenset[str] = frozenset()
+
+    def matches_order(self, order: OpenOrder) -> bool:
+        """Parent ID alone is not sufficient; broker legs must match the structure."""
+        return (
+            order.order_class == "mleg" and order.asset_class != "us_equity"
+            and (order.order_id in self.order_ids or order.client_order_id in self.order_ids)
+            and sorted(leg.symbol for leg in order.legs) == sorted(symbol for symbol, _ in self.positions)
+        )
+
+
+@dataclass(frozen=True)
 class RiskControls:
     pause_new_buys: bool = False
     drawdown: DrawdownState = field(default_factory=DrawdownState)
     option_commitments: tuple[OptionCommitment, ...] = ()
     pending_sectors: Mapping[str, str] = field(default_factory=dict)
     holding_convictions: Mapping[str, int] = field(default_factory=dict)
+    owner_entry: OwnerEntryProof | None = None
+    owner_option_scope: OwnerOptionScope | None = None
 
 
 @dataclass(frozen=True)
@@ -546,6 +567,36 @@ def classify_symbol(symbol: str, raw_sector: str | None = None) -> Classificatio
     clusters = tuple(name for name, members in Config.SYMBOL_CLUSTERS.items()
                      if aliases.intersection(members))
     return Classification(canonical, sector, clusters)
+
+
+def _owner_stock_issuer_clear(snapshot: BookSnapshot, owner: OwnerEntryProof,
+                              scope: OwnerOptionScope | None) -> bool:
+    issuer = classify_symbol(owner.symbol).issuer
+    if any(row.qty != 0 and classify_symbol(row.symbol).issuer == issuer for row in snapshot.holdings):
+        return False
+    if not isinstance(scope, OwnerOptionScope) or (scope.symbol, scope.added) != (owner.symbol, owner.added):
+        scope = None
+
+    def same_issuer_order(order: OpenOrder) -> bool:
+        symbol = order.symbol
+        occ_suffix = symbol[-15:]
+        is_occ = (len(symbol) > 15 and occ_suffix[:6].isdigit()
+                  and occ_suffix[6].upper() in ("C", "P") and occ_suffix[7:].isdigit())
+        return order.remaining_qty > 0 and (
+            classify_symbol(symbol).issuer == issuer
+            or ((order.asset_class == "us_option" or is_occ) and classify_symbol(symbol[:-15]).issuer == issuer)
+        )
+
+    for order in snapshot.open_orders:
+        if (same_issuer_order(order) or any(same_issuer_order(leg) for leg in order.legs)) and (
+            scope is None or not scope.matches_order(order)
+        ):
+            return False
+    positions = [(row.occ_symbol, row.qty) for row in snapshot.legs
+                 if row.qty != 0 and classify_symbol(row.underlying).issuer == issuer]
+    # Only the reconciled signed positions of the exact structure may remain.
+    # Do not mask extra contracts, naked legs or other option positions.
+    return not positions or (scope is not None and sorted(positions) == sorted(scope.positions))
 
 
 _SECTOR_NAMES = {
@@ -1196,12 +1247,29 @@ class RiskManager:
         raw, effective = intent.raw_conviction, intent.effective_conviction
         floor = self.config.MIN_CONVICTION
         effective_floor = max(8 if option else floor, intent.minimum_conviction)
-        if (type(raw) is not int or type(effective) is not int
-                or not floor <= raw <= 10 or not effective_floor <= effective <= 10):
-            reasons.append("conviction_floor")
-        elif abs(raw - effective) > self.config.CONVICTION_MAX_ADJUSTMENT:
-            reasons.append("conviction_adjustment")
         now = now or snapshot.as_of
+        owner = controls.owner_entry
+        if owner is not None:
+            lane = {TradeKind.BUY: "stock", TradeKind.OPTION_OPEN: "option"}.get(kind)
+            valid = (
+                isinstance(owner, OwnerEntryProof) and lane is not None and owner.lane == lane
+                and intent.symbol.strip().upper() == owner.symbol
+                and owner.generated_at == intent.signal_at and now.utcoffset() is not None
+                and owner.added <= now.astimezone(UTC).date() <= owner.expires
+                and type(raw) is int and 1 <= raw <= 10 and owner.raw_conviction == raw
+                and type(effective) is int and max(floor, effective_floor, 7) <= effective <= 9
+                and owner.effective_conviction == effective
+            )
+            if valid and lane == "stock":
+                valid = _owner_stock_issuer_clear(snapshot, owner, controls.owner_option_scope)
+            if not valid:
+                reasons.append("owner_directive_scope_mismatch")
+        else:
+            if (type(raw) is not int or type(effective) is not int
+                    or not floor <= raw <= 10 or not effective_floor <= effective <= 10):
+                reasons.append("conviction_floor")
+            elif abs(raw - effective) > self.config.CONVICTION_MAX_ADJUSTMENT:
+                reasons.append("conviction_adjustment")
         if not 0 <= (now - snapshot.as_of).total_seconds() <= self.config.MAX_ENTRY_QUOTE_AGE_SECONDS:
             reasons.append("stale_broker_book")
         if intent.signal_at is None or not (

@@ -60,6 +60,9 @@ class Harness:
     def _draft(self, body):
         text = body.get("input") or body["messages"][0]["content"]
         data = json.loads(text.split("INPUT_JSON:\n", 1)[1])
+        if body.get("tools") and (body.get("instructions") or "").startswith("Search for primary evidence"):
+            return with_grounding(body, {})  # search-only first pass of a two-pass review: sources only
+        data = data.get("original_input", data)  # a two-pass review's structured step wraps the input
         self.calls.append((self.world.clock.now_et(), self.reply.direction, data.get("reference_price")))
         evidence = next((item for item in data["evidence"] if item["published_at"]), None)
         best_ideas = "No discrete catalyst is required" in body.get("instructions", "")
