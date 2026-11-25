@@ -37,6 +37,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from stock_agent.journal import Journal
 from stock_agent.state_store import StateStore, StateUnavailable
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
+_MARKET_TZ = ZoneInfo("America/New_York")
 
 
 # =========================================================================
@@ -946,6 +948,54 @@ class Ledger:
                 (self._owner_key(symbol, added, "veto"), _iso(self.now())),
             ).rowcount == 1
 
+    def hold_owner_directive_for_session(self, symbol: str, session: date, reason: str) -> bool:
+        """Defer both owner lanes for this NY session, without using either shot."""
+        with self.store.transaction() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                (self._owner_key(symbol, session, "session_hold"), json.dumps(reason), _iso(self.now())),
+            ).rowcount == 1
+
+    def _owner_held_in(self, c, symbol: str, session: date) -> bool:
+        return c.execute("SELECT 1 FROM kv WHERE key=?",
+                         (self._owner_key(symbol, session, "session_hold"),)).fetchone() is not None
+
+    def owner_directive_held(self, symbol: str, session: date) -> bool:
+        return bool(self.store.query("SELECT 1 FROM kv WHERE key=?",
+                                     (self._owner_key(symbol, session, "session_hold"),)))
+
+    def _owner_exited_in(self, c, symbol: str, added: date) -> bool:
+        """Read a confirmed equity flatten, including one reconciled before a restart."""
+        key = self._owner_key(symbol, added, "stock_exit")
+        if c.execute("SELECT 1 FROM kv WHERE key=?", (key,)).fetchone() is not None:
+            return True
+        # Reconcile only records a normal sell close when the live broker position
+        # is flat and its latest relevant activity explains the close. It separately
+        # records a proven flat-then-reopen from replayed fills. Require an actual sell
+        # fill in that position's lifetime and use its timestamp (not observation time)
+        # to distinguish a new owner generation from a late reconcile of an old exit.
+        row = c.execute(
+            """SELECT a.ts, a.order_id FROM positions_meta p
+                 JOIN broker_activities a ON a.symbol=p.symbol
+               WHERE p.symbol=? AND p.asset_class='us_equity' AND p.closed_at IS NOT NULL
+                 AND a.activity_type='FILL' AND a.side LIKE 'sell%' AND a.qty>0
+                 AND a.ts>=? AND julianday(a.ts)>=julianday(COALESCE(p.opened_at, a.ts))
+                 AND ((p.close_cause LIKE 'sell fill %' AND substr(a.ts,1,10)=substr(p.close_cause,-10))
+                      OR (p.close_cause='flat_then_reopened' AND julianday(a.ts)<=julianday(p.closed_at)))
+               ORDER BY a.ts DESC LIMIT 1""",
+            (symbol.strip().upper(), added.isoformat()),
+        ).fetchone()
+        if row is None:
+            return False
+        c.execute("INSERT OR IGNORE INTO kv(key,value_json,updated_at) VALUES (?,?,?)",
+                  (key, json.dumps({"filled_at": row[0], "order_id": row[1]}), _iso(self.now())))
+        return True
+
+    def owner_directive_exited(self, symbol: str, added: date) -> bool:
+        """Whether a reconciled stock flatten closed both lanes for this generation."""
+        with self.store.transaction() as c:
+            return self._owner_exited_in(c, symbol, added)
+
     def mark_owner_stock_uncertainty_notified(self, symbol: str, added: date) -> bool:
         with self.store.transaction() as c:
             return c.execute(
@@ -979,7 +1029,9 @@ class Ledger:
         if not structure_id:
             return False
         with self.store.transaction() as c:
-            if self._owner_vetoed_in(c, symbol, added):
+            if (self._owner_vetoed_in(c, symbol, added)
+                    or self._owner_held_in(c, symbol, self.now().astimezone(_MARKET_TZ).date())
+                    or self._owner_exited_in(c, symbol, added)):
                 return False
             key = self._owner_key(symbol, added, "option")
             value = json.dumps(structure_id)
@@ -1064,6 +1116,10 @@ class Ledger:
                     raise NewStockEntryRefused("owner_directive_invalid", "owner proof no longer matches the buy")
                 if self._owner_vetoed_in(c, it.symbol, owner_entry.added):
                     raise NewStockEntryRefused("owner_directive_vetoed", "owner directive received a model veto")
+                if self._owner_held_in(c, it.symbol, session):
+                    raise NewStockEntryRefused("owner_directive_session_hold", "owner directive deferred this session")
+                if self._owner_exited_in(c, it.symbol, owner_entry.added):
+                    raise NewStockEntryRefused("owner_directive_exited", "owner directive closed by a confirmed stock exit")
                 if self._owner_stock_used(c, it.symbol, owner_entry.added, it.intent_id):
                     raise NewStockEntryRefused("owner_directive_used", "owner directive already reserved or filled")
                 owner_meta["owner_stock_claim"] = owner_entry.added.isoformat()

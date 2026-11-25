@@ -12,6 +12,7 @@ from stock_agent.research_focus import FocusItem
 from stock_agent.research_gate import ResearchGate
 from stock_agent.risk_manager import RiskControls
 from stock_agent.scheduler import StockAgentScheduler
+from tests.exec_helpers import enqueue as enqueue_trade
 from tests.exec_helpers import make_engine
 from tests.test_risk_projection import NOW, buy, margin_book, order, snapshot, stock
 
@@ -59,13 +60,39 @@ def test_owner_stock_fill_spends_only_stock_and_stop_out_does_not_rearm(setup, w
     assert eng.ledger.owner_directive_used("NVDA", added)
     assert eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True,
                                                 owner_lane="option").ok
+    world.clock.advance(seconds=1)
     world.price("NVDA", 40, spread=0.02)
     assert world.alpaca.position("NVDA") is None
     world.price("NVDA", 50, spread=0.02)
     second = asyncio.run(eng.execute_intent(enqueue("next", signal_at=eng.now().isoformat())))
     assert second.status == IntentStatus.SKIPPED
-    assert "owner_directive_used" in second.reason
+    assert "owner_directive_exited" in second.reason
     assert eng.ledger.owner_directive_used("NVDA", added)
+    assert not eng.ledger.claim_owner_option("NVDA", added, "after-stop")
+    denied = eng._research_gate.is_entry_eligible("NVDA", eng.now(), allow_owner=True, owner_lane="option")
+    assert denied.reasons == ("owner_directive_exited",)
+
+
+def test_stock_exit_to_zero_latches_unspent_lanes_across_restart(setup, world, tmp_path, monkeypatch):
+    eng, added, _, _ = setup
+    world.alpaca.seed_position("NVDA", 10, 50)
+    asyncio.run(eng.ledger.refresh("position before owner review"))
+    part = enqueue_trade(eng, "NVDA", "sell", qty=4, rule="hard_stop")
+    assert asyncio.run(eng.execute_intent(part)).filled_qty == 4
+    asyncio.run(eng.ledger.refresh("partial reduction"))
+    assert not eng.ledger.owner_directive_exited("NVDA", added)
+    assert world.alpaca.position("NVDA").qty == 6
+
+    flat = enqueue_trade(eng, "NVDA", "sell", rule="hard_stop")
+    assert asyncio.run(eng.execute_intent(flat)).filled_qty == 6
+    asyncio.run(eng.ledger.refresh("confirmed full exit"))
+    assert world.alpaca.position("NVDA") is None
+    reopened = make_engine(world, tmp_path, monkeypatch)
+    assert reopened.ledger.owner_directive_exited("NVDA", added)
+    for lane in ("stock", "option"):
+        assert not reopened.ledger.owner_directive_used("NVDA", added, lane=lane)
+    assert not reopened.ledger.claim_owner_option("NVDA", added, "old-generation")
+    assert not reopened.ledger.owner_directive_exited("NVDA", eng.session_date() + timedelta(days=1))
 
 
 @pytest.mark.parametrize("change", ["removed", "score", "veto", "throw", "intent_score", "health"])
@@ -144,6 +171,46 @@ def test_option_zero_fill_release_is_compare_and_delete_and_never_undoes_veto(se
     ledger.latch_owner_directive_veto("NVDA", added)
     assert not ledger.release_owner_option("NVDA", added, "two")
     assert ledger.owner_directive_used("NVDA", added, lane="option")
+
+
+def test_session_hold_blocks_both_proofs_and_stale_claims_without_consuming(setup, world):
+    eng, added, _, enqueue = setup
+    ledger, gate = eng.ledger, eng._research_gate
+    now, session = eng.now(), eng.session_date()
+    proof = gate.is_entry_eligible("NVDA", now, allow_owner=True).owner_entry
+    assert gate.is_entry_eligible("NVDA", now, allow_owner=True, owner_lane="option").ok
+    assert ledger.hold_owner_directive_for_session("NVDA", session, "issuer guidance cut")
+    assert not ledger.hold_owner_directive_for_session("NVDA", session, "live AVOID")
+    for lane in ("stock", "option"):
+        result = gate.is_entry_eligible("NVDA", now, allow_owner=True, owner_lane=lane)
+        assert not result.ok and "owner_directive_session_hold" in result.reasons
+        assert not ledger.owner_directive_used("NVDA", added, lane=lane)
+    assert not ledger.owner_directive_vetoed("NVDA", added)
+    assert not ledger.claim_owner_option("NVDA", added, "reserved")
+    assert not ledger.claim_owner_option("NVDA", session, "new-generation")
+    with pytest.raises(NewStockEntryRefused, match="deferred this session"):
+        ledger.claim_intent(enqueue("after-hold").intent_id, new_stock_session=session, new_stock_limit=3,
+                            owner_entry=proof)
+    world.clock.advance(days=1)
+    assert not ledger.owner_directive_held("NVDA", eng.session_date())
+    assert ledger.claim_owner_option("NVDA", added, "next-session")
+
+
+def test_hold_after_stock_claim_stops_submission_without_consuming(setup, world, monkeypatch):
+    eng, added, _, enqueue = setup
+    original = ExecutionEngine._gate
+
+    async def concurrent_hold(self, purpose, *args, **kwargs):
+        result = await original(self, purpose, *args, **kwargs)
+        if purpose == "entry" and self.ledger.owner_directive_used("NVDA", added):
+            self.ledger.hold_owner_directive_for_session("NVDA", self.session_date(), "live AVOID")
+        return result
+
+    monkeypatch.setattr(ExecutionEngine, "_gate", concurrent_hold)
+    result = asyncio.run(eng.execute_intent(enqueue("concurrent-hold")))
+    assert result.code == "owner_directive_session_hold"
+    assert not eng.ledger.owner_directive_used("NVDA", added)
+    world.assert_no_orders()
 
 
 @pytest.mark.parametrize("setup", [(2026, 11, 27, 12, 49, 59)], indirect=True)

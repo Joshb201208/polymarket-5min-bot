@@ -559,7 +559,8 @@ class ExecutionEngine:
         "risk_refused", "risk_controls_unavailable", "insufficient_buying_power", "broker_rejected",
         "intent_expired", "duplicate", "top_up_already_today", "top_up_thesis_direction",
         "new_stock_session_cap", "new_stock_issuer_already_admitted",
-        "owner_directive_invalid", "owner_directive_vetoed", "owner_directive_used",
+        "owner_directive_invalid", "owner_directive_vetoed", "owner_directive_used", "owner_directive_session_hold",
+        "owner_directive_exited",
         "nothing_to_sell", "exit_cap", "research_inputs_pending", "other"})
 
     def _funnel(self, it: OrderIntent, stage: str, code: str = "", reason: str = "", **extra: Any) -> None:
@@ -594,6 +595,8 @@ class ExecutionEngine:
         )
 
     def _alert_blocked_buy(self, it: OrderIntent, code: str, reason: str, risk_reasons: Any = ()) -> None:
+        if code == "owner_directive_session_hold":
+            return  # the first pipeline hold writes and alerts once for both lanes
         """Part 5: one #risk line per blocked buy (AlertService filters/dedupes). Never raises."""
         fn = getattr(self._notifier, "alert_blocked_buy", None) if self._notifier is not None else None
         if fn is None:
@@ -783,7 +786,8 @@ class ExecutionEngine:
                 reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
                 if set(reasons) <= self.OWNER_RESEARCH_TRANSIENT:
                     return await self._hold(intent, ", ".join(reasons), code="research_inputs_pending")
-                return self._skip(intent, ", ".join(reasons), "owner_directive_invalid")
+                code = self._owner_skip_code(reasons)
+                return self._skip(intent, ", ".join(reasons), code)
             owner_entry = el.owner_entry
         else:
             why, code = await self._research_verdict(intent, h)
@@ -863,7 +867,8 @@ class ExecutionEngine:
                 reasons = tuple(getattr(el, "reasons", ())) or ("owner_directive_invalid",)
                 if set(reasons) <= self.OWNER_RESEARCH_TRANSIENT:
                     return await self._hold(claimed, ", ".join(reasons), code="research_inputs_pending")
-                return self._skip(claimed, ", ".join(reasons), "owner_directive_invalid")
+                code = self._owner_skip_code(reasons)
+                return self._skip(claimed, ", ".join(reasons), code)
             controls = replace(self._risk_controls(), owner_entry=el.owner_entry)
             verdict = self.risk.evaluate_trade(snap, ti, now=self.now(), controls=controls)
             if not verdict.ok:
@@ -914,6 +919,11 @@ class ExecutionEngine:
         meta = intent.meta or {}
         return (meta.get("adjustment_reason") == "owner_directive" or "owner_directive_added" in meta
                 or "owner_stock_claim" in meta)
+
+    @staticmethod
+    def _owner_skip_code(reasons: tuple[str, ...]) -> str:
+        return next((code for code in ("owner_directive_session_hold", "owner_directive_exited")
+                     if code in reasons), "owner_directive_invalid")
 
     async def _notify_owner_stock_uncertainty(self, intent: OrderIntent) -> bool:
         meta = intent.meta or {}

@@ -20,6 +20,8 @@ class GateLedger(Protocol):
     def owner_directive_used(self, symbol: str, added: date, *, lane: OwnerLane = "stock",
                              reservation_id: str | None = None) -> bool: ...
     def owner_directive_vetoed(self, symbol: str, added: date) -> bool: ...
+    def owner_directive_held(self, symbol: str, session: date) -> bool: ...
+    def owner_directive_exited(self, symbol: str, added: date) -> bool: ...
 
 
 class GateHealth(Protocol):
@@ -115,7 +117,8 @@ class ResearchGate:
             elif type(raw) is not int or not 1 <= raw <= 10 or type(grade) is not int or not floor <= grade <= 9:
                 reasons.append("conviction_below_floor_or_invalid")
             elif generated is not None:
-                if generated.astimezone(_MARKET_TZ).date() != utc_now.astimezone(_MARKET_TZ).date():
+                session = utc_now.astimezone(_MARKET_TZ).date()
+                if generated.astimezone(_MARKET_TZ).date() != session:
                     reasons.append("owner_directive_requires_same_session_review")
                 directive = research_focus.owner_backed(now=utc_now).get(symbol)
                 if (directive is None or directive.symbol != symbol or directive.stance != "bullish"
@@ -128,8 +131,14 @@ class ResearchGate:
                 else:
                     used = getattr(self.ledger, "owner_directive_used", None)
                     vetoed = getattr(self.ledger, "owner_directive_vetoed", None)
-                    if vetoed is None or vetoed(symbol, directive.added) is not False:
+                    held = getattr(self.ledger, "owner_directive_held", None)
+                    exited = getattr(self.ledger, "owner_directive_exited", None)
+                    if held is None or held(symbol, session) is not False:
+                        reasons.append("owner_directive_session_hold")
+                    elif vetoed is None or vetoed(symbol, directive.added) is not False:
                         reasons.append("owner_directive_vetoed_or_unavailable")
+                    elif exited is None or exited(symbol, directive.added) is not False:
+                        reasons.append("owner_directive_exited")
                     elif used is None or used(symbol, directive.added, lane=owner_lane,
                                              reservation_id=reservation_id) is not False:
                         reasons.append("owner_directive_used_or_unavailable")
