@@ -924,7 +924,7 @@ class ExecutionEngine:
                 "critical", f"{intent.symbol}: owner stock order outcome unknown",
                 f"Owner grade {meta.get('owner_conviction')}; model grade {meta.get('raw_conviction')}. "
                 f"The {added} stock entry remains reserved until order {intent.client_order_id} is reconciled. "
-                "Check the broker before deciding whether to re-arm the directive.",
+                "Reconcile the order with the broker before changing 'added' in the focus file to start a new generation.",
                 key=f"owner-stock-uncertain-{intent.symbol}-{added}",
             )
         return True

@@ -176,7 +176,8 @@ def test_owner_stock_missing_after_restart_stays_ambiguous_and_alerts_once(setup
     asyncio.run(eng.resolve_pending())
     assert eng.ledger.get_intent(first.intent_id).status == IntentStatus.AMBIGUOUS
     assert eng.ledger.owner_directive_used("NVDA", added)
-    assert sum("owner stock order outcome unknown" in title for _, title, _ in eng.alerts) == 1
+    notices = [body for _, title, body in eng.alerts if "owner stock order outcome unknown" in title]
+    assert len(notices) == 1 and "changing 'added'" in notices[0]
     second = asyncio.run(eng.execute_intent(enqueue("duplicate")))
     assert second.status == IntentStatus.SKIPPED and "owner_directive_used" in second.reason
     world.assert_no_orders()
