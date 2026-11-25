@@ -75,6 +75,17 @@ def _iso_param(v: str) -> str:
     return _iso(dt)
 
 
+# Activity types the live server accepts as a filter (path or activity_types).
+# OPXRC appears in Alpaca's docs but the live API rejects it with a 422, so it
+# is deliberately absent here; the fake can still *emit* any type. The rest is
+# the documented list, UNVERIFIED as live filters (production sends none).
+SERVER_FILTER_ACTIVITY_TYPES = frozenset({
+    "FILL", "TRANS", "MISC", "ACATC", "ACATS", "CSD", "CSW", "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT",
+    "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "FEE", "INT", "INTNRA", "INTTW", "JNL", "JNLC", "JNLS", "MA",
+    "NC", "OPASN", "OPEXP", "OPEXC", "OPTRD", "PTC", "PTR", "REORG", "SC", "SSO", "SSP", "CFEE",
+})
+
+
 def _err(status: int, code: int, message: str, **extra) -> httpx.Response:
     return json_response({"code": code, "message": message, **extra}, status)
 
@@ -1197,6 +1208,10 @@ class FakeAlpaca(FakeService):
         if path.startswith("/v2/account/activities") and m == "GET":
             parts = path.split("/")
             types = [parts[4]] if len(parts) > 4 and parts[4] else (params.get("activity_types", "").split(",") if params.get("activity_types") else [])
+            bad = [t for t in types if t not in SERVER_FILTER_ACTIVITY_TYPES]
+            if bad:
+                # live Alpaca (2026-11-24): "422 invalid activity type: OPXRC"
+                return _err(422, 42210000, f"invalid activity type: {bad[0]}")
             return json_response(self._activities(types, params))
         if path == "/v2/account/portfolio/history" and m == "GET":
             return json_response(self._portfolio_history(params))
