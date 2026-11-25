@@ -52,6 +52,9 @@ async def stage(h, day: int = 25, *, start: bool = True, option_ideas: int = 1):
 async def open_session(h, day: int = 25, *, at=(9, 35), until=(9, 50)):
     await h.advance(day, *at)
     h.fresh_quote()
+    # In session the market quotes continuously; the base harness freezes quote time for its
+    # pre-open age checks, which would let a spread ladder's own fill wait stale the quote.
+    h.world.alpaca.behaviour.quotes_stay_fresh_in_session = True
     h.requote_chain(100.0)
     minutes = (until[0] * 60 + until[1]) - (at[0] * 60 + at[1])
     await h.execute(2 * minutes)
