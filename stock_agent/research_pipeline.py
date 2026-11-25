@@ -223,7 +223,8 @@ class ResearchPipeline:
             hours=self.config.RESEARCH_THESIS_MAX_AGE_H,
         )
 
-    async def run(self, kind: str, snapshot: BookSnapshot | None = None, *, work_scope: str | None = None) -> JobOutcome:
+    async def run(self, kind: str, snapshot: BookSnapshot | None = None, *, work_scope: str | None = None,
+                  prescan_deadline: tuple[float, datetime] | None = None) -> JobOutcome:
         # Avoid overlapping scheduled/news windows superseding a thesis
         # during its independent review. Broker protection has its own lane.
         started_at = self.clock() if kind == "prescan" and work_scope is None else None
@@ -233,8 +234,8 @@ class ResearchPipeline:
             session = self._session(self.clock())
             if session is None:
                 return JobOutcome(JobStatus.SKIPPED, detail={"reason": "no_execution_session"})
-            deadline = None
-            if started_at is not None and started_at < session.opens_at:
+            deadline = prescan_deadline
+            if deadline is None and started_at is not None and started_at < session.opens_at:
                 runtime = prescan_runtime_seconds(started_at, session.opens_at)
                 deadline = started + runtime, started_at + timedelta(seconds=runtime)
             try:
