@@ -84,6 +84,7 @@ class LLMReply:
     tool_error: str | None = None
     input_tokens: int = 1000
     output_tokens: int = 300
+    search_output_tokens: int = 0  # Pre-answer generation, charged against Agent total output bounds.
     cost_usd: float | None = None
 
 
@@ -165,8 +166,12 @@ class FakeOpenAI(_LLM):
         }
 
     def _responses(self, request):
-        r = self._next(request)
         body = request_json(request) or {}
+        if any(t.get("type") == "web_search" and "return_token_budget" in t
+               and t["return_token_budget"] not in ("default", "unlimited") for t in body.get("tools") or []):
+            return json_response({"error": {"type": "invalid_request_error", "code": "invalid_type",
+                                            "param": "tools[0].return_token_budget"}}, 400)
+        r = self._next(request)
         searched = any(t.get("type", "").startswith("web_search") for t in body.get("tools") or [])
         output: list[dict] = []
         if searched or r.sources:
@@ -226,20 +231,25 @@ class FakePerplexity(_LLM):
 
     def _agent(self, request):
         r = self._next(request)
+        cap = (request_json(request) or {}).get("max_output_tokens")
+        total = r.output_tokens + r.search_output_tokens
+        truncated = type(cap) is int and total > cap
+        status = "incomplete" if truncated else r.status
         output: list[dict] = []
         if r.sources:
             output.append({"type": "search_results", "queries": ["fake query"], "results": [
                 {"id": i + 1, "title": s.get("title", ""), "url": s["url"], "snippet": s.get("snippet", ""),
                  "date": s.get("date"), "last_updated": s.get("last_updated"), "source": "web"}
                 for i, s in enumerate(r.sources)]})
-        output.append({"type": "message", "id": "msg_fake", "status": r.status, "role": "assistant",
-                       "content": [{"type": "output_text", "text": r.text,
+        output.append({"type": "message", "id": "msg_fake", "status": status, "role": "assistant",
+                       "content": [{"type": "output_text", "text": r.text[:len(r.text)//2] if truncated else r.text,
                                     "annotations": _cite_annotations(r.text, r.sources)}]})
         return {
             "id": f"resp_fake_{len(self.prompts)}", "object": "response", "created_at": self._created(),
-            "status": r.status, "model": self._model(request, "perplexity/sonar"), "output": output,
-            "usage": {"input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
-                      "total_tokens": r.input_tokens + r.output_tokens,
+            "status": status, "model": self._model(request, "perplexity/sonar"), "output": output,
+            "incomplete_details": {"reason": r.incomplete_reason or "max_output_tokens"} if status == "incomplete" else None,
+            "usage": {"input_tokens": r.input_tokens, "output_tokens": min(total, cap) if truncated else total,
+                      "total_tokens": r.input_tokens + (min(total, cap) if truncated else total),
                       "cost": {"currency": "USD", "total_cost": r.cost_usd if r.cost_usd is not None else 0.001}},
         }
 

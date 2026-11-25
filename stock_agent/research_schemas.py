@@ -38,6 +38,9 @@ class Evidence(StrictModel):
     retrieved_at: datetime
     publisher: str
     snippet: str
+    # For day precision, published_at is the earliest possible UTC instant,
+    # not an observed publication time. Preserve old wire/stored rows.
+    date_precision: Literal["instant", "day"] = Field(default="instant", exclude_if=lambda value: value == "instant")
 
 
 class Claim(StrictModel):

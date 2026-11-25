@@ -368,6 +368,7 @@ class ResearchPipeline:
                 if owner_review:
                     await self._owner_unavailable(
                         key, owner_review, ", ".join(sorted(failures)) or "no_available_route", funnel,
+                        failure_codes=exc.failure_codes,
                     )
                     continue
                 state = self.store.work_state(key)
@@ -379,6 +380,7 @@ class ResearchPipeline:
                     detail={
                         "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts], "kind": kind,
                         "story": story.payload() if can_retry and story else None,
+                        **exc.failure_codes,
                     },
                     retry_at=self.clock() + timedelta(minutes=2 if kind == "news" else 5) if can_retry else None,
                 )
@@ -960,8 +962,10 @@ class ResearchPipeline:
             await result
         self.store.finish_work(key, "no_action")
 
-    async def _owner_unavailable(self, key, owner: FocusItem, reason: str, funnel) -> None:
-        self.store.finish_work(key, "unavailable", detail={"reason": "owner_directive_unavailable", "input": reason})
+    async def _owner_unavailable(self, key, owner: FocusItem, reason: str, funnel, *, failure_codes=None) -> None:
+        self.store.finish_work(key, "unavailable", detail={
+            "reason": "owner_directive_unavailable", "input": reason, **(failure_codes or {}),
+        })
         funnel.rejected_by_reason["owner_directive_unavailable"] += 1
         self._owner_event(owner, "unavailable", input=reason)
         await self._owner_alert(owner, "unavailable", reason)
@@ -989,6 +993,7 @@ class ResearchPipeline:
                     self.store.finish_confirmation(key, "unavailable")
                     self.store.finish_work(key, "confirmation_unavailable", thesis_id=thesis_id, detail={
                         "failures": [f"{err.provider}:{err.kind}" for err in exc.attempts],
+                        **exc.failure_codes,
                     })
             return
 

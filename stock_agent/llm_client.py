@@ -9,21 +9,33 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Generic, Protocol, TypeVar
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
+from pydantic import ValidationError
 
 from stock_agent.research_schemas import Evidence, ResearchTask, StrictModel, strict_json, transport_schema, utc_datetime
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=StrictModel)
 _OUTPUT = 1_800
+_PERPLEXITY_GROUNDED_OUTPUT = 4_096
 _INPUT_BUDGET = 48_000
 _SEARCH_TOKENS = 2_500
+_OPENAI_SEARCH_WINDOW = 128_000
 _TOOL_CALLS = 2
+_PROVIDER_CODES = frozenset({
+    "insufficient_quota", "quota_exceeded", "insufficient_credits", "billing_hard_limit_reached",
+    "invalid_request_error", "invalid_request", "invalid_type", "invalid_value", "unsupported_value",
+    "unsupported_parameter", "unknown_parameter", "model_not_found", "rate_limit_exceeded",
+    "authentication_error", "permission_error", "overloaded_error", "server_error", "api_error",
+    "max_output_tokens", "max_tokens", "max_steps", "content_filter", "cancelled", "canceled",
+    "invalid_tool_input", "unavailable", "max_uses_exceeded", "too_many_requests",
+    "query_too_long", "request_too_large",
+})
 _ENDPOINTS = {
     "openai": "https://api.openai.com/v1/responses",
     "perplexity": "https://api.perplexity.ai/v1/agent",
@@ -61,12 +73,22 @@ class ProviderError(Exception):
     status: int | None = None
     code: str | None = None
     retry_after: float | None = None
+    has_answer: bool = False
 
 
 class ProviderUnavailable(Exception):
     def __init__(self, attempts: tuple[ProviderError, ...]):
         self.attempts = attempts
         super().__init__(", ".join(f"{a.provider}:{a.kind}" for a in attempts) or "no configured LLM route")
+
+    @property
+    def failure_codes(self) -> dict[str, list[str]]:
+        codes = [f"{a.provider}:{a.code}" for a in self.attempts if _provider_code(a.code)]
+        return {"failure_codes": codes} if codes else {}
+
+
+def _provider_code(*candidates: object) -> str | None:
+    return next((value for value in candidates if isinstance(value, str) and value in _PROVIDER_CODES), None)
 
 
 @dataclass(frozen=True)
@@ -190,10 +212,22 @@ class LLMClient:
                     response = await self._execute(route, request, blob)
                     try:
                         value = strict_json(request.value_type, response.text)
+                    except ValidationError as error:
+                        if request.local_decision_validation and all(
+                            item["loc"] == ("direction",) and item["type"] == "literal_error"
+                            for item in error.errors(include_input=False, include_context=False)
+                        ):
+                            # A complete thesis with a disallowed owner vote is still a decision.
+                            attempts.append(ProviderError(route.provider, route.model, "decision_rejected"))
+                            break
+                        raise
+                    if request.grounded and not response.evidence:
+                        raise ProviderError(route.provider, route.model, "no_grounding", has_answer=True)
+                    try:
                         if request.validate:
                             request.validate(value, response.evidence)
                     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                        if not request.local_decision_validation:
+                        if not request.single_review:
                             raise
                         # A successful response can fail an owner decision's
                         # evidence rules without the provider being unhealthy.
@@ -213,17 +247,14 @@ class LLMClient:
                     )
                 except ProviderError as error:
                     attempts.append(error)
-                    await self._failed(route, error, now)
-                    # These two fail before sending a request. A configured
-                    # route that can actually execute is still eligible.
-                    if request.single_review and error.kind not in {"budget", "input_limit"}:
+                    if request.single_review and error.has_answer:
                         break
+                    # Transport failures never count as an owner's one decision.
+                    await self._failed(route, error, now)
                 except (ValueError, KeyError, TypeError, IndexError, AttributeError):
                     error = ProviderError(route.provider, route.model, "invalid_output")
                     attempts.append(error)
                     await self._failed(route, error, now)
-                    if request.single_review:
-                        break
         raise ProviderUnavailable(tuple(attempts))
 
     async def _failed(self, route: ModelRoute, error: ProviderError, now: datetime) -> None:
@@ -259,6 +290,8 @@ class LLMClient:
             # Claude's native web citations are incompatible with JSON mode.
             ground = self._payload(route, request, blob, evidence_pass=True)
             grounded_data, added_cost = await self._post(route, request, ground, search=True)
+            # The evidence pass can end at its token cap after the server
+            # already returned result blocks. Only the blocks feed pass two.
             evidence = self._evidence(route.provider, grounded_data)
             if not evidence:
                 raise ProviderError(route.provider, route.model, "no_grounding")
@@ -269,17 +302,23 @@ class LLMClient:
         data, cost = await self._post(route, request, payload, search=live)
         if route.provider == "anthropic":
             if data.get("stop_reason") != "end_turn":
-                raise ProviderError(route.provider, route.model, "incomplete_output")
+                raise ProviderError(route.provider, route.model, "incomplete_output",
+                                    code=_provider_code(data.get("stop_reason")))
             text = "".join(row.get("text", "") for row in data["content"] if row["type"] == "text")
         else:
             if data.get("status") != "completed" or data.get("error") or data.get("incomplete_details"):
-                raise ProviderError(route.provider, route.model, "incomplete_output")
+                incomplete, error = data.get("incomplete_details"), data.get("error")
+                raise ProviderError(route.provider, route.model, "incomplete_output", code=_provider_code(
+                    incomplete.get("reason") if isinstance(incomplete, dict) else None,
+                    error.get("code") if isinstance(error, dict) else None,
+                    error.get("type") if isinstance(error, dict) else None,
+                ))
             text = "".join(
                 part["text"] for row in data["output"] if row.get("type") == "message"
                 for part in row.get("content", ()) if part.get("type") == "output_text"
             )
             evidence = self._evidence(route.provider, data)
-            if live and not evidence:
+            if live and not evidence and not request.single_review:
                 raise ProviderError(route.provider, route.model, "no_grounding")
         if not text or len(text.encode()) > 22_000:
             raise ProviderError(route.provider, route.model, "invalid_output")
@@ -295,7 +334,10 @@ class LLMClient:
                 "messages": [{"role": "user", "content": bounded}],
             }
             if evidence_pass:
-                body["system"] = "Search for primary evidence relevant to the supplied symbol. Return brief source-cited facts, not a recommendation."
+                body["system"] = (
+                    "Search for primary evidence relevant to the supplied symbol. Use exactly one focused web "
+                    "search query and do not search again. Return brief source-cited facts, not a recommendation."
+                )
                 body["tools"] = [{
                     "name": "web_search", "type": "web_search_20250305", "max_uses": 1,
                     **({"allowed_domains": list(request.domains)} if request.domains else {}),
@@ -307,6 +349,7 @@ class LLMClient:
         if route.provider == "perplexity":
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name, "schema": schema}}
             if request.grounded:
+                body["max_output_tokens"] = _PERPLEXITY_GROUNDED_OUTPUT
                 body["max_tool_calls"] = _TOOL_CALLS
                 body["tools"] = [{
                     "type": "web_search", "max_results": 8, "max_tokens": _SEARCH_TOKENS,
@@ -324,7 +367,7 @@ class LLMClient:
                 body["max_tool_calls"] = _TOOL_CALLS
                 body["include"] = ["web_search_call.action.sources"]
                 body["tools"] = [{
-                    "type": "web_search", "return_token_budget": _SEARCH_TOKENS,
+                    "type": "web_search",
                     **({"filters": {"allowed_domains": list(request.domains)}} if request.domains else {}),
                 }]
         return body
@@ -337,9 +380,13 @@ class LLMClient:
             raise ProviderError(route.provider, route.model, "input_limit")
         # Claude search has no tool-return token cap: reserve a conservative
         # full input window for the search step, not the illustrative average.
+        # OpenAI's default result budget is not a numeric cap; reserve against
+        # its documented web-search context window instead.
+        search_tokens = _OPENAI_SEARCH_WINDOW if route.provider == "openai" else _SEARCH_TOKENS
         billed_input = (1_000_000 if route.provider == "anthropic" and search
-                        else (sent_bytes + 2_000 + search_calls * _SEARCH_TOKENS) * (1 + search_calls))
-        ceiling = int(billed_input * in_rate + _OUTPUT * out_rate + search_calls * _FEES[route.provider]) + 1
+                        else (sent_bytes + 2_000 + search_calls * search_tokens) * (1 + search_calls))
+        output_cap = body["max_tokens" if route.provider == "anthropic" else "max_output_tokens"]
+        ceiling = int(billed_input * in_rate + output_cap * out_rate + search_calls * _FEES[route.provider]) + 1
         request_id = uuid4().hex
         if self.spend is not None and not self.spend.reserve(
             request_id, self.now(), ceiling, exit_work=request.exit_work or request.task is ResearchTask.CONFIRM_EXIT,
@@ -421,42 +468,73 @@ class LLMClient:
             retry = float(response.headers["Retry-After"])
         except (ValueError, KeyError):
             retry = None
-        return ProviderError(route.provider, route.model, kind, status, next(iter(sorted(quota)), None), retry)
+        code = _provider_code(detail.get("code"), detail.get("type")) if isinstance(detail, dict) else None
+        return ProviderError(route.provider, route.model, kind, status, next(iter(sorted(quota)), code), retry)
 
     def _evidence(self, provider: str, data: dict) -> tuple[Evidence, ...]:
         rows = []
+        claude_search_limit = False
         contents = data.get("content", ()) if provider == "anthropic" else data.get("output", ())
         for item in contents:
             kind = item.get("type")
             if kind == "search_results":
-                rows.extend(item.get("results", ()))
+                rows.extend((row, "perplexity_search" if provider == "perplexity" else None)
+                            for row in item.get("results", ()))
             elif kind == "web_search_call":
                 if item.get("status") not in {None, "completed"}:
                     raise ProviderError(provider, "", "search_failed")
-                rows.extend((item.get("action") or {}).get("sources") or ())
+                rows.extend((row, None) for row in (item.get("action") or {}).get("sources") or ())
             elif kind == "web_search_tool_result":
                 content = item.get("content")
                 if isinstance(content, dict):
-                    raise ProviderError(provider, "", "search_failed")
-                rows.extend(content or ())
+                    code = _provider_code(content.get("error_code"))
+                    if provider == "anthropic" and code == "max_uses_exceeded":
+                        claude_search_limit = True
+                        continue
+                    raise ProviderError(provider, "", "search_failed", code=code)
+                rows.extend((row, "claude_search" if provider == "anthropic" else None) for row in content or ())
             elif kind == "message":
                 for piece in item.get("content", ()):
-                    rows.extend(row for row in piece.get("annotations", ()) if row.get("type") == "url_citation")
+                    rows.extend((row, None) for row in piece.get("annotations", ()) if row.get("type") == "url_citation")
             elif kind == "text":
-                rows.extend(item.get("citations") or ())
+                rows.extend((row, None) for row in item.get("citations") or ())
         found: dict[str, Evidence] = {}
-        for row in rows:
+        claude_result = False
+        now = self.now()
+        for row, source in rows:
             url = row.get("url")
             if not isinstance(url, str) or len(url) > 500 or not _public_url(url):
                 continue
+            if source == "claude_search" and row.get("type") == "web_search_result":
+                claude_result = True
             evidence_id = str(row.get("id") or hashlib.sha256(url.encode()).hexdigest()[:16])
-            published = utc_datetime(row.get("published_at") or row.get("date"))
+            if source == "perplexity_search":
+                published = utc_datetime(row.get("published_at"))
+                day_bound = _earliest_publication(row.get("date"), now) if published is None else None
+            else:
+                published = utc_datetime(row.get("published_at") or row.get("date"))
+                day_bound = None
             found.setdefault(url, Evidence(
                 evidence_id=evidence_id, url=url, title=str(row.get("title") or "")[:250],
-                published_at=published, retrieved_at=self.now(), publisher=urlsplit(url).hostname or "",
+                published_at=published or day_bound, date_precision="day" if day_bound else "instant",
+                retrieved_at=now, publisher=urlsplit(url).hostname or "",
                 snippet=str(row.get("snippet") or row.get("cited_text") or "")[:800],
             ))
+        if claude_search_limit and not claude_result:
+            raise ProviderError(provider, "", "search_failed", code="max_uses_exceeded")
         return tuple(found.values())[:16]
+
+
+def _earliest_publication(value: object, now: datetime) -> datetime | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return None
+    try:
+        # Perplexity gives a publication day without a timezone. UTC+14 is
+        # the earliest possible local midnight and never makes a source fresher.
+        earliest = datetime.combine(date.fromisoformat(value), time.min, UTC) - timedelta(hours=14)
+    except (ValueError, OverflowError):
+        return None
+    return earliest if earliest <= now else None
 
 
 def _public_url(url: str) -> bool:
