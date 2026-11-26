@@ -31,7 +31,11 @@ from stock_agent.reporting import ReportBuilder
 from stock_agent.research_store import ResearchStore, week_key
 from stock_agent.scheduler import StockAgentScheduler
 from stock_agent.trial_metrics import (
+    OPTION_FUNNEL_STAGES,
+    classify_option_scan_skip_stage,
     collect_trial_metrics,
+    format_options_funnel_field,
+    format_options_funnel_summary,
     format_trial_metrics_field,
     install_broker_quote_observer,
 )
@@ -720,6 +724,7 @@ def test_daily_summary_and_runtime_health_surface_trial_metrics(monkeypatch, tmp
             health_path = tmp_path / "runtime-health.json"
             payload = json.loads(health_path.read_text())
             assert "trial_metrics" in payload
+            assert "options_funnel" in payload
             tm = payload["trial_metrics"]
             assert tm["session_date"] == "2026-11-25"
             for section in (
@@ -730,8 +735,10 @@ def test_daily_summary_and_runtime_health_surface_trial_metrics(monkeypatch, tmp
                 "option_legs_fresh_two_sided",
                 "quote_caused_option_rejections",
                 "trade_commissions_and_slippage",
+                "options_funnel",
             ):
                 assert section in tm
+            assert payload["options_funnel"] == tm["options_funnel"]
 
             d_close = date(2026, 11, 25)
             bar_stub = _StaticBarPriceStub(
@@ -751,11 +758,13 @@ def test_daily_summary_and_runtime_health_surface_trial_metrics(monkeypatch, tmp
             )
 
             as_of_close = datetime(2026, 11, 25, 16, 20, tzinfo=ET)
-            # 1) Missed-close / no-snapshot fallback includes Trial & Data-Quality Metrics
+            # 1) Missed-close / no-snapshot fallback includes Trial & Data-Quality Metrics and Options Funnel
             missed_embeds = await rb.build_daily_summary(as_of=as_of_close)
             missed_fields = {f["name"]: f["value"] for f in missed_embeds[0]["fields"]}
             assert "Trial & Data-Quality Metrics" in missed_fields
             assert len(missed_fields["Trial & Data-Quality Metrics"]) <= 1024
+            assert "Options Funnel" in missed_fields
+            assert len(missed_fields["Options Funnel"]) <= 1024
 
             # 2) Normal close summary with recorded close mark
             snap = await sched.ledger.refresh("test")
@@ -763,6 +772,10 @@ def test_daily_summary_and_runtime_health_surface_trial_metrics(monkeypatch, tmp
             embeds = await rb.build_daily_summary(snapshot=snap, as_of=as_of_close)
             fields = {f["name"]: f["value"] for f in embeds[0]["fields"]}
             assert "Trial & Data-Quality Metrics" in fields
+            assert "Options Funnel" in fields
+            opt_val = fields["Options Funnel"]
+            assert len(opt_val) <= 1024
+            assert opt_val.startswith("Options funnel today:")
             val = fields["Trial & Data-Quality Metrics"]
             assert len(val) <= 1024
             for expected_label in (
@@ -777,6 +790,7 @@ def test_daily_summary_and_runtime_health_surface_trial_metrics(monkeypatch, tmp
                 assert expected_label in val
             for forbidden_broker_word in ("Alpaca", "IBKR", "Interactive Brokers"):
                 assert forbidden_broker_word not in val
+                assert forbidden_broker_word not in opt_val
         finally:
             await sched._cleanup()
 
@@ -882,3 +896,316 @@ def test_heartbeat_ping_url_end_to_end_and_redaction(monkeypatch, tmp_path: Path
             await sched._cleanup()
 
     asyncio.run(_run())
+
+
+def test_options_funnel_session_and_rolling_7d_contract_deepest_stage_and_summary_line(
+    tmp_path: Path,
+) -> None:
+    """Verify the shared event contract, deepest-stage deduplication, 7d window, and summary line."""
+    as_of = datetime(2026, 11, 26, 16, 15, tzinfo=ET)
+    clock = [datetime(2026, 11, 18, 11, 0, tzinfo=ET)]
+    journal = Journal(tmp_path / "journal", clock=lambda: clock[0])
+
+    # Out-of-window event (8 days ago) -> ignored
+    journal.append("options.scan_skip", symbol="SYM99", stage="news", reason="news stale")
+
+    # Prior sessions inside rolling 7d:
+    # - SYM19 skipped at order stage 3 days ago
+    clock[0] = datetime(2026, 11, 23, 11, 0, tzinfo=ET)
+    journal.append("options.scan_skip", symbol="SYM19", stage="order", reason="not filled (cancelled)")
+    # - SYM01 opened a structure 2 days ago (so 7d treats SYM01 as opened, while today's session sees it skip at news)
+    clock[0] = datetime(2026, 11, 24, 14, 0, tzinfo=ET)
+    journal.append("options.opened", underlying="SYM01", structure_id="st-001")
+
+    # Today's session: 18 distinct symbols (SYM01..SYM18):
+    # - SYM01 is seen in two scans today: first skipped at capacity, later reached news -> counts once at news!
+    clock[0] = datetime(2026, 11, 26, 10, 5, tzinfo=ET)
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM01",
+        stage="capacity",
+        reason="cool-down until 2026-11-26T15:30:00+00:00",
+    )
+
+    clock[0] = datetime(2026, 11, 26, 13, 15, tzinfo=ET)
+    # 9 symbols skipped at news (SYM01..SYM09)
+    for idx in range(1, 10):
+        journal.append(
+            "options.scan_skip",
+            symbol=f"SYM{idx:02d}",
+            stage="news",
+            reason="news stale",
+        )
+    # 3 symbols skipped at research (SYM10..SYM12) -> 18 - 9 - 3 = 6 had a usable thesis!
+    for sym, rsn in (
+        ("SYM10", "no thesis"),
+        ("SYM11", "no thesis"),
+        ("SYM12", "conviction 0.45 below 0.65"),
+    ):
+        journal.append("options.scan_skip", symbol=sym, stage="research", reason=rsn)
+    # 2 symbols skipped at chain (SYM13..SYM14)
+    for sym in ("SYM13", "SYM14"):
+        journal.append(
+            "options.scan_skip",
+            symbol=sym,
+            stage="chain",
+            reason="no listed contracts in the window",
+        )
+    # 2 symbols skipped at structure (SYM15..SYM16) -> 6 - 2 - 2 = 2 had tradable contracts!
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM15",
+        stage="structure",
+        reason="single: SYM15261218C00100000 bid-ask spread 24.0% of mid",
+    )
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM16",
+        stage="structure",
+        reason="spread: SYM16261218C00100000 open interest 12",
+    )
+    # 1 symbol skipped at pricing (SYM17) and 1 skipped at sizing (SYM18) -> 0 opened today!
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM17",
+        stage="pricing",
+        reason="no limit price meets the reward/risk floor",
+    )
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM18",
+        stage="sizing",
+        reason="options buying power unavailable",
+    )
+
+    metrics = collect_trial_metrics(journal=journal, as_of=as_of)
+    funnel = metrics["options_funnel"]
+    assert tuple(funnel["stage_order"]) == OPTION_FUNNEL_STAGES
+    assert len(OPTION_FUNNEL_STAGES) == 14
+
+    sess = funnel["session"]
+    assert sess["symbols_considered"] == 18
+    assert sess["usable_thesis"] == 6
+    assert sess["tradable_contracts"] == 2
+    assert sess["opened"] == 0
+    assert (
+        sess["summary_line"]
+        == "Options funnel today: 18 considered, 6 had a usable thesis, 2 had tradable contracts, 0 opened. Biggest drop: news stale (9)."
+    )
+    assert funnel["summary_line"] == sess["summary_line"]
+
+    # Check stage-by-stage monotonic progression in order
+    by_stage = sess["by_stage"]
+    assert by_stage["gate"] == {"reached": 18, "skipped": 0, "passed": 18, "top_reasons": []}
+    assert by_stage["capacity"] == {"reached": 18, "skipped": 0, "passed": 18, "top_reasons": []}
+    assert by_stage["underlying_quote"] == {"reached": 18, "skipped": 0, "passed": 18, "top_reasons": []}
+    assert by_stage["news"] == {
+        "reached": 18,
+        "skipped": 9,
+        "passed": 9,
+        "top_reasons": [{"reason": "news stale", "count": 9}],
+    }
+    assert by_stage["research"] == {
+        "reached": 9,
+        "skipped": 3,
+        "passed": 6,
+        "top_reasons": [
+            {"reason": "no thesis", "count": 2},
+            {"reason": "conviction below floor", "count": 1},
+        ],
+    }
+    assert by_stage["permission"]["reached"] == 6
+    assert by_stage["chain"]["skipped"] == 2
+    assert by_stage["structure"] == {
+        "reached": 4,
+        "skipped": 2,
+        "passed": 2,
+        "top_reasons": [
+            {"reason": "low open interest", "count": 1},
+            {"reason": "wide bid-ask spread", "count": 1},
+        ],
+    }
+    assert by_stage["pricing"]["reached"] == 2
+    assert by_stage["pricing"]["skipped"] == 1
+    assert by_stage["sizing"]["reached"] == 1
+    assert by_stage["sizing"]["skipped"] == 1
+    assert by_stage["risk"]["reached"] == 0
+
+    # Rolling 7d: 19 distinct symbols (SYM01..SYM19), SYM01 opened on Nov 24 so opened == 1, usable_thesis == 8
+    wk = funnel["rolling_7d"]
+    assert wk["symbols_considered"] == 19
+    assert wk["symbol_sessions_considered"] == 20
+    assert wk["opened"] == 1
+    assert wk["opened_structures"] == 1
+    assert wk["by_stage"]["news"]["skipped"] == 8  # SYM02..SYM09 (SYM01 passed all stages in 7d)
+    assert wk["by_stage"]["order"]["skipped"] == 1  # SYM19
+
+    field_txt = format_options_funnel_field(metrics)
+    assert field_txt.splitlines()[0] == sess["summary_line"]
+    assert "Drops by stage:" in field_txt
+    assert "Rolling 7d: 19 considered" in field_txt or "**Rolling 7d:** 19 considered" in field_txt
+    assert len(field_txt) <= 1020
+
+
+def test_options_funnel_star_blockers_top3_reasons_legacy_classification_and_fail_safe(
+    tmp_path: Path,
+) -> None:
+    """Verify '*' blocked scans, top-3 reason cap, legacy reason classification, unclassified fallback, and fail-safe."""
+    # 1) Legacy stage-less classification across all 14 contract stages + unclassified
+    legacy_samples = [
+        ("reconcile failed: position mismatch", "gate"),
+        ("market gate: SPY below regime filter", "gate"),
+        ("already holds a structure on this underlying", "capacity"),
+        ("3 structures open", "capacity"),
+        ("underlying stale quote", "underlying_quote"),
+        ("research gate: quote_stale_or_unavailable", "underlying_quote"),
+        ("research gate: news_stale_or_unavailable,missing_thesis", "news"),
+        ("research gate: news_stale_or_unavailable", "news"),
+        ("research gate: missing_thesis", "research"),
+        ("news direction disagrees with the thesis", "research"),
+        ("options level 1 does not allow buying options", "permission"),
+        ("no expiry between 14 and 45 days", "chain"),
+        ("single: QQQ261218C00500000 quote is 120s old", "structure"),
+        ("no limit price meets the reward/risk floor", "pricing"),
+        ("one contract risks $450, room is $300", "sizing"),
+        ("risk: desk stress over cap", "risk"),
+        ("owner directive claim refused", "owner"),
+        ("order rejected (buying_power): insufficient settled cash", "order"),
+        ("broker: connection reset by gateway", "broker"),
+        ("mystery legacy skip reason never seen before", "unclassified"),
+    ]
+    for sample_reason, expected_stage in legacy_samples:
+        assert classify_option_scan_skip_stage(sample_reason) == expected_stage
+    # Explicit contract stage always wins when valid
+    assert classify_option_scan_skip_stage("custom wording", stage="pricing") == "pricing"
+
+    # 2) Session with ONLY '*' session-level blockers (gate + broker, plus broker-name scrubbing)
+    as_of = datetime(2026, 11, 26, 16, 15, tzinfo=ET)
+    ts_dt = datetime(2026, 11, 26, 11, 0, tzinfo=ET)
+    j_blocked = Journal(tmp_path / "blocked_journal", clock=lambda: ts_dt)
+    j_blocked.append("options.scan_skip", symbol="*", stage="gate", reason="market gate: halted")
+    j_blocked.append("options.scan_skip", symbol="*", stage="broker", reason="broker: Alpaca upstream timeout")
+    m_blocked = collect_trial_metrics(journal=j_blocked, as_of=as_of)
+    s_blocked = m_blocked["options_funnel"]["session"]
+    assert s_blocked["symbols_considered"] == 0
+    assert s_blocked["scans_blocked_before_symbols"]["count"] == 2
+    assert s_blocked["scans_blocked_before_symbols"]["by_stage"] == {"broker": 1, "gate": 1}
+    assert "Scans blocked before looking at any symbol: 2" in s_blocked["summary_line"]
+    rendered_blocked = format_options_funnel_field(m_blocked)
+    for forbidden in ("Alpaca", "IBKR", "Interactive Brokers"):
+        assert forbidden not in rendered_blocked
+        assert forbidden not in json.dumps(m_blocked["options_funnel"])
+
+    # 3) Legacy events without 'stage': top-3 skip reason cap + unclassified bucket
+    j_legacy = Journal(tmp_path / "legacy_journal", clock=lambda: ts_dt)
+    for idx, rsn in enumerate(
+        (
+            "research gate: missing_thesis",
+            "research gate: missing_thesis",
+            "research gate: unverified_thesis",
+            "research gate: unverified_thesis",
+            "news direction disagrees with the thesis",
+            "thesis has no generation time",
+        ),
+        start=1,
+    ):
+        j_legacy.append("options.scan_skip", symbol=f"LGC{idx:02d}", reason=rsn)
+    j_legacy.append("options.scan_skip", symbol="UNK01", reason="completely unknown skip text")
+    m_legacy = collect_trial_metrics(journal=j_legacy, as_of=as_of)
+    s_legacy = m_legacy["options_funnel"]["session"]
+    assert s_legacy["symbols_considered"] == 7
+    assert s_legacy["unclassified"]["skipped"] == 1
+    assert s_legacy["unclassified"]["top_reasons"] == [{"reason": "completely unknown skip text", "count": 1}]
+    # 4 distinct research reasons -> capped at top 3!
+    res_top = s_legacy["by_stage"]["research"]["top_reasons"]
+    assert len(res_top) == 3
+    assert res_top[0] == {"reason": "no thesis", "count": 2}
+    assert res_top[1] == {"reason": "unverified thesis", "count": 2}
+
+    # 4) Fail-safe: corrupt/raising journal never raises and writes no files
+    class _BrokenJournal:
+        def read(self, **_kwargs):
+            raise RuntimeError("disk fault")
+
+    empty_dir = tmp_path / "read_only_check"
+    empty_dir.mkdir()
+    m_broken = collect_trial_metrics(journal=_BrokenJournal(), as_of=as_of)
+    assert m_broken["options_funnel"]["session"]["symbols_considered"] == 0
+    assert format_options_funnel_summary({}) == (
+        "Options funnel today: 0 considered, 0 had a usable thesis, 0 had tradable contracts, 0 opened."
+    )
+    assert list(empty_dir.iterdir()) == []
+
+
+def test_options_funnel_multi_expiry_structure_normalization_and_gate_blocks_line(
+    tmp_path: Path,
+) -> None:
+    """Verify 'YYYY-MM-DD: ...' multi-attempt structure normalization and dedicated gate-blocks line."""
+    as_of = datetime(2026, 11, 26, 16, 15, tzinfo=ET)
+    ts_dt = datetime(2026, 11, 26, 12, 30, tzinfo=ET)
+    journal = Journal(tmp_path / "multi_expiry_journal", clock=lambda: ts_dt)
+
+    # Global gate blockers on state change (new event with stage='gate' + legacy event without 'stage')
+    journal.append("options.scan_skip", symbol="*", stage="gate", reason="market gate: regular session closed")
+    journal.append("options.scan_skip", symbol="*", reason="reconcile failed: position check")
+
+    # Multi-attempt structure skips starting with 'YYYY-MM-DD: ' and varying digits ('open interest 28' vs '41'):
+    # First cause of first attempt is normalized so both group under 'low open interest' (count=2).
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM01",
+        stage="structure",
+        reason=(
+            "2026-12-18: spread: SYM01261218C00100000 open interest 28; "
+            "single: SYM01261218C00100000 bid-ask spread 24% of mid; "
+            "2027-01-15: spread: SYM01270115C00100000 no listed strike gives a width of 5%-12% of spot"
+        ),
+    )
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM02",
+        stage="structure",
+        reason=(
+            "2027-01-15: spread: open interest 41; "
+            "single: SYM02270115C00100000 quote is 55s old; "
+            "2027-01-22: spread: open interest 19"
+        ),
+    )
+    # Legacy event without `stage` starting with 'YYYY-MM-DD: ' and 'open interest unknown'
+    journal.append(
+        "options.scan_skip",
+        symbol="SYM03",
+        reason="2026-12-18: single: SYM03261218C00100000 open interest unknown; 2027-01-15: single: open interest 12",
+    )
+
+    metrics = collect_trial_metrics(journal=journal, as_of=as_of)
+    sess = metrics["options_funnel"]["session"]
+    # '*' gate blocks excluded from distinct-symbol counts!
+    assert sess["symbols_considered"] == 3
+    assert sess["gate_blocks"] == {
+        "count": 2,
+        "top_reasons": [
+            {"reason": "market gate: regular session closed", "count": 1},
+            {"reason": "reconcile failed", "count": 1},
+        ],
+    }
+    assert sess["by_stage"]["structure"] == {
+        "reached": 3,
+        "skipped": 3,
+        "passed": 0,
+        "top_reasons": [
+            {"reason": "low open interest", "count": 2},
+            {"reason": "open interest unknown", "count": 1},
+        ],
+    }
+
+    field_lines = format_options_funnel_field(metrics).splitlines()
+    assert field_lines[0] == (
+        "Options funnel today: 3 considered, 3 had a usable thesis, 0 had tradable contracts, 0 opened. "
+        "Biggest drop: structure (3; top: low open interest 2)."
+    )
+    assert field_lines[1] == (
+        "• **Gate blocks:** 2 (market gate: regular session closed 1, reconcile failed 1)"
+    )
+    assert "structure 3 (low open interest 2, open interest unknown 1)" in field_lines[2]
+

@@ -446,23 +446,26 @@ def test_definitive_broker_rejection_releases_the_shot_eagerly(world, tmp_path, 
 
 
 class QuoteTTLGate(StrictOwnerGate):
-    """Every owner-lane proof needs a quote refreshed since the previous gate call
-    (a ladder outlives the gate's quote TTL)."""
+    """Every owner-lane proof needs a quote refreshed within a short TTL (a ladder outlives
+    the gate's quote TTL). The refresh time is the fake clock's, read at refresh."""
 
-    def __init__(self):
+    TTL = timedelta(seconds=5)
+
+    def __init__(self, clock=None):
         super().__init__()
         self.ledger = ReleasingLedger()
-        self.fresh = False
+        self.clock = clock
+        self.refreshed_at = None
         self.refreshes = 0
 
     def refresh(self, symbol, now):
         self.refreshes += 1
-        self.fresh = True
+        self.refreshed_at = self.clock.now() if self.clock is not None else now
 
     def is_entry_eligible(self, symbol, now, *, allow_owner=False, owner_lane="stock", reservation_id=None):
         if allow_owner and owner_lane == "option":
-            fresh, self.fresh = self.fresh, False
-            if not fresh:
+            at = self.refreshed_at
+            if at is None or not (timedelta() <= now - at <= self.TTL):
                 gen = now - timedelta(hours=1)
                 return Eligibility(False, ("quote_stale_or_unavailable",), f"th-{symbol}",
                                    self.raw, self.owner, Direction.BUY, gen)

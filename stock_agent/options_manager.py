@@ -26,9 +26,11 @@ import hashlib
 import inspect
 import logging
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -66,7 +68,8 @@ from stock_agent.options_policy import (
     in_cooldown,
     parse_direction,
     parse_occ,
-    pick_expiry,
+    candidate_expiries,
+    quote_problem,
     size_structure,
 )
 from stock_agent.options_settings import OptionsSettings, load_options_settings
@@ -129,6 +132,53 @@ class ScanOutcome:
     final: bool = True
     story_id: str | None = None
     story_handled: bool = False  # the story id is durably recorded as handled
+    # funnel stage at which a skipped symbol stopped (journal contract, options.scan_skip):
+    # gate, capacity, underlying_quote, news, research, permission, chain, structure,
+    # pricing, sizing, risk, owner, order, broker. Empty for an opened structure.
+    stage: str = ""
+
+
+SCAN_STAGES = ("gate", "capacity", "underlying_quote", "news", "research", "permission", "chain",
+               "structure", "pricing", "sizing", "risk", "owner", "order", "broker")
+
+
+def _never_sent(st: Structure) -> bool:
+    """A reservation voided before any open order was sent: it neither answered nor sent
+    anything for its story (master's rule: handled once final or an order was sent)."""
+    return bool(st.open_never_sent and st.zero_fill_confirmed and st.st is StructState.VOID
+                and not st.open_order_id)
+
+
+_STALE_LEG = re.compile(r"(quote is \d+s old|quote has no timestamp)$")
+
+
+def _stale_only(reason: str) -> bool:
+    """True when every shape in a proposal rejection failed only on quote age."""
+    parts = [p for p in (reason or "").split("; ") if p]
+    return bool(parts) and all(_STALE_LEG.search(p.strip()) for p in parts)
+
+
+def _gate_key(kind: str, text: str) -> str:
+    """A stable id for a global blocker: digits, times and ids are masked so a counter or
+    timestamp in the text doesn't make each scan look like a new state."""
+    return f"{kind}:" + re.sub(r"[0-9a-f]{8,}|\d+", "#", str(text or "").lower()).strip()
+
+
+def _gate_stage(reasons) -> str:
+    """Stage for a research-gate refusal: a stale/missing news stamp is the earlier funnel
+    stage ("news"); a refusal only for a stale quote is "underlying_quote"; else "research"."""
+    text = reasons if isinstance(reasons, str) else ",".join(reasons or ())
+    if "news_stale_or_unavailable" in text:
+        return "news"
+    codes = {x.strip() for x in text.split(",") if x.strip()}
+    if codes == {"quote_stale_or_unavailable"}:
+        return "underlying_quote"
+    return "research"
+
+
+def _owner_stage(problem: str) -> str:
+    """Owner-lane problems: research-gate text classifies like the gate; the rest is owner."""
+    return _gate_stage(problem) if problem.startswith("research gate") else "owner"
 
 
 @dataclass
@@ -231,6 +281,8 @@ class OptionsManager:
         self._lock = asyncio.Lock()
         self._stale_refreshed: dict[str, datetime] = {}  # symbol -> last stale-input refresh
         self._scan_refresh_left = 0.0  # seconds of stale-input refresh left in this scan
+        self._last_gate_key: str | None = None  # last global blocker journalled (state changes only)
+        self._expiry_tries: dict[str, int] = {}  # expiry-pricing calls per symbol in this scan
         self.structures: list[Structure] = []
         self.cooldowns: dict[str, Cooldown] = {}
         self.meta: dict[str, Any] = {}
@@ -498,18 +550,24 @@ class OptionsManager:
             self._ensure_loaded()
             blocker = self.open_blocker()
             if blocker:
+                self._gate_skip(_gate_key("open_blocker", blocker), blocker)
                 syms = [c.symbol for c in candidates] if candidates else []
-                return [ScanOutcome(s, None, blocker, final=False) for s in syms] or [ScanOutcome("*", None, blocker, final=False)]
+                return [ScanOutcome(s, None, blocker, final=False, stage="gate") for s in syms] or [ScanOutcome("*", None, blocker, final=False, stage="gate")]
             try:
                 await self._reconcile_locked(now)
             except BrokerError as e:
-                return [ScanOutcome("*", None, f"reconcile failed: {e}", final=False)]
+                self._gate_skip(f"reconcile_failed:{e.kind}", f"reconcile failed: {e}")
+                return [ScanOutcome("*", None, f"reconcile failed: {e}", final=False, stage="gate")]
             blocker = self.open_blocker()
             if blocker:
-                return [ScanOutcome("*", None, blocker, final=False)]
+                self._gate_skip(_gate_key("open_blocker", blocker), blocker)
+                return [ScanOutcome("*", None, blocker, final=False, stage="gate")]
             ok, why = await self._gate("entry")
             if not ok:
-                return [ScanOutcome("*", None, f"market gate: {why}", final=False)]
+                self._gate_skip(_gate_key("market_gate", why), f"market gate: {why}")
+                return [ScanOutcome("*", None, f"market gate: {why}", final=False, stage="gate")]
+            self._last_gate_key = None  # past the global gates: the next blocker is a change
+            self._expiry_tries = {}  # expiry-pricing calls per symbol in this scan
             if candidates is None:
                 cands = [OptionCandidate(s, source="scan") for s in dict.fromkeys(self._universe())]
             else:
@@ -522,7 +580,7 @@ class OptionsManager:
                     o = await self._try_open(c, now)
                 except BrokerError as e:
                     err = e
-                    o = ScanOutcome(c.symbol, None, f"broker: {e}", final=False)
+                    o = ScanOutcome(c.symbol, None, f"broker: {e}", final=False, stage="broker")
                 if c.story_id:
                     o.story_id = c.story_id
                     if o.final or o.opened:
@@ -538,14 +596,21 @@ class OptionsManager:
                         break
             for o in out:
                 if not o.opened:
-                    self._j("options.scan_skip", symbol=o.symbol, reason=o.reason)
+                    self._j("options.scan_skip", symbol=o.symbol, reason=o.reason, stage=o.stage)
             return out
+
+    def _gate_skip(self, key: str, reason: str) -> None:
+        """Journal a global blocker once per state change (by a stable blocker id, so a
+        varying error text doesn't write an event every scan); the reason keeps the detail."""
+        if key != self._last_gate_key:
+            self._last_gate_key = key
+            self._j("options.scan_skip", symbol="*", reason=reason, stage="gate")
 
     def is_story_handled(self, story_id: str) -> bool:
         """True once a news story has had a final answer or an order was sent for it.
         Persisted in the book, so replays after a crash are answered the same way."""
         return story_id in set(self.meta.get("stories", [])) or any(
-            x.story_id == story_id for x in self.structures)
+            x.story_id == story_id and not _never_sent(x) for x in self.structures)
 
     def handled_story_ids(self, story_ids: Iterable[str]) -> set[str]:
         return {sid for sid in story_ids if sid and self.is_story_handled(sid)}
@@ -708,6 +773,7 @@ class OptionsManager:
     # by one aggregate time budget per scan (not per candidate) and once per symbol per news
     # TTL across scans (success or failure), so a slow poll cannot stall exit monitoring.
     _STALE_REFRESH_BUDGET_S = 3.0
+    _MAX_EXPIRY_TRIES = 3  # expiries priced per symbol per scan (bounds snapshot calls)
     _STALE_REFRESH_COOLDOWN = timedelta(minutes=20)
 
     def _may_stale_refresh(self, sym: str, now: datetime) -> bool:
@@ -763,15 +829,22 @@ class OptionsManager:
             return "owner directive or thesis changed"
         return None
 
-    async def _owner_still_valid(self, st: Structure) -> str | None:
-        """Re-verify an owner structure before every rung (rung 0 included): same directive,
-        not vetoed or held, claim still ours."""
-        await self._owner_refresh(st.underlying)
+    def _owner_proof_problem(self, st: Structure) -> str | None:
+        """Synchronous owner re-check right before a rung is sent: the production gate's
+        is_entry_eligible is synchronous (symbol, option lane, generation, thesis, grade, hold,
+        veto, reservation), then the claim CAS. An awaitable gate can't be asked here: refuse."""
         try:
-            el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
-                                                          owner_lane="option", reservation_id=st.id))
+            el = self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
+                                             owner_lane="option", reservation_id=st.id)
         except Exception as e:
             return f"research gate unavailable: {e}"
+        if inspect.isawaitable(el):
+            if inspect.iscoroutine(el):
+                el.close()
+            return "research gate cannot be re-checked synchronously"
+        return self._owner_proof_verdict(st, el)
+
+    def _owner_proof_verdict(self, st: Structure, el: Any) -> str | None:
         proof = getattr(el, "owner_entry", None) if el is not None and el.ok else None
         if proof is None:
             return "owner directive no longer valid"
@@ -781,35 +854,46 @@ class OptionsManager:
             return "owner directive claim lost"
         return None
 
+    async def _owner_still_valid(self, st: Structure) -> str | None:
+        """Re-verify an owner structure before every rung (rung 0 included): same directive,
+        not vetoed or held, claim still ours."""
+        await self._owner_refresh(st.underlying)
+        try:
+            el = await _maybe(self.gate.is_entry_eligible(st.underlying, self._now(), allow_owner=True,
+                                                          owner_lane="option", reservation_id=st.id))
+        except Exception as e:
+            return f"research gate unavailable: {e}"
+        return self._owner_proof_verdict(st, el)
+
     async def _try_open(self, c: OptionCandidate, now: datetime) -> ScanOutcome:
         s = self.settings
         sym = c.symbol.upper()
         today = self._today(now)
         owner = c.source == "owner"
         if any(x.underlying == sym for x in self.live()):
-            return ScanOutcome(sym, None, "already holds a structure on this underlying")
+            return ScanOutcome(sym, None, "already holds a structure on this underlying", stage="capacity")
         live = self.live()
         if len(live) >= s.max_open_structures:
-            return ScanOutcome(sym, None, f"{len(live)} structures open")
+            return ScanOutcome(sym, None, f"{len(live)} structures open", stage="capacity")
         if in_cooldown(self.cooldowns.get(sym), today):
-            return ScanOutcome(sym, None, f"cool-down until {self.cooldowns[sym].until}")
+            return ScanOutcome(sym, None, f"cool-down until {self.cooldowns[sym].until}", stage="capacity")
         if c.story_id and self.is_story_handled(c.story_id):  # news stories and research ideas alike
-            return ScanOutcome(sym, None, "story already handled")
+            return ScanOutcome(sym, None, "story already handled", stage="capacity")
         if c.source == "news":
             if self._news_opens_today(today) >= s.max_news_opens_per_session:
-                return ScanOutcome(sym, None, "news-driven option opens for this session used up")
+                return ScanOutcome(sym, None, "news-driven option opens for this session used up", stage="capacity")
         # ---- fresh underlying quote first: it also refreshes the shared price
         # health the research gate checks, so a prescan thesis isn't blocked by staleness
         spot, why = await self._spot_now(sym, now)
         if spot is None:
-            return ScanOutcome(sym, None, f"underlying {why}", final=False)
+            return ScanOutcome(sym, None, f"underlying {why}", final=False, stage="underlying_quote")
         # ---- research gate (at a time no earlier than the quote just fetched)
         now = max(now, self._now())
         proof = None
         if owner:
             el, proof, problem = await self._owner_proof(c, sym, now)
             if problem:
-                return ScanOutcome(sym, None, problem, final=False)
+                return ScanOutcome(sym, None, problem, final=False, stage=_owner_stage(problem))
         else:
             el = await _maybe(self.gate.is_entry_eligible(sym, now))
             if not el.ok and self._only_stale_inputs(el.reasons) and self._may_stale_refresh(sym, now):
@@ -820,12 +904,12 @@ class OptionsManager:
                 now = max(now, self._now())
                 el = await _maybe(self.gate.is_entry_eligible(sym, now))
             if not el.ok:
-                return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
+                return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False, stage=_gate_stage(el.reasons))
         direction = Direction.BULLISH if owner else parse_direction(el.direction)
         if direction is None:
-            return ScanOutcome(sym, None, f"thesis direction {el.direction} is not tradeable with options")
+            return ScanOutcome(sym, None, f"thesis direction {el.direction} is not tradeable with options", stage="research")
         if c.direction_hint and parse_direction(c.direction_hint) not in (None, direction):
-            return ScanOutcome(sym, None, "news direction disagrees with the thesis")
+            return ScanOutcome(sym, None, "news direction disagrees with the thesis", stage="research")
         # owner ideas: grades come from the typed proof (owner effective, model raw), never from an
         # ordinary held-review thesis grade
         conv = proof.effective_conviction if proof is not None else el.effective_conviction
@@ -833,11 +917,11 @@ class OptionsManager:
         # the model's own raw grade may sit below 7 only under a current owner proof
         raw_floor = 1 if proof is not None else 7
         if conv is None or conv < s.min_effective_conviction or (raw_grade or 0) < raw_floor:
-            return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}")
+            return ScanOutcome(sym, None, f"conviction {conv} below {s.min_effective_conviction}", stage="research")
         account = await self.broker.get_account()
         level = account.options_trading_level
         if level is not None and level < 2:
-            return ScanOutcome(sym, None, f"options level {level} does not allow buying options", final=False)
+            return ScanOutcome(sym, None, f"options level {level} does not allow buying options", final=False, stage="permission")
         kind = "call" if direction is Direction.BULLISH else "put"
         contracts = await self.broker.get_option_contracts(
             sym, type=kind, expiration_gte=today + timedelta(days=s.min_dte),
@@ -845,51 +929,74 @@ class OptionsManager:
             strike_gte=round(spot * 0.85, 2), strike_lte=round(spot * 1.15, 2))
         contracts = [x for x in contracts if x.get("tradable", True) and x.get("symbol")]
         if not contracts:
-            return ScanOutcome(sym, None, "no listed contracts in the window")
+            return ScanOutcome(sym, None, "no listed contracts in the window", stage="chain")
         expiries = [date.fromisoformat(x["expiration_date"]) for x in contracts if x.get("expiration_date")]
-        exp = pick_expiry(expiries, today, s, self._calendar_days)
-        if exp is None:
-            return ScanOutcome(sym, None, "no expiry fits the window")
-        chosen = {x["symbol"]: x for x in contracts if x.get("expiration_date") == exp.isoformat()}
-        quotes = await self._quotes(sorted(chosen), chosen)
+        exp_choices = candidate_expiries(expiries, today, s, self._calendar_days, limit=self._MAX_EXPIRY_TRIES)
+        if not exp_choices:
+            return ScanOutcome(sym, None, "no expiry fits the window", stage="chain")
         # level 2 allows long calls/puts only, level 3 adds spreads (A14: fall back, don't block)
         shapes = ("single", "spread") if level is None or level >= 3 else ("single",)
         if owner and conv < s.single_option_min_conviction:
             shapes = tuple(x for x in shapes if x == "spread")  # owner 8: a spread only, never a lone option
             if not shapes:
-                return ScanOutcome(sym, None, f"options level {level} allows no spread for an owner idea", final=False)
-        prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
-                              chain=list(quotes.values()), today=today, now=now, s=s,
-                              trading_days=self._calendar_days, shapes=shapes)
-        if isinstance(prop, Rejection):
-            return ScanOutcome(sym, None, prop.reason)
+                return ScanOutcome(sym, None, f"options level {level} allows no spread for an owner idea", final=False, stage="permission")
+        # monthly expiries first, then the rest, each nearest the target; the first expiry that
+        # gives a valid proposal is used (every proposal rule applies to each attempt)
+        tried: list[str] = []
+        prop: Proposal | Rejection | None = None
+        quotes: dict[str, ContractQuote] = {}
+        any_stale = budget_cut = False
+        for exp in exp_choices:
+            used = self._expiry_tries.get(sym, 0)
+            if used >= self._MAX_EXPIRY_TRIES:
+                budget_cut = True  # untried expiries remain: not a final answer
+                break
+            self._expiry_tries[sym] = used + 1
+            chosen = {x["symbol"]: x for x in contracts if x.get("expiration_date") == exp.isoformat()}
+            quotes = await self._quotes(sorted(chosen), chosen)
+            # judge each attempt's quotes against the real time after the fetch, never the
+            # scan's start: a later expiry must not pass on quotes aged by earlier attempts
+            now = max(now, self._now())
+            prop = build_proposal(underlying=sym, direction=direction, conviction=conv, spot=spot,
+                                  chain=list(quotes.values()), today=today, now=now, s=s,
+                                  trading_days=self._calendar_days, shapes=shapes)
+            if not isinstance(prop, Rejection):
+                break
+            tried.append(f"{exp.isoformat()}: {prop.reason}")
+            any_stale = any_stale or _stale_only(prop.reason)
+        if not isinstance(prop, Proposal):
+            if not tried:
+                return ScanOutcome(sym, None, "expiry pricing budget used this scan", final=False, stage="structure")
+            # an expiry refused only for quote age may pass on fresh quotes: not a final answer
+            return ScanOutcome(sym, None, "; ".join(tried), final=not (any_stale or budget_cut), stage="structure")
+        leg_quotes = {lg.symbol: quotes.get(lg.symbol) for lg in prop.legs}
         # ---- sizing and risk
         if el.generated_at is None:
-            return ScanOutcome(sym, None, "thesis has no generation time")
+            return ScanOutcome(sym, None, "thesis has no generation time", stage="research")
         try:
             controls = await _maybe(self._risk_controls())
         except Exception as e:  # e.g. an invalid drawdown record: refuse entries
             await self._alert("critical", "Options entries refused: risk state unreadable", str(e),
                               key="opt-risk-state")
-            return ScanOutcome(sym, None, f"risk state unavailable: {e}", final=False)
+            return ScanOutcome(sym, None, f"risk state unavailable: {e}", final=False, stage="risk")
         halted = _drawdown_halts_options(controls, self._config)
         ladder = self._open_ladder(prop)
         if not ladder:
-            return ScanOutcome(sym, None, "no limit price meets the reward/risk floor")
+            return ScanOutcome(sym, None, "no limit price meets the reward/risk floor", stage="pricing")
         worst = round(ladder[-1] * MULTIPLIER, 2)  # budgets hold even at the last rung
         sizing = size_structure(worst, equity=float(account.equity),
                                 open_max_loss=self.open_max_loss(), open_count=len(self.live()), s=s,
                                 drawdown_halt=halted)
         if sizing.qty < 1:
-            return ScanOutcome(sym, None, sizing.reason)
+            return ScanOutcome(sym, None, sizing.reason, stage="sizing")
         sid = new_structure_id()
         # re-read the underlying just before the risk check: the risk layer judges the
         # analysis price by its real quote time (option quotes were checked by mark_problem)
         spot2, why = await self._spot_now(sym, self._now())
         if spot2 is None:
-            return ScanOutcome(sym, None, f"underlying {why}", final=False)
+            return ScanOutcome(sym, None, f"underlying {why}", final=False, stage="underlying_quote")
         if abs(spot2 - spot) > spot * s.max_underlying_move_pct:
-            return ScanOutcome(sym, None, f"underlying moved {spot:.2f} -> {spot2:.2f} while pricing", final=False)
+            return ScanOutcome(sym, None, f"underlying moved {spot:.2f} -> {spot2:.2f} while pricing", final=False, stage="underlying_quote")
         spot, quote_at = spot2, self._spot_at[sym.upper()]
         intent = TradeIntent(
             kind=TradeKind.OPTION_OPEN, symbol=sym, qty=Decimal(sizing.qty),
@@ -912,7 +1019,7 @@ class OptionsManager:
                 snap = await _maybe(self._snapshot())
                 bp_why = await self._options_bp_problem(sizing.debit_cash)
                 if bp_why:
-                    return ScanOutcome(sym, None, bp_why, final=False)
+                    return ScanOutcome(sym, None, bp_why, final=False, stage="sizing")
                 # re-sample the clock after every await: the snapshot and quote are judged
                 # against the real time of the risk check, never the scan's start
                 risk_now = self._now()
@@ -920,9 +1027,9 @@ class OptionsManager:
             except BrokerError:
                 raise
             except Exception as e:  # risk unavailable -> no entry
-                return ScanOutcome(sym, None, f"risk check unavailable: {e}", final=False)
+                return ScanOutcome(sym, None, f"risk check unavailable: {e}", final=False, stage="risk")
             if not verdict.ok:
-                return ScanOutcome(sym, None, "risk: " + "; ".join(verdict.reasons))
+                return ScanOutcome(sym, None, "risk: " + "; ".join(verdict.reasons), stage="risk")
             existing = getattr(verdict, "allowed_existing_breaches", ()) or ()
             if existing:
                 self._j("options.risk_existing_breaches", symbol=sym, structure_id=sid,
@@ -931,17 +1038,24 @@ class OptionsManager:
                                   for b in existing])
             ok, why = await self._gate("entry")
             if not ok:
-                return ScanOutcome(sym, None, f"market gate: {why}", final=False)
+                return ScanOutcome(sym, None, f"market gate: {why}", final=False, stage="gate")
+            # option legs re-judged against the real clock before anything is claimed or reserved
+            bad = self._legs_problem(leg_quotes)
+            if bad:
+                return ScanOutcome(sym, None, bad, final=False, stage="pricing")
             if proof is not None:
                 if self._owner_book_used(sym, proof.added.isoformat()):
-                    return ScanOutcome(sym, None, "owner directive already used for an option structure")
+                    return ScanOutcome(sym, None, "owner directive already used for an option structure", stage="owner")
                 # re-verify from the gate (focus file, thesis, veto latch, session hold) under the
                 # capital lock, immediately before the claim (F1c/F3)
                 why = await self._owner_reverify(sym, proof, None)
                 if why:
-                    return ScanOutcome(sym, None, why, final=False)
+                    return ScanOutcome(sym, None, why, final=False, stage=_owner_stage(why))
+                bad = self._legs_problem(leg_quotes)
+                if bad:
+                    return ScanOutcome(sym, None, bad, final=False, stage="pricing")
                 if not self._owner_claim(sym, proof, sid):
-                    return ScanOutcome(sym, None, "owner directive claim refused (used, vetoed or unavailable)")
+                    return ScanOutcome(sym, None, "owner directive claim refused (used, vetoed or unavailable)", stage="owner")
             st = self._new_structure(sid, prop, sizing.qty, sizing.max_loss, c, el, now)
             if proof is not None:
                 st.owner_directive_added = proof.added.isoformat()
@@ -951,7 +1065,7 @@ class OptionsManager:
             st.open_client_id = _cid("open", st.id)
             self.structures.append(st)
             self._save()  # write-ahead: from here the commitment is visible to every lane
-        return await self._submit_open(st, prop, now)
+        return await self._submit_open(st, prop, now, leg_quotes)
 
     def _margin_enabled(self) -> bool:
         cfg = self._config
@@ -1031,7 +1145,34 @@ class OptionsManager:
     def _owner_journal(st: Structure) -> dict:
         return {"owner_directive_added": st.owner_directive_added} if st.source == "owner" else {}
 
-    async def _submit_open(self, st: Structure, prop: Proposal, now: datetime) -> ScanOutcome:
+    def _legs_problem(self, leg_quotes: dict[str, ContractQuote | None]) -> str | None:
+        """The proposal's leg quotes judged against the clock now, with the opening rules."""
+        t = self._now()
+        for sym, q in leg_quotes.items():
+            if q is None:
+                return f"leg {sym} has no quote"
+            bad = quote_problem(q, t, self.settings, need_oi=True)
+            if bad:
+                return f"leg {sym} {bad}"
+        return None
+
+    async def _requote_legs(self, leg_quotes: dict[str, ContractQuote | None]) -> dict[str, ContractQuote | None]:
+        """Fresh snapshots for the legs; open interest (a prior-day figure from the listing)
+        is carried over. Any failure leaves a leg without a quote, so the rung is not sent."""
+        try:
+            fresh = await self._quotes(sorted(leg_quotes))
+        except BrokerError as e:
+            logger.warning("options leg re-quote failed: %s", e)
+            return dict.fromkeys(leg_quotes)
+        out: dict[str, ContractQuote | None] = {}
+        for sym, old in leg_quotes.items():
+            q = fresh.get(sym)
+            out[sym] = (dc_replace(q, open_interest=old.open_interest)
+                        if q is not None and old is not None else None)
+        return out
+
+    async def _submit_open(self, st: Structure, prop: Proposal, now: datetime,
+                           leg_quotes: dict[str, ContractQuote | None]) -> ScanOutcome:
         """Send the open ladder for a structure already reserved (write-ahead) in the book."""
         self._j("options.open_submitted", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
                 direction=st.direction, qty=st.qty, expiry=st.expiry, legs=[lg.symbol for lg in st.legs],
@@ -1039,24 +1180,52 @@ class OptionsManager:
                 conviction=st.conviction, source=st.source, story_id=st.story_id, greeks=st.entry_greeks,
                 **self._owner_journal(st))
         order = None
+        stop: tuple[str, str] | None = None  # (stage, reason) when a rung was not sent
         for attempt, limit in enumerate(self._open_ladder(prop)):  # same ladder as sized
+            # every rung, rung 0 included: (1) re-read the legs (later rungs; a rung waits up
+            # to fill_wait_seconds), (2) owner refresh/validation (slow), (3) market gate as
+            # the LAST await, (4) synchronous only: write-ahead, owner proof + claim re-check,
+            # leg check, then the submit. A failed (4) restores the safe zero-fill state.
+            if attempt:
+                leg_quotes = await self._requote_legs(leg_quotes)
             if st.source == "owner":
                 why = await self._owner_still_valid(st)
                 if why:
-                    st.note(f"owner open stopped before rung {attempt}: {why}")
-                    if attempt == 0:  # nothing was sent: a confirmed zero fill
-                        st.state = StructState.VOID.value
-                        st.zero_fill_confirmed = True
-                    self._save()
-                    break
-            if attempt:
+                    stop = ("owner", why)
+            if stop is None:
                 ok, why = await self._gate("entry")
                 if not ok:
-                    break
-                st.open_client_id = _cid("open", st.id, attempt)
+                    stop = ("gate", f"market gate: {why}")
+            prior = (st.state, st.zero_fill_confirmed, st.open_client_id)
+            if stop is None:
+                if attempt:
+                    st.open_client_id = _cid("open", st.id, attempt)
                 st.state = StructState.PENDING.value
                 st.zero_fill_confirmed = False
                 self._save()
+                why = self._owner_proof_problem(st) if st.source == "owner" else None
+                stale = self._legs_problem(leg_quotes)
+                if why:
+                    stop = ("owner", why)
+                elif stale:
+                    stop = ("pricing", stale)
+            if stop is not None:
+                # nothing sent for this rung. Rung 0: no order ever existed, a definite local
+                # no-send. Later rungs: restore the previous rung's own terminal state (the
+                # loop only continues on VOID with a broker-confirmed zero fill); never certify.
+                st.note(f"open stopped before rung {attempt}: {stop[1]}")
+                if attempt:
+                    st.state, st.zero_fill_confirmed, st.open_client_id = prior
+                else:
+                    st.state = StructState.VOID.value
+                    st.zero_fill_confirmed = True
+                if attempt == 0:  # no order ever sent: no answer for the story
+                    st.open_never_sent = True
+                    if st.story_id:
+                        st.note(f"story {st.story_id} left open (no order sent)")
+                        st.story_id = None
+                self._save()
+                break
             # the reservation stays at the sized ceiling (top rung) until the order is
             # terminal; _apply_open_order then sets max loss from the actual fill
             st.limit_debit = limit
@@ -1074,14 +1243,14 @@ class OptionsManager:
                 await self._owner_settle(st)  # F2: a definitive rejection frees the owner shot now
                 await self._rejected(st, "buy", st.qty, e.message, f"Options open rejected: {st.underlying}",
                                      key=f"opt-open-{st.id}")
-                return ScanOutcome(st.underlying, None, f"order rejected: {e.message}")
+                return ScanOutcome(st.underlying, None, f"order rejected: {e.message}", stage="order")
             st.open_order_id = order.id
             self._save()
             order = await self._wait_or_cancel(order)
             self._apply_open_order(st, order)
             self._save()
-            if st.st is not StructState.VOID:
-                break
+            if not (st.st is StructState.VOID and st.zero_fill_confirmed):
+                break  # filled, partial, or no confirmed zero fill: never a further rung
         await self._owner_settle(st)
         if st.st is StructState.OPEN:
             self._j("options.opened", structure_id=st.id, underlying=st.underlying, strategy=st.strategy,
@@ -1100,8 +1269,12 @@ class OptionsManager:
                                   key=f"opt-open-{st.id}")
             return ScanOutcome(st.underlying, st.id, "opened")
         if st.st is StructState.PENDING:
-            return ScanOutcome(st.underlying, None, "open order still working", final=False)
-        return ScanOutcome(st.underlying, None, f"not filled ({order.status if order else 'not sent'})")
+            return ScanOutcome(st.underlying, None, "open order still working", final=False, stage="order")
+        if stop is not None and _never_sent(st):  # definite local no-send: retryable
+            return ScanOutcome(st.underlying, None, stop[1], final=False, stage=stop[0])
+        if stop is not None:  # an earlier rung was sent and ended with no fill: master's "not filled"
+            return ScanOutcome(st.underlying, None, f"not filled; later rung stopped: {stop[1]}", stage="order")
+        return ScanOutcome(st.underlying, None, f"not filled ({order.status if order else 'not sent'})", stage="order")
 
     async def _wait_or_cancel(self, order: BrokerOrder) -> BrokerOrder:
         s = self.settings

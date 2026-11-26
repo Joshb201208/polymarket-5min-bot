@@ -49,7 +49,7 @@ class OptionsSettings:
     single_option_min_conviction: int = 9
     # contract selection
     min_dte: int = 21
-    max_dte: int = 45
+    max_dte: int = 60
     target_dte: int = 35
     min_width_pct: float = 0.05
     max_width_pct: float = 0.12
