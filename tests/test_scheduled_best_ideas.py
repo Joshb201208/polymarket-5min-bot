@@ -139,6 +139,29 @@ def test_dated_secondary_does_not_disable_grounding_and_healthy_empty_news_can_b
         assert outcome.detail["entry_funnel"]["rejected_by_reason"] == {"news_stale_or_unavailable": 1}
 
 
+@pytest.mark.parametrize("kind", ["prescan", "weekly", "midweek"])
+def test_every_scheduled_job_gets_the_long_web_search_allowance(tmp_path, monkeypatch, kind):
+    _, ledger, _, pipeline = rig(tmp_path)
+    seen = []
+    evaluate = Analyst.evaluate
+
+    async def spy(self, data, **kwargs):
+        seen.append(kwargs.get("long_search", False))
+        return await evaluate(self, data, **kwargs)
+
+    monkeypatch.setattr(Analyst, "evaluate", spy)
+
+    async def go():
+        await ledger.refresh("test")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: response(json.loads(request.content)),
+        )) as http:
+            return await pipeline(http).run(kind)
+
+    asyncio.run(go())
+    assert seen == [True]
+
+
 def test_best_ideas_rejects_hold_and_preserves_cautious_floor(tmp_path):
     clock, ledger, _, pipeline = rig(tmp_path)
     calls = []

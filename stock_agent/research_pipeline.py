@@ -28,6 +28,9 @@ _INPUT_BLOCKERS = {"broker_book_blocked", "broker_book_unavailable", "quote_stal
                    "news_stale_or_unavailable", "llm_unavailable", "research_health_unavailable"}
 _FRESH_SET = "research:fresh_scheduled_set"
 _SCHEDULED = {"prescan", "weekly", "midweek"}
+# Every scheduled job gets the longer web-search allowance; leaving one out
+# makes its grounded reviews time out before the provider answers.
+_LONG_SEARCH = _SCHEDULED | {"market_move"}
 PRESCAN_MAX_RUNTIME = 2_100
 _PRESCAN_OPEN_BUFFER = timedelta(minutes=10)
 _PRESCAN_PRICE_TIMEOUT = 15
@@ -815,7 +818,7 @@ class ResearchPipeline:
         needs_search = not grounding_evidence
         best_ideas = task is ResearchTask.THESIS and (scheduled_job or (reanchor is not None and kind in _SCHEDULED))
         search_policy = ({"long_search": True} if (reanchor is None and story is None
-                         and kind in {"prescan", "weekly", "market_move"} and key.startswith(f"{kind}:")) else {})
+                         and kind in _LONG_SEARCH and key.startswith(f"{kind}:")) else {})
         self._require_prescan_time(deadline, SCHEDULED_REVIEW_TRANSPORT_SECONDS)
         if owner:
             if data.price is None:
