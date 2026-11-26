@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -13,8 +14,18 @@ from urllib.parse import urlsplit
 
 from stock_agent.materiality import score_materiality
 from stock_agent.research_focus import focus_symbols, owner_backed
-from stock_agent.research_pipeline import NewsEvent, SecurityInputs, SourceUnavailable
+from stock_agent.research_pipeline import (
+    NewsEvent,
+    SecurityInputs,
+    SourceUnavailable,
+    _edgar_filing,
+    _edgar_index_only,
+)
 from stock_agent.research_schemas import Evidence, utc_datetime
+from stock_agent.sec_filings import (
+    DEFAULT_SEC_LIVE_DEADLINE_S,
+    DEFAULT_SEC_SCHEDULED_DEADLINE_S,
+)
 
 _NEWS_TTL = timedelta(minutes=20)
 _QUOTE_TTL = timedelta(seconds=90)
@@ -250,6 +261,7 @@ class ResearchSources:
         fundamental_limit: int = 10,
         focus_for: Callable[..., Sequence[str]] | None = None,
         directives_for: Callable[..., Mapping[str, Any]] | None = None,
+        held_symbols: Callable[[], Sequence[str]] | None = None,
     ):
         self.prices = prices
         self.news_service = news
@@ -264,6 +276,7 @@ class ResearchSources:
         self.fundamental_limit = max(0, fundamental_limit)
         self.focus_for = focus_for or focus_symbols
         self.directives_for = directives_for or owner_backed
+        self.held_symbols = held_symbols
         self._universe: tuple[str, ...] = ()
         self._universe_at: datetime | None = None
         self._universe_tipranks_key: tuple[Any, ...] | None = None
@@ -275,6 +288,7 @@ class ResearchSources:
         self._news_at: dict[str, datetime] = {}
         self._quote_at: dict[str, datetime] = {}
         self._companies: dict[str, tuple[datetime, Any]] = {}
+        self._scheduled_archive_window: tuple[datetime, float, float] | None = None
 
     def record_universe_sources(self, counts: Mapping[str, int]) -> None:
         self.last_universe_sources = {str(k): int(v) for k, v in counts.items()}
@@ -380,7 +394,9 @@ class ResearchSources:
             focus=focus, universe=universe, mark_seen=False,
         )
         stamp = utc_datetime(batch.as_of)
-        coverage_set = tuple(dict.fromkeys((*symbols, *focus, *universe)))
+        coverage_set = tuple(
+            dict.fromkeys((*symbols, *focus, *universe, *(_MARKET if include_market else ())))
+        )
         if stamp is None or not batch.ok:
             for symbol in coverage_set:
                 self._news_at.pop(symbol, None)
@@ -422,7 +438,9 @@ class ResearchSources:
                     events.append(NewsEvent(symbol, item.story_id, evidence, round(score), direct))
         return tuple(events)
 
-    async def background(self, symbols: tuple[str, ...]) -> dict[str, tuple[Evidence, ...]]:
+    async def background(
+        self, symbols: tuple[str, ...], *, scheduled: bool = True
+    ) -> dict[str, tuple[Evidence, ...]]:
         try:
             items = await self._poll(symbols, scope="scheduled_research", include_market=False, lookback_hours=72)
         except SourceUnavailable:
@@ -434,15 +452,47 @@ class ResearchSources:
                 for symbol in item.symbols:
                     if symbol in result:
                         result[symbol].append(evidence)
-        return {symbol: tuple(sorted(rows, key=lambda e: e.published_at or e.retrieved_at, reverse=True)[:6])
-                for symbol, rows in result.items()}
+        now_fn = getattr(self.news_service, "_now", None)
+        ref_now = utc_datetime(now_fn()) if callable(now_fn) else None
+        if ref_now is None:
+            ref_now = max(
+                (e.retrieved_at for rows in result.values() for e in rows),
+                default=utc_datetime(datetime.now().astimezone()),
+            )
+        held_set = set(self._held_list())
+        ordered_targets = tuple(dict.fromkeys([*(s for s in symbols if s in held_set), *symbols]))
+        shared_deadline: float | None = None
+        if scheduled and self._scheduled_archive_window is not None:
+            win_now, win_start_mono, win_deadline_mono = self._scheduled_archive_window
+            if (
+                abs((ref_now - win_now).total_seconds()) < 120.0
+                and (time.monotonic() - win_start_mono) < 120.0
+            ):
+                shared_deadline = win_deadline_mono
+        filings_by_sym = await self._recent_filings_evidence(
+            ordered_targets,
+            ref_now,
+            scheduled=scheduled,
+            archive_deadline_mono=shared_deadline,
+        )
+        merged_out: dict[str, tuple[Evidence, ...]] = {}
+        for symbol, rows in result.items():
+            top_news = sorted(rows, key=lambda e: e.published_at or e.retrieved_at, reverse=True)[:6]
+            seen_ids = {e.evidence_id for e in top_news}
+            primary_sec = [
+                ev
+                for ev in filings_by_sym.get(symbol, ())
+                if _edgar_filing(ev.url) and not _edgar_index_only(ev.url) and ev.evidence_id not in seen_ids
+            ][:4]
+            merged_out[symbol] = tuple([*top_news, *primary_sec])
+        return merged_out
 
     async def refresh_entry_inputs(self, symbol: str, now: datetime) -> None:
         """Revalidate after model latency without replacing the analysis price."""
         if not self.quote_ok(symbol, now):
             await self._quotes((symbol,), purpose="order_sizing")
         if not self.news_ok(symbol, now):
-            await self.background((symbol,))
+            await self.background((symbol,), scheduled=False)
 
     def _company_names(self, symbol: str) -> tuple[str, ...]:
         candidates: list[str] = []
@@ -585,8 +635,17 @@ class ResearchSources:
             return []
         return self._normalize_with_alias(tuple(raw))
 
+    def _held_list(self) -> list[str]:
+        if self.held_symbols is None:
+            return []
+        try:
+            return self._normalize_with_alias(tuple(self.held_symbols()))
+        except Exception:
+            return []
+
     def _ordered_priority_symbols(self, now: datetime, *, include_daily: bool) -> tuple[str, ...]:
-        """Deterministic order: owner-backed first, then live focus, then daily focus (prescan only)."""
+        """Deterministic order: held first, then owner-backed, live focus, and daily focus (prescan only)."""
+        held_syms = self._held_list()
         owner_raw: Sequence[Any] = ()
         try:
             directives = self.directives_for(now=now)
@@ -596,7 +655,7 @@ class ResearchSources:
         owner_syms = self._normalize_with_alias(owner_raw)
         live_syms = self._focus_by_cadence(now, "live")
         daily_syms = self._focus_by_cadence(now, "daily") if include_daily else []
-        return tuple(dict.fromkeys([*owner_syms, *live_syms, *daily_syms]))
+        return tuple(dict.fromkeys([*held_syms, *owner_syms, *live_syms, *daily_syms]))
 
     async def _brief_quotes(self, symbols: Sequence[str]):
         """Pre-open analysis-only 20m quote fallback; never updates _quote_at or regular-hours price."""
@@ -611,13 +670,38 @@ class ResearchSources:
         return getattr(batch, "quotes", None) or {}
 
     async def _recent_filings_evidence(
-        self, symbols: Sequence[str], now: datetime
+        self,
+        symbols: Sequence[str],
+        now: datetime,
+        *,
+        scheduled: bool = True,
+        archive_deadline_mono: float | None = None,
     ) -> dict[str, tuple[Evidence, ...]]:
         fetch_recent = getattr(self.news_service, "fetch_recent_filings", None)
         if not symbols or not callable(fetch_recent):
             return {}
+        cfg = getattr(self.news_service, "config", None)
+        deadline_s = (
+            float(
+                getattr(
+                    cfg,
+                    "SEC_ARCHIVE_SCHEDULED_DEADLINE_S",
+                    DEFAULT_SEC_SCHEDULED_DEADLINE_S,
+                )
+            )
+            if scheduled
+            else float(getattr(cfg, "SEC_LIVE_DEADLINE_S", DEFAULT_SEC_LIVE_DEADLINE_S))
+        )
         try:
-            batches = await fetch_recent(tuple(symbols), now=now)
+            try:
+                batches = await fetch_recent(
+                    tuple(symbols),
+                    now=now,
+                    deadline_s=deadline_s,
+                    archive_deadline_mono=archive_deadline_mono,
+                )
+            except TypeError:
+                batches = await fetch_recent(tuple(symbols), now=now)
         except Exception:
             return {}
         out: dict[str, tuple[Evidence, ...]] = {}
@@ -665,13 +749,32 @@ class ResearchSources:
             return snapshot
 
         is_preopen = bool(preopen or prescan)
+        is_scheduled = bool(is_preopen or len(symbols) > 4)
+        shared_deadline: float | None = None
+        if is_scheduled:
+            cfg = getattr(self.news_service, "config", None)
+            sched_budget = float(
+                getattr(
+                    cfg,
+                    "SEC_ARCHIVE_SCHEDULED_DEADLINE_S",
+                    DEFAULT_SEC_SCHEDULED_DEADLINE_S,
+                )
+            )
+            start_mono = time.monotonic()
+            shared_deadline = start_mono + max(0.1, sched_budget)
+            self._scheduled_archive_window = (utc_datetime(now), start_mono, shared_deadline)
         ordered_priority = self._ordered_priority_symbols(now, include_daily=bool(prescan))
         requested_set = set(symbols)
         filing_targets = tuple(sym for sym in ordered_priority if sym in requested_set)
         fundamentals, quotes, recent_filings = await asyncio.gather(
             asyncio.gather(*(company(symbol) for symbol in symbols)),
             self._quotes(symbols, purpose="order_sizing"),
-            self._recent_filings_evidence(filing_targets, now),
+            self._recent_filings_evidence(
+                filing_targets,
+                now,
+                scheduled=is_scheduled,
+                archive_deadline_mono=shared_deadline,
+            ),
         )
         missing_priority_quotes = (
             [symbol for symbol in filing_targets if quotes.get(symbol) is None]
@@ -703,6 +806,9 @@ class ResearchSources:
             ev_fn = getattr(self.tipranks, "evidence_for", None)
             tr_evidence = tuple(ev_fn(symbol, now)) if ev_fn is not None else ()
             filing_evidence = recent_filings.get(symbol, ())
+            primary_filings = tuple(
+                e for e in filing_evidence if _edgar_filing(e.url) and not _edgar_index_only(e.url)
+            )
             snap_evidence = tuple(e for e in getattr(snapshot, "evidence", ()) if isinstance(e, Evidence))
             out[symbol] = SecurityInputs(
                 symbol,
@@ -712,7 +818,7 @@ class ResearchSources:
                 utc_datetime(quote.as_of) if quote else None,
                 tradable,
                 metrics,
-                (*tr_evidence, *snap_evidence)[:12],
+                (*primary_filings, *tr_evidence, *snap_evidence)[:12],
                 _provenance(raw_metrics),
                 priority_evidence=filing_evidence,
                 analysis_price=_price(bquote.price) if bquote else None,
@@ -795,8 +901,19 @@ def _news_evidence(item) -> Evidence | None:
         return None
     if url.startswith("https://news.alpaca.invalid/"):
         return None  # The feed returned no article URL; do not present its placeholder as a citation.
+    precision = "instant"
+    if (
+        getattr(item, "kind", None) == "sec_filing"
+        and getattr(item, "has_acceptance_time", True) is False
+        and getattr(item, "filing_date", None)
+    ):
+        try:
+            published = datetime.fromisoformat(f"{item.filing_date}T00:00:00+00:00")
+            precision = "day"
+        except ValueError:
+            pass
     return Evidence(
         evidence_id=item.story_id, title=str(item.headline or "")[:250], url=url,
         publisher=str(item.publisher or "")[:100], published_at=published, retrieved_at=retrieved,
-        snippet=str(item.snippet or "")[:700],
+        snippet=str(item.snippet or "")[:700], date_precision=precision,
     )

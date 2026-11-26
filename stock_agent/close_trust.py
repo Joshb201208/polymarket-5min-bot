@@ -64,7 +64,10 @@ STANDARD_MULTIPLIER = 100
 KNOWN_QUALITIES = frozenset({"live", "indicative"})
 # Detail keys persisted in equity_marks.extra_json for a conservative close (restored on replay).
 PERSISTED_KEYS = ("close_basis", "conservative", "summary", "broker_equity", "haircut", "close_equity",
-                  "unpriced_option_legs", "legs")
+                  "unpriced_option_legs", "legs", "estimated_option_value")
+# Display-only estimate for an unpriced/crossed leg: intrinsic value from the underlying's price.
+# It never changes the haircut, the close equity, or anything an entry decision reads.
+ESTIMATE_BASIS = "intrinsic_from_underlying"
 
 
 def persisted_detail(extra: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -100,7 +103,13 @@ class CloseTrust:
         return (f"conservative estimate: {len(self.unpriced_option_legs)} option legs unpriced, "
                 f"haircut ${self.haircut:,.2f}")
 
+    @property
+    def estimated_option_value(self) -> Decimal | None:
+        """Sum of the intrinsic estimates of the invalid legs, or None if any leg has none."""
+        return _estimate_total(self.legs)
+
     def detail(self) -> dict[str, Any]:
+        est = self.estimated_option_value
         out: dict[str, Any] = {
             "close_basis": self.basis,
             "conservative": self.conservative,
@@ -110,6 +119,8 @@ class CloseTrust:
             "haircut": str(self.haircut),
             "legs": [dict(item) for item in self.legs],
         }
+        if self.conservative:
+            out["estimated_option_value"] = str(est) if est is not None else None
         if self.equity is not None:
             out["close_equity"] = str(self.equity)
         if self.reason is not None:
@@ -215,6 +226,40 @@ def _leg_row(leg, group: str, haircut: Decimal, **extra) -> dict[str, Any]:
     return row
 
 
+def _estimate_total(rows) -> Decimal | None:
+    vals = [row.get("estimate_value") for row in rows if row.get("status") != "valid"]
+    if not vals or any(v is None for v in vals):
+        return None
+    return sum((_d(v) for v in vals), ZERO)
+
+
+def _with_estimates(rows: list[dict[str, Any]], snapshot, closes: Mapping[str, Decimal]) -> tuple:
+    """Add a flagged intrinsic estimate to every invalid leg row (display only)."""
+    by_symbol = {leg.occ_symbol: leg for leg in snapshot.legs}
+    out = []
+    for row in rows:
+        leg = by_symbol.get(row.get("symbol"))
+        if leg is not None and row.get("status") != "valid":
+            est = leg_estimate(snapshot, leg, closes)
+            if row.get("estimate_value") is None or est["estimate_value"] is not None:
+                row = {**row, **est}  # never overwrite a known estimate with None
+        out.append(row)
+    return tuple(out)
+
+
+def leg_estimate(snapshot, leg, closes: Mapping[str, Decimal]) -> dict[str, Any]:
+    """Intrinsic value of one leg (signed by position: a short is a liability), flagged as an
+    estimate. Only prices already in hand (held stock mark, mandatory session closes): no I/O.
+    Without a valid underlying price, or for a non-standard contract, no estimate."""
+    price, source = underlying_price_source(snapshot, leg.underlying, closes)
+    if price is None or not _standard_root(leg.underlying):
+        why = "no_underlying_price" if price is None else "non_standard_contract"
+        return {"estimate_value": None, "estimate_basis": why, "estimated": False}
+    intrinsic = _intrinsic(leg.right, _d(leg.strike), price) * STANDARD_MULTIPLIER * _d(leg.qty)
+    return {"estimate_value": str(intrinsic), "estimate_basis": ESTIMATE_BASIS, "estimated": True,
+            "estimate_underlying_price": str(price), "estimate_underlying_source": source}
+
+
 def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = None) -> CloseTrust:
     """Decide whether this snapshot's equity may be recorded as the trusted close.
 
@@ -227,7 +272,7 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
 
     def untrusted(reason: str, symbols=(), rows=(), haircut=ZERO) -> CloseTrust:
         return CloseTrust(False, reason, broker, haircut=haircut, symbols=tuple(sorted(set(symbols))),
-                          unpriced_option_legs=invalid, legs=tuple(rows))
+                          unpriced_option_legs=invalid, legs=_with_estimates(list(rows), snapshot, closes))
 
     if snapshot.quality not in KNOWN_QUALITIES:
         return untrusted(CLOSE_SNAPSHOT_QUALITY_UNKNOWN)
@@ -307,7 +352,7 @@ def assess_close(snapshot, underlying_closes: Mapping[str, Decimal] | None = Non
     if equity <= 0:
         return untrusted(CLOSE_HAIRCUT_NONPOSITIVE, (), rows, haircut)
     return CloseTrust(True, None, broker, equity=equity, haircut=haircut,
-                      unpriced_option_legs=invalid, legs=tuple(rows))
+                      unpriced_option_legs=invalid, legs=_with_estimates(rows, snapshot, closes))
 
 
 def short_leg_underlyings(snapshot) -> tuple[str, ...]:

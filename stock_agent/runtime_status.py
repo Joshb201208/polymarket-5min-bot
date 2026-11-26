@@ -7,8 +7,10 @@ import logging
 import os
 import socket
 import subprocess
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from stock_agent.market_calendar import MarketState, MarketStatus
 
@@ -41,15 +43,33 @@ def release_sha(root: Path = ROOT) -> str:
 
 
 class RuntimeStatus:
-    def __init__(self, path: Path = ROOT / "data/runtime-health.json", *, sha: str | None = None):
+    def __init__(
+        self,
+        path: Path = ROOT / "data/runtime-health.json",
+        *,
+        sha: str | None = None,
+        trial_metrics_provider: Callable[[], Mapping[str, Any] | None] | None = None,
+    ):
         self.path = path
         self.sha = release_sha() if sha is None else sha
+        self.trial_metrics_provider = trial_metrics_provider
 
     @classmethod
     def for_data_dir(cls, data_dir: Path) -> RuntimeStatus:
         # Cron and the systemd service agree on this path without moving the ledger.
         path = os.environ.get("STOCK_AGENT_RUNTIME_STATUS")
         return cls(Path(path) if path else data_dir / "runtime-health.json")
+
+    def _collect_trial_metrics(self) -> dict[str, Any] | None:
+        provider = self.trial_metrics_provider
+        if provider is None:
+            return None
+        try:
+            payload = provider()
+        except Exception:
+            LOGGER.debug("Runtime trial metrics provider failed", exc_info=True)
+            return None
+        return dict(payload) if isinstance(payload, Mapping) else None
 
     def deployment_event(self) -> dict | None:
         try:
@@ -82,6 +102,9 @@ class RuntimeStatus:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with tmp.open("w") as file:
+                trial_metrics = self._collect_trial_metrics()
+                if trial_metrics is not None:
+                    record["trial_metrics"] = trial_metrics
                 json.dump(record, file)
             tmp.replace(self.path)
         except OSError:

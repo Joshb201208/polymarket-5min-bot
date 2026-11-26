@@ -15,6 +15,7 @@ from typing import Callable
 import httpx
 
 from stock_agent.config import Config
+from stock_agent.http_safety import configure_safe_http_logging, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class HeartbeatClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            configure_safe_http_logging()
             self._client = httpx.AsyncClient(timeout=5.0)
         return self._client
 
@@ -110,7 +112,8 @@ class HeartbeatClient:
             logger.warning("Heartbeat ping returned HTTP %s", resp.status_code)
             return False
         except Exception as e:
-            logger.warning("Heartbeat ping failed (%s): %s", type(e).__name__, e)
+            safe_err = scrub_secrets(str(e)).replace(url, "[REDACTED_HEARTBEAT_URL]")
+            logger.warning("Heartbeat ping failed (%s): %s", type(e).__name__, safe_err)
             return False
 
     async def send_fail(self, reason: str = "") -> bool:
@@ -126,7 +129,12 @@ class HeartbeatClient:
             resp = await client.post(fail_url, content=body.encode("utf-8"))
             return 200 <= resp.status_code < 300
         except Exception as e:
-            logger.warning("Heartbeat fail-ping failed (%s): %s", type(e).__name__, e)
+            safe_err = (
+                scrub_secrets(str(e))
+                .replace(fail_url, "[REDACTED_HEARTBEAT_URL]/fail")
+                .replace(url, "[REDACTED_HEARTBEAT_URL]")
+            )
+            logger.warning("Heartbeat fail-ping failed (%s): %s", type(e).__name__, safe_err)
             return False
 
 

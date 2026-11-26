@@ -48,6 +48,7 @@ from stock_agent.performance import (
     twr,
 )
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
+from stock_agent.trial_metrics import collect_trial_metrics, format_trial_metrics_field
 
 logger = logging.getLogger(__name__)
 
@@ -1162,6 +1163,13 @@ class ReportBuilder:
                 empty_fields.append({"name": "Entry Lock Status", "value": "\n".join(locks_empty["lines"]), "inline": False})
             empty_fields.append(
                 {
+                    "name": "Trial & Data-Quality Metrics",
+                    "value": self._format_trial_metrics(session_date, None, now_et),
+                    "inline": False,
+                }
+            )
+            empty_fields.append(
+                {
                     "name": "Entry Funnel",
                     "value": self._format_entry_funnel_text(funnel_empty, locked=bool(locks_empty)),
                     "inline": False,
@@ -1375,6 +1383,13 @@ class ReportBuilder:
                 "inline": False,
             }
         )
+        summary_fields.append(
+            {
+                "name": "Trial & Data-Quality Metrics",
+                "value": self._format_trial_metrics(session_date, snap, now_et),
+                "inline": False,
+            }
+        )
 
         return [
             {
@@ -1384,6 +1399,30 @@ class ReportBuilder:
                 "fields": summary_fields,
             }
         ]
+
+    def _format_trial_metrics(
+        self,
+        session_date: date,
+        snap: BookSnapshot | None,
+        now_et: datetime,
+    ) -> str:
+        del session_date
+        try:
+            metrics = collect_trial_metrics(
+                store=getattr(self.ledger, "store", None),
+                ledger=self.ledger,
+                journal=getattr(self.ledger, "journal", None),
+                snapshot=snap,
+                options_store=self.options_store,
+                price_service=self.price_service,
+                config=self.config,
+                calendar=self.calendar,
+                as_of=now_et,
+            )
+            return format_trial_metrics_field(metrics)
+        except Exception as exc:
+            logger.warning("Trial metrics section degraded (%s)", type(exc).__name__)
+            return f"Trial metrics unavailable ({_safe_report_reason(exc, self.config)})"
 
     @staticmethod
     def _format_close_mark_quality(today_mark: EquityMark | None, snap: BookSnapshot | None) -> str:

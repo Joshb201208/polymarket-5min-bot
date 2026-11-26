@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
-from stock_agent.llm_client import LLMClient, LLMRequest, LLMResult, ModelRoute, OutputRuleError
+from stock_agent.llm_client import LLMClient, LLMRequest, LLMResult, ModelRoute, OutputRuleError, ProviderUnavailable
 from stock_agent.research_schemas import (
     BEST_IDEAS_DIRECTIONS,
     Direction,
@@ -187,7 +187,7 @@ class Analyst:
         self, data: ResearchInput, *, task: ResearchTask = ResearchTask.THESIS,
         adjustment: int = 0, adjustment_reason: str = "", grounded: bool = True,
         best_ideas: bool = False, owner: FocusItem | None = None, single_review: bool = False,
-        long_search: bool = False,
+        long_search: bool = False, primary: ModelRoute | None = None, deep_review: bool = False,
     ) -> ThesisEvaluation:
         _validate_inputs(data)
         held = data.holding is not None
@@ -202,6 +202,10 @@ class Analyst:
         inputs = data.payload()
         if owner:
             inputs["owner_directive"] = {"note": owner.note, "added": owner.added.isoformat(), "stance": owner.stance}
+        owner_evidence = tuple(dict.fromkeys(
+            item.evidence_id for item in _index_evidence(data, ()).values()
+            if item.snippet.strip() and item.published_at and _edgar_text(item.url)
+        )) if owner else ()
 
         def validate(draft: ThesisDraft, web: tuple[Evidence, ...]) -> None:
             if draft.symbol != data.symbol:
@@ -257,10 +261,18 @@ class Analyst:
             "Put missing-evidence statements in summary, risks, or thesis_break as applicable, "
             "subject to the decision rules above. Return an empty claims list when no claim can be cited."
         )
+        if owner:
+            prompt += ("\nKeep the summary under 300 characters. A veto requires a qualifying, dated claim "
+                       "already in claims; never invent a claim index or source to fill the field.")
+        if deep_review:
+            prompt += ("\nThis is a retrospective shadow review, not an action. Check issuer filings and recent "
+                       "results, challenged assumptions, valuation sensitivity and measurable invalidation. "
+                       "Treat the supplied quote as a historical reference, not today's market price.")
         request = LLMRequest(
             task, value_type, version, prompt, inputs, grounded,
             validate=validate, exit_work=held, single_review=owner is not None or single_review,
             local_decision_validation=owner is not None, long_search=long_search, best_ideas=best_ideas,
+            owner_evidence=owner_evidence, primary=primary, deep_review=deep_review,
         )
         result = await self.llm.complete(request)
         known = _index_evidence(data, result.evidence)
@@ -290,6 +302,22 @@ class Analyst:
             inputs_as_of=data.as_of, evidence=list({item.evidence_id: item for item in known.values()}.values()),
             input_hash=result.input_hash, normalization_notes=dict(result.normalization_notes),
         ), result, inputs, getattr(result.value, "stop_price", None) if owner else None)
+
+    async def shadow_review(self, data: ResearchInput, primary: ModelRoute, *, deep: bool) -> ThesisEvaluation:
+        routes = ([ModelRoute("openai", "gpt-6.2-sol")] if deep else
+                  [route for route in self.llm._routes(primary) if self.llm._available(route, self.llm.now())])
+        if not routes:
+            raise ProviderUnavailable(())
+        client = self.llm.shadow_client(routes[0])
+        try:
+            return await Analyst(client).evaluate(
+                replace(data, entry_thesis=None, current_thesis=None),
+                task=ResearchTask.REVIEW if data.holding else ResearchTask.THESIS,
+                grounded=deep, best_ideas=not data.holding, primary=None if deep else primary,
+                deep_review=deep,
+            )
+        finally:
+            await client.close()
 
     async def confirm_exit(self, data: ResearchInput, primary: ModelRoute) -> ConfirmedReview:
         _validate_inputs(data)
@@ -337,6 +365,13 @@ def _source_key(key: str) -> str:
         return key
     parts = urlsplit(key)
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), parts.query, ""))
+
+
+def _edgar_text(url: str) -> bool:
+    parts = urlsplit(url)
+    path = parts.path.lower()
+    return (parts.scheme == "https" and parts.hostname in {"www.sec.gov", "sec.gov"}
+            and path.startswith("/archives/edgar/data/") and not path.endswith(("-index.htm", "-index.html")))
 
 
 def _index_evidence(data: ResearchInput, web: tuple[Evidence, ...]) -> dict[str, Evidence]:
