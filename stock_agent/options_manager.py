@@ -26,6 +26,7 @@ import hashlib
 import inspect
 import logging
 import math
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -228,6 +229,8 @@ class OptionsManager:
         self._config = config
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = asyncio.Lock()
+        self._stale_refreshed: dict[str, datetime] = {}  # symbol -> last stale-input refresh
+        self._scan_refresh_left = 0.0  # seconds of stale-input refresh left in this scan
         self.structures: list[Structure] = []
         self.cooldowns: dict[str, Cooldown] = {}
         self.meta: dict[str, Any] = {}
@@ -512,6 +515,7 @@ class OptionsManager:
             else:
                 cands = list(candidates)
             out = []
+            self._scan_refresh_left = self._STALE_REFRESH_BUDGET_S
             for c in cands:
                 err: BrokerError | None = None
                 try:
@@ -699,14 +703,44 @@ class OptionsManager:
         except Exception:
             return False
 
-    async def _owner_refresh(self, sym: str) -> None:
+    _REFRESHABLE = frozenset({"quote_stale_or_unavailable", "news_stale_or_unavailable"})
+    # The stale-input refresh runs under the scan lock that exit monitoring also takes: bound it
+    # by one aggregate time budget per scan (not per candidate) and once per symbol per news
+    # TTL across scans (success or failure), so a slow poll cannot stall exit monitoring.
+    _STALE_REFRESH_BUDGET_S = 3.0
+    _STALE_REFRESH_COOLDOWN = timedelta(minutes=20)
+
+    def _may_stale_refresh(self, sym: str, now: datetime) -> bool:
+        if self._research_refresh is None or self._scan_refresh_left <= 0.05:
+            return False
+        last = self._stale_refreshed.get(sym)
+        if last is not None and timedelta() <= now - last < self._STALE_REFRESH_COOLDOWN:
+            return False
+        self._stale_refreshed[sym] = now
+        return True
+
+    async def _stale_refresh(self, sym: str) -> None:
+        started = time.monotonic()
+        try:
+            await self._owner_refresh(sym, self._scan_refresh_left)
+        finally:
+            self._scan_refresh_left -= time.monotonic() - started
+
+    @classmethod
+    def _only_stale_inputs(cls, reasons: Iterable[str]) -> bool:
+        """True when the gate refused only for stale inputs a real refresh can fix; a missing
+        or unverified thesis (or anything else) is never worth a poll."""
+        got = set(reasons or ())
+        return bool(got) and got <= cls._REFRESHABLE
+
+    async def _owner_refresh(self, sym: str, timeout_s: float = 10.0) -> None:
         """Refresh the research gate's quote/news inputs before an owner re-verify, so a ladder
         that outlives the quote TTL is judged on a fresh quote, never on a relaxed gate.
         Never raises; a failed refresh only means the gate sees the old input and refuses."""
         if self._research_refresh is None:
             return
         try:
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(timeout_s):
                 await _maybe(self._research_refresh(sym, self._now()))
         except (Exception, TimeoutError) as e:
             logger.warning("owner research refresh for %s failed: %s", sym, type(e).__name__)
@@ -778,6 +812,13 @@ class OptionsManager:
                 return ScanOutcome(sym, None, problem, final=False)
         else:
             el = await _maybe(self.gate.is_entry_eligible(sym, now))
+            if not el.ok and self._only_stale_inputs(el.reasons) and self._may_stale_refresh(sym, now):
+                # Option underlyings outside the live news poll (baseline names a TipRanks slice
+                # displaced from the research universe) carry no news stamp. Poll them for real,
+                # once, then ask the gate again; a failed poll leaves the gate refusing.
+                await self._stale_refresh(sym)
+                now = max(now, self._now())
+                el = await _maybe(self.gate.is_entry_eligible(sym, now))
             if not el.ok:
                 return ScanOutcome(sym, None, "research gate: " + ",".join(el.reasons), final=False)
         direction = Direction.BULLISH if owner else parse_direction(el.direction)

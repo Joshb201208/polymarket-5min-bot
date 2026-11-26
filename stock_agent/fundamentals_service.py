@@ -56,6 +56,7 @@ ET = ZoneInfo("America/New_York")
 FINNHUB = "https://finnhub.io/api/v1"
 SEC_CONCEPT = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{tag}.json"
 FMP_PROFILE = "https://financialmodelingprep.com/stable/profile"
+FMP_ESTIMATES = "https://financialmodelingprep.com/stable/analyst-estimates"
 _SYMBOL = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z])?$")
 _HOURS = {"bmo": time(8, 0), "dmh": time(12, 0), "amc": time(16, 5)}
 _TINY_ESTIMATE = 0.05
@@ -273,8 +274,10 @@ class FundamentalsService:
         focus_symbols: Iterable[str] | Callable[[], Iterable[str]] | None = None,
         now: Callable[[], datetime] | None = None,
         universe_size: int = 150, release_lookback_days: int = 3, finnhub_per_minute: int = 45,
+        fmp_plan=None,
     ):
         self.http, self.health, self.assets, self.prices, self.config = http, health, assets, prices, config
+        self.fmp_plan = fmp_plan
         self._focus = focus_symbols
         self.now = now or (lambda: datetime.now(UTC))
         self.universe_size = universe_size
@@ -336,6 +339,11 @@ class FundamentalsService:
             self._report(provider, capability, True)
             return {}      # concept not filed by this company: a healthy empty answer
         if code >= 400:
+            if code in {401, 402, 403} and provider == "fmp" and self.fmp_plan is not None:
+                if capability == "estimates":
+                    self.fmp_plan.record_endpoint_refused("quarterly_estimates")
+                elif symbol:
+                    self.fmp_plan.record_quote_symbol_refused(symbol)
             self._report(provider, capability, False, f"HTTP {code}", status_code=code, symbol=symbol)
             return None
         try:
@@ -498,9 +506,74 @@ class FundamentalsService:
     async def _fmp_profile(self, symbol: str) -> dict:
         if not self.config.FMP_API_KEY or self._blocked("fmp", "fundamentals", symbol):
             return {}
+        if self.fmp_plan is not None and not self.fmp_plan.can_quote_symbol(symbol):
+            return {}
         data = await self._json("fmp", "fundamentals", FMP_PROFILE,
                                 params={"symbol": symbol.replace(".", "-")}, symbol=symbol)
         return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+
+    async def _fmp_quarterly_estimates(self, symbol: str, now: datetime) -> tuple[dict[str, MetricProvenance], Evidence | None]:
+        if (
+            not self.config.FMP_API_KEY
+            or self.fmp_plan is None
+            or not self.fmp_plan.quarterly_estimates_enabled()
+            or self._blocked("fmp", "estimates", symbol)
+        ):
+            return {}, None
+        data = await self._json(
+            "fmp",
+            "estimates",
+            FMP_ESTIMATES,
+            params={"symbol": symbol.replace(".", "-"), "period": "quarter", "limit": 4},
+            symbol=symbol,
+        )
+        if not isinstance(data, list) or not data:
+            return {}, None
+        dated_rows = [
+            (d, row)
+            for row in data
+            if isinstance(row, dict) and (d := _date(row.get("date"))) is not None
+        ]
+        if not dated_rows:
+            return {}, None
+        dated_rows.sort(key=lambda pair: pair[0])
+        upcoming = [pair for pair in dated_rows if pair[0] >= now.date() - timedelta(days=45)]
+        q_date, target = upcoming[0] if upcoming else dated_rows[-1]
+
+        eps_avg = _finite(target.get("epsAvg") if target.get("epsAvg") is not None else target.get("estimatedEpsAvg"))
+        rev_avg = _finite(
+            target.get("revenueAvg") if target.get("revenueAvg") is not None else target.get("estimatedRevenueAvg")
+        )
+        n_eps = _finite(
+            target.get("numAnalystsEps")
+            if target.get("numAnalystsEps") is not None
+            else target.get("numberAnalystsEstimatedEps")
+        )
+        out: dict[str, MetricProvenance] = {}
+        public_url = f"https://site.financialmodelingprep.com/developer/docs/stable/financial-estimates?symbol={symbol}"
+        period_label = f"Q:{q_date.isoformat()}"
+        parts: list[str] = [f"period={q_date.isoformat()}"]
+        if eps_avg is not None:
+            out["eps_estimate_next_q"] = MetricProvenance(eps_avg, "USD", period_label, now, "fmp", public_url)
+            parts.append(f"consensus_eps={eps_avg:.4g}")
+        if rev_avg is not None and rev_avg > 0:
+            out["revenue_estimate_next_q_usd"] = MetricProvenance(rev_avg, "USD", period_label, now, "fmp", public_url)
+            parts.append(f"consensus_revenue_usd={rev_avg:.4g}")
+        if n_eps is not None and n_eps >= 0:
+            out["analyst_count_eps_next_q"] = MetricProvenance(n_eps, "count", period_label, now, "fmp", public_url)
+            parts.append(f"analysts={int(n_eps)}")
+        if not out:
+            return {}, None
+        ev = Evidence(
+            evidence_id=f"fmp:estimates:{symbol}:{q_date.isoformat()}",
+            url=public_url,
+            title=f"{symbol} quarterly consensus analyst estimates ({q_date.isoformat()})",
+            published_at=None,
+            retrieved_at=now,
+            publisher="Financial Modeling Prep",
+            snippet="; ".join(parts),
+        )
+        return out, ev
 
     async def _finnhub_profile(self, symbol: str) -> dict:
         if not self.config.FINNHUB_API_KEY:
@@ -551,7 +624,13 @@ class FundamentalsService:
         symbol = _norm(symbol)
         now = self.now()
         cached = self._companies.get(symbol)
-        if cached and cached.fetched_at and now - cached.fetched_at < _COMPANY_TTL:
+        est_active = bool(self.fmp_plan is not None and self.fmp_plan.quarterly_estimates_enabled())
+        if (
+            cached
+            and cached.fetched_at
+            and now - cached.fetched_at < _COMPANY_TTL
+            and (not est_active or "eps_estimate_next_q" in cached.metrics)
+        ):
             return cached
         meta = self._meta(symbol)
         cik = getattr(meta, "cik", None)
@@ -559,12 +638,16 @@ class FundamentalsService:
             from stock_agent.news_service import DEFAULT_CIK_MAP
 
             cik = DEFAULT_CIK_MAP.get(symbol)
-        (fin, fin_ev), (sec, sec_ev), profile, fmp = await asyncio.gather(
-            self._finnhub_metrics(symbol, now), self._sec_dollars(symbol, cik, now),
-            self._finnhub_profile(symbol), self._fmp_profile(symbol))
+        (fin, fin_ev), (sec, sec_ev), profile, fmp, (est, est_ev) = await asyncio.gather(
+            self._finnhub_metrics(symbol, now),
+            self._sec_dollars(symbol, cik, now),
+            self._finnhub_profile(symbol),
+            self._fmp_profile(symbol),
+            self._fmp_quarterly_estimates(symbol, now),
+        )
         if not fin and not sec:
             raise SourceUnavailable(f"no fundamentals source answered for {symbol}")
-        metrics = {**fin, **sec}
+        metrics = {**fin, **sec, **est}
         if fmp:
             url = f"https://site.financialmodelingprep.com/developer/docs/stable/profile-symbol?symbol={symbol}"
             for key, raw, unit in (("market_cap_usd", "marketCap", "USD"), ("beta", "beta", "x")):
@@ -591,7 +674,7 @@ class FundamentalsService:
         snap = CompanySnapshot(
             symbol=symbol, company_name=name, canonical_sector=str(getattr(sector, "value", sector)),
             tradable=(bool(meta.tradable and not meta.renamed_to) if meta is not None else None),
-            metrics=metrics, evidence=tuple(e for e in (fin_ev, sec_ev) if e is not None), fetched_at=now)
+            metrics=metrics, evidence=tuple(e for e in (fin_ev, sec_ev, est_ev) if e is not None), fetched_at=now)
         self._companies[symbol] = snap
         return snap
 

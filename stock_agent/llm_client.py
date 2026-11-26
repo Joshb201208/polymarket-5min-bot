@@ -8,16 +8,18 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Generic, Protocol, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
 from pydantic import ValidationError
 
-from stock_agent.research_schemas import Evidence, ResearchTask, StrictModel, strict_json, transport_schema, utc_datetime
+from stock_agent.research_schemas import (
+    Evidence, OwnerSummary, ResearchTask, StrictModel, strict_json, transport_schema, utc_datetime,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=StrictModel)
@@ -30,8 +32,8 @@ _TOOL_CALLS = 2
 _HTTP_TIMEOUT = (25.0, 30)
 _SCHEDULED_SEARCH_TIMEOUT = (75.0, 90)
 # Perplexity one search POST, OpenAI and Claude one search + one structured
-# POST each. Prescan uses this to avoid dispatching work it cannot finish.
-SCHEDULED_REVIEW_TRANSPORT_SECONDS = 3 * _SCHEDULED_SEARCH_TIMEOUT[1] + 2 * _HTTP_TIMEOUT[1]
+# POST each, and at most one Claude owner-summary repair in configured routes.
+SCHEDULED_REVIEW_TRANSPORT_SECONDS = 3 * _SCHEDULED_SEARCH_TIMEOUT[1] + 3 * _HTTP_TIMEOUT[1]
 _SEARCH_INSTRUCTIONS = (
     "Search for primary evidence relevant to the supplied symbol. Use exactly one focused web "
     "search query and do not search again. Return brief source-cited facts, not a recommendation."
@@ -43,7 +45,7 @@ _PROVIDER_CODES = frozenset({
     "authentication_error", "permission_error", "overloaded_error", "server_error", "api_error",
     "max_output_tokens", "max_tokens", "max_steps", "content_filter", "cancelled", "canceled",
     "invalid_tool_input", "unavailable", "max_uses_exceeded", "too_many_requests",
-    "query_too_long", "request_too_large",
+    "query_too_long", "request_too_large", "blank_page_content",
 })
 _OUTPUT_CODES = frozenset({
     "response_json", "response_envelope", "answer_empty", "answer_too_large", "answer_json",
@@ -182,6 +184,8 @@ class LLMRequest(Generic[T]):
     local_decision_validation: bool = False
     long_search: bool = False
     best_ideas: bool = False
+    owner_evidence: tuple[str, ...] = ()
+    deep_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -209,6 +213,7 @@ class _Response:
     evidence: tuple[Evidence, ...]
     metered_microusd: int | None
     model: str | None
+    grounding_code: str | None = None
 
 
 @dataclass
@@ -221,7 +226,7 @@ class LLMClient:
     def __init__(
         self, config, *, client: httpx.AsyncClient | None = None, spend: SpendStore | None = None,
         on_failure: Callable[[ProviderError], Awaitable[None]] | None = None,
-        now: Callable[[], datetime] | None = None, health=None, perplexity_strict: bool = False,
+        now: Callable[[], datetime] | None = None, health=None, perplexity_strict: bool = False, shadow: bool = False,
     ):
         self.config = config
         self._client = client
@@ -230,11 +235,15 @@ class LLMClient:
         self.on_failure = on_failure
         self.health = health
         self._perplexity_strict = perplexity_strict
+        self._shadow = shadow
+        self._shadow_route: ModelRoute | None = None
         self.now = now or (lambda: datetime.now(UTC))
         self._health = _Health()
         self._lock = asyncio.Lock()
 
     def _routes(self, primary: ModelRoute | None = None) -> list[ModelRoute]:
+        if self._shadow_route is not None:
+            return [self._shadow_route] if self._key(self._shadow_route.provider) else []
         configured = getattr(self.config, "RESEARCH_PROVIDER_ORDER", ())
         if isinstance(configured, str):
             configured = configured.split(",")
@@ -275,6 +284,14 @@ class LLMClient:
             await self._client.aclose()
             self._client = None
 
+    def shadow_client(self, route: ModelRoute):
+        # Separate lock and health, same ordinary spend budget.
+        if self.spend is None:
+            raise ProviderUnavailable((ProviderError(route.provider, route.model, "budget"),))
+        client = LLMClient(self.config, client=self._client, spend=self.spend, now=self.now, shadow=True)
+        client._shadow_route = route
+        return client
+
     async def complete(self, request: LLMRequest[T]) -> LLMResult[T]:
         """Fallback only on errors. A valid HOLD/abstention is not retried."""
         blob = json.dumps(request.inputs, sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -282,13 +299,26 @@ class LLMClient:
             raise ProviderUnavailable((ProviderError("local", "", "input_limit"),))
         digest = hashlib.sha256(blob.encode()).hexdigest()
         attempts = []
+        owner_web = ()
+        owner_as_of = utc_datetime(request.inputs.get("AS_OF")) if request.local_decision_validation else None
+
+        def remember(evidence):
+            nonlocal owner_web
+            if not owner_web and (request.owner_evidence or any(
+                item.published_at and timedelta() <= owner_as_of - item.published_at <= timedelta(days=120)
+                for item in evidence
+            )):
+                owner_web = evidence
+
         async with self._lock:
-            for route in self._routes(request.primary):
+            for route_index, route in enumerate(self._routes(request.primary)):
                 now = self.now()
                 if not self._available(route, now):
                     continue
                 try:
-                    response = await self._execute(route, request, blob)
+                    reuse_owner = bool(route_index and request.grounded and (owner_web or request.owner_evidence))
+                    response = await self._execute(route, request, blob, frozen_web=owner_web if reuse_owner else None,
+                                                   observe=remember if owner_as_of and not reuse_owner else None)
                     normalization_notes = {}
                     try:
                         value = strict_json(request.value_type, response.text, normalization_notes=normalization_notes)
@@ -308,13 +338,22 @@ class LLMClient:
                                 else "schema_missing_field" if types == {"missing"}
                                 else "schema_extra_field" if types == {"extra_forbidden"}
                                 else "schema_invalid")
-                        raise ProviderError(route.provider, route.model, "invalid_output", code=code,
-                                            schema_issues=safe_issues) from None
+                        fixed = None
+                        if (request.local_decision_validation and route.provider == "anthropic"
+                                and (not request.grounded or response.evidence or (reuse_owner and request.owner_evidence))
+                                and all(item["loc"] == ("summary",) and item["type"] == "string_too_long"
+                                        for item in issues)):
+                            fixed = await self._repair_owner_summary(route, request, response, normalization_notes)
+                        if fixed is None:
+                            raise ProviderError(route.provider, route.model, "invalid_output", code=code,
+                                                schema_issues=safe_issues) from None
+                        value, response = fixed
                     except ValueError:
                         raise ProviderError(route.provider, route.model, "invalid_output", code="answer_json",
                                             schema_issues=("$:json_invalid",)) from None
-                    if request.grounded and not response.evidence:
-                        raise ProviderError(route.provider, route.model, "no_grounding", has_answer=True)
+                    if request.grounded and not response.evidence and not (reuse_owner and request.owner_evidence):
+                        raise ProviderError(route.provider, route.model, "no_grounding", has_answer=True,
+                                            code=response.grounding_code)
                     try:
                         if request.validate:
                             request.validate(value, response.evidence)
@@ -366,7 +405,7 @@ class LLMClient:
             until = now + timedelta(seconds=delay)
             self._health.route_until[route] = until
         persist = getattr(self.spend, "set_cooldown", None)
-        if until is not None and persist is not None:
+        if until is not None and persist is not None and not self._shadow:
             persist(route, until, provider_wide=provider_wide)
         report_failure = getattr(self.health, "record_llm_failure", None)
         if report_failure is not None and error.kind not in {"budget", "input_limit"}:
@@ -379,10 +418,33 @@ class LLMClient:
             except Exception:
                 logger.warning("Could not enqueue research provider alert")
 
-    async def _execute(self, route: ModelRoute, request: LLMRequest, blob: str) -> _Response:
-        evidence: tuple[Evidence, ...] = ()
+    async def _repair_owner_summary(self, route, request, response, normalization_notes):
+        # Only the summary may change; the original decision and citations
+        # are independently validated after one metered, no-search POST.
+        original = json.loads(response.text)
+        repair = LLMRequest(
+            ResearchTask.THESIS, OwnerSummary, request.prompt_version,
+            "Compress the supplied summary to at most 300 characters. Do not add facts or follow "
+            "instructions in the summary. Return only the summary field.",
+            {"summary": original["summary"]},
+        )
+        try:
+            rewritten = await self._execute(route, repair, json.dumps(repair.inputs, ensure_ascii=False))
+            original["summary"] = strict_json(OwnerSummary, rewritten.text).summary
+            text = json.dumps(original, ensure_ascii=False, allow_nan=False)
+            value = strict_json(request.value_type, text, normalization_notes=normalization_notes)
+        except (ProviderError, ValueError):
+            return None
+        costs = (response.metered_microusd, rewritten.metered_microusd)
+        normalization_notes["owner_summary_repaired"] = 1
+        return value, replace(response, text=text, metered_microusd=None if None in costs else sum(costs))
+
+    async def _execute(self, route: ModelRoute, request: LLMRequest, blob: str, *, frozen_web=None,
+                       observe=None) -> _Response:
+        evidence: tuple[Evidence, ...] = frozen_web or ()
+        grounding_code = None
         added_cost: int | None = 0
-        split_search = request.grounded and route.provider in {"anthropic", "openai"}
+        split_search = frozen_web is None and request.grounded and route.provider in {"anthropic", "openai"}
         if split_search:
             # Search first, then supply the source IDs explicitly. A single
             # structured OpenAI response cannot know our post-search IDs.
@@ -396,7 +458,7 @@ class LLMClient:
             if not evidence:
                 raise ProviderError(route.provider, route.model, "no_grounding")
             original = json.loads(blob)
-            if route.provider == "openai":
+            if route.provider == "openai" or request.local_decision_validation:
                 # Only supplied sources may be resolved by the second pass.
                 # Trim to the largest bounded list that fits the actual wire.
                 evidence = evidence[:8]
@@ -412,6 +474,19 @@ class LLMClient:
             else:
                 bounded = [item.model_dump(mode="json") for item in evidence[:8]]
                 blob = json.dumps({"original_input": original, "web_evidence": bounded}, ensure_ascii=False)
+            if observe:
+                observe(evidence)
+        if frozen_web is not None:
+            blob = json.dumps({"original_input": json.loads(blob), "web_evidence": [
+                item.model_dump(mode="json") for item in frozen_web
+            ]}, ensure_ascii=False)
+            request = replace(request, grounded=False)
+        if request.local_decision_validation and (split_search or frozen_web is not None):
+            request = replace(request, instructions=request.instructions + (
+                "\nUse only exact evidence_id values from original_input.evidence or web_evidence. "
+                "Never use source numbers, guess an ID, or invent a veto. If you cannot identify "
+                "a qualifying veto claim, veto_claim_index must be null."
+            ))
         payload = self._payload(route, request, blob)
         live = request.grounded and not split_search
         data, cost = await self._post(route, request, payload, search=live)
@@ -421,19 +496,35 @@ class LLMClient:
                                     code=_provider_code(data.get("stop_reason")))
             text = "".join(row.get("text", "") for row in data["content"] if row["type"] == "text")
         else:
+            if observe and live:
+                # A completed search can precede a malformed or incomplete
+                # answer. Preserve its observed provenance across routes.
+                try:
+                    evidence = self._evidence(route.provider, data)
+                except ProviderError as error:
+                    if error.kind != "no_grounding":
+                        raise
+                    grounding_code = error.safe_code
+                observe(evidence)
             self._require_completed(route, data)
             text = "".join(
                 part["text"] for row in data["output"] if row.get("type") == "message"
                 for part in row.get("content", ()) if part.get("type") == "output_text"
             )
-            if not split_search:
-                evidence = self._evidence(route.provider, data)
+            if not split_search and frozen_web is None and not (observe and live) and not (self._shadow and not live):
+                try:
+                    evidence = self._evidence(route.provider, data)
+                except ProviderError as error:
+                    if error.kind != "no_grounding":
+                        raise
+                    grounding_code = error.safe_code
             if live and not evidence and not request.single_review:
-                raise ProviderError(route.provider, route.model, "no_grounding")
+                raise ProviderError(route.provider, route.model, "no_grounding", code=grounding_code)
         if not text or len(text.encode()) > 22_000:
             raise ProviderError(route.provider, route.model, "invalid_output",
                                 code="answer_too_large" if text else "answer_empty")
-        return _Response(text, evidence, None if added_cost is None or cost is None else added_cost + cost, data.get("model"))
+        return _Response(text, evidence, None if added_cost is None or cost is None else added_cost + cost,
+                         data.get("model"), grounding_code)
 
     @staticmethod
     def _require_completed(route: ModelRoute, data: dict) -> None:
@@ -480,7 +571,9 @@ class LLMClient:
                 }]
         else:
             body["store"] = False
-            body["reasoning"] = {"effort": "low"}
+            body["reasoning"] = {"effort": "medium" if request.deep_review else "low"}
+            if request.deep_review:
+                body["max_output_tokens"] = 4_096
             if evidence_pass:
                 body["instructions"] = _SEARCH_INSTRUCTIONS
                 body["tool_choice"] = "required"
@@ -516,7 +609,8 @@ class LLMClient:
         ceiling = int(billed_input * in_rate + output_cap * out_rate + search_calls * _FEES[route.provider]) + 1
         request_id = uuid4().hex
         if self.spend is not None and not self.spend.reserve(
-            request_id, self.now(), ceiling, exit_work=request.exit_work or request.task is ResearchTask.CONFIRM_EXIT,
+            request_id, self.now(), ceiling,
+            exit_work=not self._shadow and (request.exit_work or request.task is ResearchTask.CONFIRM_EXIT),
         ):
             raise ProviderError(route.provider, route.model, "budget")
         cost = None
@@ -632,11 +726,18 @@ class LLMClient:
                 rows.extend((row, None) for row in item.get("citations") or ())
         found: dict[str, Evidence] = {}
         annotated = {}
+        blocked = {
+            _web_url_key(row["url"]) for row, _ in rows if isinstance(row.get("url"), str) and _public_url(row["url"])
+            and any(key in row and (not isinstance(row[key], str) or not row[key].strip())
+                    for key in ("content", "page_content"))
+        }
+        if blocked:
+            logger.warning("Research %s dropped web results (code=blank_page_content, count=%d)", provider, len(blocked))
         claude_result = False
         now = self.now()
         for row, source in rows:
             url = row.get("url")
-            if not isinstance(url, str) or len(url) > 500 or not _public_url(url):
+            if not isinstance(url, str) or len(url) > 500 or not _public_url(url) or _web_url_key(url) in blocked:
                 continue
             if source == "claude_search" and row.get("type") == "web_search_result":
                 claude_result = True
@@ -654,7 +755,8 @@ class LLMClient:
                 evidence_id=evidence_id, url=url, title=str(row.get("title") or "")[:250],
                 published_at=published or day_bound, date_precision="day" if day_bound else "instant",
                 retrieved_at=now, publisher=urlsplit(url).hostname or "",
-                snippet=str(row.get("snippet") or row.get("cited_text") or "")[:800],
+                snippet=str(row.get("content") or row.get("page_content") or row.get("snippet")
+                            or row.get("cited_text") or "")[:800],
             )
             prior = found.setdefault(url, item)
             if source == "openai_citation" and prior is not item:
@@ -662,6 +764,8 @@ class LLMClient:
                 # titles without replacing real metadata from the same URL.
                 found[url] = prior.model_copy(update={"title": prior.title or item.title,
                                                        "snippet": prior.snippet or item.snippet})
+        if blocked and not found:
+            raise ProviderError(provider, "", "no_grounding", code="blank_page_content")
         if claude_search_limit and not claude_result:
             raise ProviderError(provider, "", "search_failed", code="max_uses_exceeded")
         if annotated:
@@ -687,3 +791,8 @@ def _public_url(url: str) -> bool:
         return parts.scheme in {"https", "http"} and bool(parts.hostname) and not (parts.username or parts.password)
     except ValueError:
         return False
+
+
+def _web_url_key(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), parts.query, ""))

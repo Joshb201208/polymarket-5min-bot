@@ -10,6 +10,8 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from stock_agent.asset_registry import (
     AssetRegistry, _alpaca_headers, _chunks, _json_get, _notify, _now_utc, _symbol,
 )
@@ -17,6 +19,7 @@ from stock_agent.config import Config
 
 if TYPE_CHECKING:
     from stock_agent.asset_registry import HealthReport
+    from stock_agent.fmp_plan import FmpPlanDetector
     from stock_agent.state_store import StateStore
 
 QuotePurpose = Literal["order_sizing", "stop_check", "valuation", "brief"]
@@ -67,12 +70,15 @@ class PriceService:
         self, http=None, *, config=Config, store: StateStore | None = None,
         calendar=None, assets: AssetRegistry | None = None,
         report: HealthReport | None = None, now: Callable[[], datetime] | None = None,
+        fmp_plan: FmpPlanDetector | None = None,
     ):
         """Inject a shared async HTTP client; the service does not own it."""
         self.http, self.config, self.store = http, config, store
         self.calendar, self.assets, self.report, self.now = calendar, assets, report, now or _now_utc
+        self.fmp_plan = fmp_plan
         self._quotes: OrderedDict[str, Quote] = OrderedDict()
         self._calendar: tuple[date, date, date, dict[date, datetime]] | None = None
+        self._trial_quote_stats: dict[str, dict] = {}
 
     def last_quote(self, symbol: str) -> Quote | None:
         """Cache only. The caller must still check the provider timestamp."""
@@ -87,17 +93,22 @@ class PriceService:
             raise ValueError("unknown quote purpose or nonpositive freshness limit")
         effective, missing = self._requested(symbols)
         output: dict[str, Quote] = {}
+        now_obs = self.now()
+        market_open = False
         if effective:
-            market_open = await self._market_open(self.now())
+            market_open = await self._market_open(now_obs)
             max_age = (max_age_s if max_age_s is not None else
                        (96 * 3600 if not market_open and purpose in {"brief", "valuation"}
                         else _QUOTE_AGES[purpose]))
             feed = getattr(self.config, "ALPACA_DATA_FEED", "iex")
             found, reasons = await self._snapshots(list(effective), feed, market_open, max_age)
+            unresolved = [sym for sym in effective if sym not in found]
+            fallback_reasons: dict[str, list[str]] = {sym: [reasons[sym]] for sym in unresolved}
+            if unresolved:
+                await self._resolve_fallbacks(unresolved, found, fallback_reasons, market_open, max_age)
             for symbol in effective:
                 quote = found.get(symbol)
-                if quote is None:
-                    quote, reason = await self._fallback(symbol, market_open, max_age, reasons[symbol])
+                reason = ";".join(dict.fromkeys(fallback_reasons.get(symbol, [reasons.get(symbol, "")])))
                 for requested in effective[symbol]:
                     if quote is None:
                         missing[requested] = reason
@@ -115,6 +126,27 @@ class PriceService:
         if effective or missing:
             await _notify(self.report, "price_service", "live_quotes", not missing,
                           "unresolved_quotes" if missing else None)
+        if effective:
+            try:
+                from stock_agent.trial_metrics import is_regular_hours_open, record_stock_quote_batch
+
+                if is_regular_hours_open(now_obs, calendar=self.calendar, market_open=market_open):
+                    fresh_eff = sum(1 for names in effective.values() if any(n in output for n in names))
+                    miss_eff = {
+                        sym: next((missing[n] for n in names if n in missing), "missing")
+                        for sym, names in effective.items()
+                        if not any(n in output for n in names)
+                    }
+                    record_stock_quote_batch(
+                        self.store,
+                        now_obs,
+                        requested=len(effective),
+                        fresh=fresh_eff,
+                        missing_reasons=miss_eff,
+                        in_memory_sink=self._trial_quote_stats,
+                    )
+            except Exception:
+                pass
         return PriceBatchResult(output, missing)
 
     async def get_daily_bars(
@@ -219,38 +251,109 @@ class PriceService:
                     found[symbol] = quote
         return found, missing
 
-    async def _fallback(self, symbol, market_open, max_age, primary_reason):
-        cfg, failures = self.config, [primary_reason]
+    async def _resolve_fallbacks(self, symbols, found, failures_by_symbol, market_open, max_age):
+        cfg = self.config
         if token := getattr(cfg, "FINNHUB_API_KEY", ""):
-            try:
-                data = await _json_get(
-                    self.http, "https://finnhub.io/api/v1/quote", params={"symbol": symbol},
-                    headers={"X-Finnhub-Token": token},
-                )
-                quote, reason = self._quote(symbol, data.get("c"), data.get("t"), None, None,
-                                            data.get("pc"), "finnhub_quote", market_open, max_age)
-                if quote is not None:
-                    return quote, ""
-                failures.append(reason)
-            except Exception:
-                failures.append("finnhub_unavailable")
-        if (token := getattr(cfg, "FMP_API_KEY", "")) and getattr(cfg, "FMP_QUOTES_ENABLED", True):
+            for symbol in symbols:
+                try:
+                    data = await _json_get(
+                        self.http, "https://finnhub.io/api/v1/quote", params={"symbol": symbol},
+                        headers={"X-Finnhub-Token": token},
+                    )
+                    quote, reason = self._quote(symbol, data.get("c"), data.get("t"), None, None,
+                                                data.get("pc"), "finnhub_quote", market_open, max_age)
+                    if quote is not None:
+                        found[symbol] = quote
+                    else:
+                        failures_by_symbol[symbol].append(reason)
+                except Exception:
+                    failures_by_symbol[symbol].append("finnhub_unavailable")
+
+        remaining = [sym for sym in symbols if sym not in found]
+        if not remaining:
+            return
+        fmp_key = getattr(cfg, "FMP_API_KEY", "")
+        if not fmp_key or not getattr(cfg, "FMP_QUOTES_ENABLED", True):
+            return
+
+        if len(remaining) >= 2 and self.fmp_plan is not None and self.fmp_plan.batch_quotes_enabled():
+            await self._fmp_batch_quotes(
+                remaining, found, failures_by_symbol, fmp_key, market_open, max_age
+            )
+            remaining = [sym for sym in remaining if sym not in found]
+            if not remaining:
+                return
+
+        max_single = max(1, int(getattr(cfg, "FMP_MAX_SINGLE_FALLBACKS", 30)))
+        eligible_single: list[str] = []
+        for symbol in remaining:
+            if self.fmp_plan is not None and not self.fmp_plan.can_quote_symbol(symbol):
+                failures_by_symbol[symbol].append("fmp_plan_blocked")
+            else:
+                eligible_single.append(symbol)
+        for symbol in eligible_single[max_single:]:
+            failures_by_symbol[symbol].append("fmp_fallback_cap")
+        for symbol in eligible_single[:max_single]:
             try:
                 alias = AssetRegistry.provider_symbol(symbol, "fmp")
                 rows = await _json_get(
                     self.http, "https://financialmodelingprep.com/stable/quote", params={"symbol": alias},
-                    headers={"apikey": token},
+                    headers={"apikey": fmp_key},
                 )
                 data = next((entry for entry in rows if entry.get("symbol") == alias), {})
                 quote, reason = self._quote(symbol, data.get("price"), data.get("timestamp"), None, None,
                                             data.get("previousClose"), "fmp_quote", market_open, max_age,
                                             data.get("changePercentage"))
                 if quote is not None:
-                    return quote, ""
-                failures.append(reason)
+                    found[symbol] = quote
+                else:
+                    failures_by_symbol[symbol].append(reason)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in {401, 402, 403} and self.fmp_plan is not None:
+                    self.fmp_plan.record_quote_symbol_refused(symbol)
+                    failures_by_symbol[symbol].append("fmp_plan_blocked")
+                else:
+                    failures_by_symbol[symbol].append("fmp_unavailable")
             except Exception:
-                failures.append("fmp_unavailable")
-        return None, ";".join(dict.fromkeys(failures))
+                failures_by_symbol[symbol].append("fmp_unavailable")
+
+    async def _fmp_batch_quotes(self, symbols, found, failures_by_symbol, fmp_key, market_open, max_age) -> bool:
+        for chunk in _chunks(symbols, 50):
+            alias_map = {AssetRegistry.provider_symbol(sym, "fmp"): sym for sym in chunk}
+            try:
+                rows = await _json_get(
+                    self.http,
+                    "https://financialmodelingprep.com/stable/batch-quote",
+                    params={"symbols": ",".join(alias_map)},
+                    headers={"apikey": fmp_key},
+                )
+                if not isinstance(rows, list):
+                    raise ValueError("invalid batch-quote response")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in {401, 402, 403} and self.fmp_plan is not None:
+                    self.fmp_plan.record_endpoint_refused("batch_quotes")
+                return False
+            except Exception:
+                for sym in chunk:
+                    failures_by_symbol[sym].append("fmp_unavailable")
+                continue
+            by_alias = {
+                str(entry.get("symbol") or "").upper(): entry
+                for entry in rows
+                if isinstance(entry, dict)
+            }
+            for alias, sym in alias_map.items():
+                data = by_alias.get(alias.upper(), {})
+                quote, reason = self._quote(
+                    sym, data.get("price"), data.get("timestamp"), None, None,
+                    data.get("previousClose"), "fmp_batch_quote", market_open, max_age,
+                    data.get("changePercentage"),
+                )
+                if quote is not None:
+                    found[sym] = quote
+                else:
+                    failures_by_symbol[sym].append(reason)
+        return True
 
     def _quote(self, symbol, raw_price, raw_time, bid, ask, prev, source, market_open,
                max_age, change_pct=None) -> tuple[Quote | None, str]:

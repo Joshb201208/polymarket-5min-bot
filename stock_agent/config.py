@@ -209,6 +209,8 @@ class Settings(BaseModel):
         "TIPRANKS_ENABLED",
         "OPTIONS_ENABLED",
         "RESEARCH_SHARE_NOTES",
+        "RESEARCH_SHADOW_WEEKLY_DEEP",
+        "RESEARCH_SHADOW_BUY_SECOND_OPINION",
     })
 
     # ── Broker, mode & safety locks (owned by security_config / broker_execution) ──
@@ -238,6 +240,8 @@ class Settings(BaseModel):
     RESEARCH_EXIT_RESERVE_PCT: int = Field(default=20, ge=0, lt=100)
     RESEARCH_MAX_MODEL_EXITS_PER_SESSION: int = Field(default=4, ge=1)
     RESEARCH_SHARE_NOTES: bool = False
+    RESEARCH_SHADOW_WEEKLY_DEEP: bool = False
+    RESEARCH_SHADOW_BUY_SECOND_OPINION: bool = False
 
     # ── News & market data providers (owned by news_data) ──────────────────────────
     FMP_API_KEY: str = ""

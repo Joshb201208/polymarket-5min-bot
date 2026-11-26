@@ -19,6 +19,7 @@ from stock_agent.asset_registry import AssetRegistry, SymbolRenameEvent
 from stock_agent.broker import AlpacaClient
 from stock_agent.config import Config
 from stock_agent.execution import ExecutionEngine
+from stock_agent.fmp_plan import FmpPlanDetector
 from stock_agent.fundamentals_service import UNIVERSE_CATALOGUE, FundamentalsService
 from stock_agent.heartbeat import HeartbeatClient
 from stock_agent.health import ProviderHealthRegistry
@@ -35,8 +36,9 @@ from stock_agent.research_gate import ResearchGate
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_health import ResearchInputHealth
 from stock_agent.research_pipeline import JobOutcome, OptionIdea, ResearchPipeline, prescan_runtime_seconds
+from stock_agent.research_shadow import run_shadow_research
 from stock_agent.research_sources import ResearchSources
-from stock_agent.research_store import ResearchStore
+from stock_agent.research_store import ResearchStore, week_key
 from stock_agent.risk_manager import (
     DRAWDOWN_STATE_KEY, DrawdownState, RiskControls, RiskManager, TradeKind, update_drawdown,
 )
@@ -47,6 +49,7 @@ from stock_agent.discord_alerts import DiscordReporter
 from stock_agent.telegram_alerts import TelegramReporter
 from stock_agent.macro_monitor import MacroMonitor
 from stock_agent.tipranks_ingest import TipRanksIngestor
+from stock_agent.trial_metrics import collect_trial_metrics, install_broker_quote_observer
 
 logger = logging.getLogger(__name__)
 
@@ -158,9 +161,12 @@ class StockAgentScheduler:
             self.http, config=self.config, store=self.store, report=self._provider_health, now=_now_utc,
             on_rename=self._on_asset_rename, defer_load=True,
         ))
+        self.fmp_plan = service("fmp_plan", lambda: FmpPlanDetector(
+            self.http, config=self.config, health=self.health, now=_now_utc,
+        ))
         self.prices = service("prices", lambda: PriceService(
             self.http, config=self.config, store=self.store, calendar=self.calendar,
-            assets=self.assets, report=self._provider_health, now=_now_utc,
+            assets=self.assets, report=self._provider_health, now=_now_utc, fmp_plan=self.fmp_plan,
         ))
         self.price_service = self.prices
         self.market_move_vix = getattr(services, "market_move_vix", None)
@@ -172,6 +178,7 @@ class StockAgentScheduler:
         self.fundamentals = service("fundamentals", lambda: FundamentalsService(
             self.http, config=self.config, health=self.health, assets=self.assets, prices=self.prices,
             focus_symbols=self._pollable_focus, now=_now_utc, universe_size=self.config.UNIVERSE_SIZE,
+            fmp_plan=self.fmp_plan,
         ))
         self.news = service("news", self._build_news_service)
         self.research_store = service("research_store", lambda: ResearchStore(self.store, self.config))
@@ -186,6 +193,9 @@ class StockAgentScheduler:
             cached_company=getattr(self.fundamentals, "cached_company", None),
             fetch_releases=self.fundamentals.fetch_releases, asset_for=self.assets.get_asset_meta, health=self.health,
             tipranks=self.tipranks, baseline_due=self._baseline_universe_due,
+            held_symbols=lambda: tuple(
+                m.symbol for m in self.ledger.all_open_meta() if m.asset_class == "us_equity"
+            ),
         ))
         self.research_health = service("research_health", lambda: ResearchInputHealth(
             self.ledger, self.llm, quote_ok=self.research_sources.quote_ok, news_ok=self.research_sources.news_ok,
@@ -223,6 +233,12 @@ class StockAgentScheduler:
         self.runtime = service("runtime", lambda: RuntimeStatus.for_data_dir(self.config.DATA_DIR))
         self.pause_file: Path = service("pause_file", lambda: self.config.DATA_DIR / "pause-trading")
         self._stop_event = asyncio.Event()
+        self._trial_metrics_cache: tuple[tuple[str, bool, bool], datetime, dict] | None = None
+        install_broker_quote_observer(
+            self.broker, store=self.store, config=self.config, calendar=self.calendar, clock=_now_utc,
+        )
+        if isinstance(self.runtime, RuntimeStatus):
+            self.runtime.trial_metrics_provider = self._runtime_trial_metrics
         self._normalised = False
         self._engine_resumed = False
         self._state_ready = False
@@ -302,6 +318,37 @@ class StockAgentScheduler:
 
     def _entries_enabled(self) -> bool:
         return not self._entry_safety_locks()
+
+    def _runtime_trial_metrics(self) -> dict | None:
+        now = _now_utc()
+        cache_key = (now.astimezone(ET).date().isoformat(), bool(self._state_ready), bool(self._reconciled))
+        cached = getattr(self, "_trial_metrics_cache", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 3
+            and cached[0] == cache_key
+            and timedelta() <= now - cached[1] < timedelta(seconds=60)
+        ):
+            return cached[2]
+        try:
+            snap = self.ledger.last_snapshot() if self.ledger is not None else None
+            options_store = getattr(self, "options_store", None) or getattr(getattr(self, "options", None), "store", None)
+            metrics = collect_trial_metrics(
+                store=getattr(self, "store", None),
+                ledger=getattr(self, "ledger", None),
+                journal=getattr(self, "journal", None),
+                snapshot=snap,
+                options_store=options_store,
+                price_service=getattr(self, "prices", None),
+                config=getattr(self, "config", None),
+                calendar=getattr(self, "calendar", None),
+                as_of=now,
+            )
+            self._trial_metrics_cache = (cache_key, now, metrics)
+            return metrics
+        except Exception:
+            logger.debug("Runtime trial metrics collection skipped", exc_info=True)
+            return None
 
     def _entry_safety_locks(self) -> dict[str, tuple[str, str]]:
         if self._shutdown:
@@ -575,7 +622,7 @@ class StockAgentScheduler:
         return NewsService(
             self.http, config=self.config, store=self.store, defer_load=True, health=self.health,
             assets=self.assets, enable_sec_filings=bool(getattr(self.config, "SEC_USER_AGENT", "")),
-            now=_now_utc,
+            now=_now_utc, fmp_plan=self.fmp_plan,
         )
 
     async def _refresh_assets(self, *, force: bool = False):
@@ -781,6 +828,12 @@ class StockAgentScheduler:
             self.macro.load_state()
         if isinstance(self.options, OptionsManager):
             self.options.load_state()
+        if isinstance(self.fmp_plan, FmpPlanDetector) and getattr(self.config, "FMP_API_KEY", ""):
+            try:
+                async with asyncio.timeout(6):
+                    await self.fmp_plan.probe(now=_now_utc())
+            except Exception as exc:
+                logger.warning("FMP startup plan probe deferred: %s", type(exc).__name__)
         if not boot.health.ok:
             await self._alert("critical", "State needs broker rebuild",
                               "The previous state was quarantined; new entries stay blocked until recovery.")
@@ -877,6 +930,12 @@ class StockAgentScheduler:
                 await self.alerts.flush(max_budget_sec=7)
         except Exception as exc:
             logger.warning("Alert delivery deferred: %s", type(exc).__name__)
+        if isinstance(self.fmp_plan, FmpPlanDetector) and getattr(self.config, "FMP_API_KEY", ""):
+            try:
+                async with asyncio.timeout(6):
+                    await self.fmp_plan.maybe_reprobe(_now_utc())
+            except Exception as exc:
+                logger.debug("FMP daily plan reprobe deferred: %s", type(exc).__name__)
 
     async def _tick_until_stopped(self) -> None:
         tick = asyncio.create_task(self._tick(_now_et()))
@@ -966,6 +1025,7 @@ class StockAgentScheduler:
             ("drawdown_close", self._should_send_daily_summary, self._close_drawdown, 55),
             ("daily_summary", self._summary_ready, self._send_daily_summary, 120),
             ("shadow_close", self._should_run_shadow_close, self._run_shadow_close, 240),
+            ("research_shadow", self._should_run_research_shadow, self._run_research_shadow, 1500),
             ("weekly", self._should_run_weekly, self._run_weekly_analysis, 1500),
             ("midweek", self._should_run_midweek, self._run_midweek_analysis, 1500),
         )
@@ -1228,6 +1288,30 @@ class StockAgentScheduler:
     def _should_run_shadow_close(self, now: datetime) -> bool:
         session = self.calendar.session_on(now.date())
         return bool(session and now >= session.closes_at + timedelta(minutes=16))
+
+    def _weekly_shadow_due(self, now: datetime) -> bool:
+        following = self.calendar.next_session(now.date())
+        return bool(following and (following.date - timedelta(days=following.date.weekday())).isoformat()
+                    != week_key(now))
+
+    def _should_run_research_shadow(self, now: datetime) -> bool:
+        return (
+            self.research is not None and
+            (getattr(self.config, "RESEARCH_SHADOW_BUY_SECOND_OPINION", False)
+             or (getattr(self.config, "RESEARCH_SHADOW_WEEKLY_DEEP", False) and self._weekly_shadow_due(now)))
+            and self._should_run_shadow_close(now)
+        )
+
+    async def _run_research_shadow(self):
+        now = _now_et()
+        if not self._should_run_research_shadow(now):
+            return JobOutcome(JobStatus.SKIPPED, detail={"reason": "shadow_window_closed"})
+        detail = await run_shadow_research(
+            self.analyst, self.research_store, now,
+            buys=self.config.RESEARCH_SHADOW_BUY_SECOND_OPINION,
+            weekly=self.config.RESEARCH_SHADOW_WEEKLY_DEEP and self._weekly_shadow_due(now),
+        )
+        return JobOutcome(JobStatus.DONE, detail=detail)
 
     def _should_refresh_assets(self, now: datetime) -> bool:
         session = self.calendar.session_on(now.date())

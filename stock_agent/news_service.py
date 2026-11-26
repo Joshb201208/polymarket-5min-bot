@@ -18,9 +18,11 @@ Guarantees:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -39,6 +41,14 @@ from stock_agent.materiality import (
 )
 from stock_agent.research_focus import focus_symbols
 from stock_agent.research_schemas import Evidence, utc_datetime
+from stock_agent.sec_filings import (
+    DEFAULT_SEC_LIVE_DEADLINE_S,
+    DEFAULT_SEC_REQUEST_TIMEOUT_S,
+    DEFAULT_SEC_SCHEDULED_DEADLINE_S,
+    SecArchiveCallState,
+    SecArchiveFetcher,
+    SecRateLimiter,
+)
 from stock_agent.state_store import StateStore, StateUnavailable
 
 logger = logging.getLogger(__name__)
@@ -46,6 +56,7 @@ logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 ALPACA_DATA_BASE = "https://data.alpaca.markets"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
+FMP_BASE = "https://financialmodelingprep.com"
 SEC_SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
 
 BROAD_MARKET_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ")
@@ -130,6 +141,8 @@ class NewsItem:
     kind: Literal["news", "sec_filing"] = "news"
     sec_form: str | None = None
     sec_items: tuple[str, ...] = ()
+    filing_date: str | None = None
+    has_acceptance_time: bool = True
     materiality: int = 0
     materiality_reasons: tuple[str, ...] = ()
     is_new: bool = True
@@ -173,14 +186,23 @@ class NewsItem:
     def to_evidence(self) -> Evidence:
         """Convert to `research_schemas.Evidence` for grounded LLM citations."""
         ev_url = self.url or f"https://news.alpaca.invalid/story/{self.id}"
+        pub_at = self.published_at
+        precision: Literal["instant", "day"] = "instant"
+        if self.kind == "sec_filing" and not self.has_acceptance_time and self.filing_date:
+            try:
+                pub_at = datetime.fromisoformat(f"{self.filing_date}T00:00:00+00:00")
+                precision = "day"
+            except ValueError:
+                pass
         return Evidence(
             evidence_id=self.id,
             url=ev_url,
             title=self.headline or f"{self.source} item",
-            published_at=self.published_at,
+            published_at=pub_at,
             retrieved_at=self.retrieved_at or self.published_at,
             publisher=self.source,
             snippet=self.summary or None,
+            date_precision=precision,
         )
 
 
@@ -208,6 +230,22 @@ def _safe_utc(raw: Any, *, fallback: datetime) -> datetime:
     return fallback
 
 
+def _parse_fmp_published_et(raw: Any) -> datetime | None:
+    """Parse FMP press-release timestamp (`America/New_York` when naive) into UTC."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = f"{s[:-1]}+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=ET).astimezone(UTC)
+    return dt.astimezone(UTC)
+
+
 class NewsService:
     """Timed live news polling service with cursor persistence and materiality filtering."""
 
@@ -227,7 +265,10 @@ class NewsService:
         now: Callable[[], datetime] | None = None,
         alpaca_data_base: str = ALPACA_DATA_BASE,
         finnhub_base: str = FINNHUB_BASE,
+        fmp_base: str = FMP_BASE,
         sec_submissions_base: str = SEC_SUBMISSIONS_BASE,
+        fmp_plan: Any = None,
+        sec_rate_limiter: SecRateLimiter | None = None,
     ) -> None:
         configure_safe_http_logging()
         self.config = config
@@ -237,10 +278,12 @@ class NewsService:
             config, store=store, defer_load=defer_load, now=self._now
         )
         self.assets = assets
+        self.fmp_plan = fmp_plan
         self._cik_lookup = cik_lookup
         self.enable_sec_filings = enable_sec_filings or (cik_lookup is not None)
         self.alpaca_data_base = alpaca_data_base.rstrip("/")
         self.finnhub_base = finnhub_base.rstrip("/")
+        self.fmp_base = fmp_base.rstrip("/")
         self.sec_submissions_base = sec_submissions_base.rstrip("/")
 
         if isinstance(http, DataHttpClient):
@@ -253,10 +296,16 @@ class NewsService:
             self.http = DataHttpClient(config)
             self._owns_http = True
 
+        self._sec_rate_limiter = sec_rate_limiter or SecRateLimiter(max_per_second=10.0)
+        self._sec_archives = SecArchiveFetcher(
+            self.http, config=config, rate_limiter=self._sec_rate_limiter
+        )
+
         self._seen: dict[str, dict[str, Any]] = {}
         self._evaluated: dict[str, str] = {}
         self._cursors: dict[str, datetime] = {}
         self._recent_filings_cache: dict[tuple[str, int, int], tuple[datetime, tuple[NewsItem, ...]]] = {}
+        self._sec_archive_breaker: tuple[datetime, float] | None = None
         self._latest_batch: NewsFeedBatch | None = None
         self._state_loaded: bool = store is None
         if not defer_load:
@@ -506,6 +555,24 @@ class NewsService:
                 threshold=materiality_threshold,
             )
             raw_items.extend(sec_items)
+
+        # 4. Additive: FMP corporate press releases (/stable/news/press-releases) when plan allows
+        pr_symbols = list(dict.fromkeys([*held_list, *owner_focus, *uni_list]))[:30]
+        if (
+            pr_symbols
+            and self.fmp_plan is not None
+            and self.fmp_plan.press_releases_enabled()
+            and not self.health.is_blocked("fmp", "press_releases", now=now_utc)
+        ):
+            fmp_pr_items = await self._fetch_fmp_press_releases(
+                pr_symbols,
+                start_utc=default_start,
+                now_utc=now_utc,
+                target_set=target_set,
+                focus_set=focus_set,
+                threshold=materiality_threshold,
+            )
+            raw_items.extend(fmp_pr_items)
 
         if not alpaca_ok and not finnhub_covered:
             self.health.record_news_poll(polled_symbols, now_utc, source="failed", ok=False)
@@ -831,6 +898,95 @@ class NewsService:
 
         return items, tuple(covered), last_err
 
+    async def _fetch_fmp_press_releases(
+        self,
+        symbols: Sequence[str],
+        *,
+        start_utc: datetime,
+        now_utc: datetime,
+        target_set: set[str],
+        focus_set: set[str],
+        threshold: int,
+    ) -> list[NewsItem]:
+        fmp_syms = [s.replace(".", "-") for s in symbols]
+        try:
+            resp = await self.http.get(
+                f"{self.fmp_base}/stable/news/press-releases",
+                params={"symbols": ",".join(fmp_syms), "limit": 50},
+            )
+        except httpx.HTTPError as exc:
+            self.health.record_failure(
+                "fmp", "press_releases", summary=scrub_secrets(str(exc)), at=now_utc
+            )
+            return []
+
+        if resp.status_code != 200:
+            if resp.status_code in {401, 402, 403} and self.fmp_plan is not None:
+                self.fmp_plan.record_endpoint_refused("press_releases")
+            self.health.record_failure(
+                "fmp",
+                "press_releases",
+                status_code=resp.status_code,
+                summary=f"FMP press-releases HTTP {resp.status_code}",
+                at=now_utc,
+            )
+            return []
+
+        try:
+            rows = resp.json()
+        except ValueError:
+            rows = None
+        if not isinstance(rows, list):
+            return []
+
+        self.health.record_ok("fmp", "press_releases", required=False, at=now_utc)
+        out: list[NewsItem] = []
+        for row in rows[:50]:
+            if not isinstance(row, dict):
+                continue
+            raw_sym = str(row.get("symbol") or "").strip().upper()
+            if not raw_sym:
+                continue
+            sym = self._resolve_symbol(raw_sym.replace("-", "."))
+            headline = sanitize_news_text(row.get("title") or row.get("headline"), max_chars=300)
+            if not headline:
+                continue
+            published_at = _parse_fmp_published_et(row.get("publishedDate") or row.get("date"))
+            if published_at is None:
+                continue
+            if published_at < start_utc - timedelta(hours=12) or published_at > now_utc + timedelta(minutes=5):
+                continue
+            summary = sanitize_news_text(row.get("text") or row.get("summary"), max_chars=600)
+            publisher = str(row.get("publisher") or row.get("site") or "FMP Press Release").strip()
+            url = str(row.get("url") or "").strip()
+            sid = story_fingerprint(headline, (sym,), published_at)
+            verdict = score_materiality(
+                headline,
+                summary,
+                symbols=(sym,),
+                held_or_target=target_set,
+                focus_set=focus_set,
+                threshold=threshold,
+            )
+            out.append(
+                NewsItem(
+                    id=sid,
+                    symbols=(sym,),
+                    headline=headline,
+                    summary=summary,
+                    source=publisher,
+                    published_at=published_at,
+                    url=url,
+                    retrieved_at=now_utc,
+                    provider="fmp",
+                    provider_id=url or sid,
+                    kind="news",
+                    materiality=verdict.score,
+                    materiality_reasons=verdict.reasons,
+                )
+            )
+        return out
+
     def _parse_sec_submissions(
         self,
         sym: str,
@@ -857,8 +1013,9 @@ class NewsService:
         acceptance_col = recent.get("acceptanceDateTime") or []
         report_col = recent.get("reportDate") or []
         desc_col = recent.get("primaryDocDescription") or []
+        primary_col = recent.get("primaryDocument") or []
         today_iso = now_utc.date().isoformat()
-        parsed_items: list[NewsItem] = []
+        parsed_items: list[tuple[NewsItem, str]] = []
 
         for idx, form in enumerate(forms[:max_scan_rows]):
             form_str = str(form or "").strip().upper()
@@ -914,28 +1071,186 @@ class NewsService:
                 sec_items=sec_item_codes,
                 threshold=threshold,
             )
+            primary_doc = str(primary_col[idx] or "").strip() if idx < len(primary_col) else ""
             parsed_items.append(
-                NewsItem(
-                    id=f"sec-{sym.lower()}-{acc_nodash}",
-                    symbols=(sym,),
-                    headline=headline,
-                    summary=summary,
-                    source="SEC EDGAR",
-                    published_at=published_at,
-                    url=url,
-                    retrieved_at=now_utc,
-                    provider="sec",
-                    provider_id=acc_raw,
-                    kind="sec_filing",
-                    sec_form=form_str,
-                    sec_items=sec_item_codes,
-                    materiality=verdict.score,
-                    materiality_reasons=verdict.reasons,
+                (
+                    NewsItem(
+                        id=f"sec-{sym.lower()}-{acc_nodash}",
+                        symbols=(sym,),
+                        headline=headline,
+                        summary=summary,
+                        source="SEC EDGAR",
+                        published_at=published_at,
+                        url=url,
+                        retrieved_at=now_utc,
+                        provider="sec",
+                        provider_id=acc_raw,
+                        kind="sec_filing",
+                        sec_form=form_str,
+                        sec_items=sec_item_codes,
+                        filing_date=filing_date_str,
+                        has_acceptance_time=has_explicit_acceptance,
+                        materiality=verdict.score,
+                        materiality_reasons=verdict.reasons,
+                    ),
+                    primary_doc,
                 )
             )
             if per_symbol_limit is not None and len(parsed_items) >= per_symbol_limit:
                 break
         return parsed_items
+
+    async def _enrich_sec_items_with_archives(
+        self,
+        cik_padded: str,
+        items_with_docs: Sequence[tuple[NewsItem, str]],
+        *,
+        target_set: set[str],
+        focus_set: set[str],
+        threshold: int,
+        expand_chunks: bool = False,
+        call_state: SecArchiveCallState | None = None,
+    ) -> tuple[list[NewsItem], bool, bool]:
+        """Return `(items, used_network_archive, degraded_on_symbol)`."""
+        cik_int = str(int(cik_padded))
+        enriched: list[NewsItem] = []
+        periodic_fetched = 0
+        earnings_expanded = 0
+        used_archive = False
+        degraded = False
+        for item, primary_doc in items_with_docs:
+            form_str = (item.sec_form or "").upper()
+            is_periodic = form_str in {"10-Q", "10-Q/A", "10-K", "10-K/A"}
+            if is_periodic and periodic_fetched >= 1:
+                enriched.append(item)
+                continue
+            if call_state is not None and (call_state.breaker_tripped or call_state.deadline_expired):
+                degraded = True
+                enriched.append(item)
+                continue
+            rem: float | None = None
+            if call_state is not None and call_state.deadline_mono is not None:
+                rem = call_state.deadline_mono - time.monotonic()
+                if rem <= 0.02:
+                    call_state.deadline_expired = True
+                    degraded = True
+                    enriched.append(item)
+                    continue
+            acc_raw = item.provider_id
+            acc_nodash = acc_raw.replace("-", "")
+            prior_fail = call_state.consecutive_failures if call_state is not None else 0
+            coro = self._sec_archives.fetch_filing_document(
+                cik_int=cik_int,
+                acc_nodash=acc_nodash,
+                accession=acc_raw,
+                form=form_str,
+                items=item.sec_items,
+                primary_document=primary_doc,
+                deadline_mono=call_state.deadline_mono if call_state is not None else None,
+                call_state=call_state,
+            )
+            try:
+                extracted = (
+                    await asyncio.wait_for(coro, timeout=rem) if rem is not None else await coro
+                )
+            except TimeoutError:
+                if call_state is not None:
+                    call_state.deadline_expired = True
+                    call_state.record_transient_failure("SEC archive call deadline exceeded")
+                degraded = True
+                enriched.append(item)
+                continue
+            except Exception as exc:
+                if call_state is not None:
+                    call_state.record_transient_failure(
+                        f"SEC archive hook error: {type(exc).__name__}"
+                    )
+                degraded = True
+                enriched.append(item)
+                continue
+            if is_periodic:
+                periodic_fetched += 1
+            if extracted is None:
+                if call_state is not None and (
+                    call_state.breaker_tripped
+                    or call_state.deadline_expired
+                    or call_state.consecutive_failures > prior_fail
+                ):
+                    degraded = True
+                enriched.append(item)
+                continue
+            used_archive = True
+
+            is_8k = form_str in {"8-K", "8-K/A"}
+            if expand_chunks and is_8k and earnings_expanded < 2:
+                earnings_expanded += 1
+                part_snippets = extracted.snippets[:3] or (extracted.snippet,)
+                for part_idx, part_text in enumerate(part_snippets, start=1):
+                    verdict = score_materiality(
+                        item.headline,
+                        part_text,
+                        symbols=item.symbols,
+                        held_or_target=target_set,
+                        focus_set=focus_set,
+                        sec_form=form_str,
+                        sec_items=item.sec_items,
+                        threshold=threshold,
+                    )
+                    enriched.append(
+                        NewsItem(
+                            id=f"{item.id}:{part_idx}",
+                            symbols=item.symbols,
+                            headline=item.headline,
+                            summary=part_text,
+                            source=item.source,
+                            published_at=item.published_at,
+                            url=extracted.url,
+                            retrieved_at=item.retrieved_at,
+                            provider=item.provider,
+                            provider_id=item.provider_id,
+                            kind=item.kind,
+                            sec_form=item.sec_form,
+                            sec_items=item.sec_items,
+                            filing_date=item.filing_date,
+                            has_acceptance_time=item.has_acceptance_time,
+                            materiality=verdict.score,
+                            materiality_reasons=verdict.reasons,
+                        )
+                    )
+                continue
+
+            verdict = score_materiality(
+                item.headline,
+                extracted.snippet,
+                symbols=item.symbols,
+                held_or_target=target_set,
+                focus_set=focus_set,
+                sec_form=form_str,
+                sec_items=item.sec_items,
+                threshold=threshold,
+            )
+            enriched.append(
+                NewsItem(
+                    id=item.id,
+                    symbols=item.symbols,
+                    headline=item.headline,
+                    summary=extracted.snippet,
+                    source=item.source,
+                    published_at=item.published_at,
+                    url=extracted.url,
+                    retrieved_at=item.retrieved_at,
+                    provider=item.provider,
+                    provider_id=item.provider_id,
+                    kind=item.kind,
+                    sec_form=item.sec_form,
+                    sec_items=item.sec_items,
+                    filing_date=item.filing_date,
+                    has_acceptance_time=item.has_acceptance_time,
+                    materiality=verdict.score,
+                    materiality_reasons=verdict.reasons,
+                )
+            )
+        return enriched, used_archive, degraded
 
     async def fetch_recent_filings(
         self,
@@ -945,6 +1260,8 @@ class NewsService:
         lookback_days: int = 120,
         per_symbol_limit: int = 4,
         max_symbols: int = 30,
+        deadline_s: float | None = None,
+        archive_deadline_mono: float | None = None,
     ) -> dict[str, tuple[NewsItem, ...]]:
         """Return recent issuer EDGAR filings (8-K/10-Q/10-K/6-K/20-F) cached per symbol."""
         if not self.enable_sec_filings or not symbols or lookback_days <= 0 or per_symbol_limit <= 0:
@@ -973,6 +1290,32 @@ class NewsService:
         except Exception:
             focus_live = set()
 
+        default_budget = float(
+            getattr(self.config, "SEC_ARCHIVE_SCHEDULED_DEADLINE_S", DEFAULT_SEC_SCHEDULED_DEADLINE_S)
+        )
+        eff_budget = max(0.1, float(deadline_s)) if deadline_s is not None else default_budget
+        eff_deadline_mono = (
+            archive_deadline_mono
+            if archive_deadline_mono is not None
+            else (time.monotonic() + eff_budget)
+        )
+        req_timeout_s = max(
+            0.1,
+            float(getattr(self.config, "SEC_REQUEST_TIMEOUT_S", DEFAULT_SEC_REQUEST_TIMEOUT_S)),
+        )
+        call_state = SecArchiveCallState(deadline_mono=eff_deadline_mono)
+        if self._sec_archive_breaker is not None:
+            tripped_utc, tripped_until_mono = self._sec_archive_breaker
+            if (
+                time.monotonic() < tripped_until_mono
+                and timedelta() <= (now_utc - tripped_utc) < timedelta(minutes=2)
+            ):
+                call_state.breaker_tripped = True
+            else:
+                self._sec_archive_breaker = None
+        pre_tripped = call_state.breaker_tripped
+        any_archive_ok = False
+
         result: dict[str, tuple[NewsItem, ...]] = {}
         for sym in resolved_syms:
             cache_key = (sym, lookback_days, per_symbol_limit)
@@ -985,11 +1328,16 @@ class NewsService:
             if not cik:
                 continue
             cik_padded = str(cik).zfill(10)
+            await self._sec_rate_limiter.acquire()
             try:
-                resp = await self.http.get(
-                    f"{self.sec_submissions_base}/CIK{cik_padded}.json"
+                resp = await asyncio.wait_for(
+                    self.http.get(
+                        f"{self.sec_submissions_base}/CIK{cik_padded}.json",
+                        timeout=req_timeout_s,
+                    ),
+                    timeout=req_timeout_s,
                 )
-            except httpx.HTTPError as exc:
+            except (TimeoutError, httpx.HTTPError) as exc:
                 self.health.record_failure("sec", "edgar", summary=scrub_secrets(str(exc)), at=now_utc)
                 break
             if resp.status_code != 200:
@@ -1001,28 +1349,65 @@ class NewsService:
                     at=now_utc,
                 )
                 continue
-            self.health.record_ok("sec", "edgar", required=False, at=now_utc)
+            if not call_state.breaker_tripped:
+                self.health.record_ok("sec", "edgar", required=False, at=now_utc)
+            parsed_pairs = self._parse_sec_submissions(
+                sym,
+                cik_padded,
+                resp.json(),
+                since_day_iso=since_day_iso,
+                now_utc=now_utc,
+                target_set={sym},
+                focus_set=focus_live,
+                threshold=MATERIALITY_THRESHOLD,
+                max_scan_rows=80,
+                per_symbol_limit=per_symbol_limit,
+            )
+            enriched_items, sym_archive_ok, sym_degraded = await self._enrich_sec_items_with_archives(
+                cik_padded,
+                parsed_pairs,
+                target_set={sym},
+                focus_set=focus_live,
+                threshold=MATERIALITY_THRESHOLD,
+                expand_chunks=True,
+                call_state=call_state,
+            )
+            if sym_archive_ok:
+                any_archive_ok = True
             items = tuple(
                 sorted(
-                    self._parse_sec_submissions(
-                        sym,
-                        cik_padded,
-                        resp.json(),
-                        since_day_iso=since_day_iso,
-                        now_utc=now_utc,
-                        target_set={sym},
-                        focus_set=focus_live,
-                        threshold=MATERIALITY_THRESHOLD,
-                        max_scan_rows=80,
-                        per_symbol_limit=per_symbol_limit,
-                    ),
+                    enriched_items,
                     key=lambda item: item.published_at,
                     reverse=True,
                 )
             )
-            self._recent_filings_cache[cache_key] = (now_utc, items)
+            if not sym_degraded:
+                self._recent_filings_cache[cache_key] = (now_utc, items)
             if items:
                 result[sym] = items
+
+        if call_state.breaker_tripped and not pre_tripped:
+            cooldown_s = float(getattr(self.config, "SEC_ARCHIVE_BREAKER_COOLDOWN_S", 45.0))
+            self._sec_archive_breaker = (now_utc, time.monotonic() + max(1.0, cooldown_s))
+            summary = call_state.last_error_summary or "SEC archive circuit breaker tripped"
+            self.health.record_failure(
+                "sec",
+                "edgar_archive",
+                status_code=call_state.last_status_code,
+                summary=summary,
+                required=False,
+                at=now_utc,
+            )
+            self.health.record_failure(
+                "sec",
+                "edgar",
+                status_code=call_state.last_status_code,
+                summary=f"{summary} (degraded to index-only)",
+                required=False,
+                at=now_utc,
+            )
+        elif any_archive_ok and not call_state.breaker_tripped:
+            self.health.record_ok("sec", "edgar_archive", required=False, at=now_utc)
         return result
 
     async def _fetch_sec_filings(
@@ -1035,19 +1420,38 @@ class NewsService:
         focus_set: set[str],
         threshold: int,
     ) -> list[NewsItem]:
+        """Fetch index-only SEC items for live `poll_news` without ever waiting on archive text."""
         out: list[NewsItem] = []
         since_day_iso = since_utc.astimezone(ET).date().isoformat()
+        live_budget_s = max(
+            0.1,
+            float(getattr(self.config, "SEC_LIVE_DEADLINE_S", DEFAULT_SEC_LIVE_DEADLINE_S)),
+        )
+        req_timeout_s = max(
+            0.1,
+            float(getattr(self.config, "SEC_REQUEST_TIMEOUT_S", DEFAULT_SEC_REQUEST_TIMEOUT_S)),
+        )
+        deadline_mono = time.monotonic() + live_budget_s
 
         for sym in symbols:
+            rem = deadline_mono - time.monotonic()
+            if rem <= 0.05:
+                break
             cik = self._lookup_cik(sym)
             if not cik:
                 continue
             cik_padded = str(cik).zfill(10)
+            await self._sec_rate_limiter.acquire()
+            per_req = min(req_timeout_s, max(0.05, deadline_mono - time.monotonic()))
             try:
-                resp = await self.http.get(
-                    f"{self.sec_submissions_base}/CIK{cik_padded}.json"
+                resp = await asyncio.wait_for(
+                    self.http.get(
+                        f"{self.sec_submissions_base}/CIK{cik_padded}.json",
+                        timeout=per_req,
+                    ),
+                    timeout=per_req,
                 )
-            except httpx.HTTPError as exc:
+            except (TimeoutError, httpx.HTTPError) as exc:
                 self.health.record_failure("sec", "edgar", summary=scrub_secrets(str(exc)), at=now_utc)
                 break
             if resp.status_code != 200:
@@ -1059,20 +1463,26 @@ class NewsService:
                     at=now_utc,
                 )
                 continue
-            self.health.record_ok("sec", "edgar", required=False, at=now_utc)
-            out.extend(
-                self._parse_sec_submissions(
-                    sym,
-                    cik_padded,
-                    resp.json(),
-                    since_day_iso=since_day_iso,
-                    now_utc=now_utc,
-                    target_set=target_set,
-                    focus_set=focus_set,
-                    threshold=threshold,
-                    max_scan_rows=80,
-                )
+            breaker_active = (
+                self._sec_archive_breaker is not None
+                and time.monotonic() < self._sec_archive_breaker[1]
+                and timedelta() <= (now_utc - self._sec_archive_breaker[0]) < timedelta(minutes=2)
             )
+            if not breaker_active:
+                self.health.record_ok("sec", "edgar", required=False, at=now_utc)
+            parsed_pairs = self._parse_sec_submissions(
+                sym,
+                cik_padded,
+                resp.json(),
+                since_day_iso=since_day_iso,
+                now_utc=now_utc,
+                target_set=target_set,
+                focus_set=focus_set,
+                threshold=threshold,
+                max_scan_rows=80,
+                per_symbol_limit=4,
+            )
+            out.extend(item for item, _doc in parsed_pairs)
         return out
 
     def _dedupe_and_apply_seen(
@@ -1106,6 +1516,8 @@ class NewsService:
                 kind=preferred.kind,
                 sec_form=preferred.sec_form or existing.sec_form,
                 sec_items=preferred.sec_items or existing.sec_items,
+                filing_date=preferred.filing_date or existing.filing_date,
+                has_acceptance_time=preferred.has_acceptance_time and existing.has_acceptance_time,
                 materiality=max(existing.materiality, item.materiality),
                 materiality_reasons=tuple(
                     dict.fromkeys([*existing.materiality_reasons, *item.materiality_reasons])
@@ -1140,6 +1552,8 @@ class NewsService:
                 kind=item.kind,
                 sec_form=item.sec_form,
                 sec_items=item.sec_items,
+                filing_date=item.filing_date,
+                has_acceptance_time=item.has_acceptance_time,
                 materiality=item.materiality,
                 materiality_reasons=item.materiality_reasons,
                 is_new=is_new,
