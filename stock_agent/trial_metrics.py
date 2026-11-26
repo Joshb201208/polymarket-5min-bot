@@ -26,6 +26,7 @@ import functools
 import json
 import logging
 import math
+import re
 import statistics
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -53,6 +54,46 @@ CANONICAL_ENTRY_JOBS: tuple[str, ...] = (
     "news",
     "earnings",
 )
+
+OPTION_FUNNEL_STAGES: tuple[str, ...] = (
+    "gate",
+    "capacity",
+    "underlying_quote",
+    "news",
+    "research",
+    "permission",
+    "chain",
+    "structure",
+    "pricing",
+    "sizing",
+    "risk",
+    "owner",
+    "order",
+    "broker",
+)
+_OPTION_STAGE_RANK: dict[str, int] = {name: idx for idx, name in enumerate(OPTION_FUNNEL_STAGES)}
+_OPENED_STAGE_RANK: int = len(OPTION_FUNNEL_STAGES)
+_UNCLASSIFIED_STAGE_RANK: int = -1
+_OPTION_STAGE_LABELS: dict[str, str] = {
+    "gate": "gate",
+    "capacity": "capacity",
+    "underlying_quote": "underlying quote",
+    "news": "news",
+    "research": "research",
+    "permission": "permission",
+    "chain": "chain",
+    "structure": "structure",
+    "pricing": "pricing",
+    "sizing": "sizing",
+    "risk": "risk",
+    "owner": "owner",
+    "order": "order",
+    "broker": "broker",
+    "unclassified": "unclassified",
+}
+_OCC_SYMBOL_RE = re.compile(r"\b[A-Z][A-Z0-9./]{0,5}\d{6}[CP]\d{8}\b\s*")
+_URL_SCRUB_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_BROKER_BRAND_RE = re.compile(r"\b(?:Alpaca|Interactive\s+Brokers|IBKR)\b", re.IGNORECASE)
 
 _OFFICIAL_WIRE_DOMAINS: tuple[str, ...] = (
     "businesswire.com",
@@ -985,6 +1026,7 @@ def _collect_option_leg_coverage(
 _JOURNAL_TRIAL_KINDS: frozenset[str] = frozenset(
     {
         "options.scan_skip",
+        "options.opened",
         "options.mark_rejected",
         "options.preopen_veto",
         "options.open_skipped",
@@ -1469,6 +1511,589 @@ def _collect_commissions_and_slippage(
     }
 
 
+# ---------------------------------------------------------------------------
+# Read-only options scan funnel (computed strictly from journal events)
+# ---------------------------------------------------------------------------
+def classify_option_scan_skip_stage(reason: Any, *, stage: Any = None) -> str:
+    """Resolve an ``options.scan_skip`` event's ordered funnel stage.
+
+    Honours the explicit ``stage`` field from the shared event contract when
+    valid; falls back to best-effort classification from ``reason`` for older
+    journal records, or ``"unclassified"`` when unrecognized. Never raises.
+    """
+    if isinstance(stage, str) and stage.strip():
+        st = stage.strip().lower()
+        if st in _OPTION_STAGE_RANK:
+            return st
+        if st == "unclassified":
+            return "unclassified"
+
+    if not isinstance(reason, str) or not reason.strip():
+        return "unclassified"
+    low = reason.strip().lower()
+
+    if low.startswith("broker:"):
+        return "broker"
+
+    if (
+        low.startswith(("reconcile failed", "market gate:", "market gate failed:", "options_mode="))
+        or low
+        in {
+            "options book not loaded",
+            "options book is being rebuilt from the broker",
+            "options desk disabled",
+            "broker is read-only",
+            "broker requires the typed desk for new options",
+        }
+        or "uncapped risk need attention" in low
+    ):
+        return "gate"
+
+    if low.startswith(("order rejected", "not filled (")) or low in {
+        "open order still working",
+        "not filled",
+    }:
+        return "order"
+
+    if low.startswith("owner directive"):
+        return "owner"
+
+    if low.startswith(("risk:", "risk state unavailable", "risk check unavailable", "desk stress over limit")):
+        return "risk"
+
+    if (
+        low.startswith(("options buying power", "one contract risks "))
+        or low
+        in {
+            "no equity or no price",
+            "drawdown control stops new option entries",
+            "max loss per lot above the hard cap",
+        }
+        or "structures open (max " in low
+    ):
+        return "sizing"
+
+    if low == "no limit price meets the reward/risk floor":
+        return "pricing"
+
+    low_no_date = re.sub(r"^(?:\d{4}-\d{2}-\d{2}:\s*)+", "", low)
+    if (
+        low_no_date.startswith(("single:", "spread:", "select:"))
+        or "no listed strike gives a width of" in low
+        or "spread has no positive debit" in low
+        or ("reward/risk " in low and " below " in low)
+        or "bid-ask spread " in low
+        or low_no_date.startswith("open interest ")
+        or " open interest " in low
+        or "quote has no timestamp" in low
+        or ("quote is " in low and "s old" in low)
+        or "crossed quote" in low
+        or (
+            bool(re.search(r"\b[a-z][a-z0-9./]{0,5}\d{6}[cp]\d{8}\b", low))
+            and any(tok in low for tok in ("no ask", "no bid", "no quote", "stale quote"))
+        )
+    ):
+        return "structure"
+
+    if low in {"no listed contracts in the window", "no expiry fits the window", "empty chain"} or low.startswith(
+        "no expiry between "
+    ):
+        return "chain"
+
+    if low.startswith("options level ") or "permission denied" in low:
+        return "permission"
+
+    if low.startswith("underlying ") or low == "no underlying price":
+        return "underlying_quote"
+
+    if low.startswith("research gate:"):
+        tokens = {t.strip() for t in low.split(":", 1)[1].split(",") if t.strip()}
+        if any("news_stale" in t or "news_stamp" in t for t in tokens):
+            return "news"
+        if tokens and tokens <= {"quote_stale_or_unavailable"}:
+            return "underlying_quote"
+        return "research"
+
+    if (
+        any(
+            tok in low
+            for tok in ("news stale", "news_stale", "stale news", "missing news", "no news stamp", "news stamp")
+        )
+        and "disagrees with the thesis" not in low
+        and "news-driven option opens" not in low
+    ):
+        return "news"
+
+    if (
+        low.startswith(("research gate unavailable", "research gate has no owner"))
+        or low
+        in {
+            "news direction disagrees with the thesis",
+            "thesis has no generation time",
+            "no thesis",
+            "missing_thesis",
+            "unverified_thesis",
+            "stale_or_invalid_thesis",
+        }
+        or "is not tradeable with options" in low
+        or (low.startswith("conviction ") and " below " in low)
+    ):
+        return "research"
+
+    if (
+        low
+        in {
+            "already holds a structure on this underlying",
+            "story already handled",
+            "news-driven option opens for this session used up",
+            "structure count limit",
+        }
+        or low.startswith(("cool-down until ", "cooldown until "))
+        or bool(re.match(r"^\d+\s+structures\s+open$", low))
+    ):
+        return "capacity"
+
+    return "unclassified"
+
+
+def _normalize_structure_clause(clause: str) -> str:
+    txt = re.sub(r"^(?:\d{4}-\d{2}-\d{2}:\s*)+", "", clause.strip())
+    txt = re.sub(r"^(?:(?:single|spread|select):\s*)+", "", txt, flags=re.IGNORECASE).strip()
+    txt = _OCC_SYMBOL_RE.sub("", txt)
+    txt = re.sub(r"^(?:(?:single|spread|select):\s*)+", "", txt, flags=re.IGNORECASE).strip()
+    txt = " ".join(txt.split())
+    low = txt.lower()
+    if re.search(r"quote is \d+(?:\.\d+)?s old", low):
+        return "stale leg quote"
+    if re.search(r"bid-ask spread \d+(?:\.\d+)?% of mid", low) or re.search(
+        r"spread \d+(?:\.\d+)?% > max \d+(?:\.\d+)?%", low
+    ):
+        return "wide bid-ask spread"
+    if low == "open interest unknown":
+        return "open interest unknown"
+    if re.search(r"^open interest \d+$", low):
+        return "low open interest"
+    if re.search(r"no listed strike gives a width of \S+ of spot", low):
+        return "no strike fits width"
+    if re.search(r"reward/risk \S+ below \S+", low):
+        return "reward/risk below floor"
+    if re.search(r"no expiry between \d+ and \d+ days", low):
+        return "no expiry fits the window"
+    if txt:
+        txt = re.sub(r"\$?\b\d+(?:\.\d+)?%?", "<n>", txt)
+    return txt or "structure rejected"
+
+
+def _normalize_option_skip_reason(reason: Any, *, stage: str = "") -> str:
+    """Normalize dynamic per-symbol tokens into concise, broker-neutral reason labels."""
+    if not isinstance(reason, str) or not reason.strip():
+        return "unspecified"
+    cleaned = _URL_SCRUB_RE.sub("<url>", reason.strip())
+    cleaned = _BROKER_BRAND_RE.sub("broker", cleaned)
+    cleaned = " ".join(cleaned.split())
+    low = cleaned.lower()
+
+    if low in {"news_stale_or_unavailable", "research gate: news_stale_or_unavailable"}:
+        return "news stale"
+    if low in {
+        "news_stale_or_unavailable,missing_thesis",
+        "research gate: news_stale_or_unavailable,missing_thesis",
+    }:
+        return "news stale, no thesis"
+
+    if low.startswith("research gate:"):
+        raw_tokens = [t.strip() for t in low.split(":", 1)[1].split(",") if t.strip()]
+        token_map = {
+            "missing_thesis": "no thesis",
+            "news_stale_or_unavailable": "news stale",
+            "quote_stale_or_unavailable": "quote stale",
+            "conviction_below_floor_or_invalid": "conviction below floor",
+            "non_entry_direction": "non-entry direction",
+            "unverified_thesis": "unverified thesis",
+            "stale_or_invalid_thesis": "stale thesis",
+        }
+        mapped = [token_map.get(tok, tok.replace("_", " ")) for tok in raw_tokens]
+        out = ", ".join(dict.fromkeys(mapped))
+        return (out or "research gate")[:80]
+
+    if low == "missing_thesis":
+        return "no thesis"
+    if low == "unverified_thesis":
+        return "unverified thesis"
+    if low == "non_entry_direction":
+        return "non-entry direction"
+    if low == "stale_or_invalid_thesis":
+        return "stale thesis"
+    if low == "conviction_below_floor_or_invalid":
+        return "conviction below floor"
+
+    if re.match(r"^\d+\s+structures\s+open(?:\s*\(max\s+\d+\))?$", low):
+        return "max structures open"
+    if re.match(r"^cool-?down until \S+$", low):
+        return "cool-down active"
+    if re.match(r"^underlying symbol now trades as \S+$", low):
+        return "underlying symbol renamed"
+    if re.match(r"^underlying moved .+ while pricing$", low):
+        return "underlying moved while pricing"
+    if low.startswith("underlying quote failed:"):
+        return "underlying quote failed"
+    if re.match(r"^thesis direction .+ is not tradeable with options$", low):
+        return "thesis direction not tradeable"
+    if re.match(r"^conviction \S+ below \S+$", low):
+        return "conviction below floor"
+    if re.match(r"^options level \S+ does not allow buying options$", low):
+        return "options level does not allow buying"
+    if re.match(r"^options level \S+ allows no spread for an owner idea$", low):
+        return "options level allows no spread"
+    if re.match(r"^no expiry between \d+ and \d+ days$", low):
+        return "no expiry fits the window"
+    if re.match(r"^one contract risks \S+, room is \S+$", low):
+        return "contract risk exceeds budget"
+    if low.startswith("options buying power: debit "):
+        return "insufficient options buying power"
+    if low.startswith("risk state unavailable:"):
+        return "risk state unavailable"
+    if low.startswith("risk check unavailable:"):
+        return "risk check unavailable"
+    if low.startswith("reconcile failed:"):
+        return "reconcile failed"
+    if low.startswith(("market gate: market gate failed:", "market gate failed:")):
+        return "market gate failed"
+    if re.match(r"^\d+\s+structure\(s\) with uncapped risk need attention", low):
+        return "uncapped structure needs repair"
+
+    # Multi-attempt structure reasons ("2026-12-18: spread: ...; single: ...; 2027-01-15: ..."):
+    # split on "; " and count the FIRST cause (primary expiry & preferred shape attempt) once per symbol.
+    if (
+        stage == "structure"
+        or bool(re.match(r"^\d{4}-\d{2}-\d{2}:\s*", cleaned))
+        or _OCC_SYMBOL_RE.search(cleaned)
+        or low.startswith(("single:", "spread:", "select:"))
+    ):
+        raw_parts = [part.strip() for part in cleaned.split(";") if part.strip()]
+        if raw_parts:
+            return _normalize_structure_clause(raw_parts[0])[:80]
+
+    return cleaned[:80]
+
+
+def format_options_funnel_summary(window: Mapping[str, Any], *, label: str = "today") -> str:
+    """Build a single-line plain-English summary for the daily report."""
+    considered = int(window.get("symbols_considered", 0) or 0)
+    usable = int(window.get("usable_thesis", 0) or 0)
+    tradable = int(window.get("tradable_contracts", 0) or 0)
+    opened = int(window.get("opened", 0) or 0)
+    blocked_info = window.get("scans_blocked_before_symbols") or {}
+    blocked = int(blocked_info.get("count", 0) or 0) if isinstance(blocked_info, Mapping) else 0
+    biggest = window.get("biggest_drop") if isinstance(window.get("biggest_drop"), Mapping) else None
+
+    base = (
+        f"Options funnel {label}: {considered} considered, "
+        f"{usable} had a usable thesis, "
+        f"{tradable} had tradable contracts, "
+        f"{opened} opened."
+    )
+
+    if considered == 0 and blocked > 0:
+        top_blk = ""
+        top_list = blocked_info.get("top_reasons") if isinstance(blocked_info, Mapping) else None
+        if isinstance(top_list, Sequence) and top_list and isinstance(top_list[0], Mapping):
+            top_blk = str(top_list[0].get("reason") or "")
+        detail = f": {top_blk}" if top_blk else ""
+        return f"{base} Scans blocked before looking at any symbol: {blocked}{detail}."
+
+    parts = [base]
+    if biggest is not None:
+        st_code = str(biggest.get("stage") or "")
+        st_skipped = int(biggest.get("stage_skipped", 0) or 0)
+        r_name = str(biggest.get("reason") or _OPTION_STAGE_LABELS.get(st_code, st_code))
+        r_count = int(biggest.get("reason_count", 0) or 0)
+        if st_skipped > 0:
+            if r_count == st_skipped:
+                parts.append(f"Biggest drop: {r_name} ({st_skipped}).")
+            else:
+                st_lbl = _OPTION_STAGE_LABELS.get(st_code, st_code)
+                parts.append(f"Biggest drop: {st_lbl} ({st_skipped}; top: {r_name} {r_count}).")
+
+    return " ".join(parts).replace("\n", " ")
+
+
+def _empty_options_funnel_window(*, label: str, include_sessions: bool = False) -> dict[str, Any]:
+    stages_list = [
+        {"stage": st, "reached": 0, "skipped": 0, "passed": 0, "top_reasons": []}
+        for st in OPTION_FUNNEL_STAGES
+    ]
+    by_stage = {
+        st: {"reached": 0, "skipped": 0, "passed": 0, "top_reasons": []}
+        for st in OPTION_FUNNEL_STAGES
+    }
+    win: dict[str, Any] = {
+        "symbols_considered": 0,
+        "usable_thesis": 0,
+        "tradable_contracts": 0,
+        "opened": 0,
+        "opened_structures": 0,
+        "gate_blocks": {"count": 0, "top_reasons": []},
+        "scans_blocked_before_symbols": {"count": 0, "gate_count": 0, "by_stage": {}, "top_reasons": []},
+        "stages": stages_list,
+        "by_stage": by_stage,
+        "unclassified": {"skipped": 0, "raw_events": 0, "top_reasons": []},
+        "biggest_drop": None,
+    }
+    if include_sessions:
+        win["symbol_sessions_considered"] = 0
+    win["summary_line"] = format_options_funnel_summary(win, label=label)
+    return win
+
+
+def _build_options_funnel_window(
+    outcomes: Sequence[tuple[int, str, str, int]],
+    blocked_events: Sequence[tuple[str, str]],
+    unclassified_raw_events: int,
+    *,
+    label: str,
+    symbol_sessions_considered: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate ``(rank, stage, reason, opened_count)`` per-symbol outcomes."""
+    considered = len(outcomes)
+    opened = sum(1 for rank, _, _, _ in outcomes if rank == _OPENED_STAGE_RANK)
+    opened_structures = sum(oc for _, _, _, oc in outcomes)
+
+    stages_list: list[dict[str, Any]] = []
+    by_stage: dict[str, dict[str, Any]] = {}
+    for idx, st in enumerate(OPTION_FUNNEL_STAGES):
+        reached = sum(1 for rank, _, _, _ in outcomes if rank >= idx)
+        at_stage = [rsn for rank, _, rsn, _ in outcomes if rank == idx]
+        skipped = len(at_stage)
+        passed = reached - skipped
+        rc = Counter(r for r in at_stage if r)
+        top_reasons = [
+            {"reason": r, "count": int(c)}
+            for r, c in sorted(rc.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        ]
+        entry = {
+            "stage": st,
+            "reached": reached,
+            "skipped": skipped,
+            "passed": passed,
+            "top_reasons": top_reasons,
+        }
+        stages_list.append(entry)
+        by_stage[st] = {
+            "reached": reached,
+            "skipped": skipped,
+            "passed": passed,
+            "top_reasons": top_reasons,
+        }
+
+    uncl_reasons = [rsn for rank, _, rsn, _ in outcomes if rank == _UNCLASSIFIED_STAGE_RANK]
+    uncl_rc = Counter(r for r in uncl_reasons if r)
+    uncl_top = [
+        {"reason": r, "count": int(c)}
+        for r, c in sorted(uncl_rc.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    ]
+    unclassified = {
+        "skipped": len(uncl_reasons),
+        "raw_events": int(unclassified_raw_events),
+        "top_reasons": uncl_top,
+    }
+
+    blk_stage_counts = Counter(st for st, _ in blocked_events if st)
+    blk_reason_counts = Counter(rsn for _, rsn in blocked_events if rsn)
+    gate_reason_counts = Counter(rsn for st, rsn in blocked_events if st == "gate" and rsn)
+    gate_blocks = {
+        "count": int(blk_stage_counts.get("gate", 0)),
+        "top_reasons": [
+            {"reason": r, "count": int(c)}
+            for r, c in sorted(gate_reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        ],
+    }
+    scans_blocked = {
+        "count": len(blocked_events),
+        "gate_count": int(blk_stage_counts.get("gate", 0)),
+        "by_stage": {k: int(v) for k, v in sorted(blk_stage_counts.items())},
+        "top_reasons": [
+            {"reason": r, "count": int(c)}
+            for r, c in sorted(blk_reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        ],
+    }
+
+    # Biggest drop across ordered stages (plus unclassified when present); ties go to earliest stage.
+    biggest_drop: dict[str, Any] | None = None
+    drop_candidates: list[tuple[str, int, list[dict[str, Any]]]] = [
+        (st_entry["stage"], int(st_entry["skipped"]), st_entry["top_reasons"])
+        for st_entry in stages_list
+        if int(st_entry["skipped"]) > 0
+    ]
+    if unclassified["skipped"] > 0:
+        drop_candidates.append(("unclassified", int(unclassified["skipped"]), uncl_top))
+    if drop_candidates:
+        best_stage, best_skipped, best_reasons = max(
+            drop_candidates,
+            key=lambda item: item[1],  # Python max keeps the first item on ties -> earliest stage!
+        )
+        if best_reasons:
+            top_r_name = str(best_reasons[0]["reason"])
+            top_r_cnt = int(best_reasons[0]["count"])
+        else:
+            top_r_name = _OPTION_STAGE_LABELS.get(best_stage, best_stage)
+            top_r_cnt = best_skipped
+        biggest_drop = {
+            "stage": best_stage,
+            "reason": top_r_name,
+            "reason_count": top_r_cnt,
+            "stage_skipped": best_skipped,
+        }
+
+    usable_thesis = int(by_stage["permission"]["reached"])
+    tradable_contracts = int(by_stage["pricing"]["reached"])
+
+    win: dict[str, Any] = {
+        "symbols_considered": considered,
+        "usable_thesis": usable_thesis,
+        "tradable_contracts": tradable_contracts,
+        "opened": opened,
+        "opened_structures": opened_structures,
+        "gate_blocks": gate_blocks,
+        "scans_blocked_before_symbols": scans_blocked,
+        "stages": stages_list,
+        "by_stage": by_stage,
+        "unclassified": unclassified,
+        "biggest_drop": biggest_drop,
+    }
+    if symbol_sessions_considered is not None:
+        win["symbol_sessions_considered"] = int(symbol_sessions_considered)
+    win["summary_line"] = format_options_funnel_summary(win, label=label)
+    return win
+
+
+def _pick_representative_reason(items: Sequence[tuple[str, int | str]]) -> str:
+    """Pick the most frequent reason among ``(reason, order_key)``, tie-broken by latest ``order_key``."""
+    if not items:
+        return "unspecified"
+    counts: Counter[str] = Counter()
+    latest: dict[str, int | str] = {}
+    for rsn, ord_key in items:
+        counts[rsn] += 1
+        if rsn not in latest or ord_key >= latest[rsn]:
+            latest[rsn] = ord_key
+    return max(counts, key=lambda r: (counts[r], latest[r]))
+
+
+def _collect_options_funnel(
+    journal_events: Sequence[Mapping[str, Any]],
+    session_iso: str,
+    start_7d_iso: str,
+) -> dict[str, Any]:
+    """Compute session and rolling-7d option scan funnels strictly from journal events."""
+    try:
+        # Per-(day, symbol) accumulator: {"opened": int, "skips": list[(rank, stage, reason, seq)]}
+        day_sym: dict[tuple[str, str], dict[str, Any]] = {}
+        blocked_by_day: dict[str, list[tuple[str, str]]] = {}
+        uncl_raw_session = 0
+        uncl_raw_7d = 0
+
+        for seq_idx, ev in enumerate(journal_events):
+            if not isinstance(ev, Mapping):
+                continue
+            ev_day = _et_day_iso(ev.get("ts"))
+            if ev_day is None or not (start_7d_iso <= ev_day <= session_iso):
+                continue
+            kind = str(ev.get("kind") or "")
+            if kind == "options.opened":
+                sym = str(ev.get("underlying") or ev.get("symbol") or "").strip().upper()
+                if not sym or sym == "*":
+                    continue
+                slot = day_sym.setdefault((ev_day, sym), {"opened": 0, "skips": []})
+                slot["opened"] += 1
+            elif kind == "options.scan_skip":
+                sym = str(ev.get("symbol") or ev.get("underlying") or "").strip().upper()
+                raw_reason = ev.get("reason")
+                st = classify_option_scan_skip_stage(raw_reason, stage=ev.get("stage"))
+                norm_reason = _normalize_option_skip_reason(raw_reason, stage=st)
+                if not sym or sym == "*":
+                    blocked_by_day.setdefault(ev_day, []).append((st, norm_reason))
+                    continue
+                if st == "unclassified":
+                    uncl_raw_7d += 1
+                    if ev_day == session_iso:
+                        uncl_raw_session += 1
+                rank = _UNCLASSIFIED_STAGE_RANK if st == "unclassified" else _OPTION_STAGE_RANK[st]
+                slot = day_sym.setdefault((ev_day, sym), {"opened": 0, "skips": []})
+                slot["skips"].append((rank, st, norm_reason, seq_idx))
+
+        # Step 1: Reduce each (session_day, symbol) to ONE outcome at its deepest stage reached.
+        # Map: (day, sym) -> (rank, stage, reason, opened_count)
+        per_session_outcomes: dict[tuple[str, str], tuple[int, str, str, int]] = {}
+        for (d_iso, sym), slot in day_sym.items():
+            opened_cnt = int(slot["opened"])
+            if opened_cnt > 0:
+                per_session_outcomes[(d_iso, sym)] = (_OPENED_STAGE_RANK, "opened", "", opened_cnt)
+                continue
+            skips = slot["skips"]
+            best_rank = max(r for r, _, _, _ in skips)
+            best_stage = "unclassified" if best_rank == _UNCLASSIFIED_STAGE_RANK else OPTION_FUNNEL_STAGES[best_rank]
+            at_best = [(rsn, seq_i) for r, _, rsn, seq_i in skips if r == best_rank]
+            chosen_reason = _pick_representative_reason(at_best)
+            per_session_outcomes[(d_iso, sym)] = (best_rank, best_stage, chosen_reason, 0)
+
+        session_outcomes = [
+            outcome for (d_iso, _), outcome in per_session_outcomes.items() if d_iso == session_iso
+        ]
+        session_blocked = list(blocked_by_day.get(session_iso, ()))
+
+        # Step 2: Reduce 7-day per-session outcomes to one outcome per distinct symbol across 7d.
+        by_symbol_7d: dict[str, list[tuple[str, int, str, str, int]]] = {}
+        for (d_iso, sym), (rank, st, rsn, opened_cnt) in per_session_outcomes.items():
+            by_symbol_7d.setdefault(sym, []).append((d_iso, rank, st, rsn, opened_cnt))
+
+        rolling_outcomes: list[tuple[int, str, str, int]] = []
+        for sym_entries in by_symbol_7d.values():
+            tot_opened = sum(oc for _, _, _, _, oc in sym_entries)
+            if tot_opened > 0 or any(r == _OPENED_STAGE_RANK for _, r, _, _, _ in sym_entries):
+                rolling_outcomes.append((_OPENED_STAGE_RANK, "opened", "", max(tot_opened, 1)))
+                continue
+            best_rank = max(r for _, r, _, _, _ in sym_entries)
+            best_stage = "unclassified" if best_rank == _UNCLASSIFIED_STAGE_RANK else OPTION_FUNNEL_STAGES[best_rank]
+            at_best_7d = [(rsn, d_iso) for d_iso, r, _, rsn, _ in sym_entries if r == best_rank]
+            chosen_reason = _pick_representative_reason(at_best_7d)
+            rolling_outcomes.append((best_rank, best_stage, chosen_reason, 0))
+
+        rolling_blocked = [
+            blk for d_iso in sorted(blocked_by_day) for blk in blocked_by_day[d_iso]
+        ]
+
+        session_win = _build_options_funnel_window(
+            session_outcomes,
+            session_blocked,
+            uncl_raw_session,
+            label="today",
+        )
+        rolling_win = _build_options_funnel_window(
+            rolling_outcomes,
+            rolling_blocked,
+            uncl_raw_7d,
+            label="7d",
+            symbol_sessions_considered=len(per_session_outcomes),
+        )
+        return {
+            "stage_order": list(OPTION_FUNNEL_STAGES),
+            "summary_line": session_win["summary_line"],
+            "session": session_win,
+            "rolling_7d": rolling_win,
+        }
+    except Exception:
+        logger.debug("Could not collect options funnel from journal", exc_info=True)
+        empty_s = _empty_options_funnel_window(label="today")
+        empty_7 = _empty_options_funnel_window(label="7d", include_sessions=True)
+        return {
+            "stage_order": list(OPTION_FUNNEL_STAGES),
+            "summary_line": empty_s["summary_line"],
+            "session": empty_s,
+            "rolling_7d": empty_7,
+        }
+
+
 def collect_trial_metrics(
     *,
     store: Any = None,
@@ -1518,6 +2143,7 @@ def collect_trial_metrics(
     comm_slip = _collect_commissions_and_slippage(
         resolved_store, journal_events, structures, session_iso, start_7d_iso
     )
+    opt_funnel = _collect_options_funnel(journal_events, session_iso, start_7d_iso)
 
     return {
         "session_date": session_iso,
@@ -1530,6 +2156,7 @@ def collect_trial_metrics(
         "option_legs_fresh_two_sided": option_legs,
         "quote_caused_option_rejections": opt_rejects,
         "trade_commissions_and_slippage": comm_slip,
+        "options_funnel": opt_funnel,
     }
 
 
@@ -1711,11 +2338,110 @@ def format_trial_metrics_field(metrics: Mapping[str, Any]) -> str:
     return out if len(out) <= 1020 else out[:1017] + "..."
 
 
+def format_options_funnel_field(metrics: Mapping[str, Any]) -> str:
+    """Format the read-only options scan funnel for ``ReportBuilder.build_daily_summary``."""
+    funnel = metrics.get("options_funnel") if isinstance(metrics.get("options_funnel"), Mapping) else {}
+    sess = funnel.get("session") if isinstance(funnel.get("session"), Mapping) else {}
+    wk = funnel.get("rolling_7d") if isinstance(funnel.get("rolling_7d"), Mapping) else {}
+
+    summary_line = str(
+        sess.get("summary_line")
+        or funnel.get("summary_line")
+        or format_options_funnel_summary(sess, label="today")
+    )
+    lines = [summary_line]
+
+    blk_info = (
+        sess.get("scans_blocked_before_symbols")
+        if isinstance(sess.get("scans_blocked_before_symbols"), Mapping)
+        else {}
+    )
+    gate_info = sess.get("gate_blocks") if isinstance(sess.get("gate_blocks"), Mapping) else {}
+    gate_cnt = int(gate_info.get("count", blk_info.get("gate_count", 0)) or 0)
+    total_blk = int(blk_info.get("count", 0) or 0)
+    other_blk = max(0, total_blk - gate_cnt)
+    gate_rs = gate_info.get("top_reasons") if isinstance(gate_info.get("top_reasons"), Sequence) else ()
+    gate_bits = [
+        f"{r.get('reason')} {r.get('count')}"
+        for r in gate_rs[:3]
+        if isinstance(r, Mapping) and r.get("reason")
+    ]
+    gate_detail = f" ({', '.join(gate_bits)})" if gate_bits else ""
+    extra_blk = f"; broker pre-symbol blocks: {other_blk}" if other_blk > 0 else ""
+    lines.append(f"• **Gate blocks:** {gate_cnt}{gate_detail}{extra_blk}")
+
+    stage_parts: list[str] = []
+    stages_seq = sess.get("stages") if isinstance(sess.get("stages"), Sequence) else ()
+    for st_entry in stages_seq:
+        if not isinstance(st_entry, Mapping):
+            continue
+        skipped = int(st_entry.get("skipped", 0) or 0)
+        if skipped <= 0:
+            continue
+        st_code = str(st_entry.get("stage") or "")
+        st_lbl = _OPTION_STAGE_LABELS.get(st_code, st_code)
+        top_rs = st_entry.get("top_reasons") if isinstance(st_entry.get("top_reasons"), Sequence) else ()
+        r_bits = [
+            f"{r.get('reason')} {r.get('count')}"
+            for r in top_rs[:3]
+            if isinstance(r, Mapping) and r.get("reason")
+        ]
+        detail = f" ({', '.join(r_bits)})" if r_bits else ""
+        stage_parts.append(f"{st_lbl} {skipped}{detail}")
+
+    uncl = sess.get("unclassified") if isinstance(sess.get("unclassified"), Mapping) else {}
+    uncl_skipped = int(uncl.get("skipped", 0) or 0)
+    if uncl_skipped > 0:
+        uncl_rs = uncl.get("top_reasons") if isinstance(uncl.get("top_reasons"), Sequence) else ()
+        r_bits = [
+            f"{r.get('reason')} {r.get('count')}"
+            for r in uncl_rs[:3]
+            if isinstance(r, Mapping) and r.get("reason")
+        ]
+        detail = f" ({', '.join(r_bits)})" if r_bits else ""
+        stage_parts.append(f"unclassified {uncl_skipped}{detail}")
+
+    if stage_parts:
+        shown = stage_parts[:6]
+        more = f" (+{len(stage_parts) - 6} stages)" if len(stage_parts) > 6 else ""
+        lines.append(f"• **Drops by stage:** {'; '.join(shown)}{more}")
+
+    wk_considered = int(wk.get("symbols_considered", 0) or 0)
+    wk_usable = int(wk.get("usable_thesis", 0) or 0)
+    wk_tradable = int(wk.get("tradable_contracts", 0) or 0)
+    wk_opened = int(wk.get("opened", 0) or 0)
+    wk_big = wk.get("biggest_drop") if isinstance(wk.get("biggest_drop"), Mapping) else None
+    wk_drop = ""
+    if wk_big is not None and int(wk_big.get("stage_skipped", 0) or 0) > 0:
+        wk_r = str(wk_big.get("reason") or wk_big.get("stage") or "")
+        wk_c = int(wk_big.get("reason_count", 0) or 0)
+        wk_s = int(wk_big.get("stage_skipped", 0) or 0)
+        wk_drop = (
+            f" | top drop: {wk_r} ({wk_s})"
+            if wk_c == wk_s
+            else f" | top drop: {_OPTION_STAGE_LABELS.get(str(wk_big.get('stage') or ''), str(wk_big.get('stage') or ''))} ({wk_s})"
+        )
+    wk_blk_info = wk.get("scans_blocked_before_symbols") if isinstance(wk.get("scans_blocked_before_symbols"), Mapping) else {}
+    wk_blk = int(wk_blk_info.get("count", 0) or 0)
+    wk_blk_txt = f" | blocked scans: {wk_blk}" if wk_blk > 0 else ""
+    lines.append(
+        f"• **Rolling 7d:** {wk_considered} considered, {wk_usable} usable thesis, "
+        f"{wk_tradable} tradable contracts, {wk_opened} opened{wk_drop}{wk_blk_txt}"
+    )
+
+    out = _BROKER_BRAND_RE.sub("broker", "\n".join(lines))
+    return out if len(out) <= 1020 else out[:1017] + "..."
+
+
 __all__ = [
+    "OPTION_FUNNEL_STAGES",
     "OPTION_LEG_QUOTES_KV_KEY",
     "SCHEDULED_JOBS",
     "STOCK_QUOTES_KV_KEY",
+    "classify_option_scan_skip_stage",
     "collect_trial_metrics",
+    "format_options_funnel_field",
+    "format_options_funnel_summary",
     "format_trial_metrics_field",
     "install_broker_quote_observer",
     "is_dated_primary_evidence",

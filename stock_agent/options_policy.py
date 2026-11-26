@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import StrEnum
@@ -128,8 +128,11 @@ def mark_problem(q: ContractQuote | None, now: datetime, s: OptionsSettings) -> 
     return None
 
 
-def quote_problem(q: ContractQuote, now: datetime, s: OptionsSettings, *, need_bid: bool = True) -> str | None:
-    """Why this leg's quote is not good enough to trade on, or None."""
+def quote_problem(q: ContractQuote, now: datetime, s: OptionsSettings, *, need_bid: bool = True,
+                  need_oi: bool = False) -> str | None:
+    """Why this leg's quote is not good enough to trade on, or None. `need_oi` (opening
+    proposals only) makes an unknown open interest fail closed; closes, exits, marks and
+    adoption never pass it."""
     if q.ask is None or q.ask <= 0:
         return "no ask"
     if need_bid and (q.bid is None or q.bid <= 0):
@@ -144,7 +147,9 @@ def quote_problem(q: ContractQuote, now: datetime, s: OptionsSettings, *, need_b
     mid = q.mid
     if mid is not None and (q.ask - q.bid) / mid > s.max_leg_spread_pct:
         return f"bid-ask spread {(q.ask - q.bid) / mid:.0%} of mid"
-    if q.open_interest is not None and q.open_interest < s.min_open_interest:
+    if q.open_interest is None:
+        return "open interest unknown" if need_oi else None
+    if q.open_interest < s.min_open_interest:
         return f"open interest {q.open_interest}"
     return None
 
@@ -225,6 +230,39 @@ def pick_expiry(expiries: Sequence[date], today: date, s: OptionsSettings,
     return best[1] if best else None
 
 
+def _third_friday(year: int, month: int) -> date:
+    first = date(year, month, 1)
+    return first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+
+
+def is_monthly_expiry(exp: date, listed: Iterable[date] = ()) -> bool:
+    """A standard monthly expiry: the third Friday, or the Thursday before it when that
+    Friday is not listed (an exchange holiday moves the monthly a day earlier)."""
+    tf = _third_friday(exp.year, exp.month)
+    if exp == tf:
+        return True
+    return exp == tf - timedelta(days=1) and tf not in set(listed)
+
+
+def candidate_expiries(expiries: Sequence[date], today: date, s: OptionsSettings,
+                       trading_days: Callable[[date, date], int | None], *, limit: int = 3) -> list[date]:
+    """Expiries to try in order: the same window and trading-day margin as pick_expiry,
+    monthly expiries first (open interest gathers there), then the rest, each group
+    nearest target_dte first. At most `limit`."""
+    listed = sorted(set(expiries))
+    ok = []
+    for exp in listed:
+        dte = (exp - today).days
+        if dte < s.min_dte or dte > s.max_dte:
+            continue
+        td = trading_days(today, exp)
+        if td is None or td <= s.exit_trading_days_before_expiry + 5:
+            continue
+        ok.append(exp)
+    ok.sort(key=lambda e: (not is_monthly_expiry(e, listed), abs((e - today).days - s.target_dte), e))
+    return ok[:max(0, limit)]
+
+
 def build_proposal(
     *, underlying: str, direction: Direction, conviction: int, spot: float,
     chain: Sequence[ContractQuote], today: date, now: datetime, s: OptionsSettings,
@@ -261,7 +299,7 @@ def _atm(legs: Sequence[ContractQuote], spot: float) -> ContractQuote:
 
 def _single(und, direction, spot, legs, now, s) -> Proposal | Rejection:
     q = _atm(legs, spot)
-    bad = quote_problem(q, now, s)
+    bad = quote_problem(q, now, s, need_oi=True)
     if bad:
         return Rejection(und, f"{q.symbol} {bad}")
     limit = _limit_between(q.mid, q.ask, s.limit_slippage_frac)
@@ -284,7 +322,7 @@ def _spread(und, direction, spot, legs, now, s) -> Proposal | Rejection:
     if short_q is None:
         return Rejection(und, f"no listed strike gives a width of {s.min_width_pct:.0%}-{s.max_width_pct:.0%} of spot")
     for q in (long_q, short_q):
-        bad = quote_problem(q, now, s)
+        bad = quote_problem(q, now, s, need_oi=True)
         if bad:
             return Rejection(und, f"{q.symbol} {bad}")
     width = round(abs(short_q.strike - long_q.strike), 4)

@@ -87,6 +87,9 @@ class Structure:
     owner_directive_added: str | None = None  # owner-backed: the directive generation ("added" date)
     zero_fill_confirmed: bool = False  # VOID because the broker confirmed a terminal open with no fill
     owner_claim_released: bool = False  # owner-backed: durable one-shot claim handed back
+    # VOID before any open order was sent (the first rung stopped on a stale or bad leg):
+    # no order and no answer, so the news story stays open for a later scan
+    open_never_sent: bool = False
     conviction: int | None = None
     story_id: str | None = None
     opened_at: str | None = None

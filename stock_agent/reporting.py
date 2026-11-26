@@ -48,7 +48,11 @@ from stock_agent.performance import (
     twr,
 )
 from stock_agent.risk_manager import DRAWDOWN_STATE_KEY, DrawdownState
-from stock_agent.trial_metrics import collect_trial_metrics, format_trial_metrics_field
+from stock_agent.trial_metrics import (
+    collect_trial_metrics,
+    format_options_funnel_field,
+    format_trial_metrics_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1158,13 +1162,14 @@ class ReportBuilder:
         if today_mark is None and snap is None:
             locks_empty = self._compile_entry_locks(None, entry_locks)
             funnel_empty = self._compile_entry_funnel(session_date, week=False, explicit_funnel=entry_funnel)
+            tm_empty, tm_empty_err = self._collect_report_trial_metrics(None, now_et)
             empty_fields: list[dict[str, Any]] = []
             if locks_empty:
                 empty_fields.append({"name": "Entry Lock Status", "value": "\n".join(locks_empty["lines"]), "inline": False})
             empty_fields.append(
                 {
                     "name": "Trial & Data-Quality Metrics",
-                    "value": self._format_trial_metrics(session_date, None, now_et),
+                    "value": self._render_trial_metrics_value(tm_empty, tm_empty_err),
                     "inline": False,
                 }
             )
@@ -1172,6 +1177,13 @@ class ReportBuilder:
                 {
                     "name": "Entry Funnel",
                     "value": self._format_entry_funnel_text(funnel_empty, locked=bool(locks_empty)),
+                    "inline": False,
+                }
+            )
+            empty_fields.append(
+                {
+                    "name": "Options Funnel",
+                    "value": self._render_options_funnel_value(tm_empty, tm_empty_err),
                     "inline": False,
                 }
             )
@@ -1376,6 +1388,7 @@ class ReportBuilder:
                     "inline": False,
                 }
             )
+        tm_close, tm_close_err = self._collect_report_trial_metrics(snap, now_et)
         summary_fields.append(
             {
                 "name": "Entry Funnel",
@@ -1385,8 +1398,15 @@ class ReportBuilder:
         )
         summary_fields.append(
             {
+                "name": "Options Funnel",
+                "value": self._render_options_funnel_value(tm_close, tm_close_err),
+                "inline": False,
+            }
+        )
+        summary_fields.append(
+            {
                 "name": "Trial & Data-Quality Metrics",
-                "value": self._format_trial_metrics(session_date, snap, now_et),
+                "value": self._render_trial_metrics_value(tm_close, tm_close_err),
                 "inline": False,
             }
         )
@@ -1400,13 +1420,11 @@ class ReportBuilder:
             }
         ]
 
-    def _format_trial_metrics(
+    def _collect_report_trial_metrics(
         self,
-        session_date: date,
         snap: BookSnapshot | None,
         now_et: datetime,
-    ) -> str:
-        del session_date
+    ) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
             metrics = collect_trial_metrics(
                 store=getattr(self.ledger, "store", None),
@@ -1419,10 +1437,58 @@ class ReportBuilder:
                 calendar=self.calendar,
                 as_of=now_et,
             )
+            return (metrics, None)
+        except Exception as exc:
+            logger.warning("Trial metrics collection degraded (%s)", type(exc).__name__)
+            return (None, exc)
+
+    def _render_trial_metrics_value(
+        self,
+        metrics: Mapping[str, Any] | None,
+        err: Exception | None,
+    ) -> str:
+        if metrics is None:
+            reason = _safe_report_reason(err, self.config) if err is not None else "unavailable"
+            return f"Trial metrics unavailable ({reason})"
+        try:
             return format_trial_metrics_field(metrics)
         except Exception as exc:
             logger.warning("Trial metrics section degraded (%s)", type(exc).__name__)
             return f"Trial metrics unavailable ({_safe_report_reason(exc, self.config)})"
+
+    def _render_options_funnel_value(
+        self,
+        metrics: Mapping[str, Any] | None,
+        err: Exception | None,
+    ) -> str:
+        if metrics is None:
+            reason = _safe_report_reason(err, self.config) if err is not None else "unavailable"
+            return f"Options funnel unavailable ({reason})"
+        try:
+            return format_options_funnel_field(metrics)
+        except Exception as exc:
+            logger.warning("Options funnel section degraded (%s)", type(exc).__name__)
+            return f"Options funnel unavailable ({_safe_report_reason(exc, self.config)})"
+
+    def _format_trial_metrics(
+        self,
+        session_date: date,
+        snap: BookSnapshot | None,
+        now_et: datetime,
+    ) -> str:
+        del session_date
+        metrics, err = self._collect_report_trial_metrics(snap, now_et)
+        return self._render_trial_metrics_value(metrics, err)
+
+    def _format_options_funnel(
+        self,
+        session_date: date,
+        snap: BookSnapshot | None,
+        now_et: datetime,
+    ) -> str:
+        del session_date
+        metrics, err = self._collect_report_trial_metrics(snap, now_et)
+        return self._render_options_funnel_value(metrics, err)
 
     @staticmethod
     def _format_close_mark_quality(today_mark: EquityMark | None, snap: BookSnapshot | None) -> str:

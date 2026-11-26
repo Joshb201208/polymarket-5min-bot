@@ -105,6 +105,9 @@ class RuntimeStatus:
                 trial_metrics = self._collect_trial_metrics()
                 if trial_metrics is not None:
                     record["trial_metrics"] = trial_metrics
+                    opt_funnel = trial_metrics.get("options_funnel")
+                    if isinstance(opt_funnel, Mapping):
+                        record["options_funnel"] = dict(opt_funnel)
                 json.dump(record, file)
             tmp.replace(self.path)
         except OSError:
